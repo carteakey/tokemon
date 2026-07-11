@@ -1,0 +1,13 @@
+services:
+  tokemon:
+    build:
+      context: ..
+    command: serve --database /data/tokemon.db --catalog /config/models.yaml
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../data:/data
+      - ../catalog/models.yaml:/config/models.yaml:ro
+    environment:
+      TOKEMON_INGEST_TOKEN: change-me
+    restart: unless-stopped

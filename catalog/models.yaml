@@ -1,0 +1,24 @@
+schema_version: 1
+
+models:
+  claude-opus-4:
+    provider: anthropic
+    display_name: Claude Opus 4
+    aliases:
+      - claude-opus-4
+      - anthropic/claude-opus-4
+    tier: S
+    input_price_per_million: 15
+    output_price_per_million: 75
+    cache_read_price_per_million: 1.5
+    cache_write_price_per_million: 18.75
+
+  gpt-5-codex:
+    provider: openai
+    display_name: GPT-5 Codex
+    aliases:
+      - gpt-5-codex
+      - openai/gpt-5-codex
+    tier: S
+    input_price_per_million: null
+    output_price_per_million: null
