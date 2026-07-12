@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,11 +46,70 @@ type MachineTotal struct {
 	Tokens  int64  `json:"tokens"`
 }
 
+type ProjectTotal struct {
+	Project  string `json:"project"`
+	Tokens   int64  `json:"tokens"`
+	Sessions int64  `json:"sessions"`
+	Machines int64  `json:"machines"`
+}
+
+type CostSummary struct {
+	Amount         float64 `json:"amount"`
+	PricedTokens   int64   `json:"priced_tokens"`
+	UnpricedTokens int64   `json:"unpriced_tokens"`
+}
+
+const activityWeeks = 53
+
+type TokenBreakdown struct {
+	Name          string `json:"name"`
+	Tokens        int64  `json:"tokens"`
+	UnknownTokens int64  `json:"unknown_tokens,omitempty"`
+}
+
+type DailyUsage struct {
+	Date          string           `json:"date"`
+	Tokens        int64            `json:"tokens"`
+	Events        int64            `json:"events"`
+	UnknownTokens int64            `json:"unknown_tokens,omitempty"`
+	ByModel       []TokenBreakdown `json:"by_model,omitempty"`
+	ByProvider    []TokenBreakdown `json:"by_provider,omitempty"`
+}
+
+type ActivityDay struct {
+	Date          string           `json:"date"`
+	Label         string           `json:"label"`
+	Tokens        int64            `json:"tokens"`
+	Events        int64            `json:"events"`
+	UnknownTokens int64            `json:"unknown_tokens,omitempty"`
+	Level         int              `json:"level"`
+	Future        bool             `json:"future,omitempty"`
+	ByModel       []TokenBreakdown `json:"by_model,omitempty"`
+	ByProvider    []TokenBreakdown `json:"by_provider,omitempty"`
+}
+
+type ActivityWeek struct {
+	MonthLabel string        `json:"month_label,omitempty"`
+	Days       []ActivityDay `json:"days"`
+}
+
+type ActivityHeatmap struct {
+	StartDate      string         `json:"start_date"`
+	EndDate        string         `json:"end_date"`
+	TotalTokens    int64          `json:"total_tokens"`
+	ActiveDays     int64          `json:"active_days"`
+	MaxDailyTokens int64          `json:"max_daily_tokens"`
+	Weeks          []ActivityWeek `json:"weeks"`
+}
+
 type Overview struct {
 	LifetimeTokens int64                    `json:"lifetime_tokens"`
 	Evolution      evolution.Snapshot       `json:"evolution"`
+	Activity       ActivityHeatmap          `json:"activity"`
 	ByModel        []ModelTotal             `json:"by_model"`
 	ByMachine      []MachineTotal           `json:"by_machine"`
+	ByProject      []ProjectTotal           `json:"by_project"`
+	EstimatedCost  CostSummary              `json:"estimated_cost"`
 	Accuracy       map[usage.Accuracy]int64 `json:"accuracy"`
 }
 
@@ -94,6 +154,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
   event_id TEXT PRIMARY KEY,
   timestamp TEXT NOT NULL,
   machine_id TEXT NOT NULL,
+  project TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL,
   raw_model TEXT NOT NULL,
   canonical_model TEXT NOT NULL DEFAULT '',
@@ -117,7 +178,37 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp)
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(canonical_model, raw_model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_machine ON usage_events(machine_id);
 `)
+	if err != nil {
+		return err
+	}
+	hasProject, err := hasColumn(ctx, s.db, "usage_events", "project")
+	if err != nil {
+		return err
+	}
+	if !hasProject {
+		_, err = s.db.ExecContext(ctx, `ALTER TABLE usage_events ADD COLUMN project TEXT NOT NULL DEFAULT ''`)
+	}
 	return err
+}
+
+func hasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult, error) {
@@ -162,13 +253,13 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 			return result, err
 		}
 		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events (
-event_id, timestamp, machine_id, provider, raw_model, canonical_model, tool,
+event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool,
 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
 total_tokens, cost, cost_estimated, currency, session_id, duration_ms, token_accuracy,
 adapter, adapter_version
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			event.EventID, event.Timestamp.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), event.MachineID,
-			event.Provider, event.Model, canonicalModel, event.Tool,
+			usage.NormalizeProject(event.Project), event.Provider, event.Model, canonicalModel, event.Tool,
 			ptrValue(event.InputTokens), ptrValue(event.OutputTokens), ptrValue(event.CacheReadTokens), ptrValue(event.CacheWriteTokens), ptrValue(event.ReasoningTokens),
 			ptrValue(event.TotalTokens), cost, costEstimated, currency(event.Currency), nullString(event.SessionID), ptrValue(event.DurationMS),
 			string(event.TokenAccuracy), event.Source.Adapter, event.Source.AdapterVersion,
@@ -181,6 +272,24 @@ adapter, adapter_version
 			return result, err
 		}
 		if rows == 0 {
+			// Some local providers expose a mutable aggregate per session rather
+			// than append-only records. Keep the deterministic event ID stable and
+			// refresh the snapshot so periodic scans do not double-count it.
+			_, err = tx.ExecContext(ctx, `UPDATE usage_events SET
+timestamp=?, machine_id=?, project=?, provider=?, raw_model=?, canonical_model=?, tool=?,
+input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, reasoning_tokens=?,
+total_tokens=?, cost=?, cost_estimated=?, currency=?, session_id=?, duration_ms=?, token_accuracy=?,
+adapter=?, adapter_version=?
+WHERE event_id=?`,
+				event.Timestamp.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), event.MachineID,
+				usage.NormalizeProject(event.Project), event.Provider, event.Model, canonicalModel, event.Tool,
+				ptrValue(event.InputTokens), ptrValue(event.OutputTokens), ptrValue(event.CacheReadTokens), ptrValue(event.CacheWriteTokens), ptrValue(event.ReasoningTokens),
+				ptrValue(event.TotalTokens), cost, costEstimated, currency(event.Currency), nullString(event.SessionID), ptrValue(event.DurationMS),
+				string(event.TokenAccuracy), event.Source.Adapter, event.Source.AdapterVersion, event.EventID,
+			)
+			if err != nil {
+				return result, err
+			}
 			result.Duplicates++
 		} else {
 			result.Accepted++
@@ -242,12 +351,195 @@ func (s *Store) Evolution(ctx context.Context) (evolution.Snapshot, error) {
 	return evolution.SnapshotFor(total), nil
 }
 
+func (s *Store) DailyUsage(ctx context.Context, start, end time.Time) ([]DailyUsage, error) {
+	start = dateOnly(start)
+	end = dateOnly(end)
+	if !end.After(start) {
+		return []DailyUsage{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT substr(timestamp, 1, 10),
+COALESCE(NULLIF(canonical_model, ''), raw_model), provider,
+COALESCE(SUM(total_tokens), 0), COUNT(*),
+COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
+FROM usage_events
+WHERE timestamp >= ? AND timestamp < ?
+GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC`, start.Format(time.RFC3339), end.Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type dailyAccumulator struct {
+		item       DailyUsage
+		byModel    map[string]TokenBreakdown
+		byProvider map[string]TokenBreakdown
+	}
+	byDate := make(map[string]*dailyAccumulator)
+	for rows.Next() {
+		var date, model, provider string
+		var tokens, events, unknownTokens int64
+		if err := rows.Scan(&date, &model, &provider, &tokens, &events, &unknownTokens); err != nil {
+			return nil, err
+		}
+		item := byDate[date]
+		if item == nil {
+			item = &dailyAccumulator{
+				item:       DailyUsage{Date: date},
+				byModel:    make(map[string]TokenBreakdown),
+				byProvider: make(map[string]TokenBreakdown),
+			}
+			byDate[date] = item
+		}
+		item.item.Tokens += tokens
+		item.item.Events += events
+		item.item.UnknownTokens += unknownTokens
+		modelBreakdown := item.byModel[model]
+		modelBreakdown.Name = model
+		modelBreakdown.Tokens += tokens
+		modelBreakdown.UnknownTokens += unknownTokens
+		item.byModel[model] = modelBreakdown
+		providerBreakdown := item.byProvider[provider]
+		providerBreakdown.Name = provider
+		providerBreakdown.Tokens += tokens
+		providerBreakdown.UnknownTokens += unknownTokens
+		item.byProvider[provider] = providerBreakdown
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]DailyUsage, 0, len(byDate))
+	for _, item := range byDate {
+		item.item.ByModel = breakdowns(item.byModel)
+		item.item.ByProvider = breakdowns(item.byProvider)
+		result = append(result, item.item)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].Date < result[right].Date })
+	return result, nil
+}
+
+func breakdowns(values map[string]TokenBreakdown) []TokenBreakdown {
+	result := make([]TokenBreakdown, 0, len(values))
+	for _, breakdown := range values {
+		result = append(result, breakdown)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].Tokens == result[right].Tokens {
+			return result[left].Name < result[right].Name
+		}
+		return result[left].Tokens > result[right].Tokens
+	})
+	return result
+}
+
+func (s *Store) Activity(ctx context.Context, now time.Time) (ActivityHeatmap, error) {
+	today := dateOnly(now)
+	currentWeekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	start := currentWeekStart.AddDate(0, 0, -7*(activityWeeks-1))
+	end := currentWeekStart.AddDate(0, 0, 7*activityWeeks)
+	daily, err := s.DailyUsage(ctx, start, end)
+	if err != nil {
+		return ActivityHeatmap{}, err
+	}
+	byDate := make(map[string]DailyUsage, len(daily))
+	var totalTokens, activeDays, maxDailyTokens int64
+	for _, item := range daily {
+		byDate[item.Date] = item
+		if item.Events > 0 {
+			activeDays++
+		}
+		totalTokens += item.Tokens
+		if item.Tokens > maxDailyTokens {
+			maxDailyTokens = item.Tokens
+		}
+	}
+
+	result := ActivityHeatmap{
+		StartDate:      start.Format("2006-01-02"),
+		EndDate:        today.Format("2006-01-02"),
+		TotalTokens:    totalTokens,
+		ActiveDays:     activeDays,
+		MaxDailyTokens: maxDailyTokens,
+		Weeks:          make([]ActivityWeek, 0, activityWeeks),
+	}
+	for weekIndex := 0; weekIndex < activityWeeks; weekIndex++ {
+		weekStart := start.AddDate(0, 0, weekIndex*7)
+		week := ActivityWeek{MonthLabel: activityMonthLabel(weekStart, weekIndex), Days: make([]ActivityDay, 0, 7)}
+		for dayIndex := 0; dayIndex < 7; dayIndex++ {
+			date := weekStart.AddDate(0, 0, dayIndex)
+			dateString := date.Format("2006-01-02")
+			item := byDate[dateString]
+			future := date.After(today)
+			week.Days = append(week.Days, ActivityDay{
+				Date:          dateString,
+				Label:         date.Format("Monday, January 2, 2006"),
+				Tokens:        item.Tokens,
+				Events:        item.Events,
+				UnknownTokens: item.UnknownTokens,
+				Level:         activityLevel(item.Tokens, maxDailyTokens),
+				Future:        future,
+				ByModel:       append([]TokenBreakdown(nil), item.ByModel...),
+				ByProvider:    append([]TokenBreakdown(nil), item.ByProvider...),
+			})
+		}
+		result.Weeks = append(result.Weeks, week)
+	}
+	return result, nil
+}
+
+func dateOnly(value time.Time) time.Time {
+	value = value.UTC()
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func activityMonthLabel(weekStart time.Time, weekIndex int) string {
+	for dayIndex := 0; dayIndex < 7; dayIndex++ {
+		if day := weekStart.AddDate(0, 0, dayIndex); day.Day() == 1 {
+			return day.Format("Jan")
+		}
+	}
+	if weekIndex == 0 {
+		return weekStart.Format("Jan")
+	}
+	return ""
+}
+
+func activityLevel(tokens, maxTokens int64) int {
+	if tokens <= 0 || maxTokens <= 0 {
+		return 0
+	}
+	ratio := float64(tokens) / float64(maxTokens)
+	switch {
+	case ratio <= 0.25:
+		return 1
+	case ratio <= 0.5:
+		return 2
+	case ratio <= 0.75:
+		return 3
+	default:
+		return 4
+	}
+}
+
 func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	total, err := s.LifetimeTokens(ctx)
 	if err != nil {
 		return Overview{}, err
 	}
 	result := Overview{LifetimeTokens: total, Evolution: evolution.SnapshotFor(total), Accuracy: make(map[usage.Accuracy]int64)}
+	if err := s.db.QueryRowContext(ctx, `SELECT
+COALESCE(SUM(cost), 0),
+COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0)
+FROM usage_events`).Scan(
+		&result.EstimatedCost.Amount,
+		&result.EstimatedCost.PricedTokens,
+		&result.EstimatedCost.UnpricedTokens,
+	); err != nil {
+		return Overview{}, err
+	}
+	result.Activity, err = s.Activity(ctx, time.Now().UTC())
+	if err != nil {
+		return Overview{}, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model), COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0) FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	if err != nil {
 		return result, err
@@ -278,6 +570,21 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	if err := rows.Close(); err != nil {
 		return result, err
 	}
+	rows, err = s.db.QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0), COUNT(DISTINCT NULLIF(session_id, '')), COUNT(DISTINCT machine_id) FROM usage_events WHERE project <> '' GROUP BY project ORDER BY 2 DESC`)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var item ProjectTotal
+		if err := rows.Scan(&item.Project, &item.Tokens, &item.Sessions, &item.Machines); err != nil {
+			rows.Close()
+			return result, err
+		}
+		result.ByProject = append(result.ByProject, item)
+	}
+	if err := rows.Close(); err != nil {
+		return result, err
+	}
 	rows, err = s.db.QueryContext(ctx, `SELECT token_accuracy, COUNT(*) FROM usage_events GROUP BY token_accuracy`)
 	if err != nil {
 		return result, err
@@ -295,7 +602,7 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 }
 
 func (s *Store) Events(ctx context.Context) ([]usage.Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT event_id, timestamp, machine_id, provider, raw_model, canonical_model, tool,
+	rows, err := s.db.QueryContext(ctx, `SELECT event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool,
 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
 cost, cost_estimated, currency, session_id, duration_ms, token_accuracy, adapter, adapter_version
 FROM usage_events ORDER BY timestamp, event_id`)
@@ -313,7 +620,7 @@ FROM usage_events ORDER BY timestamp, event_id`)
 		var costEstimated int
 		var session sql.NullString
 		var accuracy, adapter, adapterVersion string
-		if err := rows.Scan(&event.EventID, &timestamp, &event.MachineID, &event.Provider, &event.Model, &canonicalModel, &event.Tool,
+		if err := rows.Scan(&event.EventID, &timestamp, &event.MachineID, &event.Project, &event.Provider, &event.Model, &canonicalModel, &event.Tool,
 			&input, &output, &cacheRead, &cacheWrite, &reasoning, &total, &cost, &costEstimated, &event.Currency, &session, &duration, &accuracy, &adapter, &adapterVersion); err != nil {
 			return nil, err
 		}

@@ -593,6 +593,7 @@ All adapters emit one normalized event.
   "timestamp": "2026-07-11T18:42:00Z",
   "machine_id": "mac-server",
   "session_id": "optional-provider-session-id",
+  "project": "carteakey.dev",
   "provider": "anthropic",
   "model": "claude-opus-4.1",
   "tool": "claude-code",
@@ -620,6 +621,7 @@ All adapters emit one normalized event.
 - `event_id`
 - `timestamp`
 - `machine_id`
+- `project` is optional and contains only a normalized project label, never a repository path
 - `provider`
 - `model`
 - `tool`
@@ -949,6 +951,7 @@ Keep analytics focused:
 - Tokens by model
 - Tokens by provider
 - Tokens by machine
+- Tokens by privacy-safe project label, merged across machines
 - Tokens by tool
 - Input versus output tokens
 - Cache usage

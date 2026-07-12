@@ -16,6 +16,19 @@ func TestDeterministicID(t *testing.T) {
 	}
 }
 
+func TestNormalizeProjectDropsPathAndCase(t *testing.T) {
+	for input, want := range map[string]string{
+		"/Users/alice/repos/Carteakey.dev": `carteakey.dev`,
+		`C:\\Users\\alice\\repos\\TOKEMON`: `tokemon`,
+		"project-name":                     `project-name`,
+		"/":                                ``,
+	} {
+		if got := NormalizeProject(input); got != want {
+			t.Errorf("NormalizeProject(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestValidateRejectsUnknownAccuracy(t *testing.T) {
 	event := Event{
 		SchemaVersion: SchemaVersion,

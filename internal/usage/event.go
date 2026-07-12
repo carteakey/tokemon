@@ -42,6 +42,7 @@ type Event struct {
 	Timestamp        time.Time      `json:"timestamp"`
 	MachineID        string         `json:"machine_id"`
 	SessionID        string         `json:"session_id,omitempty"`
+	Project          string         `json:"project,omitempty"`
 	Provider         string         `json:"provider"`
 	Model            string         `json:"model"`
 	CanonicalModel   string         `json:"canonical_model,omitempty"`
@@ -111,3 +112,19 @@ func DeterministicID(machineID, adapter, sourceIdentity string, offset int64, ti
 func Int64(value int64) *int64 { return &value }
 
 func Float64(value float64) *float64 { return &value }
+
+// NormalizeProject reduces a working directory or explicit project label to a
+// case-insensitive basename. Full filesystem paths must never leave an agent.
+func NormalizeProject(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	value = strings.TrimRight(value, "/")
+	if value == "" {
+		return ""
+	}
+	parts := strings.Split(value, "/")
+	name := strings.TrimSpace(parts[len(parts)-1])
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+	return strings.ToLower(name)
+}

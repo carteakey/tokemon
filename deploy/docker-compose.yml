@@ -2,12 +2,20 @@ services:
   tokemon:
     build:
       context: ..
-    command: serve --database /data/tokemon.db --catalog /config/models.yaml
+    command: ["serve", "--database", "/data/tokemon.db", "--catalog", "/config/models.yaml"]
     ports:
-      - "8080:8080"
+      # The host port is remote-accessible on the private network by default.
+      # Override TOKEMON_PORT when this port is already in use.
+      - "0.0.0.0:${TOKEMON_PORT:-18787}:8080"
     volumes:
       - ../data:/data
       - ../catalog/models.yaml:/config/models.yaml:ro
     environment:
-      TOKEMON_INGEST_TOKEN: change-me
+      TOKEMON_INGEST_TOKEN: ${TOKEMON_INGEST_TOKEN:?Set TOKEMON_INGEST_TOKEN before deploying}
     restart: unless-stopped
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

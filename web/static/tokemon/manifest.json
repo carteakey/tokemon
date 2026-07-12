@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "assets": {
+    "0": {"form": "egg", "path": "/static/tokemon/stage-00.png"},
+    "1": {"form": "bitling", "path": "/static/tokemon/stage-01.png"},
+    "2": {"form": "bytelet", "path": "/static/tokemon/stage-02.png"},
+    "3": {"form": "promptling", "path": "/static/tokemon/stage-03.png"},
+    "4": {"form": "context-cub", "path": "/static/tokemon/stage-04.png"},
+    "5": {"form": "token-scout", "path": "/static/tokemon/stage-05.png"},
+    "6": {"form": "code-caster", "path": "/static/tokemon/stage-06.png"},
+    "7": {"form": "agent-beast", "path": "/static/tokemon/stage-07.png"},
+    "8": {"form": "context-dragon", "path": "/static/tokemon/stage-08.png"},
+    "9": {"form": "token-titan", "path": "/static/tokemon/stage-09.png"},
+    "10": {"form": "model-eater", "path": "/static/tokemon/stage-10.png"},
+    "11": {"form": "context-deity", "path": "/static/tokemon/stage-11.png"},
+    "12": {"form": "the-singularity", "path": "/static/tokemon/stage-12.png"}
+  }
+}

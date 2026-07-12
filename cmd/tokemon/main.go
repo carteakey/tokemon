@@ -10,9 +10,18 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
+	"github.com/tokemon/tokemon/internal/adapters"
+	"github.com/tokemon/tokemon/internal/adapters/claude"
+	"github.com/tokemon/tokemon/internal/adapters/codex"
+	"github.com/tokemon/tokemon/internal/adapters/generic"
+	"github.com/tokemon/tokemon/internal/adapters/opencode"
+	localagent "github.com/tokemon/tokemon/internal/agent"
 	"github.com/tokemon/tokemon/internal/api"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
@@ -30,7 +39,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required; try: tokemon serve, import, export, inspect, discover, or purge")
+		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, or purge")
 	}
 	switch args[0] {
 	case "serve":
@@ -46,13 +55,35 @@ func run(args []string) error {
 	case "purge":
 		return runPurge(args[1:])
 	case "agent":
-		return errors.New("agent polling is the next implementation slice; use discover and import while the ingestion foundation is being built")
+		return runAgent(args[1:])
+	case "catalog":
+		return runCatalog(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runCatalog(args []string) error {
+	if len(args) == 0 || args[0] != "validate" {
+		return errors.New("usage: tokemon catalog validate [--catalog catalog/models.yaml]")
+	}
+	flags := flag.NewFlagSet("catalog validate", flag.ContinueOnError)
+	catalogPath := flags.String("catalog", "catalog/models.yaml", "model catalog YAML path")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: tokemon catalog validate [--catalog catalog/models.yaml]")
+	}
+	modelCatalog, err := catalog.Load(*catalogPath)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("catalog valid: schema %s, %d models, %d resolvable names\n", catalog.SchemaVersion, len(modelCatalog.Models), len(modelCatalog.Aliases))
+	return nil
 }
 
 func runServe(args []string) error {
@@ -204,6 +235,7 @@ func runDiscover(args []string) error {
 	}{
 		{"Claude Code", filepath.Join(home, ".claude"), true},
 		{"Codex", filepath.Join(home, ".codex"), true},
+		{"OpenCode", filepath.Join(home, ".local", "share", "opencode", "opencode.db"), true},
 		{"Config", filepath.Join(home, ".config"), false},
 		{"Local data", filepath.Join(home, ".local", "share"), false},
 		{"Application Support", filepath.Join(home, "Library", "Application Support"), false},
@@ -226,6 +258,170 @@ func runDiscover(args []string) error {
 		fmt.Println("Run tokemon discover --verbose for all checked paths.")
 	}
 	return nil
+}
+
+func runAgent(args []string) error {
+	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
+	var jsonlPaths stringListFlag
+	serverURL := flags.String("server", envOr("TOKEMON_SERVER_URL", "http://127.0.0.1:8080"), "Tokemon server URL")
+	token := flags.String("token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared ingestion token")
+	machineID := flags.String("machine-id", envOr("TOKEMON_MACHINE_ID", ""), "stable machine identifier (defaults to hostname)")
+	home := flags.String("home", envOr("TOKEMON_HOME", ""), "home directory to scan (defaults to the current user's home)")
+	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
+	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
+	once := flags.Bool("once", false, "scan and upload once, then exit")
+	flags.Var(&jsonlPaths, "jsonl", "normalized generic JSONL path or glob (repeatable)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *interval <= 0 {
+		return errors.New("--interval must be positive")
+	}
+	if *home == "" {
+		var err error
+		*home, err = os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+	}
+	if *configPath == "" {
+		*configPath = localagent.DefaultConfigPath(*home)
+	}
+	configValues, err := localagent.ReadEnvFile(*configPath)
+	if err != nil {
+		return err
+	}
+	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, interval)
+	if *machineID == "" {
+		var err error
+		*machineID, err = os.Hostname()
+		if err != nil || strings.TrimSpace(*machineID) == "" {
+			*machineID = "unknown-" + runtime.GOOS
+		}
+	}
+
+	list := []adapters.Adapter{claude.New(*home), codex.New(*home), opencode.New(*home)}
+	if len(jsonlPaths) > 0 {
+		list = append(list, generic.New(jsonlPaths...))
+	}
+	client := localagent.Client{ServerURL: *serverURL, Token: *token}
+	pass := func(ctx context.Context) error {
+		events, reports := adapters.Collect(ctx, list, *machineID)
+		var sourceErrors []error
+		for _, report := range reports {
+			if report.Err != nil {
+				err := fmt.Errorf("%s %s: %w", report.Adapter, displayHome(report.Path, *home), report.Err)
+				sourceErrors = append(sourceErrors, err)
+				fmt.Fprintln(os.Stderr, "tokemon agent:", err)
+				continue
+			}
+			fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
+		}
+		if len(events) == 0 {
+			if len(sourceErrors) > 0 {
+				return errors.Join(sourceErrors...)
+			}
+			fmt.Println("No supported local usage records found.")
+			return nil
+		}
+		result, err := client.Ingest(ctx, events)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("synced %d events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(events), result.Accepted, result.Duplicates, result.CurrentTotal)
+		if len(sourceErrors) > 0 {
+			return errors.Join(sourceErrors...)
+		}
+		return nil
+	}
+
+	if *once {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return pass(ctx)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	for {
+		if err := pass(ctx); err != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "tokemon agent:", err)
+		}
+		timer := time.NewTimer(*interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+type stringListFlag []string
+
+func (values *stringListFlag) String() string { return strings.Join(*values, ",") }
+
+func (values *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("path or glob must not be empty")
+	}
+	*values = append(*values, value)
+	return nil
+}
+
+func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home *string, interval *time.Duration) {
+	if !flagWasSet(flags, "server") && os.Getenv("TOKEMON_SERVER_URL") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_SERVER_URL"]); value != "" {
+			*serverURL = value
+		}
+	}
+	if !flagWasSet(flags, "token") && os.Getenv("TOKEMON_INGEST_TOKEN") == "" {
+		if value := values["TOKEMON_INGEST_TOKEN"]; value != "" {
+			*token = value
+		}
+	}
+	if !flagWasSet(flags, "machine-id") && os.Getenv("TOKEMON_MACHINE_ID") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_MACHINE_ID"]); value != "" {
+			*machineID = value
+		}
+	}
+	if !flagWasSet(flags, "home") && os.Getenv("TOKEMON_HOME") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_HOME"]); value != "" {
+			*home = value
+		}
+	}
+	if !flagWasSet(flags, "interval") && os.Getenv("TOKEMON_SCAN_INTERVAL") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_SCAN_INTERVAL"]); value != "" {
+			if parsed, err := time.ParseDuration(value); err == nil {
+				*interval = parsed
+			}
+		}
+	}
+}
+
+func flagWasSet(flags *flag.FlagSet, name string) bool {
+	set := false
+	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+func configDurationEnv(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func readEvents(path string) ([]usage.Event, error) {
@@ -288,6 +484,13 @@ func loadCatalog(path string) (*catalog.Catalog, error) {
 	return catalog.Load(path)
 }
 
+func envOr(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func displayHome(path, home string) string {
 	return strings.Replace(path, home, "~", 1)
 }
@@ -297,14 +500,18 @@ func printUsage() {
 
 Commands:
   serve       start the HTTP API and dashboard
+  agent       scan local Claude Code/Codex/OpenCode usage and upload metadata
   import      ingest normalized JSONL into SQLite
   export      export normalized JSONL from SQLite
   inspect     validate and print the outgoing JSONL payload
   discover    report supported local tool locations
+  catalog     validate the model pricing catalog
   purge       delete events before a date
 
 Examples:
   tokemon serve --database ./data/tokemon.db
+  tokemon agent --server http://127.0.0.1:8080 --once
   tokemon import --database ./data/tokemon.db usage.jsonl
-  tokemon inspect usage.jsonl`)
+  tokemon inspect usage.jsonl
+  tokemon catalog validate --catalog catalog/models.yaml`)
 }

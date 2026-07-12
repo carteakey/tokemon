@@ -1,0 +1,79 @@
+package codex
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/tokemon/tokemon/internal/adapters"
+	"github.com/tokemon/tokemon/internal/usage"
+	_ "modernc.org/sqlite"
+)
+
+func TestParseThreadSnapshotsWithoutConversationContent(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "state_5.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE threads (
+id TEXT PRIMARY KEY,
+created_at_ms INTEGER NOT NULL,
+updated_at_ms INTEGER NOT NULL,
+model_provider TEXT NOT NULL,
+model TEXT,
+cwd TEXT NOT NULL,
+tokens_used INTEGER NOT NULL DEFAULT 0
+)`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO threads (id, created_at_ms, updated_at_ms, model_provider, model, cwd, tokens_used)
+VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)`,
+		"thread-1", 1783787474000, 1783787475000, "openai", "gpt-5.5", "/private/repos/Carteakey.dev", 42,
+		"thread-empty", 1783787474000, 1783787475000, "openai", "gpt-5.5", "/private/repos/other", 0)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("sources = %d, want 1", len(sources))
+	}
+	result, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(result.Events))
+	}
+	event := result.Events[0]
+	if event.TotalTokens == nil || *event.TotalTokens != 42 || event.Model != "gpt-5.5" || event.Provider != "openai" {
+		t.Fatalf("unexpected event: %+v", event)
+	}
+	if event.Project != "carteakey.dev" {
+		t.Fatalf("project = %q, want privacy-safe basename", event.Project)
+	}
+	if event.TokenAccuracy != usage.AccuracyReported || event.Metadata != nil {
+		t.Fatalf("unexpected privacy or accuracy fields: %+v", event)
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,35 +1,47 @@
 # Tokemon
 
-Tokemon is a small, self-hosted dashboard for AI coding usage. It stores usage metadata only and derives one global creature evolution from lifetime tokens.
+<img src="web/static/tokemon/token-dex.png" alt="Tokemon token-dex icon" width="96">
 
-The authoritative product direction is [tokemon-spec-v0.2.md](tokemon-spec-v0.2.md). [token-bandit-spec.md](token-bandit-spec.md) is retained as historical context; its name and casino theme are obsolete.
+> A tiny, local-first token garden for your coding agents.
 
-## Current slice
+Tokemon reads usage metadata, stores it in SQLite, and grows one original little creature as your lifetime token count climbs. Feed it tokens. Watch it evolve.
 
-The repository now has a working Go foundation for:
+Tokemon is an independent project made just for fun and is not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.
 
-- normalized schema-v1 JSONL events with validation and deterministic ID helpers;
-- pure power-of-ten evolution calculations and the v0.2 form names;
-- YAML model aliases and simple estimated API pricing;
-- SQLite storage with idempotent ingestion, lifetime totals, export, and purge;
-- shared-token batch ingestion and evolution/overview API endpoints;
-- a deliberately small server-rendered overview page;
-- `serve`, `import`, `export`, `inspect`, `discover`, and `purge` commands.
+No prompts, responses, source code, conversation titles, or repository paths are collected by default.
+When a supported tool reports its working directory, Tokemon keeps only the lowercase final directory name as a project label. This lets matching projects merge across machines without sending full paths.
 
-The native polling agent and Claude Code/Codex parsers are the next implementation slice. The `agent` command is intentionally explicit about that boundary instead of pretending those adapters exist.
+## Start
 
-## Run it
-
-Requires Go 1.26 or newer.
+Requires Go 1.26+.
 
 ```bash
-go test ./...
 go run ./cmd/tokemon serve --database ./data/tokemon.db
 ```
 
-The server listens on `http://localhost:8080` by default. Set `TOKEMON_INGEST_TOKEN` or pass `--ingest-token` before exposing ingestion beyond a trusted local network.
+Open [localhost:8080](http://localhost:8080), then sync the current machine:
 
-Import normalized JSONL:
+```bash
+go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
+```
+
+Leave off `--once` to keep polling. The agent currently supports Claude Code transcript JSONL plus Codex and OpenCode usage databases. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
+
+Unsupported tools can emit normalized schema-v1 events to an explicit JSONL path. Repeat `--jsonl` for multiple files or quote a glob so Tokemon, rather than the shell, discovers matching files:
+
+```bash
+go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --jsonl '~/ai-usage/*.jsonl'
+```
+
+Generic JSONL parsing supports byte cursors and safe truncation/replacement resets; durable cursor persistence is handled by the native-agent work in CAR-65. Local paths are hashed before they can enter outgoing metadata.
+
+Managed installs can use `~/.config/tokemon/agent.env`; explicit flags override environment variables, which override that file. See [macOS deployment](deploy/macos/README.md) for the LaunchAgent installer.
+
+The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
+
+## Import or export
+
+Normalized JSONL works too:
 
 ```bash
 go run ./cmd/tokemon inspect examples/usage.jsonl
@@ -37,24 +49,15 @@ go run ./cmd/tokemon import --database ./data/tokemon.db examples/usage.jsonl
 go run ./cmd/tokemon export --database ./data/tokemon.db exported.jsonl
 ```
 
-The exact outgoing payload is what `inspect` prints. It never reads prompts, responses, source code, or repository paths.
+## Develop
 
-## Normalized event
-
-The generic JSONL escape hatch accepts one schema-v1 event per line. Token fields may be JSON `null`; unknown totals do not contribute to the lifetime counter.
-
-```json
-{"schema_version":"1","event_id":"sha256:...","timestamp":"2026-07-11T18:42:00Z","machine_id":"laptop","provider":"anthropic","model":"claude-opus-4","tool":"generic-jsonl","input_tokens":12000,"output_tokens":3400,"cache_read_tokens":null,"cache_write_tokens":null,"reasoning_tokens":null,"total_tokens":15400,"duration_ms":null,"cost":null,"currency":"USD","token_accuracy":"reported","source":{"adapter":"generic-jsonl","adapter_version":"1.0.0"}}
+```bash
+go test ./...
+go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
 ```
 
-## Deployment
+`catalog/models.yaml` is the committed source of truth for API-equivalent pricing. Schema-v2 entries require an official HTTPS source, verification date, USD standard rates, and deterministic aliases. Unknown models remain unpriced; conflicting aliases or invalid pricing prevent the catalog from loading.
 
-The initial Compose file is in [deploy/docker-compose.yml](deploy/docker-compose.yml). It builds the same binary used by the local commands and persists SQLite under `./data`.
+Read the [v0.2 product spec](tokemon-spec-v0.2.md) or run `go run ./cmd/tokemon --help` for the full command list.
 
-## Design guardrails
-
-- SQLite remains the source of stored usage.
-- Evolution is derived state; there is no evolution table.
-- Unknown values stay unknown rather than silently becoming zero.
-- Prompt/response content is outside the normalized schema and is not collected by default.
-- The dashboard is calm analytics with one original creature, not a game engine.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the endpoint contract, macOS LaunchAgent path, Linux container path, Claude integration boundary, and security checklist.

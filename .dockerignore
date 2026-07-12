@@ -1,0 +1,8 @@
+.git
+.git/**
+.env
+.venv
+data
+*.db
+*.db-*
+site
