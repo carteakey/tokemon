@@ -21,6 +21,12 @@ func DefaultServerConfigPath(home string) string {
 	return filepath.Join(home, ".config", "tokemon", "server.env")
 }
 
+// DefaultStatePath returns the user-local SQLite state path for durable agent
+// cursors and metadata fingerprints.
+func DefaultStatePath(home string) string {
+	return filepath.Join(home, ".local", "share", "tokemon", "state.db")
+}
+
 // ReadEnvFile reads a deliberately small dotenv-compatible file. It does not
 // expand shell expressions or execute commands, so an agent config remains
 // data rather than a script.

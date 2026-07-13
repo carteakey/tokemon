@@ -150,7 +150,7 @@ ORDER BY time_created, id`)
 		}
 		events = append(events, event)
 	}
-	return adapters.ParseResult{Events: events}, rows.Err()
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: sourceIdentity}}, rows.Err()
 }
 
 type modelRef struct {

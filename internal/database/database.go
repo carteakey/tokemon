@@ -157,6 +157,21 @@ func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure database busy timeout: %w", err)
+	}
+	if fileBacked {
+		var journalMode string
+		if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("enable database WAL mode: %w", err)
+		}
+		if !strings.EqualFold(journalMode, "wal") {
+			db.Close()
+			return nil, fmt.Errorf("enable database WAL mode: got %q", journalMode)
+		}
+	}
 	store := &Store{db: db, catalog: modelCatalog}
 	if existing {
 		version, err := schemaVersion(context.Background(), db)

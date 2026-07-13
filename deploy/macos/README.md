@@ -47,6 +47,7 @@ The installer writes:
 
 - `~/.local/bin/tokemon`
 - `~/.config/tokemon/agent.env` with mode `0600`
+- `~/.local/share/tokemon/state.db` with mode `0600`
 - `~/Library/LaunchAgents/com.tokemon.agent.plist`
 - `~/Library/Logs/Tokemon/agent.log`
 

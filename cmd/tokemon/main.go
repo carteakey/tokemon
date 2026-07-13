@@ -285,6 +285,7 @@ func runAgent(args []string) error {
 	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
 	onceTimeout := flags.Duration("timeout", 5*time.Minute, "maximum duration for a one-shot scan and upload")
 	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
+	statePath := flags.String("state", envOr("TOKEMON_STATE", ""), "local state database (defaults to ~/.local/share/tokemon/state.db)")
 	once := flags.Bool("once", false, "scan and upload once, then exit")
 	flags.Var(&jsonlPaths, "jsonl", "normalized generic JSONL path or glob (repeatable)")
 	if err := flags.Parse(args); err != nil {
@@ -310,7 +311,7 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, interval)
+	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, interval, statePath)
 	if *machineID == "" {
 		var err error
 		*machineID, err = os.Hostname()
@@ -318,15 +319,26 @@ func runAgent(args []string) error {
 			*machineID = "unknown-" + runtime.GOOS
 		}
 	}
+	if *statePath == "" {
+		*statePath = localagent.DefaultStatePath(*home)
+	}
+	stateStore, err := localagent.OpenState(*statePath)
+	if err != nil {
+		return err
+	}
+	defer stateStore.Close()
 
 	list := []adapters.Adapter{claude.New(*home), codex.New(*home), opencode.New(*home), antigravity.New(*home)}
 	if len(jsonlPaths) > 0 {
 		list = append(list, generic.New(jsonlPaths...))
 	}
 	client := localagent.Client{ServerURL: *serverURL, Token: *token}
-	deltas := localagent.NewDeltaTracker()
 	pass := func(ctx context.Context) error {
-		events, reports := adapters.Collect(ctx, list, *machineID)
+		snapshot, err := stateStore.Snapshot(ctx, *machineID)
+		if err != nil {
+			return err
+		}
+		events, reports := adapters.CollectWithCursors(ctx, list, *machineID, snapshot.Cursors)
 		var sourceErrors []error
 		for _, report := range reports {
 			if report.Err != nil {
@@ -337,24 +349,24 @@ func runAgent(args []string) error {
 			}
 			fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
 		}
-		pending := deltas.Pending(events)
-		if len(pending) == 0 {
-			if len(sourceErrors) > 0 {
-				return errors.Join(sourceErrors...)
+		pending := snapshot.Pending(events)
+		if len(pending) > 0 {
+			result, err := client.Ingest(ctx, pending)
+			if err != nil {
+				return err
 			}
+			fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
+		}
+		if err := stateStore.Commit(ctx, *machineID, reports, pending, time.Now().UTC()); err != nil {
+			return err
+		}
+		if len(pending) == 0 {
 			if len(events) == 0 {
 				fmt.Println("No supported local usage records found.")
 			} else {
 				fmt.Println("No new or changed usage records.")
 			}
-			return nil
 		}
-		result, err := client.Ingest(ctx, pending)
-		if err != nil {
-			return err
-		}
-		deltas.MarkSent(pending)
-		fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
 		if len(sourceErrors) > 0 {
 			return errors.Join(sourceErrors...)
 		}
@@ -398,7 +410,7 @@ func (values *stringListFlag) Set(value string) error {
 	return nil
 }
 
-func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home *string, interval *time.Duration) {
+func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home *string, interval *time.Duration, statePath *string) {
 	if !flagWasSet(flags, "server") && os.Getenv("TOKEMON_SERVER_URL") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_URL"]); value != "" {
 			*serverURL = value
@@ -424,6 +436,11 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 			if parsed, err := time.ParseDuration(value); err == nil {
 				*interval = parsed
 			}
+		}
+	}
+	if !flagWasSet(flags, "state") && os.Getenv("TOKEMON_STATE") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_STATE"]); value != "" {
+			*statePath = value
 		}
 	}
 }

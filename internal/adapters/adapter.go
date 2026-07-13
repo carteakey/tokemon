@@ -30,6 +30,7 @@ type Source struct {
 type Cursor struct {
 	Identity string `json:"identity"`
 	Offset   int64  `json:"offset"`
+	Line     int64  `json:"line,omitempty"`
 }
 
 type ParseRequest struct {
@@ -68,7 +69,9 @@ type Adapter interface {
 type SourceReport struct {
 	Adapter string
 	Path    string
+	Source  Source
 	Events  int
+	Cursor  Cursor
 	Err     error
 }
 
@@ -76,6 +79,13 @@ type SourceReport struct {
 // all sources that are available. One broken source does not hide data from
 // another adapter.
 func Collect(ctx context.Context, list []Adapter, machineID string) ([]usage.Event, []SourceReport) {
+	return CollectWithCursors(ctx, list, machineID, nil)
+}
+
+// CollectWithCursors discovers and parses sources using the last committed
+// cursor for each adapter/path pair. A source parse failure is isolated so
+// healthy sources can still upload their metadata.
+func CollectWithCursors(ctx context.Context, list []Adapter, machineID string, cursors map[string]Cursor) ([]usage.Event, []SourceReport) {
 	var events []usage.Event
 	var reports []SourceReport
 	for _, adapter := range list {
@@ -85,14 +95,19 @@ func Collect(ctx context.Context, list []Adapter, machineID string) ([]usage.Eve
 			continue
 		}
 		for _, source := range sources {
-			report := SourceReport{Adapter: adapter.ID(), Path: source.Path}
-			parsed, err := adapter.Parse(ctx, source, ParseRequest{MachineID: machineID})
+			report := SourceReport{Adapter: adapter.ID(), Path: source.Path, Source: source}
+			cursor := Cursor{}
+			if cursors != nil {
+				cursor = cursors[adapter.ID()+"\x00"+source.Path]
+			}
+			parsed, err := adapter.Parse(ctx, source, ParseRequest{MachineID: machineID, Cursor: cursor})
 			if err != nil {
 				report.Err = err
 				reports = append(reports, report)
 				continue
 			}
 			report.Events = len(parsed.Events)
+			report.Cursor = parsed.Cursor
 			events = append(events, parsed.Events...)
 			reports = append(reports, report)
 		}

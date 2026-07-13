@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,21 @@ func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
 	backups, _ = filepath.Glob(filepath.Join(directory, "backups", "*.db"))
 	if len(backups) != 1 {
 		t.Fatalf("ordinary restart created another backup: %v", backups)
+	}
+}
+
+func TestOpenUsesWALForFileDatabase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal mode = %q, want wal", journalMode)
 	}
 }
 

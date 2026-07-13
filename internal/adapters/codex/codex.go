@@ -241,7 +241,7 @@ func (a *Adapter) parseLog(ctx context.Context, source adapters.Source, request 
 	if err := scanner.Err(); err != nil {
 		return adapters.ParseResult{}, err
 	}
-	return adapters.ParseResult{Events: events}, nil
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: adapters.HashIdentity(source.Path)}}, nil
 }
 
 func firstNonEmpty(values ...string) string {
@@ -290,7 +290,7 @@ ORDER BY created_at_ms, id`)
 			TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: adapterID, AdapterVersion: "0.2.0", Identity: sourceIdentity},
 		})
 	}
-	return adapters.ParseResult{Events: events}, rows.Err()
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: sourceIdentity}}, rows.Err()
 }
 
 var _ adapters.Adapter = (*Adapter)(nil)

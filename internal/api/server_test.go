@@ -129,6 +129,8 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`id="lifetime-counter"`,
 		`id="token-composition"`,
 		`fetch('/api/v1/evolution'`,
+		`updateOdometer(counter, display)`,
+		`character !== previous[index]`,
 		`window.setInterval(pollLifetime, 2000)`,
 		`live counter · analytics refresh every 60s`,
 	} {

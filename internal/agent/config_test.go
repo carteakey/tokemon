@@ -36,3 +36,10 @@ func TestDefaultServerConfigPath(t *testing.T) {
 		t.Fatalf("DefaultServerConfigPath() = %q, want %q", got, want)
 	}
 }
+
+func TestDefaultStatePath(t *testing.T) {
+	want := filepath.Join("/tmp", ".local", "share", "tokemon", "state.db")
+	if got := DefaultStatePath("/tmp"); got != want {
+		t.Fatalf("DefaultStatePath() = %q, want %q", got, want)
+	}
+}

@@ -503,6 +503,7 @@ const dashboardTemplate = `<!doctype html>
       const turns = 2 + (digitIndex % 3);
       const reel = document.createElement('span');
       reel.className = 'odometer-reel';
+      reel.dataset.value = String(digit);
       const strip = document.createElement('span');
       strip.className = 'odometer-strip';
       strip.style.transitionDelay = (digitIndex * 55) + 'ms';
@@ -534,6 +535,67 @@ const dashboardTemplate = `<!doctype html>
     odometer.append(visual);
     odometer.classList.add('is-ready');
     fit();
+  };
+
+  const rollOdometerReel = (reel, digit, delay) => {
+    const previous = Number(reel.dataset.value || 0);
+    if (previous === digit) return;
+    reel.dataset.value = String(digit);
+    const strip = document.createElement('span');
+    strip.className = 'odometer-strip';
+    strip.style.transitionDelay = delay + 'ms';
+    const steps = ((digit - previous + 10) % 10) || 10;
+    for (let step = 0; step <= steps; step += 1) {
+      const item = document.createElement('span');
+      item.className = 'odometer-digit';
+      item.textContent = (previous + step) % 10;
+      strip.append(item);
+    }
+    reel.replaceChildren(strip);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      strip.style.transform = 'translateY(-' + steps + 'em)';
+    }));
+
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      const final = document.createElement('span');
+      final.className = 'odometer-digit';
+      final.textContent = digit;
+      reel.replaceChildren(final);
+    };
+    strip.addEventListener('transitionend', settle, { once: true });
+    window.setTimeout(settle, 1600 + delay);
+  };
+
+  const updateOdometer = (odometer, display) => {
+    const previous = odometer.dataset.display || '';
+    const sameStructure = previous.length === display.length && Array.from(display).every((character, index) => {
+      return /\d/.test(character) === /\d/.test(previous[index]);
+    });
+    if (!sameStructure) {
+      renderOdometer(odometer, display, true);
+      return;
+    }
+
+    odometer.dataset.display = display;
+    odometer.setAttribute('aria-label', display);
+    const fallback = odometer.querySelector('.odometer-static');
+    if (fallback) fallback.textContent = display;
+    const reels = Array.from(odometer.querySelectorAll('.odometer-reel'));
+    const changed = [];
+    let digitIndex = 0;
+    Array.from(display).forEach((character, index) => {
+      if (!/\d/.test(character)) return;
+      if (character !== previous[index]) {
+        changed.push({ reel: reels[digitIndex], digit: Number(character) });
+      }
+      digitIndex += 1;
+    });
+    changed.reverse().forEach((item, index) => {
+      rollOdometerReel(item.reel, item.digit, index * 45);
+    });
   };
 
   document.querySelectorAll('.odometer').forEach((odometer) => {
@@ -584,7 +646,7 @@ const dashboardTemplate = `<!doctype html>
       if (snapshot.lifetime_tokens === lifetimeTokens) return;
       lifetimeTokens = snapshot.lifetime_tokens;
       const display = number.format(lifetimeTokens);
-      renderOdometer(counter, display, true);
+      updateOdometer(counter, display);
       document.getElementById('live-power-level').textContent = display;
       document.getElementById('live-progress-label').textContent = (snapshot.progress * 100).toFixed(1) + '% charged';
       document.getElementById('live-remaining-copy').textContent = snapshot.tokens_remaining == null

@@ -1,11 +1,11 @@
 # Tokemon multi-machine deployment roadmap
 
 **Status:** v0.2 rollout plan
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-13
 
 This document is the implementation roadmap for running one Tokemon server with agents on multiple machines. Linear remains the source of truth for committed work; this document defines the architecture, rollout order, and operational checks rather than creating a second backlog.
 
-Current slice status: the shared agent config loader, macOS server/agent LaunchAgent installers, and Claude Code adapter are implemented and covered by tests. A second Apple Silicon Mac is installed and syncing through the primary Mac's persistent authenticated hub. Durable cursor state, live Claude validation, release publishing, and the Linux container template remain ahead.
+Current slice status: the shared agent config loader, macOS server/agent LaunchAgent installers, Claude Code adapter, and durable agent state are implemented and covered by tests. A second Apple Silicon Mac is installed and syncing through the primary Mac's persistent authenticated hub. Live provider validation, release publishing, and the Linux container template remain ahead.
 
 ## Topology and roles
 
@@ -31,14 +31,14 @@ Agents are outbound-only. The server is the only component that needs a reachabl
 | Phase | State | Outcome | Linear work |
 | --- | --- | --- | --- |
 | 0. First multi-machine slice | Validated | Authenticated server endpoint and second macOS agent sync real metadata | CAR-63, CAR-64, CAR-65 |
-| 1. Durable hub | Implemented | Server survives LaunchAgent restart with protected config, stable SQLite, and health checks | macOS deployment slice |
-| 2. Failure-safe agents | Next | Cursors, retries, rotation, and local state obey the v0.2 contract | CAR-65 |
+| 1. Durable hub | Implemented | Server survives LaunchAgent restart with protected config, WAL-backed SQLite, and health checks | macOS deployment slice |
+| 2. Failure-safe agents | Implemented | Cursors, retries, rotation, and local state obey the v0.2 contract | CAR-65 |
 | 3. Provider evidence | Planned | Live Claude fixture plus complete Codex/OpenCode fixture and inspect coverage | CAR-63, CAR-64 |
 | 4. Release gate | Planned | Cross-provider privacy, authentication, idempotency, and two-machine tests pass | CAR-67 |
 | 5. Distribution | Planned | Signed macOS archive/Homebrew path and Linux multi-architecture image/service templates | Deployment follow-up |
 | 6. Product finish | In progress | Counter-first analytics and evolution-art release acceptance | CAR-69, CAR-66 |
 
-The immediate implementation order is Phase 1, Phase 2, Phase 3, and Phase 4. Distribution follows once the behavior is trustworthy; adding more platforms before that would multiply support paths around an unstable agent state model.
+The immediate implementation order is Phase 3, Phase 4, and Phase 5. Distribution follows once the provider evidence and release gate are trustworthy; adding more platforms before that would multiply support paths around an unstable adapter surface.
 
 ## Decision
 
@@ -86,11 +86,12 @@ TOKEMON_INGEST_TOKEN=...
 TOKEMON_MACHINE_ID=mac-mini
 TOKEMON_SCAN_INTERVAL=1m
 TOKEMON_HOME=/Users/example
+TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
 ```
 
 Resolution order is explicit flags, environment variables, the config file, then safe defaults. Secrets must not be placed in process arguments or container image layers. Config files containing tokens are user-readable only (`0600`).
 
-The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, and `--home`, plus the corresponding `TOKEMON_*` environment variables. The macOS installer writes this file and launches the service with `--config`.
+The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, `--home`, and `--state`, plus the corresponding `TOKEMON_*` environment variables. The macOS installer writes this file and launches the service with `--config`. If no state path is supplied, the agent uses `~/.local/share/tokemon/state.db`.
 
 ## Machine onboarding flow
 
@@ -117,11 +118,11 @@ The primary Mac now runs the hub as a user-level server LaunchAgent with:
 - a `/healthz` check after boot and after restart;
 - Tailscale/WireGuard or HTTPS-only reachability from enrolled agents.
 
-The installed service uses `tokemon serve --config ~/.config/tokemon/server.env`, preserves the existing SQLite database, and keeps the token out of LaunchAgent arguments. This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
+The installed service uses `tokemon serve --config ~/.config/tokemon/server.env`, preserves the existing SQLite database, enables SQLite WAL mode with a busy timeout for concurrent agent uploads, and keeps the token out of LaunchAgent arguments. The server process is the only writer; stop it before using restore or repair tooling. This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
 
 ## Phase 2: make agents failure-safe
 
-Implement the v0.2 local state contract before adding more installation surfaces. State should contain only source identity, cursor, machine ID, and last successful sync, stored at a stable user-local path such as `~/.local/share/tokemon/state.db`.
+The agent now implements the v0.2 local state contract in `~/.local/share/tokemon/state.db`. State contains only source identity, cursor, machine ID, last successful sync, and hashes of normalized event snapshots so aggregate adapters can remain delta-only across restarts.
 
 The agent must:
 
@@ -132,7 +133,7 @@ The agent must:
 - resume safely after a process or machine restart;
 - rely on deterministic event IDs to make rescans idempotent.
 
-This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
+File and append-only sources advance their cursors incrementally, including safe one-line context lookback for Claude duration metadata. Database-backed and context-dependent snapshot adapters rescan local metadata as needed, but persistent event fingerprints prevent unchanged snapshots from being uploaded again. Failed uploads leave both cursors and fingerprints uncommitted; replacement, truncation, and rotation reset file cursors safely. This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
 
 ## Phase 3: prove provider coverage
 
