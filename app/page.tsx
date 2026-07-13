@@ -1,8 +1,12 @@
 const forms = [
   { stage: "00", name: "The first signal", image: "/tokemon/stage-00.png" },
-  { stage: "04", name: "Patterns emerge", image: "/tokemon/stage-04.png" },
   { stage: "08", name: "A serious appetite", image: "/tokemon/stage-08.png" },
-  { stage: "12", name: "The final form", image: "/tokemon/stage-12.png" },
+  { stage: "13", name: "Inference Leviathan", image: "/tokemon/stage-13.png" },
+  { stage: "14", name: "Parameter Colossus", image: "/tokemon/stage-14.png" },
+  { stage: "15", name: "World Weaver", image: "/tokemon/stage-15.png" },
+  { stage: "16", name: "Cosmic Architect", image: "/tokemon/stage-16.png" },
+  { stage: "17", name: "Universe Engine", image: "/tokemon/stage-17.png" },
+  { stage: "18", name: "The Singularity", image: "/tokemon/stage-18.png" },
 ];
 
 export default function Home() {
@@ -64,8 +68,8 @@ export default function Home() {
       <section className="artifactSection" id="artifacts">
         <div className="section shell">
           <div className="sectionIntro splitIntro">
-            <div><p className="eyebrow">02 / EVOLUTION ARCHIVE</p><h2>One signal.<br /><em>Thirteen forms.</em></h2></div>
-            <p>Every power-of-ten milestone reveals another original form. The silhouette stays familiar. The details get increasingly unreasonable.</p>
+            <div><p className="eyebrow">02 / EVOLUTION ARCHIVE</p><h2>One signal.<br /><em>Nineteen forms.</em></h2></div>
+            <p>Powers of ten carry the creature to one billion tokens. After that, denser 1–2–5 checkpoints keep the late forms moving: leviathan, colossus, weaver, architect, engine, singularity.</p>
           </div>
           <div className="forms">
             {forms.map((form) => <article className="form" key={form.stage}>
@@ -74,7 +78,7 @@ export default function Home() {
               <div className="formTicks">+ + + + + + + + + + + +</div>
             </article>)}
           </div>
-          <p className="archiveNote">Four signals recovered from the complete 13-form archive.</p>
+          <p className="archiveNote">Eight signals recovered from the complete 19-form archive · final form at 1T tokens.</p>
         </div>
       </section>
 

@@ -23,6 +23,9 @@ test("server-renders the Tokemon landing page", async () => {
   assert.match(html, /Your coding tokens are/);
   assert.match(html, /QUICK INSTALL/);
   assert.match(html, /EVOLUTION ARCHIVE/);
+  assert.match(html, /Nineteen forms/);
+  assert.match(html, /1–2–5 checkpoints/);
+  assert.match(html, /The Singularity/);
   assert.match(html, /PRIVACY BY DEFAULT/);
   assert.match(html, /property="og:image" content="https?:\/\/[^\"]+\/og\.png"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
