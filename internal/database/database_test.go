@@ -195,6 +195,21 @@ func TestDetailedCodexUsageSupersedesAggregateSnapshot(t *testing.T) {
 	if len(events) != 1 || events[0].EventID != "detailed" || events[0].Cost == nil {
 		t.Fatalf("unexpected migrated events: %+v", events)
 	}
+
+	result, err = store.Ingest(context.Background(), []usage.Event{aggregate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Accepted != 0 || result.Duplicates != 1 || result.CurrentTotal != 100 {
+		t.Fatalf("legacy aggregate was not ignored after detailed backfill: %+v", result)
+	}
+	events, err = store.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "detailed" {
+		t.Fatalf("legacy aggregate returned after detailed backfill: %+v", events)
+	}
 }
 
 func TestTokenCompositionSeparatesCachedAndUnclassifiedTokens(t *testing.T) {

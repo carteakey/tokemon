@@ -237,6 +237,23 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 			result.Errors = append(result.Errors, fmt.Sprintf("event %d: %v", index+1, err))
 			continue
 		}
+		if isAggregateCodexEvent(event) && event.SessionID != "" {
+			var detailedExists bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM usage_events
+WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
+AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL)
+)`, event.MachineID, event.SessionID).Scan(&detailedExists); err != nil {
+				return result, err
+			}
+			if detailedExists {
+				// Older agents may keep sending aggregate snapshots while a rollout
+				// is in progress. Once detailed events exist for the session, the
+				// aggregate is obsolete and must not be allowed to double-count it.
+				result.Duplicates++
+				continue
+			}
+		}
 		if event.Source.Adapter == "codex" && event.SessionID != "" && event.InputTokens != nil {
 			// Detailed Codex JSONL events supersede the older aggregate thread
 			// snapshot for the same session. Remove it before inserting component
@@ -324,6 +341,12 @@ WHERE event_id=?`,
 	result.CurrentStage = evolution.Stage(after)
 	result.Evolved = result.CurrentStage > result.PreviousStage
 	return result, nil
+}
+
+func isAggregateCodexEvent(event usage.Event) bool {
+	return event.Source.Adapter == "codex" &&
+		event.InputTokens == nil && event.OutputTokens == nil &&
+		event.CacheReadTokens == nil && event.CacheWriteTokens == nil
 }
 
 func upsertMachine(ctx context.Context, tx *sql.Tx, event usage.Event, name string) error {
