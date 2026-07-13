@@ -89,13 +89,26 @@ func runCatalog(args []string) error {
 
 func runServe(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	addr := flags.String("addr", ":8080", "HTTP listen address")
-	databasePath := flags.String("database", defaultDatabase, "SQLite database path")
+	addr := flags.String("addr", envOr("TOKEMON_SERVER_ADDR", ":8080"), "HTTP listen address")
+	databasePath := flags.String("database", envOr("TOKEMON_DATABASE", defaultDatabase), "SQLite database path")
 	ingestToken := flags.String("ingest-token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared token for event ingestion")
-	catalogPath := flags.String("catalog", "catalog/models.yaml", "model catalog YAML path")
+	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
+	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *configPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		*configPath = localagent.DefaultServerConfigPath(home)
+	}
+	configValues, err := localagent.ReadEnvFile(*configPath)
+	if err != nil {
+		return err
+	}
+	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath)
 	modelCatalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
@@ -415,6 +428,29 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 	}
 }
 
+func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath *string) {
+	if !flagWasSet(flags, "addr") && os.Getenv("TOKEMON_SERVER_ADDR") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_SERVER_ADDR"]); value != "" {
+			*addr = value
+		}
+	}
+	if !flagWasSet(flags, "database") && os.Getenv("TOKEMON_DATABASE") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_DATABASE"]); value != "" {
+			*databasePath = value
+		}
+	}
+	if !flagWasSet(flags, "ingest-token") && os.Getenv("TOKEMON_INGEST_TOKEN") == "" {
+		if value := values["TOKEMON_INGEST_TOKEN"]; value != "" {
+			*ingestToken = value
+		}
+	}
+	if !flagWasSet(flags, "catalog") && os.Getenv("TOKEMON_MODEL_CATALOG") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_MODEL_CATALOG"]); value != "" {
+			*catalogPath = value
+		}
+	}
+}
+
 func flagWasSet(flags *flag.FlagSet, name string) bool {
 	set := false
 	flags.Visit(func(flag *flag.Flag) {
@@ -522,7 +558,7 @@ Commands:
   purge       delete events before a date
 
 Examples:
-  tokemon serve --database ./data/tokemon.db
+  tokemon serve --config ~/.config/tokemon/server.env
   tokemon agent --server http://127.0.0.1:8080 --once
   tokemon import --database ./data/tokemon.db usage.jsonl
   tokemon inspect usage.jsonl

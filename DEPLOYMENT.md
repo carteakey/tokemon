@@ -5,7 +5,7 @@
 
 This document is the implementation roadmap for running one Tokemon server with agents on multiple machines. Linear remains the source of truth for committed work; this document defines the architecture, rollout order, and operational checks rather than creating a second backlog.
 
-Current slice status: the shared agent config loader, macOS LaunchAgent installer, and Claude Code adapter are implemented and covered by tests. A second Apple Silicon Mac has been installed and completed its first authenticated sync. The primary server is still session-bound, and durable cursor state, live Claude validation, release publishing, and the Linux container template remain ahead.
+Current slice status: the shared agent config loader, macOS server/agent LaunchAgent installers, and Claude Code adapter are implemented and covered by tests. A second Apple Silicon Mac is installed and syncing through the primary Mac's persistent authenticated hub. Durable cursor state, live Claude validation, release publishing, and the Linux container template remain ahead.
 
 ## Topology and roles
 
@@ -31,7 +31,7 @@ Agents are outbound-only. The server is the only component that needs a reachabl
 | Phase | State | Outcome | Linear work |
 | --- | --- | --- | --- |
 | 0. First multi-machine slice | Validated | Authenticated server endpoint and second macOS agent sync real metadata | CAR-63, CAR-64, CAR-65 |
-| 1. Durable hub | Next | Server survives session logout/reboot with protected config and health checks | CAR-65 follow-up |
+| 1. Durable hub | Implemented | Server survives LaunchAgent restart with protected config, stable SQLite, and health checks | macOS deployment slice |
 | 2. Failure-safe agents | Next | Cursors, retries, rotation, and local state obey the v0.2 contract | CAR-65 |
 | 3. Provider evidence | Planned | Live Claude fixture plus complete Codex/OpenCode fixture and inspect coverage | CAR-63, CAR-64 |
 | 4. Release gate | Planned | Cross-provider privacy, authentication, idempotency, and two-machine tests pass | CAR-67 |
@@ -108,7 +108,7 @@ The server endpoint and token are the only shared deployment inputs. Provider pa
 
 ## Phase 1: make the hub durable
 
-The primary Mac currently proves the topology but its server process is attached to the active development session. The next operational change is a user-level server LaunchAgent with:
+The primary Mac now runs the hub as a user-level server LaunchAgent with:
 
 - a protected server env file containing the database path and ingest token;
 - `RunAtLoad` and `KeepAlive` behavior;
@@ -117,7 +117,7 @@ The primary Mac currently proves the topology but its server process is attached
 - a `/healthz` check after boot and after restart;
 - Tailscale/WireGuard or HTTPS-only reachability from enrolled agents.
 
-This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
+The installed service uses `tokemon serve --config ~/.config/tokemon/server.env`, preserves the existing SQLite database, and keeps the token out of LaunchAgent arguments. This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
 
 ## Phase 2: make agents failure-safe
 
@@ -157,15 +157,20 @@ The release gate passes only when it verifies authentication failure, retry with
 
 ## macOS first
 
-The first supported install path is a user-level LaunchAgent. It does not require root, Docker, or an inbound port.
+The first supported install path is a user-level LaunchAgent. It does not require root or Docker. The primary Mac uses `deploy/macos/install-server.sh` for the hub; every other Mac uses `deploy/macos/install-agent.sh` for an outbound-only agent.
+
+The server uses `tokemon serve --config ~/.config/tokemon/server.env`, while agents use `tokemon agent --config ~/.config/tokemon/agent.env`. Both config files are parsed as data-only dotenv files and are mode `0600`.
 
 Target layout:
 
 ```text
 ~/.local/bin/tokemon
 ~/.config/tokemon/agent.env       # mode 0600
+~/.config/tokemon/server.env      # mode 0600 on the hub
 ~/Library/LaunchAgents/com.tokemon.agent.plist
+~/Library/LaunchAgents/com.tokemon.server.plist
 ~/Library/Logs/Tokemon/agent.log
+~/Library/Logs/Tokemon/server.log
 ```
 
 The installer will:

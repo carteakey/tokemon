@@ -15,6 +15,12 @@ func DefaultConfigPath(home string) string {
 	return filepath.Join(home, ".config", "tokemon", "agent.env")
 }
 
+// DefaultServerConfigPath returns the per-user server configuration location
+// used by the macOS LaunchAgent and other managed server installs.
+func DefaultServerConfigPath(home string) string {
+	return filepath.Join(home, ".config", "tokemon", "server.env")
+}
+
 // ReadEnvFile reads a deliberately small dotenv-compatible file. It does not
 // expand shell expressions or execute commands, so an agent config remains
 // data rather than a script.

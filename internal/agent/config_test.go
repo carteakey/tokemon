@@ -29,3 +29,10 @@ func TestReadEnvFileRejectsMalformedLine(t *testing.T) {
 		t.Fatal("expected malformed config error")
 	}
 }
+
+func TestDefaultServerConfigPath(t *testing.T) {
+	want := filepath.Join("/tmp", ".config", "tokemon", "server.env")
+	if got := DefaultServerConfigPath("/tmp"); got != want {
+		t.Fatalf("DefaultServerConfigPath() = %q, want %q", got, want)
+	}
+}
