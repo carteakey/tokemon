@@ -227,6 +227,10 @@ dashboard itself has no user login. Deploying a new build on request is the
 same `up -d --build` command; stop it with
 `docker compose --env-file .env -f deploy/docker-compose.yml down`.
 
+The Compose service keeps its root filesystem read-only and provides a bounded,
+non-executable `/tmp` tmpfs for SQLite's transient query work. Persistent data
+remains under `./data` only.
+
 Before applying a newer SQLite schema version, Tokemon runs an integrity check
 and creates a consistent snapshot with SQLite's `VACUUM INTO`. Compose installs
 store these snapshots under `./data/backups/`; filenames record the previous
