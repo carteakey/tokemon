@@ -4,7 +4,9 @@ These are original raster pixel-art assets for the Tokemon evolution forms. They
 
 The `token-dex.png` asset is the project mark: a small handheld token field guide in the same pixel-art language as the evolution forms. It is used by the dashboard as its favicon and header icon.
 
-Provenance: the evolution forms were generated with the built-in image-generation tool using local stage references, then converted from a flat `#00ff00` chroma-key background with the image-generation chroma-key helper and resized to a 640px maximum edge. The token-dex mark follows the same generated pixel-art direction and chroma-key workflow, resized to 512px.
+The `icons/` directory contains the dashboard's original utility icon family. The five summary-card icons represent top machine, estimated API cost, cache hit, threads, and active days. The project, model, and machine icons identify rows in the usage tables. Keep these decorative in markup (`alt=""`); nearby labels carry the meaning.
+
+Provenance: the evolution forms were generated with the built-in image-generation tool using local stage references, then converted from a flat `#00ff00` chroma-key background with the image-generation chroma-key helper and resized to a 640px maximum edge. The token-dex mark follows the same generated pixel-art direction and chroma-key workflow, resized to 512px. The utility icons were generated as one original eight-icon sprite atlas on flat `#ff00ff`, converted with the same chroma-key helper, split into stable semantic filenames, and resized to 128px transparent PNGs.
 
 The stage filenames are stable and intentionally use the evolution stage number. Keep the dashboard fallback text available if an asset is missing.
 

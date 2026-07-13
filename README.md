@@ -58,6 +58,6 @@ go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
 
 `catalog/models.yaml` is the committed source of truth for API-equivalent pricing. Schema-v2 entries require an official HTTPS source, verification date, USD standard rates, and deterministic aliases. Unknown models remain unpriced; conflicting aliases or invalid pricing prevent the catalog from loading.
 
-Read the [v0.2 product spec](tokemon-spec-v0.2.md) or run `go run ./cmd/tokemon --help` for the full command list.
+Read the [v0.2 product spec](tokemon-spec-v0.2.md), the [visual style guide](STYLE_GUIDE.md), or run `go run ./cmd/tokemon --help` for the full command list.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the multi-machine roadmap, endpoint contract, macOS LaunchAgent path, Linux container path, Claude integration boundary, and security checklist.

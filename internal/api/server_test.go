@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +114,44 @@ func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	}
 }
 
+func TestDashboardDoesNotDuplicateStageWatermarkBesideFormChip(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "stage-nine-render",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "machine",
+		Provider:      "provider",
+		Model:         "model",
+		Tool:          "tool",
+		TotalTokens:   usage.Int64(1_000_000_000),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if !strings.Contains(body, `<div class="stage-chip">FORM / 09</div>`) {
+		t.Fatalf("dashboard does not render the stage-nine form chip")
+	}
+	if strings.Contains(body, `.creature-panel::after`) || strings.Contains(body, `content: "STAGE " attr(data-stage)`) {
+		t.Fatalf("dashboard still renders the duplicate stage watermark")
+	}
+}
+
 func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
@@ -128,11 +168,22 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 	for _, want := range []string{
 		`id="lifetime-counter"`,
 		`id="token-composition"`,
+		`class="composition-meter"`,
+		`id="live-cached-segment"`,
+		`aria-label="Token mix"`,
+		`>Input</span>`,
+		`>Cached</span>`,
+		`>Output</span>`,
+		`.odometer-reel::after`,
+		`linear-gradient(180deg, #292c26`,
 		`fetch('/api/v1/evolution'`,
+		`const updateComposition = (composition)`,
+		`const total = input + output + unclassified`,
+		`return share < 1 ? '<1%'`,
+		`segment.style.width`,
 		`updateOdometer(counter, display)`,
 		`character !== previous[index]`,
 		`window.setInterval(pollLifetime, 2000)`,
-		`live counter · analytics refresh every 60s`,
 	} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q", want)
@@ -163,7 +214,7 @@ func TestEvolutionEndpointIncludesTokenComposition(t *testing.T) {
 	}
 }
 
-func TestDashboardRendersAPIEquivalentCostAndCoverage(t *testing.T) {
+func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) {
 	inputPrice := 10.0
 	outputPrice := 0.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{
@@ -189,9 +240,15 @@ func TestDashboardRendersAPIEquivalentCostAndCoverage(t *testing.T) {
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"API-equivalent cost", "$10.00", "Estimated from API pricing", "67% coverage", "not your bill"} {
-		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+	body := response.Body.Bytes()
+	for _, want := range []string{"Est. API cost", "$10.00"} {
+		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
+		}
+	}
+	for _, omitted := range []string{"Estimated from API pricing", "coverage", "not your bill"} {
+		if bytes.Contains(body, []byte(omitted)) {
+			t.Fatalf("dashboard still contains pricing disclaimer %q", omitted)
 		}
 	}
 }
@@ -212,9 +269,15 @@ func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"Cache hit", "80.0%", "80 cached of 100 input tokens", "Threads", "distinct provider sessions"} {
-		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+	body := response.Body.Bytes()
+	for _, want := range []string{"Cache hit", "80.0%", "Threads", "/static/tokemon/icons/cache-hit.png", "/static/tokemon/icons/threads.png"} {
+		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
+		}
+	}
+	for _, omitted := range []string{"cached of", "distinct provider sessions"} {
+		if bytes.Contains(body, []byte(omitted)) {
+			t.Fatalf("dashboard still contains cache/session detail %q", omitted)
 		}
 	}
 }
@@ -238,9 +301,97 @@ func TestDashboardRendersMergedProjectUsage(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"Usage by project", "Merged across machines", "carteakey.dev", "150"} {
+	for _, want := range []string{"Projects", "carteakey.dev", "150", "/static/tokemon/icons/project.png", "/static/tokemon/icons/model.png", "/static/tokemon/icons/machine.png"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
 		}
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte("Merged across machines")) {
+		t.Fatal("dashboard still explains project merging in visible copy")
+	}
+}
+
+func TestDashboardOmitsDuplicateAndTechnicalCopy(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.Bytes()
+	for _, want := range []string{"Lifetime tokens", "Next evolution", "Top machine", "Local-first · no conversation content"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("dashboard does not contain concise copy %q", want)
+		}
+	}
+	for _, omitted := range []string{
+		"local · live every 2s",
+		"Current form",
+		"Tokemon form",
+		"Power level",
+		"Training ground",
+		"A pixel field of daily usage",
+		"Dashed edge",
+		"analytics refresh every 60s",
+		"schema v1",
+	} {
+		if bytes.Contains(body, []byte(omitted)) {
+			t.Fatalf("dashboard still contains unnecessary copy %q", omitted)
+		}
+	}
+}
+
+func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := make([]usage.Event, 0, 6)
+	for index := 0; index < 6; index++ {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("breakdown-%02d", index),
+			Timestamp:     time.Now().UTC(),
+			MachineID:     "machine",
+			Project:       fmt.Sprintf("project-%02d", index),
+			Provider:      "provider",
+			Model:         fmt.Sprintf("model-%02d", index),
+			Tool:          "tool",
+			TotalTokens:   usage.Int64(int64(1000 - index)),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+		})
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.Bytes()
+	for _, want := range []string{">project-00</span>", ">project-04</span>", ">model-00</span>", ">model-04</span>"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("dashboard does not contain visible top-five row %q", want)
+		}
+	}
+	for _, omitted := range []string{">project-05</span>", ">model-05</span>"} {
+		if bytes.Contains(body, []byte(omitted)) {
+			t.Fatalf("dashboard contains omitted row %q", omitted)
+		}
+	}
+	if bytes.Contains(body, []byte(`class="see-more"`)) {
+		t.Fatal("dashboard renders a non-functional see-more control")
 	}
 }
