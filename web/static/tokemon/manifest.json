@@ -13,6 +13,12 @@
     "9": {"form": "token-titan", "path": "/static/tokemon/stage-09.png"},
     "10": {"form": "model-eater", "path": "/static/tokemon/stage-10.png"},
     "11": {"form": "context-deity", "path": "/static/tokemon/stage-11.png"},
-    "12": {"form": "the-singularity", "path": "/static/tokemon/stage-12.png"}
+    "12": {"form": "reality-core", "path": "/static/tokemon/stage-12.png"},
+    "13": {"form": "inference-leviathan", "path": "/static/tokemon/stage-13.png"},
+    "14": {"form": "parameter-colossus", "path": "/static/tokemon/stage-14.png"},
+    "15": {"form": "world-weaver", "path": "/static/tokemon/stage-15.png"},
+    "16": {"form": "cosmic-architect", "path": "/static/tokemon/stage-16.png"},
+    "17": {"form": "universe-engine", "path": "/static/tokemon/stage-17.png"},
+    "18": {"form": "the-singularity", "path": "/static/tokemon/stage-18.png"}
   }
 }

@@ -1,11 +1,10 @@
 package evolution
 
-import "math"
-
 type Form struct {
-	Stage int    `json:"stage"`
-	Slug  string `json:"form"`
-	Name  string `json:"name"`
+	Stage          int    `json:"stage"`
+	Slug           string `json:"form"`
+	Name           string `json:"name"`
+	lowerThreshold int64
 }
 
 type Snapshot struct {
@@ -20,34 +19,37 @@ type Snapshot struct {
 }
 
 var forms = []Form{
-	{Stage: 0, Slug: "egg", Name: "Egg"},
-	{Stage: 1, Slug: "bitling", Name: "Bitling"},
-	{Stage: 2, Slug: "bytelet", Name: "Bytelet"},
-	{Stage: 3, Slug: "promptling", Name: "Promptling"},
-	{Stage: 4, Slug: "context-cub", Name: "Context Cub"},
-	{Stage: 5, Slug: "token-scout", Name: "Token Scout"},
-	{Stage: 6, Slug: "code-caster", Name: "Code Caster"},
-	{Stage: 7, Slug: "agent-beast", Name: "Agent Beast"},
-	{Stage: 8, Slug: "context-dragon", Name: "Context Dragon"},
-	{Stage: 9, Slug: "token-titan", Name: "Token Titan"},
-	{Stage: 10, Slug: "model-eater", Name: "Model Eater"},
-	{Stage: 11, Slug: "context-deity", Name: "Context Deity"},
-	{Stage: 12, Slug: "the-singularity", Name: "The Singularity"},
+	{Stage: 0, Slug: "egg", Name: "Egg", lowerThreshold: 0},
+	{Stage: 1, Slug: "bitling", Name: "Bitling", lowerThreshold: 10},
+	{Stage: 2, Slug: "bytelet", Name: "Bytelet", lowerThreshold: 100},
+	{Stage: 3, Slug: "promptling", Name: "Promptling", lowerThreshold: 1_000},
+	{Stage: 4, Slug: "context-cub", Name: "Context Cub", lowerThreshold: 10_000},
+	{Stage: 5, Slug: "token-scout", Name: "Token Scout", lowerThreshold: 100_000},
+	{Stage: 6, Slug: "code-caster", Name: "Code Caster", lowerThreshold: 1_000_000},
+	{Stage: 7, Slug: "agent-beast", Name: "Agent Beast", lowerThreshold: 10_000_000},
+	{Stage: 8, Slug: "context-dragon", Name: "Context Dragon", lowerThreshold: 100_000_000},
+	{Stage: 9, Slug: "token-titan", Name: "Token Titan", lowerThreshold: 1_000_000_000},
+	{Stage: 10, Slug: "model-eater", Name: "Model Eater", lowerThreshold: 2_000_000_000},
+	{Stage: 11, Slug: "context-deity", Name: "Context Deity", lowerThreshold: 5_000_000_000},
+	{Stage: 12, Slug: "reality-core", Name: "Reality Core", lowerThreshold: 10_000_000_000},
+	{Stage: 13, Slug: "inference-leviathan", Name: "Inference Leviathan", lowerThreshold: 20_000_000_000},
+	{Stage: 14, Slug: "parameter-colossus", Name: "Parameter Colossus", lowerThreshold: 50_000_000_000},
+	{Stage: 15, Slug: "world-weaver", Name: "World Weaver", lowerThreshold: 100_000_000_000},
+	{Stage: 16, Slug: "cosmic-architect", Name: "Cosmic Architect", lowerThreshold: 200_000_000_000},
+	{Stage: 17, Slug: "universe-engine", Name: "Universe Engine", lowerThreshold: 500_000_000_000},
+	{Stage: 18, Slug: "the-singularity", Name: "The Singularity", lowerThreshold: 1_000_000_000_000},
 }
 
 func Stage(tokens int64) int {
 	if tokens <= 0 {
 		return 0
 	}
-	stage := 0
-	threshold := int64(10)
-	for stage < len(forms)-1 && tokens >= threshold {
-		stage++
-		if threshold <= math.MaxInt64/10 {
-			threshold *= 10
+	for stage := len(forms) - 1; stage > 0; stage-- {
+		if tokens >= forms[stage].lowerThreshold {
+			return stage
 		}
 	}
-	return stage
+	return 0
 }
 
 func FormForStage(stage int) Form {
@@ -78,15 +80,12 @@ func SnapshotFor(tokens int64) Snapshot {
 			Stage:          stage,
 			Form:           form.Slug,
 			FormName:       form.Name,
-			LowerThreshold: pow10(stage),
+			LowerThreshold: form.lowerThreshold,
 			Progress:       1,
 		}
 	}
-	lower := int64(0)
-	if stage > 0 {
-		lower = pow10(stage)
-	}
-	next := pow10(stage + 1)
+	lower := form.lowerThreshold
+	next := forms[stage+1].lowerThreshold
 	remaining := next - tokens
 	progress := float64(tokens-lower) / float64(next-lower)
 	if progress < 0 {
@@ -105,15 +104,4 @@ func SnapshotFor(tokens int64) Snapshot {
 		TokensRemaining: &remaining,
 		Progress:        progress,
 	}
-}
-
-func pow10(exponent int) int64 {
-	value := int64(1)
-	for i := 0; i < exponent; i++ {
-		if value > math.MaxInt64/10 {
-			return math.MaxInt64
-		}
-		value *= 10
-	}
-	return value
 }

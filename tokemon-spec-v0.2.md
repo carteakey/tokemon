@@ -4,7 +4,7 @@
 **Status:** MVP product specification  
 **Working tagline:** *Your tokens are evolving.*
 
-> A tiny, self-hosted dashboard that finds AI coding usage across your machines, counts every token, and evolves your Tokemon whenever your lifetime usage crosses another order of magnitude.
+> A tiny, self-hosted dashboard that finds AI coding usage across your machines, counts every token, and evolves your Tokemon at deterministic lifetime-usage checkpoints.
 
 ---
 
@@ -14,7 +14,7 @@ Tokemon scans local usage records from AI coding tools such as Claude Code and C
 
 The centre of the dashboard is a large lifetime-token odometer and one original creature: your **Tokemon**.
 
-Every time total lifetime usage crosses a power-of-ten threshold, the Tokemon evolves.
+Every time total lifetime usage crosses a configured threshold, the Tokemon evolves. Thresholds use powers of ten through 1B tokens, then become denser so late-stage progression remains visible.
 
 ```text
 9,999 tokens      → current form
@@ -150,13 +150,13 @@ The evolution mechanic is a visual representation of lifetime usage, not a gamif
 
 ### 6.1 Core Rule
 
-The global Tokemon evolves whenever lifetime total tokens cross another power of ten.
+The global Tokemon evolves whenever lifetime total tokens cross the next threshold. Thresholds follow powers of ten through 1B, then use a repeating `1–2–5` sequence through the 1T final form.
 
 ```text
-stage = floor(log10(max(lifetime_tokens, 1)))
+stage = highest index whose threshold <= lifetime_tokens
 ```
 
-The displayed stage is derived entirely from stored usage. It is not mutable user state and does not require a separate progression service.
+The threshold table is ordered and append-only: preserve the meaning and asset number of existing stages, and add future forms only at the tail. The displayed stage is derived entirely from stored usage. It is not mutable user state and does not require a separate progression service.
 
 ### 6.2 Evolution Thresholds
 
@@ -173,10 +173,16 @@ The initial progression:
 | 1M–9.99M | 6 | Code Caster |
 | 10M–99.99M | 7 | Agent Beast |
 | 100M–999.99M | 8 | Context Dragon |
-| 1B–9.99B | 9 | Token Titan |
-| 10B–99.99B | 10 | Model Eater |
-| 100B–999.99B | 11 | Context Deity |
-| 1T+ | 12 | The Singularity |
+| 1B–1.99B | 9 | Token Titan |
+| 2B–4.99B | 10 | Model Eater |
+| 5B–9.99B | 11 | Context Deity |
+| 10B–19.99B | 12 | Reality Core |
+| 20B–49.99B | 13 | Inference Leviathan |
+| 50B–99.99B | 14 | Parameter Colossus |
+| 100B–199.99B | 15 | World Weaver |
+| 200B–499.99B | 16 | Cosmic Architect |
+| 500B–999.99B | 17 | Universe Engine |
+| 1T+ | 18 | The Singularity |
 
 These names are working copy, not hard product terminology. The visual form and stage number matter more than the labels.
 
@@ -189,7 +195,7 @@ The dashboard shows:
 - Previous threshold
 - Next threshold
 - Tokens remaining
-- Percentage progress within the current order of magnitude
+- Percentage progress within the current threshold interval
 
 Example:
 
@@ -197,17 +203,17 @@ Example:
 TOKEN TITAN · STAGE 9
 
 1,482,938,221 lifetime tokens
-14.8% toward the next evolution
-8,517,061,779 tokens remaining
+48.3% toward the next evolution
+517,061,779 tokens remaining
 ```
 
-Progress is logarithmic within the stage, not a percentage of all historical usage.
+Progress is linear within the current threshold interval, not a percentage of all historical usage.
 
 A simple calculation:
 
 ```text
-lower = 10^stage
-upper = 10^(stage + 1)
+lower = thresholds[stage]
+upper = thresholds[stage + 1]
 progress = (lifetime_tokens - lower) / (upper - lower)
 ```
 
@@ -238,7 +244,7 @@ If imported data skips several stages:
 
 Keep the art system deliberately simple.
 
-- Use original local SVG assets.
+- Use original local raster assets.
 - Ship one asset per stage.
 - Use the same silhouette family so evolution feels coherent.
 - Early forms should be small and rounded.
@@ -896,7 +902,7 @@ The Tokemon form is always based on unfiltered lifetime usage. Filters must not 
 │      [ CURRENT TOKEMON ]              1,482,938,221                  │
 │         TOKEN TITAN                  LIFETIME TOKENS                 │
 │                                                                      │
-│       Stage 9 · 14.8% toward next evolution · updated 23s ago       │
+│       Stage 9 · 48.3% toward next evolution · updated 23s ago       │
 │       ███░░░░░░░░░░░░░░░░░░░                                        │
 │                                                                      │
 ├───────────────────────────────────────────────┬──────────────────────┤
@@ -1283,9 +1289,9 @@ GET  /api/v1/catalog
   "stage": 9,
   "form": "token-titan",
   "lower_threshold": 1000000000,
-  "next_threshold": 10000000000,
-  "tokens_remaining": 8517061779,
-  "progress": 0.0536598023
+  "next_threshold": 2000000000,
+  "tokens_remaining": 517061779,
+  "progress": 0.482938221
 }
 ```
 
@@ -1446,10 +1452,10 @@ Tokemon v0.2 is ready when:
 7. Rescanning does not create duplicates.
 8. The dashboard shows lifetime tokens.
 9. The current stage is correctly derived from lifetime tokens.
-10. Crossing any configured power-of-ten threshold changes the form.
+10. Crossing any configured evolution threshold changes the form.
 11. The dashboard shows tokens remaining until the next evolution.
 12. Historical imports select the correct form without replaying every stage.
-13. The current Tokemon uses an original local SVG asset.
+13. The current Tokemon uses an original local raster asset.
 14. Reduced-motion users receive no forced evolution animation.
 15. Filter changes do not alter the global lifetime form.
 16. Usage is viewable over 24 hours, 7 days, 30 days, and all time.
@@ -1483,9 +1489,9 @@ Tokemon v0.2 is ready when:
 - One-page overview
 - Lifetime token odometer
 - Global Tokemon
-- Power-of-ten evolution
+- Power-of-ten evolution through 1B, followed by `1–2–5` checkpoints
 - Evolution progress
-- Original stage SVGs
+- Original stage raster assets
 - Usage timeline
 - Model breakdown
 - Machine status
@@ -1576,7 +1582,7 @@ No alert is required for evolution; seeing it on the dashboard is enough.
 
 ## 36. Final Product Definition
 
-**Tokemon is a tiny, self-hosted, multi-machine, provider-agnostic token analytics dashboard whose mascot evolves at every order of magnitude of lifetime usage.**
+**Tokemon is a tiny, self-hosted, multi-machine, provider-agnostic token analytics dashboard whose mascot evolves at deterministic lifetime-usage checkpoints.**
 
 Its first proper release remains intentionally boring underneath:
 
@@ -1586,8 +1592,8 @@ Its first proper release remains intentionally boring underneath:
 - SQLite
 - Three adapters
 - One YAML catalog
-- One derived evolution formula
-- A small set of original SVG forms
+- One derived evolution threshold table
+- A small set of original raster forms
 - One excellent dashboard
 
 No React application. No Postgres. No Redis. No plugin runtime. No user-account system. No live sockets. No game engine.
