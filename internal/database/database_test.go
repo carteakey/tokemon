@@ -240,6 +240,30 @@ func TestOverviewMergesProjectsAcrossMachines(t *testing.T) {
 	}
 }
 
+func TestOverviewGroupsUsageByTool(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "codex-a", Timestamp: time.Now().UTC(), MachineID: "laptop", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "codex-b", Timestamp: time.Now().UTC(), MachineID: "desktop", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "claude", Timestamp: time.Now().UTC(), MachineID: "laptop", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(75), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByTool) != 2 || overview.ByTool[0].Tool != "codex" || overview.ByTool[0].Tokens != 150 || overview.ByTool[1].Tool != "claude-code" || overview.ByTool[1].Tokens != 75 {
+		t.Fatalf("unexpected tool summary: %+v", overview.ByTool)
+	}
+}
+
 func TestIngestRefreshesAnExistingSnapshot(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

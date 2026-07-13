@@ -46,6 +46,11 @@ type MachineTotal struct {
 	Tokens  int64  `json:"tokens"`
 }
 
+type ToolTotal struct {
+	Tool   string `json:"tool"`
+	Tokens int64  `json:"tokens"`
+}
+
 type ProjectTotal struct {
 	Project  string `json:"project"`
 	Tokens   int64  `json:"tokens"`
@@ -126,6 +131,7 @@ type Overview struct {
 	Evolution      evolution.Snapshot       `json:"evolution"`
 	Activity       ActivityHeatmap          `json:"activity"`
 	ByModel        []ModelTotal             `json:"by_model"`
+	ByTool         []ToolTotal              `json:"by_tool"`
 	ByMachine      []MachineTotal           `json:"by_machine"`
 	ByProject      []ProjectTotal           `json:"by_project"`
 	EstimatedCost  CostSummary              `json:"estimated_cost"`
@@ -724,6 +730,21 @@ FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleToken
 			return result, err
 		}
 		result.ByModel = append(result.ByModel, item)
+	}
+	if err := rows.Close(); err != nil {
+		return result, err
+	}
+	rows, err = s.db.QueryContext(ctx, `SELECT tool, COALESCE(SUM(total_tokens), 0) FROM usage_events GROUP BY tool ORDER BY 2 DESC`)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var item ToolTotal
+		if err := rows.Scan(&item.Tool, &item.Tokens); err != nil {
+			rows.Close()
+			return result, err
+		}
+		result.ByTool = append(result.ByTool, item)
 	}
 	if err := rows.Close(); err != nil {
 		return result, err
