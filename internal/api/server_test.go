@@ -107,7 +107,7 @@ func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 		t.Fatalf("dashboard status = %d, want %d", response.Code, http.StatusOK)
 	}
 	body := response.Body.String()
-	for _, want := range []string{"Token activity", "last 53 weeks", "activity-cell", "42 tokens", "BY MODEL", "BY PROVIDER", "model · 42 tokens", "provider · 42 tokens"} {
+	for _, want := range []string{"Token activity", "last 53 weeks", "activity-cell", "grid-template-rows: 12px repeat(7, 12px)", "height: 12px", "42 tokens", "BY MODEL", "BY PROVIDER", "model · 42 tokens", "provider · 42 tokens"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, body)
 		}
@@ -170,11 +170,15 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`id="token-composition"`,
 		`class="composition-meter"`,
 		`id="live-cached-segment"`,
+		`class="composition-item uncached"`,
+		`class="composition-item cached"`,
+		`class="composition-item output"`,
 		`aria-label="Token mix"`,
 		`>Input</span>`,
 		`>Cached</span>`,
 		`>Output</span>`,
 		`.odometer-reel::after`,
+		`.odometer-reel { flex-basis: .8em; }`,
 		`linear-gradient(180deg, #292c26`,
 		`fetch('/api/v1/evolution'`,
 		`const updateComposition = (composition)`,
@@ -301,13 +305,96 @@ func TestDashboardRendersMergedProjectUsage(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"Projects", "carteakey.dev", "150", "/static/tokemon/icons/project.png", "/static/tokemon/icons/model.png", "/static/tokemon/icons/machine.png"} {
+	for _, want := range []string{"Projects", "Harnesses", "Codex", "carteakey.dev", "150", `class="pixel-glyph project-glyph palette-`, `class="pixel-glyph harness-glyph preset-codex`, `class="pixel-glyph model-glyph palette-`, `class="pixel-glyph machine-glyph palette-`} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
 		}
 	}
 	if bytes.Contains(response.Body.Bytes(), []byte("Merged across machines")) {
 		t.Fatal("dashboard still explains project merging in visible copy")
+	}
+}
+
+func TestModelGlyphIsStableAndNameDerived(t *testing.T) {
+	first := glyphForModel(" GPT-5.5 ")
+	again := glyphForModel("gpt-5.5")
+	other := glyphForModel("claude-sonnet-4")
+	if first != again {
+		t.Fatal("model glyph changes after normalizing the same model name")
+	}
+	if first == other {
+		t.Fatal("different model names produced the same glyph and palette")
+	}
+	if first.Cells[12] != glyphOn {
+		t.Fatal("model glyph does not retain its center pixel")
+	}
+	for row := 0; row < 5; row++ {
+		for column := 0; column < 2; column++ {
+			if first.Cells[row*5+column] != first.Cells[row*5+(4-column)] {
+				t.Fatalf("model glyph row %d is not symmetrical", row)
+			}
+		}
+	}
+}
+
+func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
+	project := glyphForProject(" Tokemon ")
+	if project != glyphForProject("tokemon") {
+		t.Fatal("project glyph changes after normalizing the same project name")
+	}
+	if project.Kind != "project" || project.Cells[3] != glyphOff || project.Cells[4] != glyphOff || project.Cells[5] != glyphDim {
+		t.Fatalf("project glyph lost its folder silhouette: %+v", project)
+	}
+
+	machine := glyphForMachine("MOSS-02")
+	if machine != glyphForMachine("moss-02") {
+		t.Fatal("machine glyph changes after normalizing the same machine name")
+	}
+	if machine.Kind != "machine" || machine.Cells[8] != glyphOn || machine.Cells[18] != glyphOn {
+		t.Fatalf("machine glyph lost its rack status lights: %+v", machine)
+	}
+	if project == machine {
+		t.Fatal("project and machine glyphs share the same semantic silhouette")
+	}
+
+	for tool, preset := range map[string]string{
+		"codex":       "codex",
+		"claude-code": "claude",
+		"opencode":    "opencode",
+		"antigravity": "gemini",
+	} {
+		glyph := glyphForHarness(tool)
+		if glyph.Kind != "harness" || glyph.Preset != preset {
+			t.Fatalf("harness %q uses glyph kind %q preset %q", tool, glyph.Kind, glyph.Preset)
+		}
+	}
+}
+
+func TestDashboardRendersFriendlyHarnessNames(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "claude", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(60), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "codex", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(40), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, want := range []string{"Harnesses", "Claude Code", "Codex", "preset-claude", "preset-codex", "60.0%", "40.0%"} {
+		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("dashboard does not contain harness breakdown %q: %s", want, response.Body.String())
+		}
 	}
 }
 

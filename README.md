@@ -37,7 +37,7 @@ Generic JSONL parsing supports byte cursors and safe truncation/replacement rese
 
 Managed installs can use `~/.config/tokemon/agent.env`; explicit flags override environment variables, which override that file. See [macOS deployment](deploy/macos/README.md) for the LaunchAgent installer.
 
-The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
+The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks plus lifetime usage cuts by project, harness, model, and machine. Harness usage groups the recorded tools, including Claude Code, Codex, OpenCode, and Antigravity. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
 
 ## Import or export
 

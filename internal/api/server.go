@@ -26,12 +26,189 @@ type Server struct {
 
 const dashboardUsageRowsLimit = 5
 
+const (
+	glyphOff uint8 = iota
+	glyphDim
+	glyphOn
+)
+
+type pixelGlyph struct {
+	Cells   [25]uint8
+	Palette int
+	Kind    string
+	Preset  string
+}
+
+func glyphSeed(kind, name string) uint32 {
+	normalized := kind + ":" + strings.ToLower(strings.TrimSpace(name))
+	if strings.HasSuffix(normalized, ":") {
+		normalized += "unknown"
+	}
+	seed := uint32(2166136261)
+	for index := 0; index < len(normalized); index++ {
+		seed ^= uint32(normalized[index])
+		seed *= 16777619
+	}
+	return seed
+}
+
+func nextGlyphSeed(state uint32) uint32 {
+	state ^= state << 13
+	state ^= state >> 17
+	state ^= state << 5
+	return state
+}
+
+func glyphFromRows(kind, preset string, palette int, rows ...string) pixelGlyph {
+	glyph := pixelGlyph{Kind: kind, Preset: preset, Palette: palette}
+	for row, pattern := range rows {
+		if row >= 5 {
+			break
+		}
+		for column := 0; column < len(pattern) && column < 5; column++ {
+			switch pattern[column] {
+			case 'd':
+				glyph.Cells[row*5+column] = glyphDim
+			case 'o':
+				glyph.Cells[row*5+column] = glyphOn
+			}
+		}
+	}
+	return glyph
+}
+
+func glyphCellClass(state uint8) string {
+	switch state {
+	case glyphDim:
+		return "dim"
+	case glyphOn:
+		return "on"
+	default:
+		return "off"
+	}
+}
+
+func glyphForModel(name string) pixelGlyph {
+	seed := glyphSeed("model", name)
+	glyph := pixelGlyph{Kind: "model", Preset: "generated", Palette: int(seed % 4)}
+	for index := range glyph.Cells {
+		glyph.Cells[index] = glyphDim
+	}
+	state := seed
+	for row := 0; row < 5; row++ {
+		state = nextGlyphSeed(state)
+		for column := 0; column < 3; column++ {
+			if state&(1<<column) != 0 {
+				glyph.Cells[row*5+column] = glyphOn
+				glyph.Cells[row*5+(4-column)] = glyphOn
+			}
+		}
+	}
+	glyph.Cells[12] = glyphOn
+	return glyph
+}
+
+func glyphForProject(name string) pixelGlyph {
+	seed := glyphSeed("project", name)
+	glyph := pixelGlyph{Kind: "project", Preset: "generated", Palette: int(seed % 4)}
+	for column := 0; column < 3; column++ {
+		glyph.Cells[column] = glyphDim
+	}
+	for column := 0; column < 5; column++ {
+		glyph.Cells[5+column] = glyphDim
+		glyph.Cells[20+column] = glyphDim
+	}
+	state := seed
+	for row := 2; row < 4; row++ {
+		glyph.Cells[row*5] = glyphDim
+		glyph.Cells[row*5+4] = glyphDim
+		state = nextGlyphSeed(state)
+		for column := 1; column < 4; column++ {
+			glyph.Cells[row*5+column] = glyphDim
+			if state&(1<<column) != 0 {
+				glyph.Cells[row*5+column] = glyphOn
+			}
+		}
+	}
+	glyph.Cells[1] = glyphOn
+	return glyph
+}
+
+func glyphForMachine(name string) pixelGlyph {
+	seed := glyphSeed("machine", name)
+	glyph := pixelGlyph{Kind: "machine", Preset: "generated", Palette: int(seed % 4)}
+	for _, row := range []int{0, 2, 4} {
+		for column := 0; column < 5; column++ {
+			glyph.Cells[row*5+column] = glyphDim
+		}
+	}
+	state := seed
+	for _, row := range []int{1, 3} {
+		glyph.Cells[row*5] = glyphDim
+		glyph.Cells[row*5+4] = glyphDim
+		state = nextGlyphSeed(state)
+		for column := 1; column < 4; column++ {
+			glyph.Cells[row*5+column] = glyphDim
+			if state&(1<<column) != 0 {
+				glyph.Cells[row*5+column] = glyphOn
+			}
+		}
+	}
+	glyph.Cells[8] = glyphOn
+	glyph.Cells[18] = glyphOn
+	return glyph
+}
+
+func glyphForHarness(tool string) pixelGlyph {
+	switch strings.ToLower(strings.TrimSpace(tool)) {
+	case "codex":
+		return glyphFromRows("harness", "codex", 1, ".odo.", "od.do", "d.o.d", "od.do", ".odo.")
+	case "claude", "claude-code":
+		return glyphFromRows("harness", "claude", 3, "o.d.o", ".ooo.", "doood", ".ooo.", "o.d.o")
+	case "opencode":
+		return glyphFromRows("harness", "opencode", 2, "ddddd", "o...d", "d.ood", "d...o", "ddddd")
+	case "antigravity", "gemini":
+		return glyphFromRows("harness", "gemini", 0, "..o..", ".odo.", "ododo", ".odo.", "..o..")
+	case "grok", "xai":
+		return glyphFromRows("harness", "grok", 1, "o...o", ".o.o.", "..o..", ".o.o.", "o...o")
+	case "deepseek":
+		return glyphFromRows("harness", "deepseek", 1, "ddddd", "...oo", "..oo.", ".oo..", "oo...")
+	case "generic-jsonl":
+		return glyphFromRows("harness", "generic", 2, ".ddd.", ".dod.", ".dod.", ".ddd.", "..o..")
+	default:
+		glyph := glyphForModel("harness:" + tool)
+		glyph.Kind = "harness"
+		return glyph
+	}
+}
+
 func topProjects(values []database.ProjectTotal) []database.ProjectTotal {
 	return limitDashboardRows(values)
 }
 
 func topModels(values []database.ModelTotal) []database.ModelTotal {
 	return limitDashboardRows(values)
+}
+
+func topTools(values []database.ToolTotal) []database.ToolTotal {
+	return limitDashboardRows(values)
+}
+
+func harnessName(tool string) string {
+	switch tool {
+	case "claude-code":
+		return "Claude Code"
+	case "codex":
+		return "Codex"
+	case "opencode":
+		return "OpenCode"
+	case "antigravity":
+		return "Antigravity"
+	case "generic-jsonl":
+		return "Generic JSONL"
+	default:
+		return tool
+	}
 }
 
 func limitDashboardRows[T any](values []T) []T {
@@ -56,9 +233,16 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 			}
 			return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 		},
-		"topProjects": topProjects,
-		"topModels":   topModels,
-		"assetPath":   func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
+		"topProjects":  topProjects,
+		"topModels":    topModels,
+		"topTools":     topTools,
+		"harnessName":  harnessName,
+		"glyphCell":    glyphCellClass,
+		"projectGlyph": glyphForProject,
+		"harnessGlyph": glyphForHarness,
+		"modelGlyph":   glyphForModel,
+		"machineGlyph": glyphForMachine,
+		"assetPath":    func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
 	}).Parse(dashboardTemplate)
 	if err != nil {
 		return nil, err
@@ -228,7 +412,7 @@ const dashboardTemplate = `<!doctype html>
     }
     a { color: inherit; text-decoration: none; }
     button { font: inherit; }
-    main { width: min(1320px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+    main { width: min(1408px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
     .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
     .brand { display: flex; align-items: center; gap: 12px; }
     .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, .22)); }
@@ -239,35 +423,37 @@ const dashboardTemplate = `<!doctype html>
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
-    .creature-panel { position: relative; min-height: 398px; overflow: hidden; padding: 16px; background: radial-gradient(circle at 50% 40%, rgba(155, 187, 160, .11), transparent 48%), var(--surface); }
-    .creature-art-wrap { display: grid; min-height: 285px; place-items: center; padding: 2px 20px 0; }
-    .creature-art { width: min(100%, 290px); max-height: 278px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 20px 24px rgba(0, 0, 0, .22)); transition: transform .35s ease, filter .35s ease; }
+    .creature-panel { position: relative; min-height: 360px; overflow: hidden; padding: 14px 16px; background: radial-gradient(circle at 50% 40%, rgba(155, 187, 160, .11), transparent 48%), var(--surface); }
+    .creature-art-wrap { display: grid; min-height: 252px; place-items: center; padding: 2px 20px 0; }
+    .creature-art { width: min(100%, 278px); max-height: 252px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 20px 24px rgba(0, 0, 0, .22)); transition: transform .35s ease, filter .35s ease; }
     .creature-art:hover { transform: translateY(-5px) scale(1.02); filter: drop-shadow(0 25px 30px rgba(0, 0, 0, .32)); }
     .creature-fallback { display: grid; width: 220px; height: 220px; place-items: center; border: 1px dashed var(--line-bright); border-radius: 50%; color: var(--accent); font: 700 30px ui-monospace, SFMono-Regular, Menlo, monospace; }
     .creature-fallback[hidden] { display: none; }
     .creature-caption { display: flex; align-items: center; flex-direction: column; gap: 6px; padding-top: 3px; text-align: center; }
     .form-name { margin-top: 2px; color: var(--text); font-family: var(--font-display); font-size: clamp(24px, 3vw, 34px); font-weight: 700; letter-spacing: .02em; }
     .stage-chip { padding: 5px 10px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 600 10px/1 var(--font-data); letter-spacing: .08em; white-space: nowrap; }
-    .power-panel { display: flex; min-height: 398px; flex-direction: column; padding: 16px 18px; }
+    .power-panel { display: flex; min-height: 360px; flex-direction: column; padding: 16px 18px; }
     .power-kicker { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .power-value { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin: 9px 0 0; overflow: hidden; column-gap: 4px; color: var(--text); font: 700 clamp(30px, 6vw, 80px)/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
+    .power-value { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin: 9px 0 0; overflow: hidden; column-gap: 3px; color: var(--text); font: 700 clamp(30px, 6vw, 90px)/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
     .odometer-static { white-space: nowrap; }
     .odometer-reel { position: relative; display: block; flex: 0 0 .82em; height: 1em; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 4px; background: linear-gradient(180deg, #292c26 0 49%, #1d201b 50% 100%); box-shadow: inset 0 1px rgba(255,255,255,.035), inset 0 -8px 18px rgba(0,0,0,.16); line-height: 1; }
     .odometer-reel::after { position: absolute; z-index: 2; top: 50%; right: 0; left: 0; border-top: 1px solid rgba(8, 9, 8, .65); border-bottom: 1px solid rgba(255, 255, 255, .025); content: ""; pointer-events: none; }
-    .odometer-separator { display: block; flex: 0 0 .22em; color: var(--muted); line-height: 1; text-align: center; }
+    .odometer-separator { display: block; flex: 0 0 .2em; color: var(--muted); line-height: 1; text-align: center; }
     .odometer-strip { display: flex; flex-direction: column; transform: translateY(0); transition: transform 1.35s cubic-bezier(.2, .75, .2, 1); will-change: transform; }
     .odometer-digit { display: grid; flex: 0 0 1em; height: 1em; place-items: center; color: var(--text); line-height: 1; text-align: center; text-shadow: 0 2px 0 rgba(0,0,0,.32); }
     .odometer.is-ready .odometer-static { display: none; }
     .power-composition { margin-top: 18px; }
-    .composition-meter { display: flex; height: 26px; overflow: hidden; gap: 3px; border: 0; border-radius: 4px; background: transparent; }
+    .composition-meter { display: flex; height: 30px; overflow: hidden; gap: 3px; border: 0; border-radius: 4px; background: transparent; }
     .composition-segment { display: block; min-width: 0; transition: width .45s ease; }
     .composition-segment.uncached { background: var(--accent-dim); }
     .composition-segment.cached { background: var(--accent); }
     .composition-segment.output { background: var(--warm); }
     .composition-segment.unclassified { background: repeating-linear-gradient(135deg, var(--warm) 0 3px, rgba(210, 164, 119, .28) 3px 6px); }
-    .composition-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 14px; margin-top: 8px; }
-    .composition-item { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font: 700 10px/1.25 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .composition-item strong { color: var(--text); font-size: 13px; font-weight: 700; letter-spacing: 0; }
+    .composition-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 3px; margin-top: 9px; }
+    .composition-item { display: flex; min-width: 0; align-items: center; flex-direction: column; justify-content: start; gap: 4px; color: var(--muted); font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .composition-item strong { color: var(--text); font-size: 17px; font-weight: 700; letter-spacing: 0; }
+    .composition-item.uncached strong, .composition-item.cached strong { color: var(--accent); }
+    .composition-item.output strong, .composition-item.unclassified strong { color: var(--warm); }
     .composition-item.unclassified { color: var(--warm); }
     .composition-swatch { display: none; }
     .composition-swatch.output { background: var(--warm); }
@@ -292,13 +478,13 @@ const dashboardTemplate = `<!doctype html>
     .stat-value.muted { color: var(--muted); font-size: 13px; font-weight: 500; }
     .activity-panel { margin-bottom: 10px; padding: 12px 16px; border-radius: 7px; }
     .activity-shell { display: flex; gap: 8px; margin-top: 7px; min-width: 0; }
-    .activity-weekday-labels { display: grid; flex: 0 0 26px; grid-template-rows: 12px repeat(7, 8px); gap: 2px; color: var(--faint); font: 8px/8px var(--font-data); text-align: right; }
-    .activity-weekday-labels span { height: 8px; }
+    .activity-weekday-labels { display: grid; flex: 0 0 26px; grid-template-rows: 12px repeat(7, 12px); gap: 2px; color: var(--faint); font: 8px/12px var(--font-data); text-align: right; }
+    .activity-weekday-labels span { height: 12px; }
     .activity-scroll { min-width: 0; flex: 1; overflow-x: auto; padding: 0 3px 7px 0; scrollbar-color: var(--line-bright) transparent; }
     .activity-grid { display: grid; width: 100%; min-width: 670px; grid-template-columns: repeat(53, minmax(9px, 1fr)); gap: 2px; }
-    .activity-week { display: grid; min-width: 0; grid-template-rows: 12px repeat(7, 8px); gap: 2px; }
+    .activity-week { display: grid; min-width: 0; grid-template-rows: 12px repeat(7, 12px); gap: 2px; }
     .activity-month { overflow: visible; color: var(--faint); font: 8px/12px var(--font-data); white-space: nowrap; }
-    .activity-cell { display: block; width: 100%; height: 8px; border: 1px solid #293127; border-radius: 0; background: #1a1f19; image-rendering: pixelated; }
+    .activity-cell { display: block; width: 100%; height: 12px; border: 1px solid #293127; border-radius: 0; background: #1a1f19; image-rendering: pixelated; }
     .activity-cell.level-1 { border-color: #36533b; background: #2a4430; }
     .activity-cell.level-2 { border-color: #4f724c; background: #416b46; }
     .activity-cell.level-3 { border-color: #779b5f; background: #6b8d56; }
@@ -320,7 +506,7 @@ const dashboardTemplate = `<!doctype html>
     .activity-tooltip-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 5px 0 4px; border-bottom: 1px dotted var(--line); font: 12px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .activity-tooltip-row span:first-child { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
     .activity-tooltip-row span:last-child { flex: 0 0 auto; color: var(--accent); white-space: nowrap; }
-    .content-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .content-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
     .data-panel { min-height: 0; padding: 12px 16px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
     .section-title { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
@@ -330,8 +516,19 @@ const dashboardTemplate = `<!doctype html>
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
     td:first-child { color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; }
+    .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row-icon { display: block; flex: 0 0 17px; width: 17px; height: 17px; object-fit: contain; image-rendering: pixelated; }
-    th:not(:first-child), td:not(:first-child) { text-align: right; }
+    .pixel-glyph { display: grid; flex: 0 0 17px; width: 17px; height: 17px; grid-template: repeat(5, 2px) / repeat(5, 2px); place-content: center; gap: 1px; border: 1px solid var(--glyph-edge); border-radius: 3px; background: #11130f; image-rendering: pixelated; }
+    .pixel-glyph i { display: block; width: 2px; height: 2px; background: transparent; }
+    .pixel-glyph i.dim { background: var(--glyph-dim); }
+    .pixel-glyph i.on { background: var(--glyph); }
+    .pixel-glyph.palette-0 { --glyph: #a995d3; --glyph-dim: #382f49; --glyph-edge: #5f5076; }
+    .pixel-glyph.palette-1 { --glyph: #7fa7c5; --glyph-dim: #293c4a; --glyph-edge: #49677b; }
+    .pixel-glyph.palette-2 { --glyph: #9bbba0; --glyph-dim: #2e4232; --glyph-edge: #536f58; }
+    .pixel-glyph.palette-3 { --glyph: #d2a477; --glyph-dim: #493724; --glyph-edge: #795c3c; }
+    .project-glyph, .machine-glyph { border-color: transparent; border-radius: 0; background: transparent; }
+    .project-glyph i.dim, .machine-glyph i.dim { background: var(--glyph-edge); }
+    th:not(:first-child), td:not(:first-child) { padding-left: 10px; text-align: right; white-space: nowrap; }
     td:last-child { color: var(--warm); font-weight: 700; }
     .empty-row td { padding: 26px 0 8px; color: var(--faint); font-size: 13px; font-weight: 400; }
     .first-run { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 16px; padding: 18px 22px; border: 1px solid rgba(155, 187, 160, .24); border-radius: 10px; background: linear-gradient(100deg, rgba(155, 187, 160, .08), rgba(155, 187, 160, .025)); }
@@ -342,6 +539,11 @@ const dashboardTemplate = `<!doctype html>
     @media (max-width: 1050px) {
       .stat-grid { grid-template-columns: repeat(3, 1fr); }
       .content-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 1240px) and (min-width: 821px) {
+      .power-value { column-gap: 2px; }
+      .odometer-reel { flex-basis: .8em; }
+      .odometer-separator { flex-basis: .18em; }
     }
     @media (max-width: 820px) {
       main { width: min(100% - 20px, 620px); margin: 10px auto; padding: 10px; }
@@ -362,6 +564,8 @@ const dashboardTemplate = `<!doctype html>
       .stat { grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 10px; }
       .stat-icon { width: 30px; height: 30px; }
       .power-value { column-gap: 2px; font-size: clamp(26px, 9vw, 48px); }
+      .odometer-reel { flex-basis: .8em; }
+      .odometer-separator { flex-basis: .18em; }
       .first-run { align-items: start; flex-direction: column; gap: 14px; }
       .command { width: 100%; overflow: auto; }
       footer { flex-direction: column; gap: 4px; }
@@ -409,9 +613,9 @@ const dashboardTemplate = `<!doctype html>
           <span class="composition-segment unclassified" id="live-unclassified-segment" hidden></span>
         </div>
         <div class="composition-grid">
-          <span class="composition-item"><span><i class="composition-swatch uncached" aria-hidden="true"></i>Input</span><strong id="live-uncached-tokens">—</strong></span>
-          <span class="composition-item"><span><i class="composition-swatch cached" aria-hidden="true"></i>Cached</span><strong id="live-cached-tokens">—</strong></span>
-          <span class="composition-item"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong id="live-output-tokens">—</strong></span>
+          <span class="composition-item uncached"><span><i class="composition-swatch uncached" aria-hidden="true"></i>Input</span><strong id="live-uncached-tokens">—</strong></span>
+          <span class="composition-item cached"><span><i class="composition-swatch cached" aria-hidden="true"></i>Cached</span><strong id="live-cached-tokens">—</strong></span>
+          <span class="composition-item output"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong id="live-output-tokens">—</strong></span>
           <span class="composition-item unclassified" id="live-unclassified" hidden><span><i class="composition-swatch unclassified" aria-hidden="true"></i>Unknown</span><strong id="live-unclassified-tokens">—</strong></span>
         </div>
       </div>
@@ -457,15 +661,19 @@ const dashboardTemplate = `<!doctype html>
   <section class="content-grid" aria-label="Usage breakdowns">
     <article class="panel data-panel">
       <div class="section-head"><div class="section-title">Projects</div></div>
-      <table><thead><tr><th>Project</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name"><img class="row-icon" src="/static/tokemon/icons/project.png" alt="" width="17" height="17"><span>{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+      <table><thead><tr><th>Project</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+    </article>
+    <article class="panel data-panel">
+      <div class="section-head"><div class="section-title">Harnesses</div></div>
+      <table><thead><tr><th>Harness</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><div class="section-title">Models</div></div>
-      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name"><img class="row-icon" src="/static/tokemon/icons/model.png" alt="" width="17" height="17"><span>{{.Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{.Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><div class="section-title">Machines</div></div>
-      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name"><img class="row-icon" src="/static/tokemon/icons/machine.png" alt="" width="17" height="17"><span>{{.Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{.Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
   </section>
 
