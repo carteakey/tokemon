@@ -25,7 +25,7 @@ Open [localhost:8080](http://localhost:8080), then sync the current machine:
 go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
 ```
 
-Leave off `--once` to keep polling. The agent currently supports Claude Code transcript JSONL plus Codex and OpenCode usage databases. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
+Leave off `--once` to keep polling. The agent currently supports Claude Code transcript JSONL plus Codex, OpenCode, and Antigravity usage databases. The Antigravity adapter reads only generation metadata from `~/.gemini/antigravity-cli/conversations/*.db`; it does not read transcripts, prompts, responses, artifacts, or conversation titles. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
 
 Unsupported tools can emit normalized schema-v1 events to an explicit JSONL path. Repeat `--jsonl` for multiple files or quote a glob so Tokemon, rather than the shell, discovers matching files:
 

@@ -46,8 +46,8 @@ Use one Go binary and one normalized event contract, with a platform-appropriate
 
 | Platform | Distribution | Supervisor | Default source access |
 | --- | --- | --- | --- |
-| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, OpenCode data |
-| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, OpenCode data |
+| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
+| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
 | Minimal/managed hosts | signed release archive | systemd or an existing orchestrator | explicit configured paths |
 
 The server remains a separate deployment from the agents. It owns SQLite, ingestion authentication, analytics, and the dashboard. An agent only reads local usage metadata and makes outbound requests.
