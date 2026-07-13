@@ -260,7 +260,7 @@ const dashboardTemplate = `<!doctype html>
     .progress { height: 10px; margin: 11px 0 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 999px; background: #11130f; }
     .progress span { display: block; width: {{percent .Evolution.Progress}}%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); box-shadow: 0 0 18px rgba(155, 187, 160, .2); }
     .thresholds { display: flex; justify-content: space-between; color: var(--faint); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 0 0 16px; }
+    .stat-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; padding: 0 0 16px; }
     .stat { min-height: 92px; padding: 15px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
     .stat-label { color: var(--faint); font-size: 10px; font-weight: 650; letter-spacing: .13em; text-transform: uppercase; }
     .stat-value { margin-top: 11px; color: var(--text); font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
@@ -319,6 +319,9 @@ const dashboardTemplate = `<!doctype html>
     .first-run p { max-width: 560px; color: var(--muted); font-size: 13px; }
     .command { padding: 10px 12px; border: 1px solid var(--line-bright); border-radius: 7px; background: #11130f; color: var(--accent); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
     footer { display: flex; justify-content: space-between; gap: 16px; padding-top: 24px; color: var(--faint); font-size: 11px; }
+    @media (max-width: 1050px) {
+      .stat-grid { grid-template-columns: repeat(3, 1fr); }
+    }
     @media (max-width: 820px) {
       main { width: min(100% - 28px, 620px); padding-top: 16px; }
       .topbar { align-items: start; flex-wrap: wrap; }
@@ -410,6 +413,8 @@ const dashboardTemplate = `<!doctype html>
     <article class="stat"><div class="stat-label">Next evolution</div><div class="stat-value" id="live-next-evolution">{{if .Evolution.TokensRemaining}}{{commasPtr .Evolution.TokensRemaining}}{{else}}Final form{{end}}</div><div class="stat-detail">{{if .Evolution.NextThreshold}}tokens remaining{{else}}nothing beyond this{{end}}</div></article>
     <article class="stat"><div class="stat-label">Training ground</div>{{if .ByMachine}}<div class="stat-value">{{(index .ByMachine 0).Machine}}</div><div class="stat-detail">{{commas (index .ByMachine 0).Tokens}} tokens</div>{{else}}<div class="stat-value muted">Awaiting agent</div><div class="stat-detail">no machines yet</div>{{end}}</article>
     <article class="stat"><div class="stat-label">API-equivalent cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div><div class="stat-detail">Estimated from API pricing · {{coverage .EstimatedCost.PricedTokens .EstimatedCost.UnpricedTokens}}% coverage · not your bill</div>{{else}}<div class="stat-value muted">Unavailable</div><div class="stat-detail">no usage with known API pricing</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div><div class="stat-detail">{{commas .Cache.CachedTokens}} cached of {{commas .Cache.EligibleTokens}} input tokens</div>{{else}}<div class="stat-value muted">Unavailable</div><div class="stat-detail">no classified input usage</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Threads}}</div><div class="stat-detail">distinct provider sessions</div></article>
   </section>
 
   <section class="panel activity-panel" aria-labelledby="activity-title">

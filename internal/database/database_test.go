@@ -2,12 +2,84 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/usage"
 )
+
+func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "tokemon.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE sentinel (value TEXT); INSERT INTO sentinel VALUES ('preserved')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v1-*.db"))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("backups = %v, err = %v", backups, err)
+	}
+	backup, err := sql.Open("sqlite", backups[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var value string
+	if err := backup.QueryRow(`SELECT value FROM sentinel`).Scan(&value); err != nil || value != "preserved" {
+		t.Fatalf("backup value = %q, err = %v", value, err)
+	}
+
+	reopened, err := Open(path, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.Close()
+	backups, _ = filepath.Glob(filepath.Join(directory, "backups", "*.db"))
+	if len(backups) != 1 {
+		t.Fatalf("ordinary restart created another backup: %v", backups)
+	}
+}
+
+func TestPruneBackupsKeepsNewestFiles(t *testing.T) {
+	directory := t.TempDir()
+	for _, name := range []string{"tokemon-1.db", "tokemon-2.db", "tokemon-3.db", "other.db"} {
+		if err := os.WriteFile(filepath.Join(directory, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pruneBackups(directory, "tokemon-", 2); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	want := []string{"other.db", "tokemon-2.db", "tokemon-3.db"}
+	if fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Fatalf("files = %v, want %v", names, want)
+	}
+}
 
 func TestIngestIsIdempotentAndDerivesEvolution(t *testing.T) {
 	inputPrice, outputPrice := 10.0, 20.0
@@ -92,6 +164,33 @@ func TestOverviewCostPreservesUnpricedUsage(t *testing.T) {
 	}
 	if overview.EstimatedCost.Amount != 10 || overview.EstimatedCost.PricedTokens != 1_000_000 || overview.EstimatedCost.UnpricedTokens != 500_000 {
 		t.Fatalf("unexpected estimated cost summary: %+v", overview.EstimatedCost)
+	}
+}
+
+func TestOverviewReportsCacheHitRateAndDistinctThreads(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "one", Timestamp: now, MachineID: "machine", SessionID: "thread-1", Provider: "openai", Model: "model", Tool: "codex", InputTokens: usage.Int64(20), CacheReadTokens: usage.Int64(80), OutputTokens: usage.Int64(5), TotalTokens: usage.Int64(105), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "two", Timestamp: now, MachineID: "machine", SessionID: "thread-1", Provider: "openai", Model: "model", Tool: "codex", InputTokens: usage.Int64(30), CacheReadTokens: usage.Int64(70), OutputTokens: usage.Int64(5), TotalTokens: usage.Int64(105), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "three", Timestamp: now, MachineID: "machine", SessionID: "thread-2", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Cache.CachedTokens != 150 || overview.Cache.EligibleTokens != 200 || overview.Cache.HitRate != 0.75 {
+		t.Fatalf("unexpected cache summary: %+v", overview.Cache)
+	}
+	if overview.Threads != 2 {
+		t.Fatalf("threads = %d, want 2", overview.Threads)
 	}
 }
 

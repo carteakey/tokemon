@@ -59,6 +59,12 @@ type CostSummary struct {
 	UnpricedTokens int64   `json:"unpriced_tokens"`
 }
 
+type CacheSummary struct {
+	HitRate        float64 `json:"hit_rate"`
+	CachedTokens   int64   `json:"cached_tokens"`
+	EligibleTokens int64   `json:"eligible_tokens"`
+}
+
 type TokenComposition struct {
 	InputTokens         int64 `json:"input_tokens"`
 	UncachedInputTokens int64 `json:"uncached_input_tokens"`
@@ -68,6 +74,11 @@ type TokenComposition struct {
 }
 
 const activityWeeks = 53
+
+const (
+	databaseSchemaVersion = 1
+	backupRetention       = 10
+)
 
 type TokenBreakdown struct {
 	Name          string `json:"name"`
@@ -118,6 +129,8 @@ type Overview struct {
 	ByMachine      []MachineTotal           `json:"by_machine"`
 	ByProject      []ProjectTotal           `json:"by_project"`
 	EstimatedCost  CostSummary              `json:"estimated_cost"`
+	Cache          CacheSummary             `json:"cache"`
+	Threads        int64                    `json:"threads"`
 	Accuracy       map[usage.Accuracy]int64 `json:"accuracy"`
 }
 
@@ -125,7 +138,14 @@ func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is required")
 	}
-	if !strings.HasPrefix(path, ":") && !strings.HasPrefix(path, "file:") {
+	fileBacked := !strings.HasPrefix(path, ":") && !strings.HasPrefix(path, "file:")
+	existing := false
+	if fileBacked {
+		if info, err := os.Stat(path); err == nil {
+			existing = info.Size() > 0
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("inspect database: %w", err)
+		}
 		if directory := filepath.Dir(path); directory != "." {
 			if err := os.MkdirAll(directory, 0o755); err != nil {
 				return nil, fmt.Errorf("create database directory: %w", err)
@@ -138,6 +158,19 @@ func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	store := &Store{db: db, catalog: modelCatalog}
+	if existing {
+		version, err := schemaVersion(context.Background(), db)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		if version < databaseSchemaVersion {
+			if err := backupBeforeMigration(context.Background(), db, path, version, databaseSchemaVersion, time.Now().UTC()); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+	}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -196,7 +229,63 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_machine ON usage_events(machine_id);
 	if !hasProject {
 		_, err = s.db.ExecContext(ctx, `ALTER TABLE usage_events ADD COLUMN project TEXT NOT NULL DEFAULT ''`)
 	}
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, databaseSchemaVersion))
 	return err
+}
+
+func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read database schema version: %w", err)
+	}
+	return version, nil
+}
+
+func backupBeforeMigration(ctx context.Context, db *sql.DB, databasePath string, fromVersion, toVersion int, now time.Time) error {
+	var integrity string
+	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		return fmt.Errorf("check database before migration: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("database integrity check failed before migration: %s", integrity)
+	}
+
+	backupDir := filepath.Join(filepath.Dir(databasePath), "backups")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return fmt.Errorf("create backup directory: %w", err)
+	}
+	name := fmt.Sprintf("%s-v%d-before-v%d-%s.db", strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath)), fromVersion, toVersion, now.Format("20060102T150405.000000000Z"))
+	backupPath := filepath.Join(backupDir, name)
+	if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, backupPath); err != nil {
+		return fmt.Errorf("back up database before migration: %w", err)
+	}
+	if err := pruneBackups(backupDir, strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath))+"-", backupRetention); err != nil {
+		return fmt.Errorf("prune database backups: %w", err)
+	}
+	return nil
+}
+
+func pruneBackups(directory, prefix string, keep int) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".db") {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names[:max(0, len(names)-keep)] {
+		if err := os.Remove(filepath.Join(directory, name)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func hasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
@@ -594,6 +683,16 @@ FROM usage_events`).Scan(
 		&result.EstimatedCost.UnpricedTokens,
 	); err != nil {
 		return Overview{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
+FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleTokens, &result.Threads); err != nil {
+		return Overview{}, err
+	}
+	if result.Cache.EligibleTokens > 0 {
+		result.Cache.HitRate = float64(result.Cache.CachedTokens) / float64(result.Cache.EligibleTokens)
 	}
 	result.Activity, err = s.Activity(ctx, time.Now().UTC())
 	if err != nil {

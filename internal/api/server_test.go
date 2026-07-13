@@ -194,6 +194,29 @@ func TestDashboardRendersAPIEquivalentCostAndCoverage(t *testing.T) {
 	}
 }
 
+func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "cache", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "thread", Provider: "openai", Model: "model", Tool: "codex", InputTokens: usage.Int64(20), CacheReadTokens: usage.Int64(80), OutputTokens: usage.Int64(5), TotalTokens: usage.Int64(105), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, want := range []string{"Cache hit", "80.0%", "80 cached of 100 input tokens", "Threads", "distinct provider sessions"} {
+		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
+		}
+	}
+}
+
 func TestDashboardRendersMergedProjectUsage(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

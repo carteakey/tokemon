@@ -221,6 +221,15 @@ dashboard itself has no user login. Deploying a new build on request is the
 same `up -d --build` command; stop it with
 `docker compose --env-file .env -f deploy/docker-compose.yml down`.
 
+Before applying a newer SQLite schema version, Tokemon runs an integrity check
+and creates a consistent snapshot with SQLite's `VACUUM INTO`. Compose installs
+store these snapshots under `./data/backups/`; filenames record the previous
+and target schema versions. Tokemon retains the newest ten snapshots and does
+not create another backup on ordinary restarts at the same schema version. To
+restore, stop the server, preserve the current database separately, copy the
+selected snapshot to `./data/tokemon.db`, and start the server so migrations can
+run again. Never restore over a running server.
+
 The agent runs with `--home /agent-home`, so provider discovery stays identical inside and outside the container. A read-only mount limits mutation, not visibility; a compromised container could still read mounted files. The explicit mount allowlist and metadata-only parser are therefore both required.
 
 Standalone binaries plus systemd remain the fallback for machines without Docker or Podman. Ansible can install either path across a fleet later.
@@ -233,7 +242,7 @@ Claude Code usage is stored in session JSONL files under:
 ~/.claude/projects/<encoded-project>/<session-id>.jsonl
 ```
 
-The adapter will stream those files and inspect only assistant records containing `message.usage`. It will extract:
+The adapter streams those files and inspects assistant records containing `message.usage`, plus the metadata-only `system` / `turn_duration` record that Claude Code writes after a turn. It extracts:
 
 - timestamp;
 - session ID;
@@ -242,12 +251,13 @@ The adapter will stream those files and inspect only assistant records containin
 - output tokens;
 - cache-read tokens;
 - cache-creation/write tokens.
+- turn duration in milliseconds when present.
 
 It will not send message content, tool content, project names, encoded project paths, titles, or repository paths. File identity is hashed before it participates in an event ID or source identity. Missing token fields remain unknown; totals are derived only when the required components are present.
 
 Each assistant API response becomes one deterministic usage event. Stable identity is based on the hashed transcript identity, line offset, timestamp, and session ID. This permits rescans without duplicate lifetime totals while the durable cursor state is completed.
 
-No live Claude transcript fixtures exist on this Mac today, so the enabled adapter ships with synthetic privacy fixtures and an explicit inspect-equivalent payload test until a real Claude session is available for end-to-end verification.
+The adapter is covered by synthetic privacy fixtures and an exact normalized-payload test. Its record and usage-field shapes were also checked against live Claude Code transcripts on an enrolled machine without retaining or displaying conversation content, titles, working directories, or source paths.
 
 ## Security baseline
 

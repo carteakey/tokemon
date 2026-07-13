@@ -104,6 +104,15 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			// a session is active. The next poll will see the complete record.
 			continue
 		}
+		if record.Type == "system" && record.Subtype == "turn_duration" && record.DurationMS != nil {
+			// Claude Code writes turn duration as a metadata-only system record
+			// immediately after the assistant response it describes. Keep it on
+			// that usage event instead of emitting a second, tokenless event.
+			if len(events) > 0 && (record.SessionID == "" || events[len(events)-1].SessionID == record.SessionID) {
+				events[len(events)-1].DurationMS = record.DurationMS
+			}
+			continue
+		}
 		if record.Type != "assistant" || record.Message == nil {
 			continue
 		}
@@ -144,9 +153,11 @@ func (a *Adapter) sourceIdentity(path string) string {
 
 type transcriptRecord struct {
 	Type         string         `json:"type"`
+	Subtype      string         `json:"subtype"`
 	Timestamp    string         `json:"timestamp"`
 	SessionID    string         `json:"sessionId"`
 	SessionIDAlt string         `json:"session_id"`
+	DurationMS   *int64         `json:"durationMs"`
 	Message      *messageRecord `json:"message"`
 	Usage        *tokenUsage    `json:"usage"`
 }
