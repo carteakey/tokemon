@@ -112,6 +112,55 @@ func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	}
 }
 
+func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, want := range []string{
+		`id="lifetime-counter"`,
+		`id="token-composition"`,
+		`fetch('/api/v1/evolution'`,
+		`window.setInterval(pollLifetime, 2000)`,
+		`live counter · analytics refresh every 60s`,
+	} {
+		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("dashboard does not contain %q", want)
+		}
+	}
+}
+
+func TestEvolutionEndpointIncludesTokenComposition(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "components", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", InputTokens: usage.Int64(5), CacheReadTokens: usage.Int64(7), CacheWriteTokens: usage.Int64(0), OutputTokens: usage.Int64(3), TotalTokens: usage.Int64(15), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	for _, want := range []string{`"lifetime_tokens":15`, `"input_tokens":12`, `"uncached_input_tokens":5`, `"cached_input_tokens":7`, `"output_tokens":3`} {
+		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("evolution response does not contain %q: %s", want, response.Body.String())
+		}
+	}
+}
+
 func TestDashboardRendersAPIEquivalentCostAndCoverage(t *testing.T) {
 	inputPrice := 10.0
 	outputPrice := 0.0
@@ -138,7 +187,7 @@ func TestDashboardRendersAPIEquivalentCostAndCoverage(t *testing.T) {
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"API-equivalent cost", "Est. $10.00", "67% of known tokens", "not your subscription bill"} {
+	for _, want := range []string{"API-equivalent cost", "$10.00", "Estimated from API pricing", "67% coverage", "not your bill"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
 		}

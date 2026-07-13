@@ -60,4 +60,4 @@ go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
 
 Read the [v0.2 product spec](tokemon-spec-v0.2.md) or run `go run ./cmd/tokemon --help` for the full command list.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the endpoint contract, macOS LaunchAgent path, Linux container path, Claude integration boundary, and security checklist.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the multi-machine roadmap, endpoint contract, macOS LaunchAgent path, Linux container path, Claude integration boundary, and security checklist.

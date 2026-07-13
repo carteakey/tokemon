@@ -59,6 +59,14 @@ type CostSummary struct {
 	UnpricedTokens int64   `json:"unpriced_tokens"`
 }
 
+type TokenComposition struct {
+	InputTokens         int64 `json:"input_tokens"`
+	UncachedInputTokens int64 `json:"uncached_input_tokens"`
+	CachedInputTokens   int64 `json:"cached_input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	UnclassifiedTokens  int64 `json:"unclassified_tokens"`
+}
+
 const activityWeeks = 53
 
 type TokenBreakdown struct {
@@ -229,6 +237,16 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 			result.Errors = append(result.Errors, fmt.Sprintf("event %d: %v", index+1, err))
 			continue
 		}
+		if event.Source.Adapter == "codex" && event.SessionID != "" && event.InputTokens != nil {
+			// Detailed Codex JSONL events supersede the older aggregate thread
+			// snapshot for the same session. Remove it before inserting component
+			// events so upgrading an agent cannot double-count lifetime usage.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM usage_events
+WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
+AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, event.MachineID, event.SessionID); err != nil {
+				return result, err
+			}
+		}
 		canonicalModel := event.CanonicalModel
 		var estimatedCost *float64
 		if canonicalModel == "" && s.catalog != nil {
@@ -341,6 +359,24 @@ func (s *Store) LifetimeTokens(ctx context.Context) (int64, error) {
 	var total sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0) FROM usage_events WHERE total_tokens IS NOT NULL`).Scan(&total)
 	return total.Int64, err
+}
+
+func (s *Store) TokenComposition(ctx context.Context) (TokenComposition, error) {
+	var result TokenComposition
+	err := s.db.QueryRowContext(ctx, `SELECT
+COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0),
+COALESCE(SUM(input_tokens), 0),
+COALESCE(SUM(COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0),
+COALESCE(SUM(output_tokens), 0),
+COALESCE(SUM(MAX(COALESCE(total_tokens, 0) - COALESCE(input_tokens, 0) - COALESCE(cache_read_tokens, 0) - COALESCE(cache_write_tokens, 0) - COALESCE(output_tokens, 0), 0)), 0)
+FROM usage_events`).Scan(
+		&result.InputTokens,
+		&result.UncachedInputTokens,
+		&result.CachedInputTokens,
+		&result.OutputTokens,
+		&result.UnclassifiedTokens,
+	)
+	return result, err
 }
 
 func (s *Store) Evolution(ctx context.Context) (evolution.Snapshot, error) {

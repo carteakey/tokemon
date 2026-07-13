@@ -165,6 +165,61 @@ func TestIngestRefreshesAnExistingSnapshot(t *testing.T) {
 	}
 }
 
+func TestDetailedCodexUsageSupersedesAggregateSnapshot(t *testing.T) {
+	inputPrice, outputPrice, cachePrice, cacheWritePrice := 1.0, 10.0, 0.1, 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"gpt": {Provider: "openai", DisplayName: "GPT", Aliases: []string{"gpt"}, Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com/pricing", InputPricePerMillion: &inputPrice, OutputPricePerMillion: &outputPrice, CacheReadPricePerMillion: &cachePrice, CacheWritePricePerMillion: &cacheWritePrice}},
+	})
+	store, err := Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	aggregate := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "aggregate", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "session", Provider: "openai", Model: "gpt", Tool: "codex", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "0.2.0"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{aggregate}); err != nil {
+		t.Fatal(err)
+	}
+	detailed := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "detailed", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "session", Provider: "openai", Model: "gpt", Tool: "codex", InputTokens: usage.Int64(10), OutputTokens: usage.Int64(10), CacheReadTokens: usage.Int64(80), CacheWriteTokens: usage.Int64(0), TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "0.3.0"}}
+	result, err := store.Ingest(context.Background(), []usage.Event{detailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CurrentTotal != 100 {
+		t.Fatalf("lifetime tokens = %d, want 100", result.CurrentTotal)
+	}
+	events, err := store.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "detailed" || events[0].Cost == nil {
+		t.Fatalf("unexpected migrated events: %+v", events)
+	}
+}
+
+func TestTokenCompositionSeparatesCachedAndUnclassifiedTokens(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "detailed-components", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", InputTokens: usage.Int64(40), CacheReadTokens: usage.Int64(50), CacheWriteTokens: usage.Int64(10), OutputTokens: usage.Int64(20), TotalTokens: usage.Int64(120), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "aggregate-only", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "other", Model: "model", Tool: "other", TotalTokens: usage.Int64(30), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	composition, err := store.TokenComposition(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := TokenComposition{InputTokens: 100, UncachedInputTokens: 40, CachedInputTokens: 60, OutputTokens: 20, UnclassifiedTokens: 30}
+	if composition != want {
+		t.Fatalf("composition = %+v, want %+v", composition, want)
+	}
+}
+
 func TestActivityBuildsPixelCalendarAndPreservesUnknownTotals(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

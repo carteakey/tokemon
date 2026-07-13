@@ -1,11 +1,44 @@
-# Tokemon deployment and agent plan
+# Tokemon multi-machine deployment roadmap
 
 **Status:** v0.2 rollout plan
 **Last updated:** 2026-07-12
 
-This document records the deployment architecture and rollout contract for Tokemon. Linear remains the source of truth for committed work; this is an implementation and operations document, not a second backlog.
+This document is the implementation roadmap for running one Tokemon server with agents on multiple machines. Linear remains the source of truth for committed work; this document defines the architecture, rollout order, and operational checks rather than creating a second backlog.
 
-Current slice status: the shared agent config loader, macOS LaunchAgent installer, and Claude Code adapter are implemented and covered by tests. Release publishing, the Linux container template, and durable cursor state remain ahead.
+Current slice status: the shared agent config loader, macOS LaunchAgent installer, and Claude Code adapter are implemented and covered by tests. A second Apple Silicon Mac has been installed and completed its first authenticated sync. The primary server is still session-bound, and durable cursor state, live Claude validation, release publishing, and the Linux container template remain ahead.
+
+## Topology and roles
+
+```mermaid
+flowchart LR
+    A[macOS agent] -->|authenticated metadata batches| S[Tokemon server]
+    B[Linux or container agent] -->|authenticated metadata batches| S
+    C[future machine agent] -->|authenticated metadata batches| S
+    S --> D[(SQLite)]
+    S --> E[Dashboard and evolution]
+```
+
+| Role | Responsibility | Initial placement |
+| --- | --- | --- |
+| Server | Authenticated ingestion, SQLite, analytics, dashboard, evolution | Primary Mac, then a stable Linux host if needed |
+| Agent | Read local provider metadata, normalize, upload, retain local cursor state | Primary Mac and the second Mac already deployed |
+| Endpoint | One private base URL reachable by every trusted machine | Tailscale/WireGuard address or HTTPS hostname |
+
+Agents are outbound-only. The server is the only component that needs a reachable listening port. A machine is enrolled by installing the same binary, writing the endpoint and token to its local config, and starting its platform supervisor.
+
+## Roadmap at a glance
+
+| Phase | State | Outcome | Linear work |
+| --- | --- | --- | --- |
+| 0. First multi-machine slice | Validated | Authenticated server endpoint and second macOS agent sync real metadata | CAR-63, CAR-64, CAR-65 |
+| 1. Durable hub | Next | Server survives session logout/reboot with protected config and health checks | CAR-65 follow-up |
+| 2. Failure-safe agents | Next | Cursors, retries, rotation, and local state obey the v0.2 contract | CAR-65 |
+| 3. Provider evidence | Planned | Live Claude fixture plus complete Codex/OpenCode fixture and inspect coverage | CAR-63, CAR-64 |
+| 4. Release gate | Planned | Cross-provider privacy, authentication, idempotency, and two-machine tests pass | CAR-67 |
+| 5. Distribution | Planned | Signed macOS archive/Homebrew path and Linux multi-architecture image/service templates | Deployment follow-up |
+| 6. Product finish | In progress | Counter-first analytics and evolution-art release acceptance | CAR-69, CAR-66 |
+
+The immediate implementation order is Phase 1, Phase 2, Phase 3, and Phase 4. Distribution follows once the behavior is trustworthy; adding more platforms before that would multiply support paths around an unstable agent state model.
 
 ## Decision
 
@@ -58,6 +91,69 @@ TOKEMON_HOME=/Users/example
 Resolution order is explicit flags, environment variables, the config file, then safe defaults. Secrets must not be placed in process arguments or container image layers. Config files containing tokens are user-readable only (`0600`).
 
 The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, and `--home`, plus the corresponding `TOKEMON_*` environment variables. The macOS installer writes this file and launches the service with `--config`.
+
+## Machine onboarding flow
+
+Every new machine follows the same sequence:
+
+1. Confirm the server is healthy on the private endpoint.
+2. Generate or retrieve the deployment ingest token through a protected channel.
+3. Install a matching Tokemon binary for the machine architecture.
+4. Write `TOKEMON_SERVER_URL`, `TOKEMON_INGEST_TOKEN`, and `TOKEMON_MACHINE_ID` to the local mode-0600 config.
+5. Start the native supervisor or container with the local provider paths mounted read-only.
+6. Verify one authenticated sync, then verify that the next sync refreshes rather than duplicates events.
+7. Confirm the new machine appears in the dashboard with a recent heartbeat.
+
+The server endpoint and token are the only shared deployment inputs. Provider paths, machine IDs, local state, and supervisor configuration remain machine-local.
+
+## Phase 1: make the hub durable
+
+The primary Mac currently proves the topology but its server process is attached to the active development session. The next operational change is a user-level server LaunchAgent with:
+
+- a protected server env file containing the database path and ingest token;
+- `RunAtLoad` and `KeepAlive` behavior;
+- a stable SQLite path outside temporary build output;
+- stdout/stderr logs under `~/Library/Logs/Tokemon`;
+- a `/healthz` check after boot and after restart;
+- Tailscale/WireGuard or HTTPS-only reachability from enrolled agents.
+
+This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
+
+## Phase 2: make agents failure-safe
+
+Implement the v0.2 local state contract before adding more installation surfaces. State should contain only source identity, cursor, machine ID, and last successful sync, stored at a stable user-local path such as `~/.local/share/tokemon/state.db`.
+
+The agent must:
+
+- read only new records from each source;
+- advance a cursor only after the server accepts the batch;
+- retain the cursor and retry after a failed upload;
+- detect truncation, replacement, missing files, and rotation;
+- resume safely after a process or machine restart;
+- rely on deterministic event IDs to make rescans idempotent.
+
+This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
+
+## Phase 3: prove provider coverage
+
+Complete the adapters against representative fixtures, then validate one real Claude Code transcript without retaining its content. The evidence set should cover:
+
+- Claude Code assistant usage records, cache fields, duration when present, and unknown values;
+- Codex and OpenCode model aliases, token fields, sessions, and source discovery;
+- exact `inspect` output for each provider;
+- assertions that prompts, responses, titles, repository paths, and source code never enter outgoing events.
+
+Synthetic fixtures remain useful for deterministic tests, but one live Claude capture is needed to catch format drift before release.
+
+## Phase 4: release gate
+
+CAR-67 should exercise the complete path on at least two machines:
+
+```text
+provider files → local adapter → agent state → authenticated batch API → SQLite → dashboard
+```
+
+The release gate passes only when it verifies authentication failure, retry without cursor advancement, rotation, duplicate refresh, restart recovery, privacy redaction, machine attribution, and correct evolution totals.
 
 ## macOS first
 
@@ -177,13 +273,16 @@ Every deployment path must verify:
 6. A captured normalized payload contains no prompt, response, title, source-code, or repository-path content.
 7. The agent survives a restart and retries when the server is temporarily unavailable.
 
-## Rollout order
+## Distribution after the release gate
 
-1. Finish the shared config loader and macOS LaunchAgent installer.
-2. Add the Claude Code adapter and privacy fixtures alongside the macOS path.
-3. Add cross-provider ingestion tests and source-path redaction assertions.
-4. Publish signed macOS binaries and a Homebrew tap.
-5. Publish the multi-architecture agent image and Linux Compose template.
-6. Add systemd/Quadlet and Ansible paths after the first macOS and Docker installs are verified.
+Once the two-machine release gate passes:
 
-Relevant committed work is tracked in the Tokemon v0.2 Linear milestone: CAR-63, CAR-64, CAR-65, CAR-67, and CAR-68.
+1. Publish signed macOS arm64 and amd64 archives, then add the Homebrew formula.
+2. Publish a multi-architecture OCI image for `linux/amd64` and `linux/arm64`.
+3. Add a Compose template with explicit read-only provider mounts and a non-root runtime.
+4. Add systemd/Quadlet instructions for Linux hosts that do not use Docker or Podman.
+5. Add Ansible or another fleet wrapper only after the native and container contracts are stable.
+
+The Mac path remains native and Docker-free. Containers are a Linux distribution option, not a requirement for small agents.
+
+Relevant committed work is tracked in the Tokemon v0.2 Linear milestone: CAR-63, CAR-64, CAR-65, CAR-66, CAR-67, CAR-68, and CAR-69. Distribution work is intentionally sequenced after the reliability and release gates so every platform shares one tested agent contract.

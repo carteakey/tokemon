@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/tokemon/tokemon/internal/database"
+	"github.com/tokemon/tokemon/internal/evolution"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/web"
 )
@@ -126,7 +127,15 @@ func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	composition, err := s.store.TokenComposition(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		evolution.Snapshot
+		Composition database.TokenComposition `json:"composition"`
+	}{Snapshot: result, Composition: composition})
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +218,9 @@ const dashboardTemplate = `<!doctype html>
     .nav-link.active { border-color: var(--line); background: var(--surface); color: var(--text); }
     .status { display: flex; align-items: center; gap: 7px; color: var(--faint); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
     .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px rgba(155, 187, 160, .08); }
+    .status.is-live .status-dot { animation: live-pulse 2s ease-out infinite; }
+    .status.is-stale .status-dot { background: var(--danger); animation: none; }
+    @keyframes live-pulse { 0% { box-shadow: 0 0 0 0 rgba(155, 187, 160, .32); } 70%, 100% { box-shadow: 0 0 0 7px rgba(155, 187, 160, 0); } }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 16px; padding: 24px 0 16px; }
     .panel { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
     .creature-panel { position: relative; min-height: 430px; overflow: hidden; padding: 22px; background: radial-gradient(circle at 50% 46%, rgba(155, 187, 160, .09), transparent 48%), var(--surface); }
@@ -237,6 +249,9 @@ const dashboardTemplate = `<!doctype html>
     .odometer-digit { display: block; flex: 0 0 1em; height: 1em; line-height: 1; text-align: center; }
     .odometer.is-ready .odometer-static { display: none; }
     .power-unit { color: var(--muted); font-size: 13px; }
+    .power-composition { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 9px; color: var(--faint); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+    .power-composition strong { color: var(--muted); font-weight: 600; }
+    .power-composition .unclassified { color: var(--warm); }
     .power-note { flex: 0 1 230px; max-width: 230px; color: var(--faint); font-size: 12px; line-height: 1.45; text-align: right; }
     .power-note strong { display: block; margin-bottom: 3px; color: var(--warm); font-size: 13px; }
     .progress-block { margin-top: auto; padding-top: 32px; }
@@ -276,6 +291,16 @@ const dashboardTemplate = `<!doctype html>
     .activity-legend .activity-cell { width: 11px; height: 11px; }
     .activity-note { margin-left: auto; font-family: inherit; text-align: right; }
     .activity-empty { margin-top: 4px; color: var(--faint); font-size: 12px; }
+    .activity-tooltip { position: fixed; z-index: 20; width: min(320px, calc(100vw - 24px)); padding: 15px 16px 16px; border: 2px solid var(--warm); border-radius: 0; background: #12160f; box-shadow: 4px 4px 0 #090b08, inset 0 0 0 1px rgba(155, 187, 160, .16); color: var(--text); pointer-events: none; }
+    .activity-tooltip[hidden] { display: none; }
+    .activity-tooltip-date { color: var(--accent); font-family: var(--font-display); font-size: 15px; font-weight: 600; letter-spacing: .02em; line-height: 1.2; }
+    .activity-tooltip-summary { margin-top: 10px; padding: 8px 0; border-top: 1px solid var(--line-bright); border-bottom: 1px solid var(--line-bright); color: var(--text); font: 700 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .activity-tooltip-note { margin-top: 8px; color: var(--warm); font-family: var(--font-display); font-size: 11px; line-height: 1.25; }
+    .activity-tooltip-section { margin-top: 12px; }
+    .activity-tooltip-section-title { color: var(--faint); font-family: var(--font-display); font-size: 10px; font-weight: 600; letter-spacing: .14em; line-height: 1; }
+    .activity-tooltip-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 5px 0 4px; border-bottom: 1px dotted var(--line); font: 12px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .activity-tooltip-row span:first-child { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+    .activity-tooltip-row span:last-child { flex: 0 0 auto; color: var(--accent); white-space: nowrap; }
     .content-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 16px; }
     .data-panel { min-height: 250px; padding: 22px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
@@ -336,7 +361,7 @@ const dashboardTemplate = `<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link active" href="/">Overview</a>
       <a class="nav-link" href="/api/v1/analytics/overview">Data</a>
-      <span class="status"><span class="status-dot"></span>local · auto refresh</span>
+      <span class="status" id="live-status"><span class="status-dot"></span><span id="live-status-text">local · connecting</span></span>
     </nav>
   </header>
 
@@ -357,27 +382,34 @@ const dashboardTemplate = `<!doctype html>
       <div class="power-header">
         <div>
           <div class="power-kicker">Lifetime tokens</div>
-          <div class="power-value odometer" data-display="{{commas .LifetimeTokens}}" aria-label="{{commas .LifetimeTokens}}"><span class="odometer-static">{{commas .LifetimeTokens}}</span></div>
+          <div class="power-value odometer" id="lifetime-counter" data-display="{{commas .LifetimeTokens}}" aria-label="{{commas .LifetimeTokens}}"><span class="odometer-static">{{commas .LifetimeTokens}}</span></div>
           <div class="power-unit">the power level behind this form</div>
+          <div class="power-composition" id="token-composition" aria-label="Lifetime token composition">
+            <span><strong>Input</strong> <span id="live-input-tokens">—</span></span>
+            <span><strong>Uncached</strong> <span id="live-uncached-tokens">—</span></span>
+            <span><strong>Cached</strong> <span id="live-cached-tokens">—</span></span>
+            <span><strong>Output</strong> <span id="live-output-tokens">—</span></span>
+            <span class="unclassified" id="live-unclassified" hidden><strong>Unclassified</strong> <span id="live-unclassified-tokens">—</span></span>
+          </div>
         </div>
         <div class="power-note">
-          <strong>{{printf "%.1f" (mul .Evolution.Progress 100)}}% charged</strong>
-          {{if .Evolution.TokensRemaining}}{{commasPtr .Evolution.TokensRemaining}} tokens until the next evolution{{else}}The Singularity has no next form.{{end}}
+          <strong id="live-progress-label">{{printf "%.1f" (mul .Evolution.Progress 100)}}% charged</strong>
+          <span id="live-remaining-copy">{{if .Evolution.TokensRemaining}}{{commasPtr .Evolution.TokensRemaining}} tokens until the next evolution{{else}}The Singularity has no next form.{{end}}</span>
         </div>
       </div>
       <div class="progress-block">
         <div class="progress-row"><span>Evolution progress</span><strong>Stage {{.Evolution.Stage}} → {{if .Evolution.NextThreshold}}{{commasPtr .Evolution.NextThreshold}}{{else}}∞{{end}}</strong></div>
-        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
+        <div class="progress" id="live-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
         <div class="thresholds"><span>{{commas .Evolution.LowerThreshold}}</span><span>{{if .Evolution.NextThreshold}}{{commasPtr .Evolution.NextThreshold}}{{else}}FINAL FORM{{end}}</span></div>
       </div>
     </article>
   </section>
 
   <section class="stat-grid" aria-label="Usage summary">
-    <article class="stat"><div class="stat-label">Power level</div><div class="stat-value">{{commas .LifetimeTokens}}</div><div class="stat-detail">lifetime tokens</div></article>
-    <article class="stat"><div class="stat-label">Next evolution</div><div class="stat-value">{{if .Evolution.TokensRemaining}}{{commasPtr .Evolution.TokensRemaining}}{{else}}Final form{{end}}</div><div class="stat-detail">{{if .Evolution.NextThreshold}}tokens remaining{{else}}nothing beyond this{{end}}</div></article>
+    <article class="stat"><div class="stat-label">Power level</div><div class="stat-value" id="live-power-level">{{commas .LifetimeTokens}}</div><div class="stat-detail">lifetime tokens</div></article>
+    <article class="stat"><div class="stat-label">Next evolution</div><div class="stat-value" id="live-next-evolution">{{if .Evolution.TokensRemaining}}{{commasPtr .Evolution.TokensRemaining}}{{else}}Final form{{end}}</div><div class="stat-detail">{{if .Evolution.NextThreshold}}tokens remaining{{else}}nothing beyond this{{end}}</div></article>
     <article class="stat"><div class="stat-label">Training ground</div>{{if .ByMachine}}<div class="stat-value">{{(index .ByMachine 0).Machine}}</div><div class="stat-detail">{{commas (index .ByMachine 0).Tokens}} tokens</div>{{else}}<div class="stat-value muted">Awaiting agent</div><div class="stat-detail">no machines yet</div>{{end}}</article>
-    <article class="stat"><div class="stat-label">API-equivalent cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">Est. {{money .EstimatedCost.Amount}}</div><div class="stat-detail">{{coverage .EstimatedCost.PricedTokens .EstimatedCost.UnpricedTokens}}% of known tokens · not your subscription bill</div>{{else}}<div class="stat-value muted">Unavailable</div><div class="stat-detail">no usage with known API pricing</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">API-equivalent cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div><div class="stat-detail">Estimated from API pricing · {{coverage .EstimatedCost.PricedTokens .EstimatedCost.UnpricedTokens}}% coverage · not your bill</div>{{else}}<div class="stat-value muted">Unavailable</div><div class="stat-detail">no usage with known API pricing</div>{{end}}</article>
   </section>
 
   <section class="panel activity-panel" aria-labelledby="activity-title">
@@ -397,7 +429,7 @@ const dashboardTemplate = `<!doctype html>
           {{range .Activity.Weeks}}
           <div class="activity-week">
             <span class="activity-month">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}title="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="0"{{end}}></span>{{end}}
+            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="0"{{end}}></span>{{end}}
           </div>
           {{end}}
         </div>
@@ -432,12 +464,18 @@ const dashboardTemplate = `<!doctype html>
   </section>
   {{end}}
 
-  <footer><span>SQLite · local-first · no conversation content</span><span>Just for fun · not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.</span><span>updated on refresh · schema v1</span></footer>
+  <footer><span>SQLite · local-first · no conversation content</span><span>Just for fun · not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.</span><span>live counter · analytics refresh every 60s · schema v1</span></footer>
 </main>
 <script>
 (() => {
-  document.querySelectorAll('.odometer').forEach((odometer) => {
-    const display = odometer.dataset.display || '';
+  const renderOdometer = (odometer, display, animate = true) => {
+    odometer.dataset.display = display;
+    odometer.setAttribute('aria-label', display);
+    odometer.replaceChildren();
+    const fallback = document.createElement('span');
+    fallback.className = 'odometer-static';
+    fallback.textContent = display;
+    odometer.append(fallback);
     const fit = () => {
       const width = odometer.getBoundingClientRect().width;
       const size = Math.max(28, Math.min(86, width / Math.max(display.length * .68, 1)));
@@ -478,16 +516,184 @@ const dashboardTemplate = `<!doctype html>
       reel.append(strip);
       visual.append(reel);
 
-      requestAnimationFrame(() => {
+      if (animate) {
+        requestAnimationFrame(() => {
+          strip.style.transform = 'translateY(-' + (turns * 10) + 'em)';
+        });
+      } else {
+        strip.style.transition = 'none';
         strip.style.transform = 'translateY(-' + (turns * 10) + 'em)';
-      });
+      }
       digitIndex += 1;
     });
     odometer.append(visual);
     odometer.classList.add('is-ready');
     fit();
-    window.addEventListener('resize', fit, { passive: true });
+  };
+
+  document.querySelectorAll('.odometer').forEach((odometer) => {
+    renderOdometer(odometer, odometer.dataset.display || '', true);
   });
+  window.addEventListener('resize', () => {
+    document.querySelectorAll('.odometer').forEach((odometer) => {
+      const display = odometer.dataset.display || '';
+      const width = odometer.getBoundingClientRect().width;
+      odometer.style.fontSize = Math.max(28, Math.min(86, width / Math.max(display.length * .68, 1))) + 'px';
+    });
+  }, { passive: true });
+
+  const number = new Intl.NumberFormat('en-US');
+  const counter = document.getElementById('lifetime-counter');
+  const status = document.getElementById('live-status');
+  const statusText = document.getElementById('live-status-text');
+  let lifetimeTokens = Number((counter.dataset.display || '0').replaceAll(',', ''));
+  let currentStage = Number(document.querySelector('.creature-panel').dataset.stage);
+  let polling = false;
+
+  const setLiveStatus = (live) => {
+    status.classList.toggle('is-live', live);
+    status.classList.toggle('is-stale', !live);
+    statusText.textContent = live ? 'local · live every 2s' : 'local · reconnecting';
+  };
+
+  const pollLifetime = async () => {
+    if (polling || document.hidden) return;
+    polling = true;
+    try {
+      const response = await fetch('/api/v1/evolution', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new Error('live counter unavailable');
+      const snapshot = await response.json();
+      setLiveStatus(true);
+      const composition = snapshot.composition || {};
+      document.getElementById('live-input-tokens').textContent = number.format(composition.input_tokens || 0);
+      document.getElementById('live-uncached-tokens').textContent = number.format(composition.uncached_input_tokens || 0);
+      document.getElementById('live-cached-tokens').textContent = number.format(composition.cached_input_tokens || 0);
+      document.getElementById('live-output-tokens').textContent = number.format(composition.output_tokens || 0);
+      const unclassified = composition.unclassified_tokens || 0;
+      document.getElementById('live-unclassified-tokens').textContent = number.format(unclassified);
+      document.getElementById('live-unclassified').hidden = unclassified === 0;
+      if (snapshot.stage !== currentStage) {
+        location.reload();
+        return;
+      }
+      if (snapshot.lifetime_tokens === lifetimeTokens) return;
+      lifetimeTokens = snapshot.lifetime_tokens;
+      const display = number.format(lifetimeTokens);
+      renderOdometer(counter, display, true);
+      document.getElementById('live-power-level').textContent = display;
+      document.getElementById('live-progress-label').textContent = (snapshot.progress * 100).toFixed(1) + '% charged';
+      document.getElementById('live-remaining-copy').textContent = snapshot.tokens_remaining == null
+        ? 'The Singularity has no next form.'
+        : number.format(snapshot.tokens_remaining) + ' tokens until the next evolution';
+      document.getElementById('live-next-evolution').textContent = snapshot.tokens_remaining == null
+        ? 'Final form'
+        : number.format(snapshot.tokens_remaining);
+      const progress = document.getElementById('live-progress');
+      progress.setAttribute('aria-valuenow', String(snapshot.progress * 100));
+      progress.firstElementChild.style.width = (snapshot.progress * 100) + '%';
+    } catch (_) {
+      setLiveStatus(false);
+    } finally {
+      polling = false;
+    }
+  };
+  pollLifetime();
+  window.setInterval(pollLifetime, 2000);
+  document.addEventListener('visibilitychange', pollLifetime);
+
+  const tooltip = document.createElement('div');
+  tooltip.className = 'activity-tooltip';
+  tooltip.setAttribute('role', 'tooltip');
+  tooltip.hidden = true;
+  document.body.append(tooltip);
+
+  let activeCell = null;
+  const addTooltipText = (className, text) => {
+    const node = document.createElement('div');
+    node.className = className;
+    node.textContent = text;
+    tooltip.append(node);
+    return node;
+  };
+
+  const renderTooltip = (cell) => {
+    tooltip.replaceChildren();
+    const lines = (cell.dataset.tooltip || '').split('\n');
+    addTooltipText('activity-tooltip-date', lines.shift() || '');
+    addTooltipText('activity-tooltip-summary', lines.shift() || '');
+    let section = null;
+    lines.forEach((line) => {
+      if (line === 'Some token totals unavailable') {
+        addTooltipText('activity-tooltip-note', line);
+        return;
+      }
+      if (line === 'BY MODEL' || line === 'BY PROVIDER') {
+        section = document.createElement('div');
+        section.className = 'activity-tooltip-section';
+        const heading = document.createElement('div');
+        heading.className = 'activity-tooltip-section-title';
+        heading.textContent = line;
+        section.append(heading);
+        tooltip.append(section);
+        return;
+      }
+      if (!section || !line.startsWith('  ')) {
+        return;
+      }
+      const row = document.createElement('div');
+      row.className = 'activity-tooltip-row';
+      const separator = line.indexOf(' · ');
+      const name = separator >= 0 ? line.slice(2, separator) : line.trim();
+      const tokens = separator >= 0 ? line.slice(separator + 3) : '';
+      const nameNode = document.createElement('span');
+      nameNode.textContent = name;
+      const tokenNode = document.createElement('span');
+      tokenNode.textContent = tokens;
+      row.append(nameNode, tokenNode);
+      section.append(row);
+    });
+  };
+
+  const positionTooltip = () => {
+    if (!activeCell || tooltip.hidden) {
+      return;
+    }
+    const cell = activeCell.getBoundingClientRect();
+    const margin = 12;
+    const width = tooltip.offsetWidth;
+    const height = tooltip.offsetHeight;
+    let left = cell.left + (cell.width / 2) - (width / 2);
+    let top = cell.top - height - margin;
+    if (top < margin) {
+      top = cell.bottom + margin;
+    }
+    left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+    top = Math.max(margin, Math.min(top, window.innerHeight - height - margin));
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  };
+
+  const showTooltip = (cell) => {
+    activeCell = cell;
+    renderTooltip(cell);
+    tooltip.hidden = false;
+    positionTooltip();
+    requestAnimationFrame(positionTooltip);
+  };
+
+  const hideTooltip = () => {
+    activeCell = null;
+    tooltip.hidden = true;
+  };
+
+  document.querySelectorAll('.activity-cell[data-tooltip]').forEach((cell) => {
+    cell.addEventListener('pointerenter', () => showTooltip(cell));
+    cell.addEventListener('pointerleave', hideTooltip);
+    cell.addEventListener('focus', () => showTooltip(cell));
+    cell.addEventListener('blur', hideTooltip);
+  });
+  window.addEventListener('resize', positionTooltip, { passive: true });
+  window.addEventListener('scroll', positionTooltip, { passive: true, capture: true });
 })();
 </script>
 </body>

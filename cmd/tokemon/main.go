@@ -268,6 +268,7 @@ func runAgent(args []string) error {
 	machineID := flags.String("machine-id", envOr("TOKEMON_MACHINE_ID", ""), "stable machine identifier (defaults to hostname)")
 	home := flags.String("home", envOr("TOKEMON_HOME", ""), "home directory to scan (defaults to the current user's home)")
 	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
+	onceTimeout := flags.Duration("timeout", 5*time.Minute, "maximum duration for a one-shot scan and upload")
 	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
 	once := flags.Bool("once", false, "scan and upload once, then exit")
 	flags.Var(&jsonlPaths, "jsonl", "normalized generic JSONL path or glob (repeatable)")
@@ -276,6 +277,9 @@ func runAgent(args []string) error {
 	}
 	if *interval <= 0 {
 		return errors.New("--interval must be positive")
+	}
+	if *onceTimeout <= 0 {
+		return errors.New("--timeout must be positive")
 	}
 	if *home == "" {
 		var err error
@@ -336,7 +340,7 @@ func runAgent(args []string) error {
 	}
 
 	if *once {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), *onceTimeout)
 		defer cancel()
 		return pass(ctx)
 	}
