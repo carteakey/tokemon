@@ -381,11 +381,22 @@ func runAgent(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	currentInterval := *interval
 	for {
-		if err := pass(ctx); err != nil && ctx.Err() == nil {
+		err := pass(ctx)
+		if err != nil && ctx.Err() == nil {
 			fmt.Fprintln(os.Stderr, "tokemon agent:", err)
+			currentInterval = currentInterval * 2
+			if currentInterval > 5*time.Minute {
+				currentInterval = 5 * time.Minute
+			}
+			if currentInterval < *interval {
+				currentInterval = *interval
+			}
+		} else {
+			currentInterval = *interval
 		}
-		timer := time.NewTimer(*interval)
+		timer := time.NewTimer(currentInterval)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
