@@ -309,6 +309,7 @@ func runAgent(args []string) error {
 		list = append(list, generic.New(jsonlPaths...))
 	}
 	client := localagent.Client{ServerURL: *serverURL, Token: *token}
+	deltas := localagent.NewDeltaTracker()
 	pass := func(ctx context.Context) error {
 		events, reports := adapters.Collect(ctx, list, *machineID)
 		var sourceErrors []error
@@ -321,18 +322,24 @@ func runAgent(args []string) error {
 			}
 			fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
 		}
-		if len(events) == 0 {
+		pending := deltas.Pending(events)
+		if len(pending) == 0 {
 			if len(sourceErrors) > 0 {
 				return errors.Join(sourceErrors...)
 			}
-			fmt.Println("No supported local usage records found.")
+			if len(events) == 0 {
+				fmt.Println("No supported local usage records found.")
+			} else {
+				fmt.Println("No new or changed usage records.")
+			}
 			return nil
 		}
-		result, err := client.Ingest(ctx, events)
+		result, err := client.Ingest(ctx, pending)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("synced %d events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(events), result.Accepted, result.Duplicates, result.CurrentTotal)
+		deltas.MarkSent(pending)
+		fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
 		if len(sourceErrors) > 0 {
 			return errors.Join(sourceErrors...)
 		}
