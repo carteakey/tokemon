@@ -238,7 +238,30 @@ run again. Never restore over a running server.
 
 The agent runs with `--home /agent-home`, so provider discovery stays identical inside and outside the container. A read-only mount limits mutation, not visibility; a compromised container could still read mounted files. The explicit mount allowlist and metadata-only parser are therefore both required.
 
-Standalone binaries plus systemd remain the fallback for machines without Docker or Podman. Ansible can install either path across a fleet later.
+Standalone binaries plus systemd are the fallback for machines without Docker or
+Podman. The repository includes a user-level unit at
+`deploy/linux/tokemon-agent.service`. Install the matching binary at
+`~/.local/bin/tokemon`, write the mode-0600 `~/.config/tokemon/agent.env` using
+the endpoint contract above, then run:
+
+```bash
+install -d -m 700 ~/.config/tokemon ~/.local/share/tokemon
+install -m 644 deploy/linux/tokemon-agent.service \
+  ~/.config/systemd/user/tokemon-agent.service
+systemctl --user daemon-reload
+systemctl --user enable --now tokemon-agent.service
+systemctl --user status tokemon-agent.service
+```
+
+The unit has no inbound listener, uses the user-owned state directory, and
+restarts after transient failures. Enable user lingering when the agent must
+run without an interactive login:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+Ansible can install either path across a fleet later.
 
 ## Claude Code integration
 
