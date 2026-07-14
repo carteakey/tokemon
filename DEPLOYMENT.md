@@ -135,6 +135,8 @@ The agent must:
 
 File and append-only sources advance their cursors incrementally, including safe one-line context lookback for Claude duration metadata. Database-backed and context-dependent snapshot adapters rescan local metadata as needed, but persistent event fingerprints prevent unchanged snapshots from being uploaded again. Failed uploads leave both cursors and fingerprints uncommitted; replacement, truncation, and rotation reset file cursors safely. This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
 
+The Antigravity adapter caches the direct `conversations` directory listing by directory metadata, caches SQLite capability checks by database file signature, and skips reopening an unchanged source when its cursor is already current. The main database and its `-wal` sidecar are included in the signature, so active writes invalidate the cache while unchanged or malformed files do not trigger repeated SQLite probes. The cache retains only cursors and signatures, never parsed event slices. Agent upload failures retain the existing exponential backoff, capped at five minutes.
+
 ## Phase 3: prove provider coverage
 
 Complete the adapters against representative fixtures, then validate one real Claude Code transcript without retaining its content. The evidence set should cover:
