@@ -226,6 +226,8 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 		"mul":             func(left, right float64) float64 { return left * right },
 		"percent":         func(value float64) float64 { return value * 100 },
 		"money":           func(value float64) string { return fmt.Sprintf("$%.2f", value) },
+		"compact":         compact,
+		"cacheUncached":   cacheUncached,
 		"compactPtr":      compactPtr,
 		"share": func(part, total int64) string {
 			if total == 0 {
@@ -441,25 +443,27 @@ const dashboardTemplate = `<!doctype html>
     .odometer-separator { display: block; flex: 0 0 .2em; color: var(--muted); line-height: 1; text-align: center; }
     .odometer-strip { display: flex; flex-direction: column; transform: translateY(0); transition: transform 1.35s cubic-bezier(.2, .75, .2, 1); will-change: transform; }
     .odometer-digit { display: grid; flex: 0 0 1em; height: 1em; place-items: center; color: var(--text); line-height: 1; text-align: center; text-shadow: 0 2px 0 rgba(0,0,0,.32); }
-    .odometer.is-ready .odometer-static { display: none; }
+    .odometer.is-ready .odometer-static, .mini-odometer.is-ready .odometer-static { display: none; }
     .power-composition { margin-top: 18px; }
     .composition-meter { display: flex; height: 30px; overflow: hidden; gap: 3px; border: 0; border-radius: 4px; background: transparent; }
     .composition-segment { display: block; min-width: 0; transition: width .45s ease; }
     .composition-segment.uncached { background: var(--accent-dim); }
     .composition-segment.cached { background: var(--accent); }
     .composition-segment.output { background: var(--warm); }
-    .composition-segment.unclassified { background: repeating-linear-gradient(135deg, var(--warm) 0 3px, rgba(210, 164, 119, .28) 3px 6px); }
-    .composition-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 3px; margin-top: 9px; }
-    .composition-item { display: flex; min-width: 0; align-items: center; flex-direction: column; justify-content: start; gap: 4px; color: var(--muted); font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .composition-item strong { color: var(--text); font-size: 17px; font-weight: 700; letter-spacing: 0; }
-    .composition-item.uncached strong, .composition-item.cached strong { color: var(--accent); }
-    .composition-item.output strong, .composition-item.unclassified strong { color: var(--warm); }
-    .composition-item.unclassified { color: var(--warm); }
-    .composition-swatch { display: none; }
+    .composition-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
+    .composition-item { display: flex; min-width: 0; align-items: start; flex-direction: column; justify-content: start; gap: 4px; padding: 8px 10px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); color: var(--muted); cursor: help; font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .22); outline-offset: 2px; }
+    .composition-item.output { border-color: rgba(210, 164, 119, .58); background: rgba(210, 164, 119, .06); }
+    .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: rgba(210, 164, 119, .24); }
+    .composition-item strong { color: var(--text); font-size: 20px; font-weight: 700; letter-spacing: 0; line-height: 1; }
+    .composition-item.output strong { color: var(--warm); font-size: 22px; }
+    .mini-odometer { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin-top: 2px; overflow: hidden; column-gap: 1px; color: var(--text); font: 700 20px/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
+    .mini-odometer .odometer-reel { flex-basis: .82em; }
+    .mini-odometer .odometer-separator { flex-basis: .18em; }
+    .composition-item.output .odometer-digit, .composition-item.output .odometer-separator { color: var(--warm); }
+    .composition-swatch { display: inline-block; width: 7px; height: 7px; margin: 0 5px 1px 0; border-radius: 1px; }
     .composition-swatch.output { background: var(--warm); }
-    .composition-swatch.uncached { background: var(--accent-dim); }
-    .composition-swatch.cached { background: var(--accent); }
-    .composition-swatch.unclassified { border: 1px dashed var(--warm); background: transparent; }
+    .composition-swatch.input { background: var(--accent-dim); }
     .progress-block { margin-top: auto; padding-top: 18px; }
     .progress-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
     .progress-row strong { color: var(--text); font-weight: 600; }
@@ -476,6 +480,7 @@ const dashboardTemplate = `<!doctype html>
     .stat-label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     .stat-value { margin-top: 8px; overflow: hidden; color: var(--text); font: 700 20px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .stat-value.muted { color: var(--muted); font-size: 13px; font-weight: 500; }
+    .stat-detail { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 9px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .activity-panel { margin-bottom: 10px; padding: 12px 16px; border-radius: 7px; }
     .activity-shell { display: flex; gap: 8px; margin-top: 7px; min-width: 0; }
     .activity-weekday-labels { display: grid; flex: 0 0 26px; grid-template-rows: 12px repeat(7, 12px); gap: 2px; color: var(--faint); font: 8px/12px var(--font-data); text-align: right; }
@@ -614,13 +619,10 @@ const dashboardTemplate = `<!doctype html>
           <span class="composition-segment uncached" id="live-uncached-segment"></span>
           <span class="composition-segment cached" id="live-cached-segment"></span>
           <span class="composition-segment output" id="live-output-segment"></span>
-          <span class="composition-segment unclassified" id="live-unclassified-segment" hidden></span>
         </div>
-        <div class="composition-grid">
-          <span class="composition-item uncached"><span><i class="composition-swatch uncached" aria-hidden="true"></i>Input</span><strong id="live-uncached-tokens">—</strong></span>
-          <span class="composition-item cached"><span><i class="composition-swatch cached" aria-hidden="true"></i>Cached</span><strong id="live-cached-tokens">—</strong></span>
-          <span class="composition-item output"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong id="live-output-tokens">—</strong></span>
-          <span class="composition-item unclassified" id="live-unclassified" hidden><span><i class="composition-swatch unclassified" aria-hidden="true"></i>Unknown</span><strong id="live-unclassified-tokens">—</strong></span>
+        <div class="composition-primary">
+          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
+          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
         </div>
       </div>
       <div class="progress-block">
@@ -702,7 +704,10 @@ const dashboardTemplate = `<!doctype html>
     odometer.append(fallback);
     const fit = () => {
       const width = odometer.getBoundingClientRect().width;
-      const size = Math.max(28, Math.min(80, width / Math.max(display.length * .82, 1)));
+      const mini = odometer.classList.contains('mini-odometer');
+      const spacing = mini ? Math.max(display.length - 1, 0) : 0;
+      const scale = mini ? .95 : .82;
+      const size = Math.max(mini ? 10 : 28, Math.min(mini ? 28 : 80, Math.max(width - spacing, 1) / Math.max(display.length * scale, 1)));
       odometer.style.fontSize = size + 'px';
     };
     fit();
@@ -817,15 +822,18 @@ const dashboardTemplate = `<!doctype html>
     });
   };
 
-  document.querySelectorAll('.odometer').forEach((odometer) => {
-    renderOdometer(odometer, odometer.dataset.display || '', true);
-  });
-  window.addEventListener('resize', () => {
-    document.querySelectorAll('.odometer').forEach((odometer) => {
-      const display = odometer.dataset.display || '';
-      const width = odometer.getBoundingClientRect().width;
-      odometer.style.fontSize = Math.max(28, Math.min(80, width / Math.max(display.length * .82, 1))) + 'px';
+    document.querySelectorAll('.odometer, .mini-odometer').forEach((odometer) => {
+      renderOdometer(odometer, odometer.dataset.display || '', true);
     });
+    window.addEventListener('resize', () => {
+      document.querySelectorAll('.odometer, .mini-odometer').forEach((odometer) => {
+        const display = odometer.dataset.display || '';
+        const width = odometer.getBoundingClientRect().width;
+        const mini = odometer.classList.contains('mini-odometer');
+        const spacing = mini ? Math.max(display.length - 1, 0) : 0;
+        const scale = mini ? .95 : .82;
+        odometer.style.fontSize = Math.max(mini ? 10 : 28, Math.min(mini ? 28 : 80, Math.max(width - spacing, 1) / Math.max(display.length * scale, 1))) + 'px';
+      });
   }, { passive: true });
 
   const number = new Intl.NumberFormat('en-US');
@@ -839,29 +847,28 @@ const dashboardTemplate = `<!doctype html>
     const uncached = Math.max(0, Number(composition.uncached_input_tokens) || 0);
     const cached = Math.max(0, Number(composition.cached_input_tokens) || 0);
     const output = Math.max(0, Number(composition.output_tokens) || 0);
-    const unclassified = Math.max(0, Number(composition.unclassified_tokens) || 0);
-    const total = input + output + unclassified;
+    const total = input + output;
     const segments = [
       ['live-uncached-segment', uncached],
       ['live-cached-segment', cached],
       ['live-output-segment', output],
-      ['live-unclassified-segment', unclassified],
     ];
     segments.forEach(([id, value]) => {
       const segment = document.getElementById(id);
       segment.hidden = value === 0;
       segment.style.width = total === 0 ? '0%' : (value / total * 100) + '%';
     });
-    const percent = (value) => {
-      if (total === 0 || value === 0) return '0%';
-      const share = value / total * 100;
-      return share < 1 ? '<1%' : Math.round(share) + '%';
+    const setTooltip = (id, title, value, details) => {
+      const item = document.getElementById(id);
+      const exact = number.format(value) + ' tokens';
+      item.dataset.tooltip = [title, exact, ...details].join('\n');
+      const accessibleDetails = details.length ? '. ' + details.map((detail) => detail.trim().replace(' · ', ': ')).join('. ') : '';
+      item.setAttribute('aria-label', title + ': ' + exact + accessibleDetails);
     };
-    document.getElementById('live-uncached-tokens').textContent = percent(uncached);
-    document.getElementById('live-cached-tokens').textContent = percent(cached);
-    document.getElementById('live-output-tokens').textContent = percent(output);
-    document.getElementById('live-unclassified-tokens').textContent = percent(unclassified);
-    document.getElementById('live-unclassified').hidden = unclassified === 0;
+    updateOdometer(document.getElementById('live-input-tokens'), number.format(input));
+    updateOdometer(document.getElementById('live-output-tokens'), number.format(output));
+    setTooltip('live-input', 'Input', input, []);
+    setTooltip('live-output', 'Output', output, []);
   };
 
   const pollLifetime = async () => {
@@ -924,6 +931,22 @@ const dashboardTemplate = `<!doctype html>
     const lines = (cell.dataset.tooltip || '').split('\n');
     addTooltipText('activity-tooltip-date', lines.shift() || '');
     addTooltipText('activity-tooltip-summary', lines.shift() || '');
+    if (cell.dataset.tooltipKind === 'composition') {
+      lines.forEach((line) => {
+        const row = document.createElement('div');
+        row.className = 'activity-tooltip-row';
+        const separator = line.indexOf(' · ');
+        const name = separator >= 0 ? line.slice(2, separator) : line.trim();
+        const tokens = separator >= 0 ? line.slice(separator + 3) : '';
+        const nameNode = document.createElement('span');
+        nameNode.textContent = name;
+        const tokenNode = document.createElement('span');
+        tokenNode.textContent = tokens;
+        row.append(nameNode, tokenNode);
+        tooltip.append(row);
+      });
+      return;
+    }
     let section = null;
     lines.forEach((line) => {
       if (line === 'Some token totals unavailable') {
@@ -989,7 +1012,7 @@ const dashboardTemplate = `<!doctype html>
     tooltip.hidden = true;
   };
 
-  document.querySelectorAll('.activity-cell[data-tooltip]').forEach((cell) => {
+  document.querySelectorAll('.activity-cell[data-tooltip], .composition-item[data-tooltip-kind]').forEach((cell) => {
     cell.addEventListener('pointerenter', () => showTooltip(cell));
     cell.addEventListener('pointerleave', hideTooltip);
     cell.addEventListener('focus', () => showTooltip(cell));
@@ -1100,6 +1123,17 @@ func compactPtr(value *int64) string {
 		}
 	}
 	return strconv.FormatInt(*value, 10)
+}
+
+func compact(value int64) string {
+	return compactPtr(&value)
+}
+
+func cacheUncached(value database.CacheSummary) int64 {
+	if value.EligibleTokens <= value.CachedTokens {
+		return 0
+	}
+	return value.EligibleTokens - value.CachedTokens
 }
 
 func twoDigits(value int) string {

@@ -170,20 +170,27 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`id="token-composition"`,
 		`class="composition-meter"`,
 		`id="live-cached-segment"`,
-		`class="composition-item uncached"`,
-		`class="composition-item cached"`,
+		`class="composition-primary"`,
+		`class="composition-item input"`,
 		`class="composition-item output"`,
+		`class="mini-odometer"`,
+		`id="live-input-tokens"`,
+		`id="live-output-tokens"`,
+		`data-tooltip-kind="composition"`,
 		`aria-label="Token mix"`,
 		`>Input</span>`,
-		`>Cached</span>`,
 		`>Output</span>`,
 		`.odometer-reel::after`,
 		`.odometer-reel { flex-basis: .8em; }`,
 		`linear-gradient(180deg, #292c26`,
 		`fetch('/api/v1/evolution'`,
 		`const updateComposition = (composition)`,
-		`const total = input + output + unclassified`,
-		`return share < 1 ? '<1%'`,
+		`const total = input + output`,
+		`updateOdometer(document.getElementById('live-input-tokens'), number.format(input))`,
+		`updateOdometer(document.getElementById('live-output-tokens'), number.format(output))`,
+		`setTooltip('live-input', 'Input'`,
+		`setTooltip('live-output', 'Output'`,
+		`cell.dataset.tooltipKind === 'composition'`,
 		`segment.style.width`,
 		`updateOdometer(counter, display)`,
 		`character !== previous[index]`,
@@ -192,6 +199,9 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q", want)
 		}
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte(`live-unclassified`)) || bytes.Contains(response.Body.Bytes(), []byte(`Unknown</span>`)) {
+		t.Fatal("dashboard should hide unknown token composition")
 	}
 }
 

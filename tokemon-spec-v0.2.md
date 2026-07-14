@@ -947,6 +947,8 @@ Default label:
 
 The creature and number should read as one unit: the usage total explains why this form exists.
 
+The counter subtext should give Input and Output equal-width mini split-flap counters using full comma-separated values. Output should use the amber accent so it remains legible even when Input is much larger. Hovering or focusing either value reveals the same exact token total. Cache detail belongs in the Cache hit summary below. Unknown token fields remain preserved in storage and analytics but are intentionally omitted from the overview hero.
+
 ---
 
 ## 21. Core Analytics
