@@ -46,8 +46,8 @@ Use one Go binary and one normalized event contract, with a platform-appropriate
 
 | Platform | Distribution | Supervisor | Default source access |
 | --- | --- | --- | --- |
-| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
-| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
+| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
+| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
 | Minimal/managed hosts | signed release archive | systemd or an existing orchestrator | explicit configured paths |
 
 The server remains a separate deployment from the agents. It owns SQLite, ingestion authentication, analytics, and the dashboard. An agent only reads local usage metadata and makes outbound requests.
@@ -135,12 +135,14 @@ The agent must:
 
 File and append-only sources advance their cursors incrementally, including safe one-line context lookback for Claude duration metadata. Database-backed and context-dependent snapshot adapters rescan local metadata as needed, but persistent event fingerprints prevent unchanged snapshots from being uploaded again. Failed uploads leave both cursors and fingerprints uncommitted; replacement, truncation, and rotation reset file cursors safely. This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
 
+The Antigravity adapter caches the direct `conversations` directory listing by directory metadata, caches SQLite capability checks by database file signature, and skips reopening an unchanged source when its cursor is already current. The main database and its `-wal` sidecar are included in the signature, so active writes invalidate the cache while unchanged or malformed files do not trigger repeated SQLite probes. The cache retains only cursors and signatures, never parsed event slices. Agent upload failures retain the existing exponential backoff, capped at five minutes.
+
 ## Phase 3: prove provider coverage
 
 Complete the adapters against representative fixtures, then validate one real Claude Code transcript without retaining its content. The evidence set should cover:
 
 - Claude Code assistant usage records, cache fields, duration when present, and unknown values;
-- Codex and OpenCode model aliases, token fields, sessions, and source discovery;
+- Codex, GitHub Copilot CLI, and OpenCode model aliases, token fields, sessions, and source discovery;
 - exact `inspect` output for each provider;
 - assertions that prompts, responses, titles, repository paths, and source code never enter outgoing events.
 
@@ -205,6 +207,7 @@ The initial Linux mounts are:
 ```text
 ${HOME}/.claude/projects     → /agent-home/.claude/projects:ro
 ${HOME}/.codex               → /agent-home/.codex:ro
+${HOME}/.copilot/session-state → /agent-home/.copilot/session-state:ro
 ${HOME}/.local/share/opencode → /agent-home/.local/share/opencode:ro
 ```
 
@@ -291,6 +294,16 @@ It will not send message content, tool content, project names, encoded project p
 Each assistant API response becomes one deterministic usage event. Stable identity is based on the hashed transcript identity, line offset, timestamp, and session ID. This permits rescans without duplicate lifetime totals while the durable cursor state is completed.
 
 The adapter is covered by synthetic privacy fixtures and an exact normalized-payload test. Its record and usage-field shapes were also checked against live Claude Code transcripts on an enrolled machine without retaining or displaying conversation content, titles, working directories, or source paths.
+
+## GitHub Copilot CLI integration
+
+GitHub Copilot CLI usage is stored in durable session event streams under:
+
+```text
+~/.copilot/session-state/<session-id>/events.jsonl
+```
+
+The adapter reads only the `session.shutdown` event's per-model `modelMetrics.usage` aggregate and the metadata-only session context needed to normalize a project basename. It emits one stable usage snapshot per model and session, preserving input, output, cache-read, cache-write, and reasoning token fields when reported. It does not read or send prompts, responses, tool arguments, titles, repository paths, or modified-file lists. Active sessions are picked up after Copilot writes their durable shutdown aggregate.
 
 ## Security baseline
 

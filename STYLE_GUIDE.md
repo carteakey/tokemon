@@ -64,7 +64,7 @@ Use a compact 2px / 4px / 6px / 8px / 10px / 12px / 16px / 20px rhythm.
 - Summary-card icons render at 36px on desktop and 30px on phones.
 - Table-row icons render at 17px.
 - Source icons are transparent 128px PNGs under `web/static/tokemon/icons/`.
-- Harness rows use stable preset glyphs for known tools such as Codex, Claude Code, OpenCode, and Antigravity. Model rows use a mirrored 5×5 glyph derived from the normalized model name.
+- Harness rows use stable preset glyphs for known tools such as Codex, Claude Code, GitHub Copilot CLI, OpenCode, and Antigravity. Model rows use a mirrored 5×5 glyph derived from the normalized model name.
 - Project and machine rows derive stable variants from their names while preserving fixed folder and server-rack silhouettes. “Random” identity must never reshuffle between renders or machines.
 - Use `image-rendering: pixelated`, `object-fit: contain`, explicit dimensions, and empty alt text when the adjacent label already names the item.
 - Keep a consistent visual mass across a set. Do not mix line icons, emoji, smooth vectors, and pixel sprites.
@@ -73,9 +73,11 @@ Use a compact 2px / 4px / 6px / 8px / 10px / 12px / 16px / 20px rhythm.
 ## Data presentation
 
 - Lifetime tokens use the split-flap counter and remain the dominant number.
-- Composition is one thick segmented meter with compact percentages or totals beneath it.
+- Composition is one thick segmented meter with Input and Output as mini split-flap values beneath it; cache detail belongs in the Cache hit summary.
+- Output uses the amber accent and should not be visually drowned out by the larger Input total.
 - Evolution progress appears once: remaining amount, percentage, and one progress bar.
 - Activity uses the compact daily pixel field. Details belong on hover or focus.
+- Exact Input and Output totals are visible in the mini counters and remain available on hover or focus; Unknown remains preserved in the data layer but is omitted from the overview hero.
 - Tables show at most the most useful rows and align numeric columns to the right.
 - Unknown values stay unknown; never silently convert them to zero.
 

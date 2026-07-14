@@ -20,6 +20,7 @@ import (
 	"github.com/tokemon/tokemon/internal/adapters/antigravity"
 	"github.com/tokemon/tokemon/internal/adapters/claude"
 	"github.com/tokemon/tokemon/internal/adapters/codex"
+	"github.com/tokemon/tokemon/internal/adapters/copilot"
 	"github.com/tokemon/tokemon/internal/adapters/generic"
 	"github.com/tokemon/tokemon/internal/adapters/opencode"
 	localagent "github.com/tokemon/tokemon/internal/agent"
@@ -249,6 +250,7 @@ func runDiscover(args []string) error {
 	}{
 		{"Claude Code", filepath.Join(home, ".claude"), true},
 		{"Codex", filepath.Join(home, ".codex"), true},
+		{"GitHub Copilot CLI", filepath.Join(home, ".copilot", "session-state"), true},
 		{"OpenCode", filepath.Join(home, ".local", "share", "opencode", "opencode.db"), true},
 		{"Antigravity CLI", filepath.Join(home, ".gemini", "antigravity-cli", "conversations"), true},
 		{"Config", filepath.Join(home, ".config"), false},
@@ -328,7 +330,7 @@ func runAgent(args []string) error {
 	}
 	defer stateStore.Close()
 
-	list := []adapters.Adapter{claude.New(*home), codex.New(*home), opencode.New(*home), antigravity.New(*home)}
+	list := []adapters.Adapter{claude.New(*home), codex.New(*home), copilot.New(*home), opencode.New(*home), antigravity.New(*home)}
 	if len(jsonlPaths) > 0 {
 		list = append(list, generic.New(jsonlPaths...))
 	}
@@ -577,7 +579,7 @@ func printUsage() {
 
 Commands:
   serve       start the HTTP API and dashboard
-  agent       scan local Claude Code/Codex/OpenCode usage and upload metadata
+	 agent       scan local Claude Code/Codex/Copilot/OpenCode usage and upload metadata
   import      ingest normalized JSONL into SQLite
   export      export normalized JSONL from SQLite
   inspect     validate and print the outgoing JSONL payload

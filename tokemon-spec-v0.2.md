@@ -542,6 +542,7 @@ Inspect known locations such as:
 ```text
 ~/.claude/
 ~/.codex/
+~/.copilot/session-state/
 ~/.config/
 ~/.local/share/
 ~/Library/Application Support/
@@ -722,6 +723,9 @@ Ship only:
 1. Claude Code
 2. Codex
 3. Generic JSONL
+4. GitHub Copilot CLI
+
+GitHub Copilot CLI usage is read from `~/.copilot/session-state/*/events.jsonl`. The adapter consumes only durable `session.shutdown.modelMetrics.usage` aggregates and the final directory name from session context. Prompts, responses, tool arguments, titles, repository paths, and modified-file lists are never included in normalized events. One stable snapshot is emitted per model and session; active sessions become visible after Copilot writes their shutdown aggregate.
 
 ### Generic JSONL
 
@@ -736,7 +740,6 @@ Any script can emit normalized events into a configured JSONL file. This gives T
 - Aider
 - Cursor
 - Continue
-- GitHub Copilot CLI
 - Cline
 - Roo Code
 - Windsurf
@@ -946,6 +949,8 @@ Default label:
 > **Lifetime Tokens**
 
 The creature and number should read as one unit: the usage total explains why this form exists.
+
+The counter subtext should give Input and Output equal-width mini split-flap counters using full comma-separated values. Output should use the amber accent so it remains legible even when Input is much larger. Hovering or focusing either value reveals the same exact token total. Cache detail belongs in the Cache hit summary below. Unknown token fields remain preserved in storage and analytics but are intentionally omitted from the overview hero.
 
 ---
 

@@ -3,6 +3,7 @@ package antigravity
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,106 @@ import (
 	"github.com/tokemon/tokemon/internal/usage"
 	_ "modernc.org/sqlite"
 )
+
+func TestDiscoverCachesSQLiteCapabilityProbe(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(root, "first.db")
+	second := filepath.Join(root, "second.db")
+	if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(home)
+	readDirs := 0
+	readDir := a.readDir
+	a.readDir = func(path string) ([]os.DirEntry, error) {
+		readDirs++
+		return readDir(path)
+	}
+	probes := 0
+	a.probe = func(context.Context, string) (bool, error) {
+		probes++
+		return true, nil
+	}
+	if sources, err := a.Discover(context.Background()); err != nil || len(sources) != 2 {
+		t.Fatalf("first discovery = %d sources, error: %v", len(sources), err)
+	}
+	if probes != 2 {
+		t.Fatalf("first discovery probes = %d, want 2", probes)
+	}
+	for i := 0; i < 100; i++ {
+		if sources, err := a.Discover(context.Background()); err != nil || len(sources) != 2 {
+			t.Fatalf("cached discovery %d = %d sources, error: %v", i, len(sources), err)
+		}
+	}
+	if probes != 2 {
+		t.Fatalf("cached discovery probes = %d, want 2", probes)
+	}
+	if readDirs != 1 {
+		t.Fatalf("cached discovery directory reads = %d, want 1", readDirs)
+	}
+	if err := os.WriteFile(second, []byte("second file changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if probes != 3 {
+		t.Fatalf("changed discovery probes = %d, want 3", probes)
+	}
+	third := filepath.Join(root, "third.db")
+	if err := os.WriteFile(third, []byte("third"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := a.Discover(context.Background())
+	if err != nil || len(sources) != 3 {
+		t.Fatalf("new file discovery = %d sources, error: %v", len(sources), err)
+	}
+	if probes != 4 {
+		t.Fatalf("new file probes = %d, want 4", probes)
+	}
+	if readDirs != 2 {
+		t.Fatalf("new file directory reads = %d, want 2", readDirs)
+	}
+}
+
+func TestDiscoverCachesUnsupportedProbeResult(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "malformed.db")
+	if err := os.WriteFile(path, []byte("not sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(home)
+	probes := 0
+	a.probe = func(context.Context, string) (bool, error) {
+		probes++
+		return false, fmt.Errorf("database disk image is malformed")
+	}
+	for i := 0; i < 100; i++ {
+		sources, err := a.Discover(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sources) != 0 {
+			t.Fatalf("discovery %d returned unsupported source: %+v", i, sources)
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("malformed database probes = %d, want 1", probes)
+	}
+}
 
 func TestParseGenerationMetadataWithoutReadingConversationContent(t *testing.T) {
 	home := t.TempDir()
@@ -36,6 +137,14 @@ INSERT INTO steps (idx, step_payload) VALUES (0, 'secret prompt and response');`
 	}
 
 	a := New(home)
+	var opened []*sql.DB
+	a.open = func(ctx context.Context, path string) (*sql.DB, error) {
+		db, err := adapters.OpenReadOnly(ctx, path)
+		if db != nil {
+			opened = append(opened, db)
+		}
+		return db, err
+	}
 	sources, err := a.Discover(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -66,11 +175,83 @@ INSERT INTO steps (idx, step_payload) VALUES (0, 'secret prompt and response');`
 	if err := event.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	if len(opened) != 1 {
+		t.Fatalf("opened SQLite handles = %d, want 1", len(opened))
+	}
+	stats := opened[0].Stats()
+	if stats.InUse != 0 || stats.OpenConnections != 0 || stats.Idle != 0 {
+		t.Fatalf("SQLite handles leaked: %+v", stats)
+	}
 }
 
 func TestDecodeGenerationMetadataRejectsMalformedData(t *testing.T) {
 	if _, ok := decodeGenerationMetadata([]byte("secret transcript")); ok {
 		t.Fatal("malformed protobuf was accepted")
+	}
+}
+
+func TestParseSkipsUnchangedDatabase(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "unchanged.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0); INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)`, 7, fixtureMetadata(), len(fixtureMetadata())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(home)
+	sources, err := a.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	first, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %d events, error: %v", len(first.Events), err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.Parse(canceled, sources[0], adapters.ParseRequest{MachineID: "machine"}); err == nil {
+		t.Fatal("canceled parse unexpectedly succeeded")
+	}
+	retry, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(retry.Events) != 1 {
+		t.Fatalf("retry after canceled parse = %d events, error: %v", len(retry.Events), err)
+	}
+	opens := 0
+	a.open = func(context.Context, string) (*sql.DB, error) {
+		opens++
+		return nil, fmt.Errorf("source was reopened")
+	}
+	for i := 0; i < 100; i++ {
+		second, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(second.Events) != 0 || second.Cursor != first.Cursor {
+			t.Fatalf("cached parse %d = %+v, want unchanged cursor and no events", i, second)
+		}
+	}
+	if opens != 0 {
+		t.Fatalf("unchanged source opens = %d, want 0", opens)
+	}
+	if err := os.WriteFile(path+"-wal", []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor}); err == nil {
+		t.Fatal("changed source was not reopened")
+	}
+	if opens != 1 {
+		t.Fatalf("changed source opens = %d, want 1", opens)
 	}
 }
 

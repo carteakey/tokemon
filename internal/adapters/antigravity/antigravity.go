@@ -5,12 +5,14 @@ package antigravity
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/adapters"
@@ -22,14 +24,61 @@ const (
 	adapterVersion = "0.1.0"
 )
 
-type Adapter struct{ roots []string }
+type fileSignature struct {
+	exists  bool
+	size    int64
+	modTime int64
+}
+
+type sourceSignature struct {
+	database fileSignature
+	wal      fileSignature
+}
+
+type discoveryEntry struct {
+	signature sourceSignature
+	supported bool
+}
+
+type directoryEntry struct {
+	signature fileSignature
+	paths     []string
+}
+
+type parseEntry struct {
+	signature     sourceSignature
+	identity      string
+	requestCursor adapters.Cursor
+	resultCursor  adapters.Cursor
+	err           error
+}
+
+type Adapter struct {
+	roots []string
+	mu    sync.Mutex
+
+	directories map[string]directoryEntry
+	discovery   map[string]discoveryEntry
+	parsed      map[string]parseEntry
+	probe       func(context.Context, string) (bool, error)
+	open        func(context.Context, string) (*sql.DB, error)
+	readDir     func(string) ([]os.DirEntry, error)
+}
 
 func New(home string) *Adapter {
-	return &Adapter{roots: []string{
-		filepath.Join(home, ".gemini", "antigravity-cli", "conversations"),
-		filepath.Join(home, ".gemini", "antigravity", "conversations"),
-		filepath.Join(home, ".gemini", "antigravity-ide", "conversations"),
-	}}
+	return &Adapter{
+		roots: []string{
+			filepath.Join(home, ".gemini", "antigravity-cli", "conversations"),
+			filepath.Join(home, ".gemini", "antigravity", "conversations"),
+			filepath.Join(home, ".gemini", "antigravity-ide", "conversations"),
+		},
+		directories: make(map[string]directoryEntry),
+		discovery:   make(map[string]discoveryEntry),
+		parsed:      make(map[string]parseEntry),
+		probe:       supportsGenerationMetadata,
+		open:        adapters.OpenReadOnly,
+		readDir:     os.ReadDir,
+	}
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -47,32 +96,117 @@ func (a *Adapter) Capabilities() adapters.Capabilities {
 
 func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 	var sources []adapters.Source
+	seen := make(map[string]struct{})
 	for _, root := range a.roots {
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil
-				}
-				return err
+		paths, err := a.candidatePaths(root)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
 			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".db") {
-				return nil
-			}
-			supported, err := supportsGenerationMetadata(ctx, path)
-			if err == nil && supported {
-				sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
-			}
-			return nil
-		})
-		if err != nil && !os.IsNotExist(err) {
 			return nil, err
 		}
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return nil, err
+			}
+			signature := sourceSignature{database: signatureFromInfo(info)}
+			seen[path] = struct{}{}
+			a.mu.Lock()
+			cached, cachedOK := a.discovery[path]
+			a.mu.Unlock()
+			supported := false
+			if cachedOK && cached.signature == signature {
+				supported = cached.supported
+			} else {
+				probe := a.probe
+				if probe == nil {
+					probe = supportsGenerationMetadata
+				}
+				supported, _ = probe(ctx, path)
+				a.mu.Lock()
+				a.discovery[path] = discoveryEntry{signature: signature, supported: supported}
+				a.mu.Unlock()
+			}
+			if supported {
+				sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
+			}
+		}
 	}
+	a.mu.Lock()
+	for path := range a.discovery {
+		if _, ok := seen[path]; !ok {
+			delete(a.discovery, path)
+		}
+	}
+	for path := range a.parsed {
+		if _, ok := seen[path]; !ok {
+			delete(a.parsed, path)
+		}
+	}
+	a.mu.Unlock()
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Path < sources[j].Path })
 	return sources, nil
+}
+
+func (a *Adapter) candidatePaths(root string) ([]string, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("Antigravity source root is not a directory: %s", root)
+	}
+	signature := signatureFromInfo(info)
+	a.mu.Lock()
+	cached, cachedOK := a.directories[root]
+	a.mu.Unlock()
+	if cachedOK && cached.signature == signature {
+		return append([]string(nil), cached.paths...), nil
+	}
+	readDir := a.readDir
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	entries, err := readDir(root)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".db") {
+			paths = append(paths, filepath.Join(root, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	a.mu.Lock()
+	a.directories[root] = directoryEntry{signature: signature, paths: append([]string(nil), paths...)}
+	a.mu.Unlock()
+	return paths, nil
+}
+
+func signatureFromInfo(info os.FileInfo) fileSignature {
+	return fileSignature{exists: true, size: info.Size(), modTime: info.ModTime().UnixNano()}
+}
+
+func sourceSignatureForPath(path string) (sourceSignature, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return sourceSignature{}, err
+	}
+	signature := sourceSignature{database: signatureFromInfo(info)}
+	if sidecar, err := os.Stat(path + "-wal"); err == nil {
+		signature.wal = signatureFromInfo(sidecar)
+	} else if !os.IsNotExist(err) {
+		return sourceSignature{}, err
+	}
+	return signature, nil
 }
 
 func supportsGenerationMetadata(ctx context.Context, path string) (bool, error) {
@@ -88,23 +222,43 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if strings.TrimSpace(request.MachineID) == "" {
 		return adapters.ParseResult{}, fmt.Errorf("machine ID is required")
 	}
-	db, err := adapters.OpenReadOnly(ctx, source.Path)
+	signature, err := sourceSignatureForPath(source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	defer db.Close()
-	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
 	identity := source.Identity
 	if identity == "" {
 		identity = adapters.HashIdentity(source.Path)
 	}
+	a.mu.Lock()
+	cached, cachedOK := a.parsed[source.Path]
+	a.mu.Unlock()
+	if cachedOK && cached.signature == signature && cached.identity == identity {
+		if cached.err != nil && cached.requestCursor == request.Cursor {
+			return adapters.ParseResult{}, cached.err
+		}
+		if cached.err == nil && cached.resultCursor == request.Cursor {
+			return adapters.ParseResult{Cursor: cached.resultCursor}, nil
+		}
+	}
+	open := a.open
+	if open == nil {
+		open = adapters.OpenReadOnly
+	}
+	db, err := open(ctx, source.Path)
+	if err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
+	defer db.Close()
+	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
 	start := request.Cursor.Offset
 	if (request.Cursor.Identity != "" && request.Cursor.Identity != identity) || start < 0 {
 		start = 0
 	}
 	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
 	if err != nil {
-		return adapters.ParseResult{}, fmt.Errorf("read Antigravity generation metadata: %w", err)
+		err = fmt.Errorf("read Antigravity generation metadata: %w", err)
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 	}
 	defer rows.Close()
 	var events []usage.Event
@@ -113,7 +267,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		var idx int64
 		var data []byte
 		if err := rows.Scan(&idx, &data); err != nil {
-			return adapters.ParseResult{}, err
+			return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 		}
 		if idx >= nextOffset {
 			nextOffset = idx + 1
@@ -139,7 +293,33 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: identity, Offset: idx},
 		})
 	}
-	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}, rows.Err()
+	result := adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}
+	if err := rows.Err(); err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
+	if err := rows.Close(); err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
+	if err := db.Close(); err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
+	if current, err := sourceSignatureForPath(source.Path); err == nil {
+		signature = current
+	}
+	a.mu.Lock()
+	a.parsed[source.Path] = parseEntry{signature: signature, identity: identity, resultCursor: result.Cursor}
+	a.mu.Unlock()
+	return result, nil
+}
+
+func (a *Adapter) rememberParse(path string, signature sourceSignature, identity string, cursor adapters.Cursor, result adapters.ParseResult, err error) (adapters.ParseResult, error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return result, err
+	}
+	a.mu.Lock()
+	a.parsed[path] = parseEntry{signature: signature, identity: identity, requestCursor: cursor, resultCursor: result.Cursor, err: err}
+	a.mu.Unlock()
+	return result, err
 }
 
 func providerForModel(model string) string {
