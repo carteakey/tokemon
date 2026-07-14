@@ -370,6 +370,7 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 	for tool, preset := range map[string]string{
 		"codex":       "codex",
 		"claude-code": "claude",
+		"copilot-cli": "copilot",
 		"opencode":    "opencode",
 		"antigravity": "gemini",
 	} {
@@ -377,6 +378,9 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 		if glyph.Kind != "harness" || glyph.Preset != preset {
 			t.Fatalf("harness %q uses glyph kind %q preset %q", tool, glyph.Kind, glyph.Preset)
 		}
+	}
+	if got := harnessName("copilot-cli"); got != "GitHub Copilot CLI" {
+		t.Fatalf("Copilot harness label = %q", got)
 	}
 }
 

@@ -25,7 +25,7 @@ Open [localhost:8080](http://localhost:8080), then sync the current machine:
 go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
 ```
 
-Leave off `--once` to keep polling. The agent currently supports Claude Code transcript JSONL plus Codex, OpenCode, and Antigravity usage databases. The Antigravity adapter reads only generation metadata from `~/.gemini/antigravity-cli/conversations/*.db`; it does not read transcripts, prompts, responses, artifacts, or conversation titles. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
+Leave off `--once` to keep polling. The agent currently supports Claude Code transcript JSONL plus Codex, GitHub Copilot CLI, OpenCode, and Antigravity usage records. The Copilot adapter reads only durable per-model shutdown aggregates from `~/.copilot/session-state/*/events.jsonl`; it does not read prompts, responses, tool arguments, titles, or repository paths. The Antigravity adapter reads only generation metadata from `~/.gemini/antigravity-cli/conversations/*.db`; it does not read transcripts, prompts, responses, artifacts, or conversation titles. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
 
 Unsupported tools can emit normalized schema-v1 events to an explicit JSONL path. Repeat `--jsonl` for multiple files or quote a glob so Tokemon, rather than the shell, discovers matching files:
 
@@ -37,7 +37,7 @@ Generic JSONL parsing supports byte cursors and safe truncation/replacement rese
 
 Managed installs can use `~/.config/tokemon/agent.env`; explicit flags override environment variables, which override that file. See [macOS deployment](deploy/macos/README.md) for the LaunchAgent installer.
 
-The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks plus lifetime usage cuts by project, harness, model, and machine. Harness usage groups the recorded tools, including Claude Code, Codex, OpenCode, and Antigravity. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
+The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks plus lifetime usage cuts by project, harness, model, and machine. Harness usage groups the recorded tools, including Claude Code, Codex, GitHub Copilot CLI, OpenCode, and Antigravity. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
 
 ## Import or export
 

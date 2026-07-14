@@ -167,6 +167,8 @@ func glyphForHarness(tool string) pixelGlyph {
 		return glyphFromRows("harness", "claude", 3, "o.d.o", ".ooo.", "doood", ".ooo.", "o.d.o")
 	case "opencode":
 		return glyphFromRows("harness", "opencode", 2, "ddddd", "o...d", "d.ood", "d...o", "ddddd")
+	case "copilot-cli", "github-copilot":
+		return glyphFromRows("harness", "copilot", 3, "d...d", ".ddd.", "ddddd", ".ddd.", "d...d")
 	case "antigravity", "gemini":
 		return glyphFromRows("harness", "gemini", 0, "..o..", ".odo.", "ododo", ".odo.", "..o..")
 	case "grok", "xai":
@@ -202,6 +204,8 @@ func harnessName(tool string) string {
 		return "Codex"
 	case "opencode":
 		return "OpenCode"
+	case "copilot-cli", "github-copilot":
+		return "GitHub Copilot CLI"
 	case "antigravity":
 		return "Antigravity"
 	case "generic-jsonl":
@@ -685,7 +689,7 @@ const dashboardTemplate = `<!doctype html>
 
   {{if eq .LifetimeTokens 0}}
   <section class="first-run" aria-label="Getting started">
-    <div><h2>The egg is waiting for its first token.</h2><p>Run the agent on a machine with Claude Code, Codex, or a configured JSONL source. Tokemon only sends usage metadata.</p></div>
+    <div><h2>The egg is waiting for its first token.</h2><p>Run the agent on a machine with Claude Code, Codex, GitHub Copilot CLI, or a configured JSONL source. Tokemon only sends usage metadata.</p></div>
     <code class="command">tokemon agent --server …</code>
   </section>
   {{end}}

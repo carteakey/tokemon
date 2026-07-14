@@ -542,6 +542,7 @@ Inspect known locations such as:
 ```text
 ~/.claude/
 ~/.codex/
+~/.copilot/session-state/
 ~/.config/
 ~/.local/share/
 ~/Library/Application Support/
@@ -722,6 +723,9 @@ Ship only:
 1. Claude Code
 2. Codex
 3. Generic JSONL
+4. GitHub Copilot CLI
+
+GitHub Copilot CLI usage is read from `~/.copilot/session-state/*/events.jsonl`. The adapter consumes only durable `session.shutdown.modelMetrics.usage` aggregates and the final directory name from session context. Prompts, responses, tool arguments, titles, repository paths, and modified-file lists are never included in normalized events. One stable snapshot is emitted per model and session; active sessions become visible after Copilot writes their shutdown aggregate.
 
 ### Generic JSONL
 
@@ -736,7 +740,6 @@ Any script can emit normalized events into a configured JSONL file. This gives T
 - Aider
 - Cursor
 - Continue
-- GitHub Copilot CLI
 - Cline
 - Roo Code
 - Windsurf
