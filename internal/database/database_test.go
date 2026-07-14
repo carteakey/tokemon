@@ -33,7 +33,7 @@ func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Close()
-	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v1-*.db"))
+	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v2-*.db"))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("backups = %v, err = %v", backups, err)
 	}
@@ -70,6 +70,38 @@ func TestOpenUsesWALForFileDatabase(t *testing.T) {
 	}
 	if !strings.EqualFold(journalMode, "wal") {
 		t.Fatalf("journal mode = %q, want wal", journalMode)
+	}
+}
+
+func TestDisplayAliasesRoundTrip(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.SetDisplayAlias(context.Background(), AliasKindModel, "claude-sonnet-4", "Sonnet 4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDisplayAlias(context.Background(), AliasKindMachine, "machine-1", "Desk"); err != nil {
+		t.Fatal(err)
+	}
+	aliases, err := store.DisplayAliases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliases) != 2 || aliases[0].Kind != AliasKindMachine || aliases[1].Alias != "Sonnet 4" {
+		t.Fatalf("aliases = %+v", aliases)
+	}
+	if err := store.SetDisplayAlias(context.Background(), AliasKindMachine, "machine-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	aliases, err = store.DisplayAliases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aliases) != 1 || aliases[0].Kind != AliasKindModel {
+		t.Fatalf("aliases after clear = %+v", aliases)
 	}
 }
 
@@ -443,5 +475,55 @@ func TestActivityBuildsPixelCalendarAndPreservesUnknownTotals(t *testing.T) {
 	future, ok := findDay("2026-07-13")
 	if !ok || !future.Future {
 		t.Fatalf("expected future cells after the current day: %+v", future)
+	}
+}
+
+func TestAnalyticsSupportsPeriodsFiltersBreakdownsAndUnknownTotals(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "analytics-one", Timestamp: time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC), MachineID: "machine-one", Project: "project-a", Provider: "openai", Model: "gpt", Tool: "codex", SessionID: "session-one", InputTokens: usage.Int64(60), CacheReadTokens: usage.Int64(20), OutputTokens: usage.Int64(20), TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "analytics-two", Timestamp: time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC), MachineID: "machine-two", Project: "project-b", Provider: "anthropic", Model: "claude", Tool: "claude-code", SessionID: "session-two", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "analytics-unknown", Timestamp: time.Date(2026, 7, 13, 11, 0, 0, 0, time.UTC), MachineID: "machine-one", Project: "project-a", Provider: "openai", Model: "gpt", Tool: "codex", TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "analytics-old", Timestamp: time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC), MachineID: "machine-two", Project: "project-old", Provider: "anthropic", Model: "claude", Tool: "claude-code", TotalTokens: usage.Int64(999), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+
+	filtered, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "30d", Dimension: "projects", Machine: "machine-one", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered.Summary.Tokens != 100 || filtered.Summary.Events != 2 || filtered.Summary.ActiveDays != 1 || filtered.Summary.UnknownEvents != 1 {
+		t.Fatalf("unexpected filtered summary: %+v", filtered.Summary)
+	}
+	if len(filtered.Points) != 1 || filtered.Points[0].Tokens != 100 || filtered.Points[0].UnknownEvents != 1 || filtered.Points[0].InputTokens != 60 || filtered.Points[0].CachedTokens != 20 || filtered.Points[0].OutputTokens != 20 {
+		t.Fatalf("unexpected filtered points: %+v", filtered.Points)
+	}
+	if len(filtered.Breakdown) != 1 || filtered.Breakdown[0].Name != "project-a" || filtered.Breakdown[0].Tokens != 100 || filtered.Breakdown[0].Share != 1 {
+		t.Fatalf("unexpected filtered breakdown: %+v", filtered.Breakdown)
+	}
+	if len(filtered.Sessions) != 1 || filtered.Sessions[0].SessionID != "session-one" {
+		t.Fatalf("unexpected filtered sessions: %+v", filtered.Sessions)
+	}
+
+	allTime, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "all", Dimension: "models", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allTime.Bucket != "month" || len(allTime.Points) != 2 || allTime.Summary.Tokens != 1149 {
+		t.Fatalf("unexpected all-time analytics: %+v", allTime)
+	}
+	if len(allTime.Breakdown) != 2 || allTime.Breakdown[0].Name != "claude" || allTime.Breakdown[1].Name != "gpt" {
+		t.Fatalf("unexpected model breakdown: %+v", allTime.Breakdown)
+	}
+	if len(allTime.Facets.Machines) != 2 || len(allTime.Facets.Providers) != 2 || len(allTime.Facets.Models) != 2 || len(allTime.Facets.Tools) != 2 {
+		t.Fatalf("unexpected analytics facets: %+v", allTime.Facets)
 	}
 }

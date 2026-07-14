@@ -2,14 +2,18 @@ package api
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/evolution"
@@ -22,6 +26,32 @@ type Server struct {
 	ingestToken string
 	template    *template.Template
 	static      http.Handler
+}
+
+type dashboardPage struct {
+	database.Overview
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
+}
+
+type analyticsPageData struct {
+	database.Analytics
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
+	ExportURL      string
+}
+
+type aliasRow struct {
+	Identity string
+	Alias    string
+	Default  string
+}
+
+type settingsPage struct {
+	Models   []aliasRow
+	Machines []aliasRow
+	Saved    bool
+	Error    string
 }
 
 const dashboardUsageRowsLimit = 5
@@ -215,6 +245,224 @@ func harnessName(tool string) string {
 	}
 }
 
+func compactModelName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return raw
+	}
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool { return r == '-' || r == '_' || r == '/' })
+	if len(parts) < 2 {
+		return trimmed
+	}
+	if strings.EqualFold(parts[0], "claude") {
+		parts = parts[1:]
+		if len(parts) > 1 && len(parts[len(parts)-1]) == 8 && isDigits(parts[len(parts)-1]) {
+			parts = parts[:len(parts)-1]
+		}
+		if len(parts) == 0 {
+			return trimmed
+		}
+		for index := range parts {
+			parts[index] = titleWord(parts[index])
+		}
+		return strings.Join(parts, " ")
+	}
+	if strings.EqualFold(parts[0], "gpt") {
+		if len(parts) == 2 {
+			return "GPT-" + parts[1]
+		}
+		return "GPT-" + parts[1] + " " + strings.Join(titleWords(parts[2:]), " ")
+	}
+	return trimmed
+}
+
+func titleWords(values []string) []string {
+	result := make([]string, len(values))
+	for index, value := range values {
+		result[index] = titleWord(value)
+	}
+	return result
+}
+
+func compactMachineName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return raw
+	}
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool { return r == '-' || r == '_' || r == ' ' })
+	for index, part := range parts {
+		if strings.EqualFold(part, "macbook") {
+			return strings.Join(parts[index:], " ")
+		}
+	}
+	if len(parts) == 2 && len(parts[0]) <= 4 {
+		return titleWord(parts[1])
+	}
+	return trimmed
+}
+
+func titleWord(value string) string {
+	if value == "" {
+		return value
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
+}
+
+func isDigits(value string) bool {
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func modelDisplayName(aliases map[string]string, raw string) string {
+	if alias := strings.TrimSpace(aliases[raw]); alias != "" {
+		return alias
+	}
+	return compactModelName(raw)
+}
+
+func machineDisplayName(aliases map[string]string, raw string) string {
+	if alias := strings.TrimSpace(aliases[raw]); alias != "" {
+		return alias
+	}
+	return compactMachineName(raw)
+}
+
+func analyticsBarPercent(value, maximum int64) float64 {
+	if value <= 0 || maximum <= 0 {
+		return 0
+	}
+	return float64(value) * 100 / float64(maximum)
+}
+
+func analyticsPartPercent(value, total int64) float64 {
+	if value <= 0 || total <= 0 {
+		return 0
+	}
+	return float64(value) * 100 / float64(total)
+}
+
+func analyticsShortTime(raw string) string {
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return raw
+	}
+	return parsed.UTC().Format("Jan 2, 15:04")
+}
+
+func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
+	values := r.URL.Query()
+	period := values.Get("period")
+	switch period {
+	case "7d", "30d", "90d", "all":
+	default:
+		period = "30d"
+	}
+	dimension := values.Get("dimension")
+	switch dimension {
+	case "projects", "harnesses", "models", "machines":
+	default:
+		dimension = "projects"
+	}
+	return database.AnalyticsQuery{
+		Period:    period,
+		Dimension: dimension,
+		Machine:   strings.TrimSpace(values.Get("machine")),
+		Provider:  strings.TrimSpace(values.Get("provider")),
+		Model:     strings.TrimSpace(values.Get("model")),
+		Tool:      strings.TrimSpace(values.Get("tool")),
+		Now:       time.Now().UTC(),
+	}
+}
+
+func analyticsExportURL(query database.AnalyticsQuery) string {
+	values := url.Values{}
+	values.Set("period", query.Period)
+	values.Set("dimension", query.Dimension)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return "/api/v1/analytics/export?" + values.Encode()
+}
+
+func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
+	query.Dimension = dimension
+	values := url.Values{}
+	values.Set("period", query.Period)
+	values.Set("dimension", query.Dimension)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return "/analytics?" + values.Encode()
+}
+
+func aliasMaps(values []database.DisplayAlias) (map[string]string, map[string]string) {
+	models := make(map[string]string)
+	machines := make(map[string]string)
+	for _, value := range values {
+		switch value.Kind {
+		case database.AliasKindModel:
+			models[value.Identity] = value.Alias
+		case database.AliasKindMachine:
+			machines[value.Identity] = value.Alias
+		}
+	}
+	return models, machines
+}
+
+func modelAliasRows(values []database.ModelTotal, aliases map[string]string) []aliasRow {
+	rows := make([]aliasRow, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		seen[value.Model] = struct{}{}
+		rows = append(rows, aliasRow{Identity: value.Model, Alias: aliases[value.Model], Default: compactModelName(value.Model)})
+	}
+	for identity, alias := range aliases {
+		if _, ok := seen[identity]; !ok {
+			rows = append(rows, aliasRow{Identity: identity, Alias: alias, Default: compactModelName(identity)})
+		}
+	}
+	sort.SliceStable(rows, func(left, right int) bool { return rows[left].Identity < rows[right].Identity })
+	return rows
+}
+
+func machineAliasRows(values []database.MachineTotal, aliases map[string]string) []aliasRow {
+	rows := make([]aliasRow, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		seen[value.Machine] = struct{}{}
+		rows = append(rows, aliasRow{Identity: value.Machine, Alias: aliases[value.Machine], Default: compactMachineName(value.Machine)})
+	}
+	for identity, alias := range aliases {
+		if _, ok := seen[identity]; !ok {
+			rows = append(rows, aliasRow{Identity: identity, Alias: alias, Default: compactMachineName(identity)})
+		}
+	}
+	sort.SliceStable(rows, func(left, right int) bool { return rows[left].Identity < rows[right].Identity })
+	return rows
+}
+
 func limitDashboardRows[T any](values []T) []T {
 	if len(values) <= dashboardUsageRowsLimit {
 		return values
@@ -239,18 +487,30 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 			}
 			return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 		},
-		"topProjects":  topProjects,
-		"topModels":    topModels,
-		"topTools":     topTools,
-		"harnessName":  harnessName,
-		"glyphCell":    glyphCellClass,
-		"projectGlyph": glyphForProject,
-		"harnessGlyph": glyphForHarness,
-		"modelGlyph":   glyphForModel,
-		"machineGlyph": glyphForMachine,
-		"assetPath":    func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
+		"topProjects":        topProjects,
+		"topModels":          topModels,
+		"topTools":           topTools,
+		"harnessName":        harnessName,
+		"modelDisplayName":   modelDisplayName,
+		"machineDisplayName": machineDisplayName,
+		"analyticsBar":       analyticsBarPercent,
+		"analyticsPart":      analyticsPartPercent,
+		"analyticsTime":      analyticsShortTime,
+		"analyticsURL":       analyticsViewURL,
+		"glyphCell":          glyphCellClass,
+		"projectGlyph":       glyphForProject,
+		"harnessGlyph":       glyphForHarness,
+		"modelGlyph":         glyphForModel,
+		"machineGlyph":       glyphForMachine,
+		"assetPath":          func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
 	}).Parse(dashboardTemplate)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := page.Parse(settingsTemplate); err != nil {
+		return nil, err
+	}
+	if _, err := page.Parse(analyticsTemplate); err != nil {
 		return nil, err
 	}
 	staticFiles, err := fs.Sub(web.StaticFS, "static")
@@ -265,9 +525,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", s.static))
 	mux.HandleFunc("GET /", s.dashboard)
+	mux.HandleFunc("GET /analytics", s.analyticsPage)
+	mux.HandleFunc("GET /data", s.analyticsPage)
+	mux.HandleFunc("GET /settings", s.settings)
+	mux.HandleFunc("POST /settings/aliases", s.saveSettings)
 	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
 	mux.HandleFunc("GET /api/v1/evolution", s.evolution)
 	mux.HandleFunc("GET /api/v1/analytics/overview", s.overview)
+	mux.HandleFunc("GET /api/v1/analytics", s.analyticsAPI)
+	mux.HandleFunc("GET /api/v1/analytics/export", s.analyticsExport)
 	return securityHeaders(mux)
 }
 
@@ -362,9 +628,118 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := s.template.Execute(w, result); err != nil {
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases}
+	if err := s.template.ExecuteTemplate(w, "dashboard", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
+	query := analyticsQueryFromRequest(r)
+	result, err := s.store.Analytics(r.Context(), query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := analyticsPageData{
+		Analytics:      result,
+		ModelAliases:   modelAliases,
+		MachineAliases: machineAliases,
+		ExportURL:      analyticsExportURL(result.Filter),
+	}
+	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload = append(payload, '\n')
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-analytics-`+result.Filter.Period+`.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Overview(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := settingsPage{
+		Models:   modelAliasRows(result.ByModel, modelAliases),
+		Machines: machineAliasRows(result.ByMachine, machineAliases),
+		Saved:    r.URL.Query().Get("saved") == "1",
+	}
+	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid settings form", http.StatusBadRequest)
+		return
+	}
+	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindModel, r.Form["model_identity"], r.Form["model_alias"]); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindMachine, r.Form["machine_identity"], r.Form["machine_alias"]); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
+}
+
+func saveAliasGroup(ctx context.Context, store *database.Store, kind string, identities, aliases []string) error {
+	if len(identities) != len(aliases) {
+		return fmt.Errorf("invalid %s alias form", kind)
+	}
+	for index, identity := range identities {
+		if err := store.SetDisplayAlias(ctx, kind, identity, aliases[index]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -426,6 +801,8 @@ const dashboardTemplate = `<!doctype html>
     .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
+    .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
@@ -599,8 +976,9 @@ const dashboardTemplate = `<!doctype html>
     </a>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link active" href="/">Overview</a>
-      <a class="nav-link" href="/api/v1/analytics/overview">Data</a>
+      <a class="nav-link" href="/analytics">Analytics</a>
     </nav>
+    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
   </header>
 
   <section class="hero" aria-label="Current Tokemon and lifetime usage">
@@ -638,9 +1016,9 @@ const dashboardTemplate = `<!doctype html>
   </section>
 
   <section class="stat-grid" aria-label="Usage summary">
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/top-machine.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Top machine</div>{{if .ByMachine}}<div class="stat-value" title="{{(index .ByMachine 0).Machine}}">{{(index .ByMachine 0).Machine}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
+    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/top-machine.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Top machine</div>{{if .ByMachine}}<div class="stat-value" title="{{(index .ByMachine 0).Machine}}">{{machineDisplayName $.MachineAliases (index .ByMachine 0).Machine}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
     <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/api-cost.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Est. API cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/cache-hit.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
+    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/cache-hit.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div><small class="stat-detail">{{compact .Cache.CachedTokens}} cached · {{compact (cacheUncached .Cache)}} uncached</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
     <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/threads.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Threads}}</div></div></article>
     <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/active-days.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Activity.ActiveDays}}</div></div></article>
   </section>
@@ -679,11 +1057,11 @@ const dashboardTemplate = `<!doctype html>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><div class="section-title">Models</div></div>
-      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{.Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><div class="section-title">Machines</div></div>
-      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{.Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
   </section>
 
@@ -1149,3 +1527,357 @@ func twoDigits(value int) string {
 	}
 	return strconv.FormatInt(int64(value/10), 10) + strconv.FormatInt(int64(value%10), 10)
 }
+
+const settingsTemplate = `{{define "settings"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Settings</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #10110f;
+      --surface: #171916;
+      --text: #f0ede5;
+      --muted: #a2a69b;
+      --faint: #6f766b;
+      --line: #30352d;
+      --line-bright: #485044;
+      --accent: #9bbba0;
+      --warm: #d2a477;
+      --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; }
+    main { width: min(900px, calc(100% - 24px)); margin: 24px auto; padding: 18px; border: 1px solid var(--line); border-radius: 12px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+    .back-link { color: var(--accent); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    h1, h2 { margin: 0; font-family: var(--font-data); }
+    h1 { color: var(--accent); font-size: 16px; letter-spacing: .08em; text-transform: uppercase; }
+    h2 { margin-top: 24px; padding-bottom: 8px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+    .intro { margin: 14px 0 0; color: var(--muted); }
+    .notice { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-data); font-size: 12px; }
+    .alias-list { display: grid; gap: 8px; margin-top: 10px; }
+    .alias-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, .7fr); align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); background: var(--surface); }
+    .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
+    .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
+    input:focus { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+    button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: none; }
+    .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
+    footer { margin-top: 20px; color: var(--faint); font-size: 10px; }
+    @media (max-width: 620px) {
+      main { margin: 8px auto; padding: 12px; }
+      .alias-row { grid-template-columns: 1fr; gap: 8px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <h1>Settings</h1>
+    <a class="back-link" href="/">← Overview</a>
+  </header>
+  <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
+  {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
+  <form action="/settings/aliases" method="post">
+    <h2>Models</h2>
+    {{if .Models}}
+    <div class="alias-list">
+      {{range $index, $row := .Models}}
+      <div class="alias-row">
+        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
+        <input id="model-alias-{{$index}}" name="model_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
+        <input type="hidden" name="model_identity" value="{{$row.Identity}}">
+      </div>
+      {{end}}
+    </div>
+    {{else}}<p class="empty">No models recorded yet.</p>{{end}}
+    <h2>Machines</h2>
+    {{if .Machines}}
+    <div class="alias-list">
+      {{range $index, $row := .Machines}}
+      <div class="alias-row">
+        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
+        <input id="machine-alias-{{$index}}" name="machine_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
+        <input type="hidden" name="machine_identity" value="{{$row.Identity}}">
+      </div>
+      {{end}}
+    </div>
+    {{else}}<p class="empty">No machines recorded yet.</p>{{end}}
+    <div class="actions"><button type="submit">Save aliases</button></div>
+  </form>
+  <footer>Aliases affect dashboard presentation only; usage records and analytics identifiers remain unchanged.</footer>
+</main>
+</body>
+</html>{{end}}`
+
+const analyticsTemplate = `{{define "analytics"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Analytics</title>
+  <style>
+    @font-face {
+      font-family: "Pixelify Sans";
+      font-style: normal;
+      font-weight: 400 700;
+      font-display: swap;
+      src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2");
+    }
+    :root {
+      color-scheme: dark;
+      --bg: #10110f;
+      --surface: #171916;
+      --surface-raised: #1d201b;
+      --text: #f0ede5;
+      --muted: #a2a69b;
+      --faint: #6f766b;
+      --line: #30352d;
+      --line-bright: #485044;
+      --accent: #9bbba0;
+      --accent-dim: #607864;
+      --warm: #d2a477;
+      --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif;
+      --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    a { color: inherit; text-decoration: none; }
+    button, select { font: inherit; }
+    main { width: min(1408px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; }
+    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
+    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
+    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
+    .analytics-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
+    .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
+    .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
+    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid rgba(210, 164, 119, .22); outline-offset: 2px; }
+    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
+    .filter-panel { padding: 14px 16px; }
+    .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
+    label { display: grid; gap: 7px; color: var(--faint); }
+    select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
+    select:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    .filter-actions { display: flex; align-items: end; gap: 8px; }
+    .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
+    .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
+    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .stat { min-width: 0; min-height: 82px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .stat-value { margin-top: 9px; overflow: hidden; color: var(--text); font: 700 clamp(18px, 2.3vw, 26px)/1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .stat-value.muted { color: var(--muted); font-size: 16px; }
+    .stat-meta { margin-top: 7px; overflow: hidden; color: var(--faint); font: 10px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .note { margin-top: 10px; padding: 9px 12px; border: 1px solid rgba(210, 164, 119, .45); color: var(--warm); font: 11px/1.3 var(--font-data); }
+    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(360px, .8fr); gap: 10px; margin-top: 10px; }
+    .section-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding: 13px 16px 10px; border-bottom: 1px solid var(--line); }
+    .section-meta { color: var(--faint); font: 10px/1.2 var(--font-data); text-align: right; }
+    .trend-legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-swatch { width: 9px; height: 9px; border-radius: 2px; background: var(--accent-dim); }
+    .legend-swatch.cached { background: var(--accent); }
+    .legend-swatch.output { background: var(--warm); }
+    .legend-swatch.unknown { border: 1px solid var(--warm); background: transparent; }
+    .trend-chart { display: flex; align-items: end; gap: 4px; min-height: 258px; margin-top: 8px; padding: 12px 16px 16px; overflow-x: auto; border-bottom: 1px solid var(--line); }
+    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; gap: 6px; min-height: 220px; }
+    .trend-column.unknown::after { position: absolute; right: 0; bottom: 19px; left: 0; height: 3px; border: 1px solid var(--warm); background: transparent; content: ""; }
+    .trend-track { position: relative; display: flex; height: 190px; align-items: end; }
+    .trend-bar { display: flex; width: 100%; min-height: 2px; flex-direction: column-reverse; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 2px 2px 0 0; background: #20251e; }
+    .trend-column.unknown .trend-bar { border-color: var(--warm); }
+    .trend-part { display: block; min-height: 0; }
+    .trend-part.input { background: var(--accent-dim); }
+    .trend-part.cached { background: var(--accent); }
+    .trend-part.output { background: var(--warm); }
+    .trend-label { overflow: hidden; color: var(--faint); font: 9px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
+    .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
+    .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
+    .dimension-link { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font: 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+    .dimension-link.active { border-color: var(--accent); color: var(--accent); }
+    .table-scroll { overflow-x: auto; padding: 0 16px 12px; }
+    table { width: 100%; min-width: 430px; border-collapse: collapse; table-layout: fixed; }
+    th, td { padding: 8px 0; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--faint); font-size: 9px; }
+    td { color: var(--muted); font: 12px/1.25 var(--font-data); }
+    th:first-child, td:first-child { width: 42%; }
+    th:not(:first-child), td:not(:first-child) { padding-left: 9px; text-align: right; white-space: nowrap; }
+    td:first-child { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    .empty-row td { padding: 30px 0 12px; color: var(--faint); text-align: left; }
+    .session-project { display: block; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+    .session-machine { display: block; margin-top: 3px; overflow: hidden; color: var(--faint); font-size: 10px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+    .unknown-flag { display: inline-grid; width: 14px; height: 14px; place-items: center; margin-left: 4px; border: 1px solid var(--warm); border-radius: 50%; color: var(--warm); font-size: 9px; }
+    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
+    @media (max-width: 1080px) {
+      .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .filter-actions { grid-column: span 3; }
+      .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .analytics-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 700px) {
+      main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; }
+      .topbar { display: flex; align-items: start; flex-wrap: wrap; }
+      .nav { order: 3; width: 100%; justify-content: center; }
+      .analytics-heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; }
+      .action { width: 100%; }
+      .filter-panel { padding: 13px 12px; }
+      .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .filter-actions { grid-column: span 2; }
+      .filter-actions .action { width: auto; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .section-head { align-items: start; flex-direction: column; }
+      .section-meta { text-align: left; }
+      footer { flex-direction: column; gap: 4px; }
+    }
+    @media (max-width: 430px) {
+      .filter-form, .stats { grid-template-columns: 1fr; }
+      .filter-actions { grid-column: auto; }
+      .filter-actions .action { flex: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Tokemon overview">
+      <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
+      <span class="brand-name">TOKEMON</span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="nav-link" href="/">Overview</a>
+      <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
+    </nav>
+  </header>
+
+  <section class="analytics-heading">
+    <div>
+      <div class="eyebrow">Detailed usage</div>
+      <h1>Analytics</h1>
+      <p class="heading-copy">Explore token volume over time and see which projects, harnesses, models, and machines are carrying the load.</p>
+    </div>
+    <a class="action" href="{{.ExportURL}}">Export analytics JSON</a>
+  </section>
+
+  <section class="panel filter-panel" aria-label="Analytics filters">
+    <form class="filter-form" method="get" action="/analytics">
+      <label>Window
+        <select name="period">
+          <option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>Last 7 days</option>
+          <option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>Last 30 days</option>
+          <option value="90d"{{if eq .Filter.Period "90d"}} selected{{end}}>Last 90 days</option>
+          <option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All time</option>
+        </select>
+      </label>
+      <label>Breakdown
+        <select name="dimension">
+          <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
+          <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
+          <option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option>
+          <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
+        </select>
+      </label>
+      <label>Machine
+        <select name="machine">
+          <option value="">All machines</option>
+          {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
+        </select>
+      </label>
+      <label>Provider
+        <select name="provider">
+          <option value="">All providers</option>
+          {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      <label>Model
+        <select name="model">
+          <option value="">All models</option>
+          {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
+        </select>
+      </label>
+      <label>Harness
+        <select name="tool">
+          <option value="">All harnesses</option>
+          {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
+        </select>
+      </label>
+      <div class="filter-actions">
+        <button class="action apply" type="submit">Apply filters</button>
+        <a class="action" href="/analytics">Reset</a>
+      </div>
+    </form>
+  </section>
+
+  <section class="stats" aria-label="Period summary">
+    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value">{{commas .Summary.Tokens}}</div><div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div></article>
+    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">Days with recorded events</div></article>
+    <article class="stat"><div class="stat-label">Average active day</div><div class="stat-value">{{printf "%.0f" .Summary.AverageActiveDay}}</div><div class="stat-meta">Tokens per active day</div></article>
+    <article class="stat"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Summary.Threads}}</div><div class="stat-meta">Distinct recorded sessions</div></article>
+    <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens</div>{{end}}</article>
+  </section>
+  {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
+
+  <section class="analytics-grid">
+    <article class="panel trend-panel" aria-labelledby="trend-title">
+      <div class="section-head"><div class="section-title" id="trend-title">Token trend</div><div class="section-meta">{{if eq .Bucket "month"}}Monthly buckets{{else}}Daily buckets{{end}} · {{commas .Summary.Events}} events</div></div>
+      <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
+      {{if .Points}}
+      <div class="trend-chart" role="img" aria-label="Token volume over the selected window">
+        {{range .Points}}
+        <div class="trend-column{{if .UnknownEvents}} unknown{{end}}" title="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+          <div class="trend-track"><div class="trend-bar" style="height: {{analyticsBar .Tokens $.MaxTokens}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></div></div>
+          <span class="trend-label">{{.Label}}</span>
+        </div>
+        {{end}}
+      </div>
+      {{else}}<div class="empty-chart">No token activity in this window.</div>{{end}}
+    </article>
+
+    <article class="panel breakdown-panel" aria-labelledby="breakdown-title">
+      <div class="section-head"><div class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</div><div class="section-meta">Token share</div></div>
+      <nav class="dimension-nav" aria-label="Breakdown dimension">
+        <a class="dimension-link{{if eq .Filter.Dimension "projects"}} active{{end}}" href="{{analyticsURL .Filter "projects"}}">Projects</a>
+        <a class="dimension-link{{if eq .Filter.Dimension "harnesses"}} active{{end}}" href="{{analyticsURL .Filter "harnesses"}}">Harnesses</a>
+        <a class="dimension-link{{if eq .Filter.Dimension "models"}} active{{end}}" href="{{analyticsURL .Filter "models"}}">Models</a>
+        <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}">Machines</a>
+      </nav>
+      <div class="table-scroll">
+        <table><thead><tr><th>Name</th><th>Tokens</th><th>Share</th><th>Events</th></tr></thead><tbody>
+          {{range .Breakdown}}
+          <tr><td title="{{.Name}}">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Events}}</td></tr>
+          {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
+        </tbody></table>
+      </div>
+    </article>
+  </section>
+
+  <section class="panel sessions-panel" aria-labelledby="sessions-title">
+    <div class="section-head"><div class="section-title" id="sessions-title">Recent sessions</div><div class="section-meta">Metadata only · latest 12</div></div>
+    <div class="table-scroll">
+      <table><thead><tr><th>When</th><th>Project / machine</th><th>Model</th><th>Harness</th><th>Tokens</th></tr></thead><tbody>
+        {{range .Sessions}}
+        <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
+        {{else}}<tr class="empty-row"><td colspan="5">No sessions match these filters.</td></tr>{{end}}
+      </tbody></table>
+    </div>
+  </section>
+
+  <footer><span>Local-first · metadata only</span><span>Export contains analytics metadata, not prompts, responses, source code, or repository contents.</span></footer>
+</main>
+</body>
+</html>{{end}}`

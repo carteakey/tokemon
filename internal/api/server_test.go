@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,67 @@ func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	body := response.Body.String()
 	for _, want := range []string{"Token activity", "last 53 weeks", "activity-cell", "grid-template-rows: 12px repeat(7, 12px)", "height: 12px", "42 tokens", "BY MODEL", "BY PROVIDER", "model · 42 tokens", "provider · 42 tokens"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+			t.Fatalf("dashboard does not contain %q: %s", want, body)
+		}
+	}
+}
+
+func TestDashboardAliasSettingsUseCompactDefaultsAndSavedOverrides(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "alias-settings-1",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "Kartikeys-MacBook-Air",
+		Provider:      "anthropic",
+		Model:         "claude-sonnet-4",
+		Tool:          "claude-code",
+		TotalTokens:   usage.Int64(42),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := httptest.NewRecorder()
+	server.Handler().ServeHTTP(settings, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if settings.Code != http.StatusOK {
+		t.Fatalf("settings status = %d, want %d", settings.Code, http.StatusOK)
+	}
+	for _, want := range []string{"Settings", "claude-sonnet-4", "Sonnet 4", "Kartikeys-MacBook-Air", "MacBook Air", "Save aliases"} {
+		if !strings.Contains(settings.Body.String(), want) {
+			t.Fatalf("settings does not contain %q: %s", want, settings.Body.String())
+		}
+	}
+
+	form := url.Values{
+		"model_identity":   {"claude-sonnet-4"},
+		"model_alias":      {"Sonnet 4"},
+		"machine_identity": {"Kartikeys-MacBook-Air"},
+		"machine_alias":    {"Work Mac"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	saved := httptest.NewRecorder()
+	server.Handler().ServeHTTP(saved, request)
+	if saved.Code != http.StatusSeeOther || saved.Header().Get("Location") != "/settings?saved=1" {
+		t.Fatalf("save response = %d, location %q", saved.Code, saved.Header().Get("Location"))
+	}
+
+	dashboard := httptest.NewRecorder()
+	server.Handler().ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := dashboard.Body.String()
+	for _, want := range []string{">Sonnet 4</span>", ">Work Mac</span>", `title="claude-sonnet-4"`, `title="Kartikeys-MacBook-Air"`} {
+		if !strings.Contains(body, want) {
 			t.Fatalf("dashboard does not contain %q: %s", want, body)
 		}
 	}
@@ -494,5 +556,67 @@ func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte(`class="see-more"`)) {
 		t.Fatal("dashboard renders a non-functional see-more control")
+	}
+}
+
+func TestAnalyticsPageAndJSONExport(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "analytics-page",
+		Timestamp:     time.Now().UTC().Add(-24 * time.Hour),
+		MachineID:     "machine-one",
+		Project:       "project-a",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		SessionID:     "session-one",
+		InputTokens:   usage.Int64(60),
+		OutputTokens:  usage.Int64(40),
+		TotalTokens:   usage.Int64(100),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	pageResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/analytics?period=7d&dimension=models&machine=machine-one", nil))
+	if pageResponse.Code != http.StatusOK {
+		t.Fatalf("analytics page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
+	}
+	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines"} {
+		if !bytes.Contains(pageResponse.Body.Bytes(), []byte(want)) {
+			t.Fatalf("analytics page does not contain %q: %s", want, pageResponse.Body.String())
+		}
+	}
+	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`/api/v1/analytics/overview">Data</a>`)) {
+		t.Fatal("analytics navigation still points directly at the overview JSON")
+	}
+
+	exportResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(exportResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=7d&dimension=models", nil))
+	if exportResponse.Code != http.StatusOK {
+		t.Fatalf("analytics export status = %d, want %d: %s", exportResponse.Code, http.StatusOK, exportResponse.Body.String())
+	}
+	if got := exportResponse.Header().Get("Content-Disposition"); got != `attachment; filename="tokemon-analytics-7d.json"` {
+		t.Fatalf("content disposition = %q", got)
+	}
+	var exported database.Analytics
+	if err := json.Unmarshal(exportResponse.Body.Bytes(), &exported); err != nil {
+		t.Fatalf("decode analytics export: %v", err)
+	}
+	if exported.Filter.Period != "7d" || exported.Summary.Tokens != 100 || exported.Filter.Dimension != "models" {
+		t.Fatalf("unexpected exported analytics: %+v", exported)
 	}
 }

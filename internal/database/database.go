@@ -81,7 +81,7 @@ type TokenComposition struct {
 const activityWeeks = 53
 
 const (
-	databaseSchemaVersion = 1
+	databaseSchemaVersion = 2
 	backupRetention       = 10
 )
 
@@ -138,6 +138,83 @@ type Overview struct {
 	Cache          CacheSummary             `json:"cache"`
 	Threads        int64                    `json:"threads"`
 	Accuracy       map[usage.Accuracy]int64 `json:"accuracy"`
+}
+
+// AnalyticsQuery describes the bounded, metadata-only slice shown by the
+// detailed analytics view. Now is injectable so callers and tests can use a
+// stable UTC calendar boundary.
+type AnalyticsQuery struct {
+	Period    string    `json:"period"`
+	Dimension string    `json:"dimension"`
+	Machine   string    `json:"machine,omitempty"`
+	Provider  string    `json:"provider,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	Tool      string    `json:"tool,omitempty"`
+	Now       time.Time `json:"-"`
+}
+
+type AnalyticsSummary struct {
+	Tokens           int64        `json:"tokens"`
+	Events           int64        `json:"events"`
+	ActiveDays       int64        `json:"active_days"`
+	AverageActiveDay float64      `json:"average_active_day"`
+	UnknownEvents    int64        `json:"unknown_events"`
+	EstimatedCost    CostSummary  `json:"estimated_cost"`
+	Cache            CacheSummary `json:"cache"`
+	Threads          int64        `json:"threads"`
+}
+
+type AnalyticsPoint struct {
+	Date          string `json:"date"`
+	Label         string `json:"label"`
+	Tokens        int64  `json:"tokens"`
+	Events        int64  `json:"events"`
+	UnknownEvents int64  `json:"unknown_events,omitempty"`
+	InputTokens   int64  `json:"input_tokens"`
+	CachedTokens  int64  `json:"cached_tokens"`
+	OutputTokens  int64  `json:"output_tokens"`
+}
+
+type AnalyticsBreakdown struct {
+	Name     string  `json:"name"`
+	Tokens   int64   `json:"tokens"`
+	Events   int64   `json:"events"`
+	Sessions int64   `json:"sessions"`
+	Share    float64 `json:"share"`
+}
+
+type AnalyticsSession struct {
+	SessionID     string `json:"session_id,omitempty"`
+	Timestamp     string `json:"timestamp"`
+	Machine       string `json:"machine"`
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	Tool          string `json:"tool"`
+	Project       string `json:"project,omitempty"`
+	Tokens        int64  `json:"tokens"`
+	Events        int64  `json:"events"`
+	UnknownEvents int64  `json:"unknown_events,omitempty"`
+}
+
+type AnalyticsFacets struct {
+	Machines  []string `json:"machines"`
+	Providers []string `json:"providers"`
+	Models    []string `json:"models"`
+	Tools     []string `json:"tools"`
+}
+
+type Analytics struct {
+	LifetimeTokens int64                `json:"lifetime_tokens"`
+	Filter         AnalyticsQuery       `json:"filter"`
+	StartDate      string               `json:"start_date"`
+	EndDate        string               `json:"end_date"`
+	Bucket         string               `json:"bucket"`
+	Summary        AnalyticsSummary     `json:"summary"`
+	Points         []AnalyticsPoint     `json:"points"`
+	MaxTokens      int64                `json:"max_tokens"`
+	Breakdown      []AnalyticsBreakdown `json:"breakdown"`
+	Sessions       []AnalyticsSession   `json:"recent_sessions"`
+	Facets         AnalyticsFacets      `json:"facets"`
 }
 
 func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
@@ -239,6 +316,13 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(canonical_model, raw_model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_machine ON usage_events(machine_id);
+CREATE TABLE IF NOT EXISTS display_aliases (
+  kind TEXT NOT NULL CHECK (kind IN ('model', 'machine')),
+  identity TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (kind, identity)
+);
 `)
 	if err != nil {
 		return err
@@ -793,6 +877,291 @@ FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleToken
 		result.Accuracy[usage.Accuracy(accuracy)] = count
 	}
 	return result, rows.Close()
+}
+
+func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics, error) {
+	query, start, end := normalizeAnalyticsQuery(query)
+	result := Analytics{Filter: query, Bucket: "day"}
+	result.LifetimeTokens, _ = s.LifetimeTokens(ctx)
+	result.StartDate = dateOnly(end.AddDate(0, 0, -1)).Format("2006-01-02")
+	result.EndDate = result.StartDate
+	if !start.IsZero() {
+		result.StartDate = dateOnly(start).Format("2006-01-02")
+	}
+	if query.Period == "all" {
+		result.Bucket = "month"
+	}
+
+	where, args := analyticsWhere(query, start, end)
+	if err := s.analyticsSummary(ctx, where, args, &result.Summary); err != nil {
+		return Analytics{}, err
+	}
+	points, err := s.analyticsPoints(ctx, query, where, args)
+	if err != nil {
+		return Analytics{}, err
+	}
+	result.Points = points
+	for _, point := range points {
+		if point.Tokens > result.MaxTokens {
+			result.MaxTokens = point.Tokens
+		}
+	}
+	if query.Period == "all" && len(points) > 0 {
+		result.StartDate = points[0].Date
+	}
+	result.Breakdown, err = s.analyticsBreakdown(ctx, query, where, args, result.Summary.Tokens)
+	if err != nil {
+		return Analytics{}, err
+	}
+	result.Sessions, err = s.analyticsSessions(ctx, where, args)
+	if err != nil {
+		return Analytics{}, err
+	}
+	result.Facets, err = s.analyticsFacets(ctx)
+	if err != nil {
+		return Analytics{}, err
+	}
+	return result, nil
+}
+
+func normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, time.Time, time.Time) {
+	switch query.Period {
+	case "7d", "30d", "90d", "all":
+	default:
+		query.Period = "30d"
+	}
+	switch query.Dimension {
+	case "projects", "harnesses", "models", "machines":
+	default:
+		query.Dimension = "projects"
+	}
+	now := query.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	today := dateOnly(now)
+	end := today.AddDate(0, 0, 1)
+	start := time.Time{}
+	switch query.Period {
+	case "7d":
+		start = today.AddDate(0, 0, -6)
+	case "30d":
+		start = today.AddDate(0, 0, -29)
+	case "90d":
+		start = today.AddDate(0, 0, -89)
+	}
+	query.Now = time.Time{}
+	return query, start, end
+}
+
+func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) {
+	conditions := []string{"1 = 1"}
+	args := make([]any, 0, 6)
+	if !start.IsZero() {
+		conditions = append(conditions, "timestamp >= ?")
+		args = append(args, start.UTC().Format(time.RFC3339))
+	}
+	if !end.IsZero() {
+		conditions = append(conditions, "timestamp < ?")
+		args = append(args, end.UTC().Format(time.RFC3339))
+	}
+	if query.Machine != "" {
+		conditions = append(conditions, "machine_id = ?")
+		args = append(args, query.Machine)
+	}
+	if query.Provider != "" {
+		conditions = append(conditions, "provider = ?")
+		args = append(args, query.Provider)
+	}
+	if query.Model != "" {
+		conditions = append(conditions, "COALESCE(NULLIF(canonical_model, ''), raw_model) = ?")
+		args = append(args, query.Model)
+	}
+	if query.Tool != "" {
+		conditions = append(conditions, "tool = ?")
+		args = append(args, query.Tool)
+	}
+	return strings.Join(conditions, " AND "), args
+}
+
+func (s *Store) analyticsSummary(ctx context.Context, where string, args []any, summary *AnalyticsSummary) error {
+	err := s.db.QueryRowContext(ctx, `SELECT
+COALESCE(SUM(total_tokens), 0),
+COUNT(*),
+COUNT(DISTINCT substr(timestamp, 1, 10)),
+COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0),
+COALESCE(SUM(cost), 0),
+COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
+FROM usage_events WHERE `+where, args...).Scan(
+		&summary.Tokens,
+		&summary.Events,
+		&summary.ActiveDays,
+		&summary.UnknownEvents,
+		&summary.EstimatedCost.Amount,
+		&summary.EstimatedCost.PricedTokens,
+		&summary.EstimatedCost.UnpricedTokens,
+		&summary.Cache.CachedTokens,
+		&summary.Cache.EligibleTokens,
+		&summary.Threads,
+	)
+	if err != nil {
+		return err
+	}
+	if summary.ActiveDays > 0 {
+		summary.AverageActiveDay = float64(summary.Tokens) / float64(summary.ActiveDays)
+	}
+	if summary.Cache.EligibleTokens > 0 {
+		summary.Cache.HitRate = float64(summary.Cache.CachedTokens) / float64(summary.Cache.EligibleTokens)
+	}
+	return nil
+}
+
+func (s *Store) analyticsPoints(ctx context.Context, query AnalyticsQuery, where string, args []any) ([]AnalyticsPoint, error) {
+	bucketExpression := "substr(timestamp, 1, 10)"
+	if query.Period == "all" {
+		bucketExpression = "strftime('%Y-%m', timestamp)"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+bucketExpression+`, MIN(substr(timestamp, 1, 10)),
+COALESCE(SUM(total_tokens), 0),
+COUNT(*),
+COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0),
+COALESCE(SUM(input_tokens), 0),
+COALESCE(SUM(COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0),
+COALESCE(SUM(output_tokens), 0)
+FROM usage_events WHERE `+where+` GROUP BY 1 ORDER BY 2`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AnalyticsPoint
+	for rows.Next() {
+		var bucket, date string
+		var point AnalyticsPoint
+		if err := rows.Scan(&bucket, &date, &point.Tokens, &point.Events, &point.UnknownEvents, &point.InputTokens, &point.CachedTokens, &point.OutputTokens); err != nil {
+			return nil, err
+		}
+		point.Date = date
+		point.Label = analyticsPointLabel(date, query.Period)
+		result = append(result, point)
+	}
+	return result, rows.Err()
+}
+
+func analyticsPointLabel(date, period string) string {
+	parsed, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return date
+	}
+	if period == "all" {
+		return parsed.Format("Jan 2006")
+	}
+	return parsed.Format("Jan 2")
+}
+
+func analyticsBreakdownExpression(dimension string) string {
+	switch dimension {
+	case "harnesses":
+		return "NULLIF(tool, '')"
+	case "models":
+		return "NULLIF(COALESCE(NULLIF(canonical_model, ''), raw_model), '')"
+	case "machines":
+		return "NULLIF(machine_id, '')"
+	default:
+		return "NULLIF(project, '')"
+	}
+}
+
+func (s *Store) analyticsBreakdown(ctx context.Context, query AnalyticsQuery, where string, args []any, total int64) ([]AnalyticsBreakdown, error) {
+	expression := "COALESCE(" + analyticsBreakdownExpression(query.Dimension) + ", 'Unknown')"
+	rows, err := s.db.QueryContext(ctx, `SELECT `+expression+`,
+COALESCE(SUM(total_tokens), 0),
+COUNT(*),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
+FROM usage_events WHERE `+where+` GROUP BY 1 ORDER BY 2 DESC, 1`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AnalyticsBreakdown
+	for rows.Next() {
+		var item AnalyticsBreakdown
+		if err := rows.Scan(&item.Name, &item.Tokens, &item.Events, &item.Sessions); err != nil {
+			return nil, err
+		}
+		if total > 0 {
+			item.Share = float64(item.Tokens) / float64(total)
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) analyticsSessions(ctx context.Context, where string, args []any) ([]AnalyticsSession, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT
+MAX(timestamp),
+MAX(NULLIF(session_id, '')),
+machine_id,
+provider,
+COALESCE(NULLIF(MAX(NULLIF(canonical_model, '')), ''), MAX(raw_model)),
+MAX(tool),
+MAX(project),
+COALESCE(SUM(total_tokens), 0),
+COUNT(*),
+COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
+FROM usage_events WHERE `+where+` AND NULLIF(session_id, '') IS NOT NULL
+GROUP BY COALESCE(NULLIF(session_id, ''), event_id), machine_id, provider, tool
+ORDER BY 1 DESC LIMIT 12`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AnalyticsSession
+	for rows.Next() {
+		var item AnalyticsSession
+		var sessionID, project sql.NullString
+		if err := rows.Scan(&item.Timestamp, &sessionID, &item.Machine, &item.Provider, &item.Model, &item.Tool, &project, &item.Tokens, &item.Events, &item.UnknownEvents); err != nil {
+			return nil, err
+		}
+		item.SessionID = sessionID.String
+		item.Project = project.String
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) analyticsFacets(ctx context.Context) (AnalyticsFacets, error) {
+	var result AnalyticsFacets
+	queries := []struct {
+		target     *[]string
+		expression string
+	}{
+		{target: &result.Machines, expression: "NULLIF(machine_id, '')"},
+		{target: &result.Providers, expression: "NULLIF(provider, '')"},
+		{target: &result.Models, expression: "NULLIF(COALESCE(NULLIF(canonical_model, ''), raw_model), '')"},
+		{target: &result.Tools, expression: "NULLIF(tool, '')"},
+	}
+	for _, item := range queries {
+		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT `+item.expression+` FROM usage_events WHERE `+item.expression+` IS NOT NULL ORDER BY 1`)
+		if err != nil {
+			return AnalyticsFacets{}, err
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				rows.Close()
+				return AnalyticsFacets{}, err
+			}
+			*item.target = append(*item.target, value)
+		}
+		if err := rows.Close(); err != nil {
+			return AnalyticsFacets{}, err
+		}
+	}
+	return result, nil
 }
 
 func (s *Store) Events(ctx context.Context) ([]usage.Event, error) {
