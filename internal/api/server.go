@@ -510,12 +510,15 @@ const dashboardTemplate = `<!doctype html>
     .data-panel { min-height: 0; padding: 12px 16px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
     .section-title { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    table { width: 100%; border-collapse: collapse; margin-top: 2px; }
+    table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 2px; }
     th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    td:first-child { color: var(--text); font-weight: 600; }
-    .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; }
+    th:first-child, td:first-child { width: 43%; }
+    th:nth-child(2), td:nth-child(2) { width: 41%; }
+    th:last-child, td:last-child { width: 16%; }
+    td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
+    .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
     .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row-icon { display: block; flex: 0 0 17px; width: 17px; height: 17px; object-fit: contain; image-rendering: pixelated; }
     .pixel-glyph { display: grid; flex: 0 0 17px; width: 17px; height: 17px; grid-template: repeat(5, 2px) / repeat(5, 2px); place-content: center; gap: 1px; border: 1px solid var(--glyph-edge); border-radius: 3px; background: #11130f; image-rendering: pixelated; }
@@ -528,7 +531,8 @@ const dashboardTemplate = `<!doctype html>
     .pixel-glyph.palette-3 { --glyph: #d2a477; --glyph-dim: #493724; --glyph-edge: #795c3c; }
     .project-glyph, .machine-glyph { border-color: transparent; border-radius: 0; background: transparent; }
     .project-glyph i.dim, .machine-glyph i.dim { background: var(--glyph-edge); }
-    th:not(:first-child), td:not(:first-child) { padding-left: 10px; text-align: right; white-space: nowrap; }
+    th:not(:first-child), td:not(:first-child) { padding-left: 6px; text-align: right; white-space: nowrap; }
+    td:nth-child(2), td:last-child { overflow: hidden; text-overflow: ellipsis; }
     td:last-child { color: var(--warm); font-weight: 700; }
     .empty-row td { padding: 26px 0 8px; color: var(--faint); font-size: 13px; font-weight: 400; }
     .first-run { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 16px; padding: 18px 22px; border: 1px solid rgba(155, 187, 160, .24); border-radius: 10px; background: linear-gradient(100deg, rgba(155, 187, 160, .08), rgba(155, 187, 160, .025)); }
