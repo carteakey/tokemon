@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,21 @@ func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
 	backups, _ = filepath.Glob(filepath.Join(directory, "backups", "*.db"))
 	if len(backups) != 1 {
 		t.Fatalf("ordinary restart created another backup: %v", backups)
+	}
+}
+
+func TestOpenUsesWALForFileDatabase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal mode = %q, want wal", journalMode)
 	}
 }
 
@@ -221,6 +237,30 @@ func TestOverviewMergesProjectsAcrossMachines(t *testing.T) {
 	}
 	if eventsRoundTrip[0].Project != "carteakey.dev" {
 		t.Fatalf("stored project leaked or was not normalized: %+v", eventsRoundTrip[0])
+	}
+}
+
+func TestOverviewGroupsUsageByTool(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "codex-a", Timestamp: time.Now().UTC(), MachineID: "laptop", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "codex-b", Timestamp: time.Now().UTC(), MachineID: "desktop", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "claude", Timestamp: time.Now().UTC(), MachineID: "laptop", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(75), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByTool) != 2 || overview.ByTool[0].Tool != "codex" || overview.ByTool[0].Tokens != 150 || overview.ByTool[1].Tool != "claude-code" || overview.ByTool[1].Tokens != 75 {
+		t.Fatalf("unexpected tool summary: %+v", overview.ByTool)
 	}
 }
 

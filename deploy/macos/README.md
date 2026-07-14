@@ -1,6 +1,38 @@
-# macOS agent deployment
+# macOS deployment
 
-The installer creates a user-level LaunchAgent. It does not require root or Docker.
+The installers create user-level LaunchAgents. They do not require root or Docker.
+
+## Server
+
+The primary Mac can run the Tokemon hub persistently with the server installer. It keeps the ingest token in `~/.config/tokemon/server.env` with mode `0600`; the token is not placed in the LaunchAgent arguments.
+
+Build or obtain the matching Tokemon binary, then run:
+
+```bash
+bash deploy/macos/install-server.sh \
+  --binary ./tokemon \
+  --catalog ./catalog/models.yaml \
+  --database ./data/tokemon.db \
+  --token 'replace-with-a-generated-secret'
+```
+
+The default listen address is `0.0.0.0:18080`. The server config supports `TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`, and `TOKEMON_INGEST_TOKEN`. Its LaunchAgent is `com.tokemon.server`.
+
+The installer writes:
+
+- `~/.local/bin/tokemon`
+- `~/.config/tokemon/server.env` with mode `0600`
+- `~/Library/Application Support/Tokemon/models.yaml`
+- `~/Library/LaunchAgents/com.tokemon.server.plist`
+- `~/Library/Logs/Tokemon/server.log`
+
+Remove the server supervisor and config without deleting the database with:
+
+```bash
+bash deploy/macos/install-server.sh --uninstall
+```
+
+## Agent
 
 Build or obtain the matching Tokemon binary, then run:
 
@@ -15,6 +47,7 @@ The installer writes:
 
 - `~/.local/bin/tokemon`
 - `~/.config/tokemon/agent.env` with mode `0600`
+- `~/.local/share/tokemon/state.db` with mode `0600`
 - `~/Library/LaunchAgents/com.tokemon.agent.plist`
 - `~/Library/Logs/Tokemon/agent.log`
 

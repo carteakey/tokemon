@@ -3,9 +3,12 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,17 +94,63 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	defer file.Close()
 
 	identity := a.sourceIdentity(source.Path)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	info, err := file.Stat()
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	cursorID := cursorIdentity(source.Path, info)
+	offset := request.Cursor.Offset
+	lineNumber := request.Cursor.Line
+	if (request.Cursor.Identity != "" && request.Cursor.Identity != cursorID) || offset < 0 || offset > info.Size() {
+		offset = 0
+		lineNumber = 0
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return adapters.ParseResult{}, err
+	}
+	if offset > 0 && lineNumber > 0 {
+		replay, err := nextLineIsDuration(file, offset)
+		if err != nil {
+			return adapters.ParseResult{}, err
+		}
+		if replay {
+			if start, err := previousLineStart(file, offset); err != nil {
+				return adapters.ParseResult{}, err
+			} else if start < offset {
+				offset = start
+				lineNumber--
+				if _, err := file.Seek(offset, io.SeekStart); err != nil {
+					return adapters.ParseResult{}, err
+				}
+			}
+		}
+	}
+	reader := bufio.NewReaderSize(file, 64*1024)
+	position := offset
 	var events []usage.Event
-	for lineNumber := int64(1); scanner.Scan(); lineNumber++ {
+	for {
 		if err := ctx.Err(); err != nil {
 			return adapters.ParseResult{}, err
 		}
+		lineOffset := position
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) == 0 && errors.Is(readErr, io.EOF) {
+			break
+		}
+		position += int64(len(line))
+		lineNumber++
 		var record transcriptRecord
-		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+		if err := json.Unmarshal(line, &record); err != nil {
 			// Claude transcripts can contain partially written final records while
 			// a session is active. The next poll will see the complete record.
+			if errors.Is(readErr, io.EOF) && !bytes.HasSuffix(line, []byte{'\n'}) {
+				position = lineOffset
+				lineNumber--
+				break
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return adapters.ParseResult{}, readErr
+			}
 			continue
 		}
 		if record.Type == "system" && record.Subtype == "turn_duration" && record.DurationMS != nil {
@@ -136,11 +185,77 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		}
 		event := normalize(record, rawUsage, machineID, identity, lineNumber, sessionID, timestamp)
 		events = append(events, event)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return adapters.ParseResult{}, readErr
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return adapters.ParseResult{}, err
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: cursorID, Offset: position, Line: lineNumber}}, nil
+}
+
+func nextLineIsDuration(file *os.File, offset int64) (bool, error) {
+	const chunkSize = 64 * 1024
+	buffer := make([]byte, chunkSize)
+	n, err := file.ReadAt(buffer, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
 	}
-	return adapters.ParseResult{Events: events}, nil
+	if n == 0 {
+		return false, nil
+	}
+	line := buffer[:n]
+	if end := bytes.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	var record transcriptRecord
+	if err := json.Unmarshal(line, &record); err != nil {
+		return false, nil
+	}
+	return record.Type == "system" && record.Subtype == "turn_duration" && record.DurationMS != nil, nil
+}
+
+func previousLineStart(file *os.File, offset int64) (int64, error) {
+	if offset <= 0 {
+		return 0, nil
+	}
+	lastByte := []byte{0}
+	if _, err := file.ReadAt(lastByte, offset-1); err != nil {
+		return 0, err
+	}
+	if lastByte[0] != '\n' {
+		return offset, nil
+	}
+
+	const chunkSize = 64 * 1024
+	buffer := make([]byte, chunkSize)
+	position := offset
+	newlines := 0
+	for position > 0 {
+		readSize := int64(len(buffer))
+		if readSize > position {
+			readSize = position
+		}
+		position -= readSize
+		n, err := file.ReadAt(buffer[:readSize], position)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		for index := n - 1; index >= 0; index-- {
+			if buffer[index] != '\n' {
+				continue
+			}
+			newlines++
+			if newlines == 2 {
+				return position + int64(index) + 1, nil
+			}
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return 0, nil
 }
 
 func (a *Adapter) sourceIdentity(path string) string {
@@ -149,6 +264,10 @@ func (a *Adapter) sourceIdentity(path string) string {
 		relative = filepath.Base(path)
 	}
 	return adapters.HashIdentity(adapterID + ":" + filepath.ToSlash(relative))
+}
+
+func cursorIdentity(path string, info os.FileInfo) string {
+	return fileIdentity(adapterID, path, info)
 }
 
 type transcriptRecord struct {

@@ -10,6 +10,8 @@ services:
     volumes:
       - ../data:/data
       - ../catalog/models.yaml:/config/models.yaml:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     environment:
       TOKEMON_INGEST_TOKEN: ${TOKEMON_INGEST_TOKEN:?Set TOKEMON_INGEST_TOKEN before deploying}
     restart: unless-stopped

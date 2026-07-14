@@ -33,11 +33,11 @@ Unsupported tools can emit normalized schema-v1 events to an explicit JSONL path
 go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --jsonl '~/ai-usage/*.jsonl'
 ```
 
-Generic JSONL parsing supports byte cursors and safe truncation/replacement resets; durable cursor persistence is handled by the native-agent work in CAR-65. Local paths are hashed before they can enter outgoing metadata.
+Generic JSONL parsing supports byte cursors and safe truncation/replacement resets. The native agent persists cursors and metadata fingerprints in `~/.local/share/tokemon/state.db`, advancing them only after a successful upload. Local paths are hashed before they can enter outgoing metadata.
 
 Managed installs can use `~/.config/tokemon/agent.env`; explicit flags override environment variables, which override that file. See [macOS deployment](deploy/macos/README.md) for the LaunchAgent installer.
 
-The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
+The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks plus lifetime usage cuts by project, harness, model, and machine. Harness usage groups the recorded tools, including Claude Code, Codex, OpenCode, and Antigravity. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
 
 ## Import or export
 
@@ -58,6 +58,6 @@ go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
 
 `catalog/models.yaml` is the committed source of truth for API-equivalent pricing. Schema-v2 entries require an official HTTPS source, verification date, USD standard rates, and deterministic aliases. Unknown models remain unpriced; conflicting aliases or invalid pricing prevent the catalog from loading.
 
-Read the [v0.2 product spec](tokemon-spec-v0.2.md) or run `go run ./cmd/tokemon --help` for the full command list.
+Read the [v0.2 product spec](tokemon-spec-v0.2.md), the [visual style guide](STYLE_GUIDE.md), or run `go run ./cmd/tokemon --help` for the full command list.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the multi-machine roadmap, endpoint contract, macOS LaunchAgent path, Linux container path, Claude integration boundary, and security checklist.

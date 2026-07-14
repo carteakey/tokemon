@@ -118,3 +118,128 @@ func TestParseUnknownCacheFieldsDoesNotInventTotal(t *testing.T) {
 		t.Fatalf("unknown fields were silently converted: %+v", result.Events)
 	}
 }
+
+func TestParseUsesCommittedCursorForAppendedRecords(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session-123","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}` + "\n"
+	second := `{"type":"assistant","timestamp":"2026-07-12T12:00:02Z","sessionId":"session-123","message":{"model":"claude-sonnet","usage":{"input_tokens":11,"output_tokens":21,"cache_read_input_tokens":31,"cache_creation_input_tokens":41}}}` + "\n"
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	source := adapters.Source{Path: path}
+	initial, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.Events) != 1 || initial.Cursor.Offset != int64(len(first)) || initial.Cursor.Line != 1 {
+		t.Fatalf("unexpected initial parse: %+v", initial)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(second); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	incremental, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine", Cursor: initial.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incremental.Events) != 1 || len(full.Events) != 2 || incremental.Events[0].EventID != full.Events[1].EventID {
+		t.Fatalf("cursor changed event identity: incremental=%+v full=%+v", incremental.Events, full.Events)
+	}
+}
+
+func TestParseLeavesIncompleteFinalRecordForRetry(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	complete := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session-123","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}` + "\n"
+	partial := `{"type":"assistant","timestamp":"2026-07-12T12:00:02Z","sessionId":"session-123","message":{"model":"claude-sonnet","usage":{"input_tokens":11`
+	if err := os.WriteFile(path, []byte(complete+partial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	result, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Cursor.Offset != int64(len(complete)) {
+		t.Fatalf("incomplete record advanced cursor: %+v", result)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`,"output_tokens":21,"cache_read_input_tokens":31,"cache_creation_input_tokens":41}}}` + "\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retry.Events) != 1 {
+		t.Fatalf("completed record was not retried: %+v", retry.Events)
+	}
+}
+
+func TestParseReplaysPreviousLineForLateDurationMetadata(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assistant := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session-123","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}` + "\n"
+	if err := os.WriteFile(path, []byte(assistant), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	initial, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.Events) != 1 || initial.Events[0].DurationMS != nil {
+		t.Fatalf("unexpected initial parse: %+v", initial)
+	}
+	duration := `{"type":"system","subtype":"turn_duration","timestamp":"2026-07-12T12:00:02Z","sessionId":"session-123","durationMs":1234}` + "\n"
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(duration); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine", Cursor: initial.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Events) != 1 || updated.Events[0].DurationMS == nil || *updated.Events[0].DurationMS != 1234 {
+		t.Fatalf("late duration was not attached: %+v", updated)
+	}
+	if updated.Events[0].EventID != initial.Events[0].EventID {
+		t.Fatalf("late duration changed event ID: initial=%q updated=%q", initial.Events[0].EventID, updated.Events[0].EventID)
+	}
+}

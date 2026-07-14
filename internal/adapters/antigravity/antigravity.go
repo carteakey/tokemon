@@ -93,23 +93,30 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return adapters.ParseResult{}, err
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx`)
-	if err != nil {
-		return adapters.ParseResult{}, fmt.Errorf("read Antigravity generation metadata: %w", err)
-	}
-	defer rows.Close()
-
 	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
 	identity := source.Identity
 	if identity == "" {
 		identity = adapters.HashIdentity(source.Path)
 	}
+	start := request.Cursor.Offset
+	if (request.Cursor.Identity != "" && request.Cursor.Identity != identity) || start < 0 {
+		start = 0
+	}
+	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
+	if err != nil {
+		return adapters.ParseResult{}, fmt.Errorf("read Antigravity generation metadata: %w", err)
+	}
+	defer rows.Close()
 	var events []usage.Event
+	nextOffset := start
 	for rows.Next() {
 		var idx int64
 		var data []byte
 		if err := rows.Scan(&idx, &data); err != nil {
 			return adapters.ParseResult{}, err
+		}
+		if idx >= nextOffset {
+			nextOffset = idx + 1
 		}
 		metadata, ok := decodeGenerationMetadata(data)
 		if !ok || metadata.InputTokens+metadata.OutputTokens <= 0 || metadata.Timestamp.IsZero() {
@@ -132,7 +139,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: identity, Offset: idx},
 		})
 	}
-	return adapters.ParseResult{Events: events}, rows.Err()
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}, rows.Err()
 }
 
 func providerForModel(model string) string {
