@@ -35,11 +35,6 @@ type sourceSignature struct {
 	wal      fileSignature
 }
 
-type discoveryEntry struct {
-	signature sourceSignature
-	supported bool
-}
-
 type directoryEntry struct {
 	signature fileSignature
 	paths     []string
@@ -58,9 +53,7 @@ type Adapter struct {
 	mu    sync.Mutex
 
 	directories map[string]directoryEntry
-	discovery   map[string]discoveryEntry
 	parsed      map[string]parseEntry
-	probe       func(context.Context, string) (bool, error)
 	open        func(context.Context, string) (*sql.DB, error)
 	readDir     func(string) ([]os.DirEntry, error)
 }
@@ -73,9 +66,7 @@ func New(home string) *Adapter {
 			filepath.Join(home, ".gemini", "antigravity-ide", "conversations"),
 		},
 		directories: make(map[string]directoryEntry),
-		discovery:   make(map[string]discoveryEntry),
 		parsed:      make(map[string]parseEntry),
-		probe:       supportsGenerationMetadata,
 		open:        adapters.OpenReadOnly,
 		readDir:     os.ReadDir,
 	}
@@ -109,42 +100,13 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			info, err := os.Stat(path)
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
-				return nil, err
-			}
-			signature := sourceSignature{database: signatureFromInfo(info)}
 			seen[path] = struct{}{}
-			a.mu.Lock()
-			cached, cachedOK := a.discovery[path]
-			a.mu.Unlock()
-			supported := false
-			if cachedOK && cached.signature == signature {
-				supported = cached.supported
-			} else {
-				probe := a.probe
-				if probe == nil {
-					probe = supportsGenerationMetadata
-				}
-				supported, _ = probe(ctx, path)
-				a.mu.Lock()
-				a.discovery[path] = discoveryEntry{signature: signature, supported: supported}
-				a.mu.Unlock()
-			}
-			if supported {
-				sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
-			}
+			// We skip the expensive database probe here.
+			// Just assume every candidate .db is a source, and we will verify table existence in Parse.
+			sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
 		}
 	}
 	a.mu.Lock()
-	for path := range a.discovery {
-		if _, ok := seen[path]; !ok {
-			delete(a.discovery, path)
-		}
-	}
 	for path := range a.parsed {
 		if _, ok := seen[path]; !ok {
 			delete(a.parsed, path)
@@ -209,15 +171,6 @@ func sourceSignatureForPath(path string) (sourceSignature, error) {
 	return signature, nil
 }
 
-func supportsGenerationMetadata(ctx context.Context, path string) (bool, error) {
-	db, err := adapters.OpenReadOnly(ctx, path)
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
-	return adapters.HasTable(ctx, db, "gen_metadata")
-}
-
 func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
 	if strings.TrimSpace(request.MachineID) == "" {
 		return adapters.ParseResult{}, fmt.Errorf("machine ID is required")
@@ -229,6 +182,10 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	identity := source.Identity
 	if identity == "" {
 		identity = adapters.HashIdentity(source.Path)
+	}
+	start := request.Cursor.Offset
+	if (request.Cursor.Identity != "" && request.Cursor.Identity != identity) || start < 0 {
+		start = 0
 	}
 	a.mu.Lock()
 	cached, cachedOK := a.parsed[source.Path]
@@ -250,11 +207,23 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 	}
 	defer db.Close()
-	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
-	start := request.Cursor.Offset
-	if (request.Cursor.Identity != "" && request.Cursor.Identity != identity) || start < 0 {
-		start = 0
+
+	// Check if this database actually supports generation metadata (contains the table 'gen_metadata')
+	hasTable, err := adapters.HasTable(ctx, db, "gen_metadata")
+	if err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 	}
+	if !hasTable {
+		// A regular SQLite database without the gen_metadata table is not an
+		// Antigravity source. Cache the empty cursor so it is not reopened.
+		result := adapters.ParseResult{Cursor: adapters.Cursor{Identity: identity, Offset: start}}
+		a.mu.Lock()
+		a.parsed[source.Path] = parseEntry{signature: signature, identity: identity, resultCursor: result.Cursor}
+		a.mu.Unlock()
+		return result, nil
+	}
+
+	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
 	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
 	if err != nil {
 		err = fmt.Errorf("read Antigravity generation metadata: %w", err)

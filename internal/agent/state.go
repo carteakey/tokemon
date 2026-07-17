@@ -46,8 +46,7 @@ type StateStore struct {
 
 // StateSnapshot is the committed view used for one polling pass.
 type StateSnapshot struct {
-	Cursors      map[string]adapters.Cursor
-	fingerprints map[string][sha256.Size]byte
+	Cursors map[string]adapters.Cursor
 }
 
 // OpenState opens or creates a local agent state database.
@@ -93,8 +92,7 @@ func (s *StateStore) Close() error {
 // machine ID intentionally starts with an empty view.
 func (s *StateStore) Snapshot(ctx context.Context, machineID string) (StateSnapshot, error) {
 	snapshot := StateSnapshot{
-		Cursors:      make(map[string]adapters.Cursor),
-		fingerprints: make(map[string][sha256.Size]byte),
+		Cursors: make(map[string]adapters.Cursor),
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT adapter, source_path, cursor_identity, cursor_offset, cursor_line
@@ -116,44 +114,75 @@ WHERE machine_id = ?`, machineID)
 		return StateSnapshot{}, fmt.Errorf("read agent cursors: %w", err)
 	}
 
-	rows, err = s.db.QueryContext(ctx, `
-SELECT event_id, fingerprint
-FROM event_state
-WHERE machine_id = ?`, machineID)
-	if err != nil {
-		return StateSnapshot{}, fmt.Errorf("read agent event state: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var eventID string
-		var fingerprint []byte
-		if err := rows.Scan(&eventID, &fingerprint); err != nil {
-			return StateSnapshot{}, fmt.Errorf("scan agent event state: %w", err)
-		}
-		if len(fingerprint) != sha256.Size {
-			return StateSnapshot{}, fmt.Errorf("event %q has invalid fingerprint length %d", eventID, len(fingerprint))
-		}
-		var digest [sha256.Size]byte
-		copy(digest[:], fingerprint)
-		snapshot.fingerprints[eventID] = digest
-	}
-	if err := rows.Err(); err != nil {
-		return StateSnapshot{}, fmt.Errorf("read agent event state: %w", err)
-	}
 	return snapshot, nil
 }
 
 // Pending returns only new or changed events since the last successful sync.
-func (s StateSnapshot) Pending(events []usage.Event) []usage.Event {
+// It loads fingerprints for the current event batch only; historical event
+// state stays in SQLite instead of growing an in-memory map each poll.
+func (s *StateStore) Pending(ctx context.Context, machineID string, events []usage.Event) ([]usage.Event, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
+	known := make(map[string][sha256.Size]byte, len(events))
+	const lookupChunkSize = 500
+	for start := 0; start < len(events); start += lookupChunkSize {
+		end := min(start+lookupChunkSize, len(events))
+		ids := make([]string, 0, end-start)
+		seen := make(map[string]struct{}, end-start)
+		for _, event := range events[start:end] {
+			if _, ok := seen[event.EventID]; ok {
+				continue
+			}
+			seen[event.EventID] = struct{}{}
+			ids = append(ids, event.EventID)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, machineID)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT event_id, fingerprint FROM event_state WHERE machine_id = ? AND event_id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read agent event state: %w", err)
+		}
+		for rows.Next() {
+			var eventID string
+			var fingerprint []byte
+			if err := rows.Scan(&eventID, &fingerprint); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan agent event state: %w", err)
+			}
+			if len(fingerprint) != sha256.Size {
+				rows.Close()
+				return nil, fmt.Errorf("event %q has invalid fingerprint length %d", eventID, len(fingerprint))
+			}
+			var digest [sha256.Size]byte
+			copy(digest[:], fingerprint)
+			known[eventID] = digest
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("read agent event state: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close agent event state: %w", err)
+		}
+	}
+
 	pending := make([]usage.Event, 0, len(events))
 	for _, event := range events {
 		fingerprint := eventFingerprint(event)
-		if previous, ok := s.fingerprints[event.EventID]; ok && previous == fingerprint {
+		if previous, ok := known[event.EventID]; ok && previous == fingerprint {
 			continue
 		}
 		pending = append(pending, event)
 	}
-	return pending
+	return pending, nil
 }
 
 // Commit advances successful source cursors and records uploaded event

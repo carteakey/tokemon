@@ -29,11 +29,12 @@ const (
 // It deliberately consumes only session lifecycle metadata and shutdown
 // aggregates; prompts, responses, tool arguments, and file paths are ignored.
 type Adapter struct {
-	root string
+	root  string
+	cache *adapters.SnapshotCache
 }
 
 func New(home string) *Adapter {
-	return &Adapter{root: filepath.Join(home, ".copilot", "session-state")}
+	return &Adapter{root: filepath.Join(home, ".copilot", "session-state"), cache: adapters.NewSnapshotCache()}
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -75,6 +76,11 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 		}
 		sources = append(sources, adapters.Source{Path: path, Identity: sourceIdentity(path)})
 	}
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		seen[source.Path] = struct{}{}
+	}
+	a.cache.Prune(seen)
 	return sources, nil
 }
 
@@ -82,16 +88,29 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if strings.TrimSpace(request.MachineID) == "" {
 		return adapters.ParseResult{}, errors.New("machine ID is required")
 	}
+	signature, err := adapters.Signature(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	identity := source.Identity
+	if identity == "" {
+		identity = sourceIdentity(source.Path)
+	}
+	if cached, err, ok := a.cache.Lookup(source.Path, signature, identity, request.Cursor); ok {
+		return cached, err
+	}
+	result, err := a.parseUncached(ctx, source, request, identity)
+	a.cache.Store(source.Path, signature, identity, request.Cursor, result, err)
+	return result, err
+}
+
+func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, identity string) (adapters.ParseResult, error) {
 	file, err := os.Open(source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
 	defer file.Close()
 
-	identity := source.Identity
-	if identity == "" {
-		identity = sourceIdentity(source.Path)
-	}
 	sessionID := filepath.Base(filepath.Dir(source.Path))
 	var project string
 	var sessionStart time.Time

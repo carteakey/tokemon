@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -19,13 +20,14 @@ const (
 
 type Adapter struct {
 	paths []string
+	cache *adapters.SnapshotCache
 }
 
 func New(home string) *Adapter {
 	return &Adapter{paths: []string{
 		filepath.Join(home, ".local", "share", "opencode", "opencode.db"),
 		filepath.Join(home, "Library", "Application Support", "opencode", "opencode.db"),
-	}}
+	}, cache: adapters.NewSnapshotCache()}
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -47,28 +49,27 @@ func (a *Adapter) Capabilities() adapters.Capabilities {
 
 func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 	var sources []adapters.Source
-	seen := make(map[string]struct{})
+	seenPaths := make(map[string]struct{})
 	for _, path := range a.paths {
-		if _, ok := seen[path]; ok {
+		if _, ok := seenPaths[path]; ok {
 			continue
 		}
-		seen[path] = struct{}{}
-		supported, err := supportsSessions(ctx, path)
-		if err != nil || !supported {
+		seenPaths[path] = struct{}{}
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) || (err == nil && info.IsDir()) {
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		sources = append(sources, adapters.Source{Path: path})
 	}
-	return sources, nil
-}
-
-func supportsSessions(ctx context.Context, path string) (bool, error) {
-	db, err := adapters.OpenReadOnly(ctx, path)
-	if err != nil {
-		return false, err
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		seen[source.Path] = struct{}{}
 	}
-	defer db.Close()
-	return adapters.HasTable(ctx, db, "session")
+	a.cache.Prune(seen)
+	return sources, nil
 }
 
 func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
@@ -76,11 +77,32 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if strings.TrimSpace(machineID) == "" {
 		return adapters.ParseResult{}, fmt.Errorf("machine ID is required")
 	}
+	signature, err := adapters.Signature(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	sourceIdentity := adapterID + ":" + filepath.Base(source.Path) + ":session"
+	if cached, err, ok := a.cache.Lookup(source.Path, signature, sourceIdentity, request.Cursor); ok {
+		return cached, err
+	}
+	result, err := a.parseUncached(ctx, source, request, machineID, sourceIdentity)
+	a.cache.Store(source.Path, signature, sourceIdentity, request.Cursor, result, err)
+	return result, err
+}
+
+func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, machineID, sourceIdentity string) (adapters.ParseResult, error) {
 	db, err := adapters.OpenReadOnly(ctx, source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
 	defer db.Close()
+	hasSession, err := adapters.HasTable(ctx, db, "session")
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	if !hasSession {
+		return adapters.ParseResult{Cursor: adapters.Cursor{Identity: sourceIdentity}}, nil
+	}
 	projectExpression := `''`
 	if hasDirectory, err := adapters.HasColumn(ctx, db, "session", "directory"); err != nil {
 		return adapters.ParseResult{}, err
@@ -99,7 +121,6 @@ ORDER BY time_created, id`)
 	}
 	defer rows.Close()
 
-	sourceIdentity := adapterID + ":" + filepath.Base(source.Path) + ":session"
 	var events []usage.Event
 	for rows.Next() {
 		var (

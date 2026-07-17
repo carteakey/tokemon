@@ -89,4 +89,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	if err := event.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	repeated, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil || len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unchanged OpenCode snapshot was reparsed: %+v, error: %v", repeated, err)
+	}
 }

@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -25,11 +24,12 @@ const (
 )
 
 type Adapter struct {
-	root string
+	root        string
+	directories *adapters.DirectoryCache
 }
 
 func New(home string) *Adapter {
-	return &Adapter{root: filepath.Join(home, ".claude", "projects")}
+	return &Adapter{root: filepath.Join(home, ".claude", "projects"), directories: adapters.NewDirectoryCache()}
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -50,31 +50,13 @@ func (a *Adapter) Capabilities() adapters.Capabilities {
 }
 
 func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
-	if _, err := os.Stat(a.root); os.IsNotExist(err) {
+	paths, err := a.directories.Paths(ctx, a.root, ".jsonl")
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if len(paths) == 0 {
 		return nil, nil
-	} else if err != nil {
-		return nil, err
 	}
-	var paths []string
-	err := filepath.WalkDir(a.root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if entry.Type().IsRegular() && strings.EqualFold(filepath.Ext(entry.Name()), ".jsonl") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(paths)
 	sources := make([]adapters.Source, 0, len(paths))
 	for _, path := range paths {
 		sources = append(sources, adapters.Source{Path: path})

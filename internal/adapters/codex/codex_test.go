@@ -78,6 +78,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)`,
 	if err := event.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	repeated, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil || len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unchanged thread snapshot was reparsed: %+v, error: %v", repeated, err)
+	}
 }
 
 func TestParseSessionLogPriceDefiningTokensWithoutConversationContent(t *testing.T) {
@@ -127,5 +131,9 @@ func TestParseSessionLogPriceDefiningTokensWithoutConversationContent(t *testing
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("event leaked %q: %s", forbidden, encoded)
 		}
+	}
+	repeated, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil || len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unchanged session log was reparsed: %+v, error: %v", repeated, err)
 	}
 }

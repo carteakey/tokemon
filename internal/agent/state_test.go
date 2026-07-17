@@ -56,11 +56,11 @@ func TestStatePersistsCursorsAndEventFingerprints(t *testing.T) {
 	if !ok || cursor.Identity != "file-identity" || cursor.Offset != 42 || cursor.Line != 3 {
 		t.Fatalf("cursor = %+v, present=%t", cursor, ok)
 	}
-	if pending := snapshot.Pending([]usage.Event{event}); len(pending) != 0 {
+	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{event}); err != nil || len(pending) != 0 {
 		t.Fatalf("unchanged event remained pending: %+v", pending)
 	}
 	changed := stateEvent("event-1", 20)
-	if pending := snapshot.Pending([]usage.Event{changed}); len(pending) != 1 || pending[0].TotalTokens == nil || *pending[0].TotalTokens != 20 {
+	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{changed}); err != nil || len(pending) != 1 || pending[0].TotalTokens == nil || *pending[0].TotalTokens != 20 {
 		t.Fatalf("changed event was not pending: %+v", pending)
 	}
 }
@@ -80,12 +80,7 @@ func TestStateLeavesCursorAndFingerprintUncommittedUntilUploadSucceeds(t *testin
 		Cursor:  adapters.Cursor{Identity: "file-identity", Offset: 42},
 	}
 	event := stateEvent("event-1", 10)
-	snapshot, err := store.Snapshot(context.Background(), machineID)
-	if err != nil {
-		store.Close()
-		t.Fatal(err)
-	}
-	if pending := snapshot.Pending([]usage.Event{event}); len(pending) != 1 {
+	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{event}); err != nil || len(pending) != 1 {
 		store.Close()
 		t.Fatalf("initial event pending = %d, want 1", len(pending))
 	}
@@ -98,12 +93,7 @@ func TestStateLeavesCursorAndFingerprintUncommittedUntilUploadSucceeds(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err = store.Snapshot(context.Background(), machineID)
-	if err != nil {
-		store.Close()
-		t.Fatal(err)
-	}
-	if pending := snapshot.Pending([]usage.Event{event}); len(pending) != 1 {
+	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{event}); err != nil || len(pending) != 1 {
 		store.Close()
 		t.Fatalf("failed upload lost pending event: %d", len(pending))
 	}
@@ -120,11 +110,7 @@ func TestStateLeavesCursorAndFingerprintUncommittedUntilUploadSucceeds(t *testin
 		t.Fatal(err)
 	}
 	defer store.Close()
-	snapshot, err = store.Snapshot(context.Background(), machineID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pending := snapshot.Pending([]usage.Event{event}); len(pending) != 0 {
+	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{event}); err != nil || len(pending) != 0 {
 		t.Fatalf("committed event remained pending: %d", len(pending))
 	}
 }
@@ -146,6 +132,21 @@ func TestStateSkipsFailedSourceReports(t *testing.T) {
 	}
 	if len(snapshot.Cursors) != 0 {
 		t.Fatalf("failed source advanced state: %+v", snapshot.Cursors)
+	}
+}
+
+func TestSnapshotDoesNotLoadHistoricalEventFingerprints(t *testing.T) {
+	store, err := OpenState(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.db.Exec(`INSERT INTO event_state (machine_id, event_id, fingerprint, last_successful_sync) VALUES (?, ?, ?, ?)`, "machine-a", "historical", []byte("not a full fingerprint"), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Snapshot(context.Background(), "machine-a"); err != nil {
+		t.Fatalf("snapshot scanned historical event fingerprints: %v", err)
 	}
 }
 

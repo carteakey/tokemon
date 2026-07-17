@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,11 +23,13 @@ const (
 )
 
 type Adapter struct {
-	root string
+	root        string
+	cache       *adapters.SnapshotCache
+	directories *adapters.DirectoryCache
 }
 
 func New(home string) *Adapter {
-	return &Adapter{root: filepath.Join(home, ".codex")}
+	return &Adapter{root: filepath.Join(home, ".codex"), cache: adapters.NewSnapshotCache(), directories: adapters.NewDirectoryCache()}
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -45,6 +46,11 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 		return nil, err
 	}
 	if len(logs) > 0 {
+		seen := make(map[string]struct{}, len(logs))
+		for _, source := range logs {
+			seen[source.Path] = struct{}{}
+		}
+		a.cache.Prune(seen)
 		return logs, nil
 	}
 
@@ -53,53 +59,34 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 		return nil, err
 	}
 	sort.Strings(paths)
-	var sources []adapters.Source
+	sources := make([]adapters.Source, 0, len(paths))
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		supported, err := supportsThreads(ctx, path)
-		if err != nil || !supported {
-			continue
-		}
 		sources = append(sources, adapters.Source{Path: path})
 	}
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		seen[source.Path] = struct{}{}
+	}
+	a.cache.Prune(seen)
 	return sources, nil
 }
 
 func (a *Adapter) discoverLogs(ctx context.Context) ([]adapters.Source, error) {
 	var sources []adapters.Source
 	for _, root := range []string{filepath.Join(a.root, "sessions"), filepath.Join(a.root, "archived_sessions")} {
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil
-				}
-				return err
-			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !entry.IsDir() && strings.EqualFold(filepath.Ext(path), ".jsonl") {
-				sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
-			}
-			return nil
-		})
+		paths, err := a.directories.Paths(ctx, root, ".jsonl")
 		if err != nil && !os.IsNotExist(err) {
 			return nil, err
+		}
+		for _, path := range paths {
+			sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
 		}
 	}
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Path < sources[j].Path })
 	return sources, nil
-}
-
-func supportsThreads(ctx context.Context, path string) (bool, error) {
-	db, err := adapters.OpenReadOnly(ctx, path)
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
-	return adapters.HasTable(ctx, db, "threads")
 }
 
 func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
@@ -150,6 +137,23 @@ type tokenUsage struct {
 }
 
 func (a *Adapter) parseLog(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
+	signature, err := adapters.Signature(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	identity := source.Identity
+	if identity == "" {
+		identity = adapters.HashIdentity(source.Path)
+	}
+	if cached, err, ok := a.cache.Lookup(source.Path, signature, identity, request.Cursor); ok {
+		return cached, err
+	}
+	result, err := a.parseLogUncached(ctx, source, request)
+	a.cache.Store(source.Path, signature, identity, request.Cursor, result, err)
+	return result, err
+}
+
+func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
 	file, err := os.Open(source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
@@ -254,11 +258,32 @@ func firstNonEmpty(values ...string) string {
 }
 
 func (a *Adapter) parseThreadSnapshots(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
+	signature, err := adapters.Signature(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	sourceIdentity := adapterID + ":" + filepath.Base(source.Path) + ":threads"
+	if cached, err, ok := a.cache.Lookup(source.Path, signature, sourceIdentity, request.Cursor); ok {
+		return cached, err
+	}
+	result, err := a.parseThreadSnapshotsUncached(ctx, source, request, sourceIdentity)
+	a.cache.Store(source.Path, signature, sourceIdentity, request.Cursor, result, err)
+	return result, err
+}
+
+func (a *Adapter) parseThreadSnapshotsUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, sourceIdentity string) (adapters.ParseResult, error) {
 	db, err := adapters.OpenReadOnly(ctx, source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
 	defer db.Close()
+	hasThreads, err := adapters.HasTable(ctx, db, "threads")
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	if !hasThreads {
+		return adapters.ParseResult{Cursor: adapters.Cursor{Identity: sourceIdentity}}, nil
+	}
 	rows, err := db.QueryContext(ctx, `
 SELECT id, created_at_ms, updated_at_ms, COALESCE(model_provider, ''), COALESCE(model, ''), COALESCE(cwd, ''), tokens_used
 FROM threads
@@ -269,7 +294,6 @@ ORDER BY created_at_ms, id`)
 	}
 	defer rows.Close()
 
-	sourceIdentity := adapterID + ":" + filepath.Base(source.Path) + ":threads"
 	var events []usage.Event
 	for rows.Next() {
 		var sessionID, provider, model, cwd string

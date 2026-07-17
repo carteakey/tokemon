@@ -14,7 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestDiscoverCachesSQLiteCapabilityProbe(t *testing.T) {
+func TestDiscoverDoesNotOpenSQLite(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -36,24 +36,17 @@ func TestDiscoverCachesSQLiteCapabilityProbe(t *testing.T) {
 		readDirs++
 		return readDir(path)
 	}
-	probes := 0
-	a.probe = func(context.Context, string) (bool, error) {
-		probes++
-		return true, nil
+	a.open = func(context.Context, string) (*sql.DB, error) {
+		t.Fatal("discovery opened SQLite")
+		return nil, nil
 	}
 	if sources, err := a.Discover(context.Background()); err != nil || len(sources) != 2 {
 		t.Fatalf("first discovery = %d sources, error: %v", len(sources), err)
-	}
-	if probes != 2 {
-		t.Fatalf("first discovery probes = %d, want 2", probes)
 	}
 	for i := 0; i < 100; i++ {
 		if sources, err := a.Discover(context.Background()); err != nil || len(sources) != 2 {
 			t.Fatalf("cached discovery %d = %d sources, error: %v", i, len(sources), err)
 		}
-	}
-	if probes != 2 {
-		t.Fatalf("cached discovery probes = %d, want 2", probes)
 	}
 	if readDirs != 1 {
 		t.Fatalf("cached discovery directory reads = %d, want 1", readDirs)
@@ -64,9 +57,6 @@ func TestDiscoverCachesSQLiteCapabilityProbe(t *testing.T) {
 	if _, err := a.Discover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if probes != 3 {
-		t.Fatalf("changed discovery probes = %d, want 3", probes)
-	}
 	third := filepath.Join(root, "third.db")
 	if err := os.WriteFile(third, []byte("third"), 0o600); err != nil {
 		t.Fatal(err)
@@ -75,15 +65,51 @@ func TestDiscoverCachesSQLiteCapabilityProbe(t *testing.T) {
 	if err != nil || len(sources) != 3 {
 		t.Fatalf("new file discovery = %d sources, error: %v", len(sources), err)
 	}
-	if probes != 4 {
-		t.Fatalf("new file probes = %d, want 4", probes)
-	}
 	if readDirs != 2 {
 		t.Fatalf("new file directory reads = %d, want 2", readDirs)
 	}
 }
 
-func TestDiscoverCachesUnsupportedProbeResult(t *testing.T) {
+func TestParseCachesUnsupportedDatabase(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "other.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(home)
+	sources, err := a.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	first, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 0 {
+		t.Fatalf("first unsupported parse = %+v, error: %v", first, err)
+	}
+	a.open = func(context.Context, string) (*sql.DB, error) {
+		return nil, fmt.Errorf("unsupported source was reopened")
+	}
+	for i := 0; i < 100; i++ {
+		result, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+		if err != nil || len(result.Events) != 0 || result.Cursor != first.Cursor {
+			t.Fatalf("cached unsupported parse %d = %+v, error: %v", i, result, err)
+		}
+	}
+}
+
+func TestParseCachesMalformedDatabaseError(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -95,22 +121,27 @@ func TestDiscoverCachesUnsupportedProbeResult(t *testing.T) {
 	}
 
 	a := New(home)
-	probes := 0
-	a.probe = func(context.Context, string) (bool, error) {
-		probes++
-		return false, fmt.Errorf("database disk image is malformed")
+	sources, err := a.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	opens := 0
+	a.open = func(ctx context.Context, path string) (*sql.DB, error) {
+		opens++
+		return adapters.OpenReadOnly(ctx, path)
+	}
+	_, firstErr := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if firstErr == nil {
+		t.Fatal("malformed parse unexpectedly succeeded")
 	}
 	for i := 0; i < 100; i++ {
-		sources, err := a.Discover(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(sources) != 0 {
-			t.Fatalf("discovery %d returned unsupported source: %+v", i, sources)
+		_, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+		if err == nil || err.Error() != firstErr.Error() {
+			t.Fatalf("cached malformed parse %d error = %v, want %v", i, err, firstErr)
 		}
 	}
-	if probes != 1 {
-		t.Fatalf("malformed database probes = %d, want 1", probes)
+	if opens != 1 {
+		t.Fatalf("malformed database opens = %d, want 1", opens)
 	}
 }
 

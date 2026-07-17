@@ -351,7 +351,12 @@ func runAgent(args []string) error {
 			}
 			fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
 		}
-		pending := snapshot.Pending(events)
+		pending, err := stateStore.Pending(ctx, *machineID, events)
+		if err != nil {
+			return err
+		}
+		eventCount := len(events)
+		events = nil
 		if len(pending) > 0 {
 			result, err := client.Ingest(ctx, pending)
 			if err != nil {
@@ -363,7 +368,7 @@ func runAgent(args []string) error {
 			return err
 		}
 		if len(pending) == 0 {
-			if len(events) == 0 {
+			if eventCount == 0 {
 				fmt.Println("No supported local usage records found.")
 			} else {
 				fmt.Println("No new or changed usage records.")

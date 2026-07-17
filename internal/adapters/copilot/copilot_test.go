@@ -73,8 +73,8 @@ func TestParseShutdownUsageWithoutCollectingSessionContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(repeated.Events) != 1 || repeated.Events[0].EventID != event.EventID {
-		t.Fatalf("event identity changed across rescan: first=%+v second=%+v", event, repeated.Events)
+	if len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unchanged snapshot was reparsed: first=%+v second=%+v", event, repeated)
 	}
 }
 
