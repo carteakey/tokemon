@@ -500,17 +500,38 @@ func TestAnalyticsSupportsPeriodsFiltersBreakdownsAndUnknownTotals(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filtered.Summary.Tokens != 100 || filtered.Summary.Events != 2 || filtered.Summary.ActiveDays != 1 || filtered.Summary.UnknownEvents != 1 {
+	if filtered.Summary.Tokens != 100 || filtered.Summary.Events != 2 || filtered.Summary.ActiveDays != 1 || filtered.Summary.UnknownEvents != 1 || filtered.Summary.SessionTokens != 100 {
 		t.Fatalf("unexpected filtered summary: %+v", filtered.Summary)
 	}
-	if len(filtered.Points) != 1 || filtered.Points[0].Tokens != 100 || filtered.Points[0].UnknownEvents != 1 || filtered.Points[0].InputTokens != 60 || filtered.Points[0].CachedTokens != 20 || filtered.Points[0].OutputTokens != 20 {
+	if len(filtered.Points) != 30 {
 		t.Fatalf("unexpected filtered points: %+v", filtered.Points)
+	}
+	filteredDay := filtered.Points[len(filtered.Points)-1]
+	if filtered.Points[0].Tokens != 0 || filteredDay.Date != "2026-07-13" || filteredDay.Tokens != 100 || filteredDay.UnknownEvents != 1 || filteredDay.InputTokens != 60 || filteredDay.CachedTokens != 20 || filteredDay.OutputTokens != 20 {
+		t.Fatalf("analytics points do not preserve quiet days and the active bucket: %+v", filtered.Points)
 	}
 	if len(filtered.Breakdown) != 1 || filtered.Breakdown[0].Name != "project-a" || filtered.Breakdown[0].Tokens != 100 || filtered.Breakdown[0].Share != 1 {
 		t.Fatalf("unexpected filtered breakdown: %+v", filtered.Breakdown)
 	}
 	if len(filtered.Sessions) != 1 || filtered.Sessions[0].SessionID != "session-one" {
 		t.Fatalf("unexpected filtered sessions: %+v", filtered.Sessions)
+	}
+	if filtered.Comparison == nil || filtered.Comparison.PreviousTokens != 0 || filtered.Comparison.TokenChangePercent != nil {
+		t.Fatalf("unexpected filtered comparison: %+v", filtered.Comparison)
+	}
+
+	last24Hours, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "24h", Dimension: "providers", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last24Hours.Bucket != "hour" || len(last24Hours.Points) != 25 || last24Hours.Summary.Tokens != 100 {
+		t.Fatalf("unexpected rolling 24-hour analytics: %+v", last24Hours)
+	}
+	if len(last24Hours.Breakdown) != 1 || last24Hours.Breakdown[0].Name != "openai" {
+		t.Fatalf("unexpected provider breakdown: %+v", last24Hours.Breakdown)
+	}
+	if last24Hours.Comparison == nil || last24Hours.Comparison.PreviousTokens != 50 || last24Hours.Comparison.TokenChangePercent == nil || *last24Hours.Comparison.TokenChangePercent != 100 {
+		t.Fatalf("unexpected 24-hour comparison: %+v", last24Hours.Comparison)
 	}
 
 	allTime, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "all", Dimension: "models", Now: now})

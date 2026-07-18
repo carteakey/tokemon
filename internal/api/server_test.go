@@ -595,7 +595,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if pageResponse.Code != http.StatusOK {
 		t.Fatalf("analytics page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
 	}
-	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines"} {
+	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines", ">24H</a>", ">Providers</a>", "data-count=", "data-label=", "prefers-reduced-motion"} {
 		if !bytes.Contains(pageResponse.Body.Bytes(), []byte(want)) {
 			t.Fatalf("analytics page does not contain %q: %s", want, pageResponse.Body.String())
 		}

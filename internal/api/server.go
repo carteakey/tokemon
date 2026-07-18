@@ -39,6 +39,8 @@ type analyticsPageData struct {
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
 	ExportURL      string
+	PeakPoint      database.AnalyticsPoint
+	AverageThread  int64
 }
 
 type aliasRow struct {
@@ -345,6 +347,43 @@ func analyticsPartPercent(value, total int64) float64 {
 	return float64(value) * 100 / float64(total)
 }
 
+func analyticsPeakPoint(points []database.AnalyticsPoint) database.AnalyticsPoint {
+	if len(points) == 0 {
+		return database.AnalyticsPoint{}
+	}
+	peak := points[0]
+	for _, point := range points[1:] {
+		if point.Tokens > peak.Tokens {
+			peak = point
+		}
+	}
+	return peak
+}
+
+func analyticsAverageThread(summary database.AnalyticsSummary) int64 {
+	if summary.Threads <= 0 {
+		return 0
+	}
+	return summary.SessionTokens / summary.Threads
+}
+
+func analyticsChangeLabel(value *float64) string {
+	if value == nil {
+		return "No earlier baseline"
+	}
+	return fmt.Sprintf("%+.1f%%", *value)
+}
+
+func analyticsChangeClass(value *float64) string {
+	if value == nil || *value == 0 {
+		return "flat"
+	}
+	if *value > 0 {
+		return "up"
+	}
+	return "down"
+}
+
 func analyticsShortTime(raw string) string {
 	parsed, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil {
@@ -357,13 +396,13 @@ func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
 	values := r.URL.Query()
 	period := values.Get("period")
 	switch period {
-	case "7d", "30d", "90d", "all":
+	case "24h", "7d", "30d", "90d", "all":
 	default:
 		period = "30d"
 	}
 	dimension := values.Get("dimension")
 	switch dimension {
-	case "projects", "harnesses", "models", "machines":
+	case "projects", "harnesses", "providers", "models", "machines":
 	default:
 		dimension = "projects"
 	}
@@ -415,6 +454,11 @@ func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
 		values.Set("tool", query.Tool)
 	}
 	return "/analytics?" + values.Encode()
+}
+
+func analyticsPeriodURL(query database.AnalyticsQuery, period string) string {
+	query.Period = period
+	return analyticsViewURL(query, query.Dimension)
 }
 
 func aliasMaps(values []database.DisplayAlias) (map[string]string, map[string]string) {
@@ -487,22 +531,25 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 			}
 			return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 		},
-		"topProjects":        topProjects,
-		"topModels":          topModels,
-		"topTools":           topTools,
-		"harnessName":        harnessName,
-		"modelDisplayName":   modelDisplayName,
-		"machineDisplayName": machineDisplayName,
-		"analyticsBar":       analyticsBarPercent,
-		"analyticsPart":      analyticsPartPercent,
-		"analyticsTime":      analyticsShortTime,
-		"analyticsURL":       analyticsViewURL,
-		"glyphCell":          glyphCellClass,
-		"projectGlyph":       glyphForProject,
-		"harnessGlyph":       glyphForHarness,
-		"modelGlyph":         glyphForModel,
-		"machineGlyph":       glyphForMachine,
-		"assetPath":          func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
+		"topProjects":          topProjects,
+		"topModels":            topModels,
+		"topTools":             topTools,
+		"harnessName":          harnessName,
+		"modelDisplayName":     modelDisplayName,
+		"machineDisplayName":   machineDisplayName,
+		"analyticsBar":         analyticsBarPercent,
+		"analyticsPart":        analyticsPartPercent,
+		"analyticsTime":        analyticsShortTime,
+		"analyticsURL":         analyticsViewURL,
+		"analyticsPeriodURL":   analyticsPeriodURL,
+		"analyticsChange":      analyticsChangeLabel,
+		"analyticsChangeClass": analyticsChangeClass,
+		"glyphCell":            glyphCellClass,
+		"projectGlyph":         glyphForProject,
+		"harnessGlyph":         glyphForHarness,
+		"modelGlyph":           glyphForModel,
+		"machineGlyph":         glyphForMachine,
+		"assetPath":            func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
 	}).Parse(dashboardTemplate)
 	if err != nil {
 		return nil, err
@@ -658,6 +705,8 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		ModelAliases:   modelAliases,
 		MachineAliases: machineAliases,
 		ExportURL:      analyticsExportURL(result.Filter),
+		PeakPoint:      analyticsPeakPoint(result.Points),
+		AverageThread:  analyticsAverageThread(result.Summary),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -1668,6 +1717,11 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
     .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
+    .heading-actions { display: flex; align-items: center; gap: 10px; }
+    .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
+    .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
+    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid rgba(155, 187, 160, .18); outline-offset: 1px; }
+    .window-link.active { background: var(--accent); color: var(--bg); }
     .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
     .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid rgba(210, 164, 119, .22); outline-offset: 2px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
@@ -1680,12 +1734,20 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
     .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-    .stat { min-width: 0; min-height: 82px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .stat { min-width: 0; min-height: 94px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); animation: stat-in 300ms both; }
+    .stat:nth-child(2) { animation-delay: 25ms; }
+    .stat:nth-child(3) { animation-delay: 50ms; }
+    .stat:nth-child(4) { animation-delay: 75ms; }
+    .stat:nth-child(5) { animation-delay: 100ms; }
     .stat-value { margin-top: 9px; overflow: hidden; color: var(--text); font: 700 clamp(18px, 2.3vw, 26px)/1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .stat-value.muted { color: var(--muted); font-size: 16px; }
     .stat-meta { margin-top: 7px; overflow: hidden; color: var(--faint); font: 10px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .comparison { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+    .comparison strong { color: var(--text); font-weight: 700; }
+    .comparison.up strong { color: var(--accent); }
+    .comparison.down strong { color: var(--warm); }
     .note { margin-top: 10px; padding: 9px 12px; border: 1px solid rgba(210, 164, 119, .45); color: var(--warm); font: 11px/1.3 var(--font-data); }
-    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(360px, .8fr); gap: 10px; margin-top: 10px; }
+    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(360px, .8fr); align-items: start; gap: 10px; margin-top: 10px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding: 13px 16px 10px; border-bottom: 1px solid var(--line); }
     .section-meta { color: var(--faint); font: 10px/1.2 var(--font-data); text-align: right; }
     .trend-legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
@@ -1694,46 +1756,71 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .legend-swatch.cached { background: var(--accent); }
     .legend-swatch.output { background: var(--warm); }
     .legend-swatch.unknown { border: 1px solid var(--warm); background: transparent; }
-    .trend-chart { display: flex; align-items: end; gap: 4px; min-height: 258px; margin-top: 8px; padding: 12px 16px 16px; overflow-x: auto; border-bottom: 1px solid var(--line); }
-    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; gap: 6px; min-height: 220px; }
+    .trend-readout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 50px; margin: 12px 16px 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); }
+    .readout-kicker { color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .09em; text-transform: uppercase; }
+    .readout-value { overflow: hidden; color: var(--text); font: 700 15px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .readout-mix { overflow: hidden; color: var(--muted); font: 10px/1.2 var(--font-data); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+    .trend-visual { position: relative; border-bottom: 1px solid var(--line); }
+    .trend-grid { position: absolute; z-index: 0; inset: 18px 16px 39px; pointer-events: none; }
+    .trend-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .38); }
+    .trend-grid i:nth-child(1) { top: 0; }
+    .trend-grid i:nth-child(2) { top: 25%; }
+    .trend-grid i:nth-child(3) { top: 50%; }
+    .trend-grid i:nth-child(4) { top: 75%; }
+    .trend-chart { position: relative; z-index: 1; display: flex; min-height: 252px; align-items: end; gap: 4px; margin-top: 8px; padding: 12px 16px 16px; overflow-x: auto; }
+    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; gap: 6px; min-height: 220px; padding: 0; border: 0; background: transparent; color: inherit; cursor: crosshair; }
+    .trend-column:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 2px; }
     .trend-column.unknown::after { position: absolute; right: 0; bottom: 19px; left: 0; height: 3px; border: 1px solid var(--warm); background: transparent; content: ""; }
     .trend-track { position: relative; display: flex; height: 190px; align-items: end; }
-    .trend-bar { display: flex; width: 100%; min-height: 2px; flex-direction: column-reverse; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 2px 2px 0 0; background: #20251e; }
+    .trend-bar { display: flex; width: 100%; min-height: 2px; flex-direction: column-reverse; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 2px 2px 0 0; background: #20251e; transform-origin: bottom; animation: chart-rise 460ms cubic-bezier(.2, .75, .25, 1) both; animation-delay: calc(var(--index) * 6ms); }
     .trend-column.unknown .trend-bar { border-color: var(--warm); }
     .trend-part { display: block; min-height: 0; }
     .trend-part.input { background: var(--accent-dim); }
     .trend-part.cached { background: var(--accent); }
     .trend-part.output { background: var(--warm); }
-    .trend-label { overflow: hidden; color: var(--faint); font: 9px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .trend-label { overflow: hidden; color: var(--faint); font: 9px/1 var(--font-data); opacity: 0; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .period-7d .trend-label, .period-24h .trend-column:nth-child(4n + 1) .trend-label, .period-30d .trend-column:nth-child(5n + 1) .trend-label, .period-90d .trend-column:nth-child(15n + 1) .trend-label, .period-all .trend-column:nth-child(3n + 1) .trend-label { opacity: 1; }
     .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
-    .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
+    .trend-panel, .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
     .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
     .dimension-link { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font: 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
     .dimension-link.active { border-color: var(--accent); color: var(--accent); }
     .table-scroll { overflow-x: auto; padding: 0 16px 12px; }
+    .breakdown-scroll { max-height: 350px; overflow-y: auto; scrollbar-color: var(--line-bright) transparent; }
     table { width: 100%; min-width: 430px; border-collapse: collapse; table-layout: fixed; }
     th, td { padding: 8px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font-size: 9px; }
+    .breakdown-scroll th { position: sticky; z-index: 2; top: 0; background: var(--surface); }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
     th:first-child, td:first-child { width: 42%; }
     th:not(:first-child), td:not(:first-child) { padding-left: 9px; text-align: right; white-space: nowrap; }
     td:first-child { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    tbody tr { transition: background-color 140ms ease; }
+    tbody tr:hover { background: rgba(155, 187, 160, .035); }
+    .breakdown-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .breakdown-meter { display: block; height: 2px; margin-top: 5px; overflow: hidden; background: var(--line); }
+    .breakdown-meter span { display: block; width: var(--share); height: 100%; background: var(--accent-dim); animation: meter-grow 680ms cubic-bezier(.2, .75, .25, 1) both; }
     .empty-row td { padding: 30px 0 12px; color: var(--faint); text-align: left; }
     .session-project { display: block; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
     .session-machine { display: block; margin-top: 3px; overflow: hidden; color: var(--faint); font-size: 10px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
     .unknown-flag { display: inline-grid; width: 14px; height: 14px; place-items: center; margin-left: 4px; border: 1px solid var(--warm); border-radius: 50%; color: var(--warm); font-size: 9px; }
     footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
+    @keyframes chart-rise { from { opacity: .65; transform: scaleY(.12); } to { opacity: 1; transform: scaleY(1); } }
+    @keyframes meter-grow { from { width: 0; } }
+    @keyframes stat-in { from { opacity: .72; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 1080px) {
       .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .filter-actions { grid-column: span 3; }
       .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .analytics-grid { grid-template-columns: 1fr; }
+      .analytics-grid { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 700px) {
       main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; }
       .topbar { display: flex; align-items: start; flex-wrap: wrap; }
       .nav { order: 3; width: 100%; justify-content: center; }
       .analytics-heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; }
+      .heading-actions { width: 100%; align-items: stretch; flex-direction: column; }
+      .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); }
       .action { width: 100%; }
       .filter-panel { padding: 13px 12px; }
       .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1742,6 +1829,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .section-head { align-items: start; flex-direction: column; }
       .section-meta { text-align: left; }
+      .trend-readout { grid-template-columns: 1fr; gap: 5px; }
+      .readout-mix { text-align: left; white-space: normal; }
       footer { flex-direction: column; gap: 4px; }
     }
     @media (max-width: 430px) {
@@ -1749,7 +1838,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       .filter-actions { grid-column: auto; }
       .filter-actions .action { flex: 1; }
     }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-delay: 0ms !important; } }
   </style>
 </head>
 <body>
@@ -1771,23 +1860,26 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       <h1>Analytics</h1>
       <p class="heading-copy">Explore token volume over time and see which projects, harnesses, models, and machines are carrying the load.</p>
     </div>
-    <a class="action" href="{{.ExportURL}}">Export analytics JSON</a>
+    <div class="heading-actions">
+      <nav class="window-nav" aria-label="Time window">
+        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{analyticsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
+        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
+        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
+        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
+        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
+      </nav>
+      <a class="action" href="{{.ExportURL}}">Export analytics JSON</a>
+    </div>
   </section>
 
   <section class="panel filter-panel" aria-label="Analytics filters">
     <form class="filter-form" method="get" action="/analytics">
-      <label>Window
-        <select name="period">
-          <option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>Last 7 days</option>
-          <option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>Last 30 days</option>
-          <option value="90d"{{if eq .Filter.Period "90d"}} selected{{end}}>Last 90 days</option>
-          <option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All time</option>
-        </select>
-      </label>
+      <input type="hidden" name="period" value="{{.Filter.Period}}">
       <label>Breakdown
         <select name="dimension">
           <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
           <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
+          <option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option>
           <option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option>
           <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
         </select>
@@ -1824,42 +1916,51 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   </section>
 
   <section class="stats" aria-label="Period summary">
-    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value">{{commas .Summary.Tokens}}</div><div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div></article>
-    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">Days with recorded events</div></article>
-    <article class="stat"><div class="stat-label">Average active day</div><div class="stat-value">{{printf "%.0f" .Summary.AverageActiveDay}}</div><div class="stat-meta">Tokens per active day</div></article>
-    <article class="stat"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Summary.Threads}}</div><div class="stat-meta">Distinct recorded sessions</div></article>
+    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value" data-count="{{.Summary.Tokens}}">{{commas .Summary.Tokens}}</div>{{if .Comparison}}{{if .Comparison.TokenChangePercent}}<div class="stat-meta comparison {{analyticsChangeClass .Comparison.TokenChangePercent}}"><strong>{{analyticsChange .Comparison.TokenChangePercent}}</strong><span>vs previous window</span></div>{{else}}<div class="stat-meta">No earlier baseline</div>{{end}}{{else}}<div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value" data-count="{{.Summary.ActiveDays}}">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div></article>
+    <article class="stat"><div class="stat-label">Average thread</div><div class="stat-value" data-count="{{.AverageThread}}">{{commas .AverageThread}}</div><div class="stat-meta">Across {{commas .Summary.Threads}} thread{{if ne .Summary.Threads 1}}s{{end}}</div></article>
+    <article class="stat"><div class="stat-label">Cache hit</div>{{if .Summary.Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (percent .Summary.Cache.HitRate)}}</div><div class="stat-meta">{{commas .Summary.Cache.CachedTokens}} cached tokens</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No eligible input tokens</div>{{end}}</article>
     <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens</div>{{end}}</article>
   </section>
   {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
 
   <section class="analytics-grid">
     <article class="panel trend-panel" aria-labelledby="trend-title">
-      <div class="section-head"><div class="section-title" id="trend-title">Token trend</div><div class="section-meta">{{if eq .Bucket "month"}}Monthly buckets{{else}}Daily buckets{{end}} · {{commas .Summary.Events}} events</div></div>
+      <div class="section-head"><div class="section-title" id="trend-title">Token trend</div><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
       <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
       {{if .Points}}
-      <div class="trend-chart" role="img" aria-label="Token volume over the selected window">
-        {{range .Points}}
-        <div class="trend-column{{if .UnknownEvents}} unknown{{end}}" title="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
-          <div class="trend-track"><div class="trend-bar" style="height: {{analyticsBar .Tokens $.MaxTokens}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></div></div>
-          <span class="trend-label">{{.Label}}</span>
+      <div class="trend-readout" aria-live="polite">
+        <span class="readout-kicker">Selected bucket</span>
+        <strong class="readout-value" id="trend-readout-value">{{.PeakPoint.Label}} · {{commas .PeakPoint.Tokens}} tokens</strong>
+        <span class="readout-mix" id="trend-readout-mix">Input {{commas .PeakPoint.InputTokens}} · Cached {{commas .PeakPoint.CachedTokens}} · Output {{commas .PeakPoint.OutputTokens}}</span>
+      </div>
+      <div class="trend-visual">
+        <div class="trend-grid" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div class="trend-chart period-{{.Filter.Period}}" aria-label="Token volume over the selected window">
+          {{range $index, $point := .Points}}
+          <button class="trend-column{{if .UnknownEvents}} unknown{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.MaxTokens}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
+            <span class="trend-label">{{.Label}}</span>
+          </button>
+          {{end}}
         </div>
-        {{end}}
       </div>
       {{else}}<div class="empty-chart">No token activity in this window.</div>{{end}}
     </article>
 
     <article class="panel breakdown-panel" aria-labelledby="breakdown-title">
-      <div class="section-head"><div class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</div><div class="section-meta">Token share</div></div>
+      <div class="section-head"><div class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</div><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
       <nav class="dimension-nav" aria-label="Breakdown dimension">
         <a class="dimension-link{{if eq .Filter.Dimension "projects"}} active{{end}}" href="{{analyticsURL .Filter "projects"}}">Projects</a>
         <a class="dimension-link{{if eq .Filter.Dimension "harnesses"}} active{{end}}" href="{{analyticsURL .Filter "harnesses"}}">Harnesses</a>
+        <a class="dimension-link{{if eq .Filter.Dimension "providers"}} active{{end}}" href="{{analyticsURL .Filter "providers"}}">Providers</a>
         <a class="dimension-link{{if eq .Filter.Dimension "models"}} active{{end}}" href="{{analyticsURL .Filter "models"}}">Models</a>
         <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}">Machines</a>
       </nav>
-      <div class="table-scroll">
-        <table><thead><tr><th>Name</th><th>Tokens</th><th>Share</th><th>Events</th></tr></thead><tbody>
+      <div class="table-scroll breakdown-scroll">
+        <table><thead><tr><th>Name</th><th>Tokens</th><th>Share</th><th>Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
-          <tr><td title="{{.Name}}">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Events}}</td></tr>
+          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
@@ -1871,7 +1972,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <div class="table-scroll">
       <table><thead><tr><th>When</th><th>Project / machine</th><th>Model</th><th>Harness</th><th>Tokens</th></tr></thead><tbody>
         {{range .Sessions}}
-        <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
+        <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}"><span class="session-project">{{modelDisplayName $.ModelAliases .Model}}</span><span class="session-machine">{{.Provider}}</span></td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
         {{else}}<tr class="empty-row"><td colspan="5">No sessions match these filters.</td></tr>{{end}}
       </tbody></table>
     </div>
@@ -1879,5 +1980,39 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 
   <footer><span>Local-first · metadata only</span><span>Export contains analytics metadata, not prompts, responses, source code, or repository contents.</span></footer>
 </main>
+<script>
+  (() => {
+    const number = new Intl.NumberFormat('en-US');
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!reducedMotion) {
+      document.querySelectorAll('[data-count]').forEach((node) => {
+        const target = Number(node.dataset.count);
+        if (!Number.isFinite(target) || target <= 0) return;
+        const start = target * .92;
+        const started = performance.now();
+        const tick = (now) => {
+          const progress = Math.min(1, (now - started) / 520);
+          const eased = 1 - Math.pow(1 - progress, 3);
+          node.textContent = number.format(Math.round(start + (target - start) * eased));
+          if (progress < 1) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      });
+    }
+
+    const value = document.getElementById('trend-readout-value');
+    const mix = document.getElementById('trend-readout-mix');
+    const showPoint = (column) => {
+      if (!value || !mix) return;
+      value.textContent = column.dataset.label + ' · ' + number.format(Number(column.dataset.tokens)) + ' tokens';
+      mix.textContent = 'Input ' + number.format(Number(column.dataset.input)) + ' · Cached ' + number.format(Number(column.dataset.cached)) + ' · Output ' + number.format(Number(column.dataset.output));
+    };
+    document.querySelectorAll('.trend-column').forEach((column) => {
+      column.addEventListener('mouseenter', () => showPoint(column));
+      column.addEventListener('focus', () => showPoint(column));
+      column.addEventListener('click', () => showPoint(column));
+    });
+  })();
+</script>
 </body>
 </html>{{end}}`

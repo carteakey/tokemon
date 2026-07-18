@@ -39,7 +39,7 @@ Managed installs can use `~/.config/tokemon/agent.env`; explicit flags override 
 
 The overview includes a Pokédex-inspired, pixel-style activity field for the last 53 weeks plus lifetime usage cuts by project, harness, model, and machine. Harness usage groups the recorded tools, including Claude Code, Codex, GitHub Copilot CLI, OpenCode, and Antigravity. Hover or focus any past day to see its total plus model and provider token breakdowns; dates are grouped in UTC and unknown token totals remain visibly marked rather than being treated as zero.
 
-Open `/analytics` for period-based token trends, filters by machine/provider/model/harness, detailed breakdowns, recent metadata-only sessions, and an explicit **Export analytics JSON** action. The browser-facing page is separate from the machine-readable `/api/v1/analytics` endpoint; downloads use `/api/v1/analytics/export` and include the selected filters.
+Open `/analytics` for rolling 24-hour, 7-day, 30-day, 90-day, and all-time token trends; previous-window comparisons; filters by machine/provider/model/harness; breakdowns by project, harness, provider, model, or machine; and recent metadata-only sessions. Every trend bucket remains keyboard-readable, quiet periods stay visible as zeroes, and the page includes an explicit **Export analytics JSON** action. The browser-facing page is separate from the machine-readable `/api/v1/analytics` endpoint; downloads use `/api/v1/analytics/export` and include the selected filters.
 
 Use the small gear in the overview header to assign compact dashboard aliases for models and machines. Aliases affect presentation only; raw identities remain available in tooltips and the data view.
 

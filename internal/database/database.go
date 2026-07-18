@@ -161,7 +161,14 @@ type AnalyticsSummary struct {
 	UnknownEvents    int64        `json:"unknown_events"`
 	EstimatedCost    CostSummary  `json:"estimated_cost"`
 	Cache            CacheSummary `json:"cache"`
+	SessionTokens    int64        `json:"session_tokens"`
 	Threads          int64        `json:"threads"`
+}
+
+type AnalyticsComparison struct {
+	PreviousTokens     int64    `json:"previous_tokens"`
+	PreviousEvents     int64    `json:"previous_events"`
+	TokenChangePercent *float64 `json:"token_change_percent,omitempty"`
 }
 
 type AnalyticsPoint struct {
@@ -210,6 +217,7 @@ type Analytics struct {
 	EndDate        string               `json:"end_date"`
 	Bucket         string               `json:"bucket"`
 	Summary        AnalyticsSummary     `json:"summary"`
+	Comparison     *AnalyticsComparison `json:"comparison,omitempty"`
 	Points         []AnalyticsPoint     `json:"points"`
 	MaxTokens      int64                `json:"max_tokens"`
 	Breakdown      []AnalyticsBreakdown `json:"breakdown"`
@@ -882,11 +890,14 @@ FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleToken
 func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics, error) {
 	query, start, end := normalizeAnalyticsQuery(query)
 	result := Analytics{Filter: query, Bucket: "day"}
+	if query.Period == "24h" {
+		result.Bucket = "hour"
+	}
 	result.LifetimeTokens, _ = s.LifetimeTokens(ctx)
-	result.StartDate = dateOnly(end.AddDate(0, 0, -1)).Format("2006-01-02")
+	result.StartDate = dateOnly(end.Add(-time.Nanosecond)).Format("2006-01-02")
 	result.EndDate = result.StartDate
 	if !start.IsZero() {
-		result.StartDate = dateOnly(start).Format("2006-01-02")
+		result.StartDate = start.UTC().Format("2006-01-02")
 	}
 	if query.Period == "all" {
 		result.Bucket = "month"
@@ -896,10 +907,26 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 	if err := s.analyticsSummary(ctx, where, args, &result.Summary); err != nil {
 		return Analytics{}, err
 	}
+	if !start.IsZero() {
+		previousEnd := start
+		previousStart := previousEnd.Add(-end.Sub(start))
+		previousWhere, previousArgs := analyticsWhere(query, previousStart, previousEnd)
+		var previous AnalyticsSummary
+		if err := s.analyticsSummary(ctx, previousWhere, previousArgs, &previous); err != nil {
+			return Analytics{}, err
+		}
+		comparison := &AnalyticsComparison{PreviousTokens: previous.Tokens, PreviousEvents: previous.Events}
+		if previous.Tokens > 0 {
+			change := float64(result.Summary.Tokens-previous.Tokens) * 100 / float64(previous.Tokens)
+			comparison.TokenChangePercent = &change
+		}
+		result.Comparison = comparison
+	}
 	points, err := s.analyticsPoints(ctx, query, where, args)
 	if err != nil {
 		return Analytics{}, err
 	}
+	points = fillAnalyticsPoints(points, query, start, end)
 	result.Points = points
 	for _, point := range points {
 		if point.Tokens > result.MaxTokens {
@@ -926,16 +953,16 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 
 func normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, time.Time, time.Time) {
 	switch query.Period {
-	case "7d", "30d", "90d", "all":
+	case "24h", "7d", "30d", "90d", "all":
 	default:
 		query.Period = "30d"
 	}
 	switch query.Dimension {
-	case "projects", "harnesses", "models", "machines":
+	case "projects", "harnesses", "providers", "models", "machines":
 	default:
 		query.Dimension = "projects"
 	}
-	now := query.Now
+	now := query.Now.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -943,6 +970,9 @@ func normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, time.Time, t
 	end := today.AddDate(0, 0, 1)
 	start := time.Time{}
 	switch query.Period {
+	case "24h":
+		end = now
+		start = now.Add(-24 * time.Hour)
 	case "7d":
 		start = today.AddDate(0, 0, -6)
 	case "30d":
@@ -995,6 +1025,7 @@ COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN total_tokens ELSE 0 END), 0),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
 FROM usage_events WHERE `+where, args...).Scan(
 		&summary.Tokens,
@@ -1006,6 +1037,7 @@ FROM usage_events WHERE `+where, args...).Scan(
 		&summary.EstimatedCost.UnpricedTokens,
 		&summary.Cache.CachedTokens,
 		&summary.Cache.EligibleTokens,
+		&summary.SessionTokens,
 		&summary.Threads,
 	)
 	if err != nil {
@@ -1022,7 +1054,9 @@ FROM usage_events WHERE `+where, args...).Scan(
 
 func (s *Store) analyticsPoints(ctx context.Context, query AnalyticsQuery, where string, args []any) ([]AnalyticsPoint, error) {
 	bucketExpression := "substr(timestamp, 1, 10)"
-	if query.Period == "all" {
+	if query.Period == "24h" {
+		bucketExpression = "strftime('%Y-%m-%dT%H:00:00Z', timestamp)"
+	} else if query.Period == "all" {
 		bucketExpression = "strftime('%Y-%m', timestamp)"
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+bucketExpression+`, MIN(substr(timestamp, 1, 10)),
@@ -1044,14 +1078,71 @@ FROM usage_events WHERE `+where+` GROUP BY 1 ORDER BY 2`, args...)
 		if err := rows.Scan(&bucket, &date, &point.Tokens, &point.Events, &point.UnknownEvents, &point.InputTokens, &point.CachedTokens, &point.OutputTokens); err != nil {
 			return nil, err
 		}
-		point.Date = date
+		point.Date = bucket
+		if query.Period == "all" {
+			point.Date += "-01"
+		}
 		point.Label = analyticsPointLabel(date, query.Period)
 		result = append(result, point)
 	}
 	return result, rows.Err()
 }
 
+func fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuery, start, end time.Time) []AnalyticsPoint {
+	if len(points) == 0 {
+		return points
+	}
+	byDate := make(map[string]AnalyticsPoint, len(points))
+	for _, point := range points {
+		byDate[point.Date] = point
+	}
+
+	var first, last time.Time
+	var step func(time.Time) time.Time
+	switch query.Period {
+	case "24h":
+		first = start.UTC().Truncate(time.Hour)
+		last = end.UTC().Truncate(time.Hour).Add(time.Hour)
+		step = func(value time.Time) time.Time { return value.Add(time.Hour) }
+	case "all":
+		parsed, err := time.Parse("2006-01-02", points[0].Date)
+		if err != nil {
+			return points
+		}
+		first = time.Date(parsed.Year(), parsed.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate := end.Add(-time.Nanosecond).UTC()
+		last = time.Date(endDate.Year(), endDate.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
+		step = func(value time.Time) time.Time { return value.AddDate(0, 1, 0) }
+	default:
+		first = dateOnly(start)
+		last = dateOnly(end)
+		step = func(value time.Time) time.Time { return value.AddDate(0, 0, 1) }
+	}
+
+	result := make([]AnalyticsPoint, 0, len(points))
+	for cursor := first; cursor.Before(last); cursor = step(cursor) {
+		key := cursor.Format("2006-01-02")
+		if query.Period == "24h" {
+			key = cursor.Format("2006-01-02T15:00:00Z")
+		}
+		point, ok := byDate[key]
+		if !ok {
+			point = AnalyticsPoint{Date: key}
+		}
+		point.Label = analyticsPointLabel(point.Date, query.Period)
+		result = append(result, point)
+	}
+	return result
+}
+
 func analyticsPointLabel(date, period string) string {
+	if period == "24h" {
+		parsed, err := time.Parse(time.RFC3339, date)
+		if err != nil {
+			return date
+		}
+		return parsed.UTC().Format("Jan 2 15:00")
+	}
 	parsed, err := time.Parse("2006-01-02", date)
 	if err != nil {
 		return date
@@ -1066,6 +1157,8 @@ func analyticsBreakdownExpression(dimension string) string {
 	switch dimension {
 	case "harnesses":
 		return "NULLIF(tool, '')"
+	case "providers":
+		return "NULLIF(provider, '')"
 	case "models":
 		return "NULLIF(COALESCE(NULLIF(canonical_model, ''), raw_model), '')"
 	case "machines":
