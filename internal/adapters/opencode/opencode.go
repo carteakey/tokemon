@@ -103,6 +103,27 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 	if !hasSession {
 		return adapters.ParseResult{Cursor: adapters.Cursor{Identity: sourceIdentity}}, nil
 	}
+	for _, column := range []string{
+		"id", "time_created", "time_updated", "tokens_input", "tokens_output",
+		"tokens_reasoning", "tokens_cache_read", "tokens_cache_write", "cost",
+	} {
+		hasColumn, err := adapters.HasColumn(ctx, db, "session", column)
+		if err != nil {
+			return adapters.ParseResult{}, err
+		}
+		if !hasColumn {
+			// Older OpenCode databases can have session metadata without the
+			// token aggregates Tokemon is allowed to consume. Treat them as
+			// unsupported rather than retrying a query that cannot succeed.
+			return adapters.ParseResult{Cursor: adapters.Cursor{Identity: sourceIdentity}}, nil
+		}
+	}
+	modelExpression := "''"
+	if hasModel, err := adapters.HasColumn(ctx, db, "session", "model"); err != nil {
+		return adapters.ParseResult{}, err
+	} else if hasModel {
+		modelExpression = "model"
+	}
 	projectExpression := `''`
 	if hasDirectory, err := adapters.HasColumn(ctx, db, "session", "directory"); err != nil {
 		return adapters.ParseResult{}, err
@@ -110,7 +131,7 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 		projectExpression = "directory"
 	}
 	rows, err := db.QueryContext(ctx, `
-SELECT id, time_created, time_updated, model,
+	SELECT id, time_created, time_updated, `+modelExpression+`,
        tokens_input, tokens_output, tokens_reasoning,
        tokens_cache_read, tokens_cache_write, cost, `+projectExpression+`
 FROM session

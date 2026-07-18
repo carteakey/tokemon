@@ -94,3 +94,45 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.Fatalf("unchanged OpenCode snapshot was reparsed: %+v, error: %v", repeated, err)
 	}
 }
+
+func TestParseSkipsSessionMetadataWithoutTokenColumns(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".local", "share", "opencode")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "opencode.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE session (
+id TEXT PRIMARY KEY,
+time_created INTEGER NOT NULL,
+time_updated INTEGER NOT NULL,
+directory TEXT NOT NULL
+)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	result, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 0 {
+		t.Fatalf("unsupported schema produced %d events", len(result.Events))
+	}
+	repeated, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil || len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unsupported schema was not cached: %+v, error: %v", repeated, err)
+	}
+}
