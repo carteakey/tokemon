@@ -595,7 +595,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if pageResponse.Code != http.StatusOK {
 		t.Fatalf("analytics page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
 	}
-	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines", ">24H</a>", ">Providers</a>", "data-count=", "data-label=", "prefers-reduced-motion"} {
+	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines", ">24H</a>", ">Providers</a>", "data-count=", "data-label=", "prefers-reduced-motion", "trend-y-axis", "trend-annotation", "Peak bucket", "tick-start"} {
 		if !bytes.Contains(pageResponse.Body.Bytes(), []byte(want)) {
 			t.Fatalf("analytics page does not contain %q: %s", want, pageResponse.Body.String())
 		}
@@ -618,5 +618,31 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	}
 	if exported.Filter.Period != "7d" || exported.Summary.Tokens != 100 || exported.Filter.Dimension != "models" {
 		t.Fatalf("unexpected exported analytics: %+v", exported)
+	}
+}
+
+func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
+	for _, test := range []struct {
+		maximum int64
+		want    int64
+	}{
+		{maximum: 1, want: 1},
+		{maximum: 83_000_000, want: 100_000_000},
+		{maximum: 220_762_070, want: 250_000_000},
+	} {
+		if got := analyticsNiceMax(test.maximum); got != test.want {
+			t.Errorf("analyticsNiceMax(%d) = %d, want %d", test.maximum, got, test.want)
+		}
+	}
+
+	ticks := analyticsAxisTicks(250_000_000)
+	if len(ticks) != 5 || ticks[0].Value != 250_000_000 || ticks[0].Position != 100 || ticks[4].Value != 0 || ticks[4].Position != 0 {
+		t.Fatalf("unexpected analytics axis ticks: %+v", ticks)
+	}
+	if got := analyticsDateTickClass(5, 30, "30d"); got != " tick" {
+		t.Fatalf("30-day date tick class = %q, want tick", got)
+	}
+	if got := analyticsDateTickClass(6, 30, "30d"); got != "" {
+		t.Fatalf("unexpected intermediate 30-day tick class: %q", got)
 	}
 }

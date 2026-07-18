@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -41,6 +42,13 @@ type analyticsPageData struct {
 	ExportURL      string
 	PeakPoint      database.AnalyticsPoint
 	AverageThread  int64
+	AxisMax        int64
+	AxisTicks      []analyticsAxisTick
+}
+
+type analyticsAxisTick struct {
+	Value    int64
+	Position int
 }
 
 type aliasRow struct {
@@ -347,6 +355,75 @@ func analyticsPartPercent(value, total int64) float64 {
 	return float64(value) * 100 / float64(total)
 }
 
+func analyticsNiceMax(maximum int64) int64 {
+	if maximum <= 0 {
+		return 0
+	}
+	power := math.Pow(10, math.Floor(math.Log10(float64(maximum))))
+	fraction := float64(maximum) / power
+	niceFraction := 10.0
+	for _, candidate := range []float64{1, 1.25, 1.5, 2, 2.5, 5, 10} {
+		if fraction <= candidate {
+			niceFraction = candidate
+			break
+		}
+	}
+	return int64(math.Ceil(niceFraction * power))
+}
+
+func analyticsAxisTicks(maximum int64) []analyticsAxisTick {
+	if maximum <= 0 {
+		return nil
+	}
+	ticks := make([]analyticsAxisTick, 0, 5)
+	for position := 100; position >= 0; position -= 25 {
+		ticks = append(ticks, analyticsAxisTick{
+			Value:    int64(math.Round(float64(maximum) * float64(position) / 100)),
+			Position: position,
+		})
+	}
+	return ticks
+}
+
+func analyticsDateTickClass(index, total int, period string) string {
+	if total <= 0 || index < 0 || index >= total {
+		return ""
+	}
+	step := 1
+	switch period {
+	case "24h":
+		step = 4
+	case "30d":
+		step = 5
+	case "90d":
+		step = 15
+	case "all":
+		step = max(1, int(math.Ceil(float64(total)/6)))
+	}
+	if index != 0 && index != total-1 && index%step != 0 {
+		return ""
+	}
+	class := " tick"
+	if index == 0 {
+		class += " tick-start"
+	}
+	if index == total-1 {
+		class += " tick-end"
+	}
+	return class
+}
+
+func analyticsDateTickLabel(point database.AnalyticsPoint, period string) string {
+	if period != "24h" {
+		return point.Label
+	}
+	parsed, err := time.Parse(time.RFC3339, point.Date)
+	if err != nil {
+		return point.Label
+	}
+	return parsed.UTC().Format("15:04")
+}
+
 func analyticsPeakPoint(points []database.AnalyticsPoint) database.AnalyticsPoint {
 	if len(points) == 0 {
 		return database.AnalyticsPoint{}
@@ -539,6 +616,8 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 		"machineDisplayName":   machineDisplayName,
 		"analyticsBar":         analyticsBarPercent,
 		"analyticsPart":        analyticsPartPercent,
+		"analyticsDateTick":    analyticsDateTickClass,
+		"analyticsDateLabel":   analyticsDateTickLabel,
 		"analyticsTime":        analyticsShortTime,
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
@@ -700,6 +779,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
+	axisMax := analyticsNiceMax(result.MaxTokens)
 	page := analyticsPageData{
 		Analytics:      result,
 		ModelAliases:   modelAliases,
@@ -707,6 +787,8 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		ExportURL:      analyticsExportURL(result.Filter),
 		PeakPoint:      analyticsPeakPoint(result.Points),
 		AverageThread:  analyticsAverageThread(result.Summary),
+		AxisMax:        axisMax,
+		AxisTicks:      analyticsAxisTicks(axisMax),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -1761,15 +1843,16 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .readout-value { overflow: hidden; color: var(--text); font: 700 15px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .readout-mix { overflow: hidden; color: var(--muted); font: 10px/1.2 var(--font-data); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
     .trend-visual { position: relative; border-bottom: 1px solid var(--line); }
-    .trend-grid { position: absolute; z-index: 0; inset: 18px 16px 39px; pointer-events: none; }
-    .trend-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .38); }
-    .trend-grid i:nth-child(1) { top: 0; }
-    .trend-grid i:nth-child(2) { top: 25%; }
-    .trend-grid i:nth-child(3) { top: 50%; }
-    .trend-grid i:nth-child(4) { top: 75%; }
-    .trend-chart { position: relative; z-index: 1; display: flex; min-height: 252px; align-items: end; gap: 4px; margin-top: 8px; padding: 12px 16px 16px; overflow-x: auto; }
-    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; gap: 6px; min-height: 220px; padding: 0; border: 0; background: transparent; color: inherit; cursor: crosshair; }
+    .trend-y-axis { position: absolute; z-index: 2; top: 18px; bottom: 31px; left: 8px; width: 44px; pointer-events: none; }
+    .trend-axis-unit { position: absolute; top: -13px; right: 0; color: var(--faint); font: 700 8px/1 var(--font-data); letter-spacing: .08em; }
+    .trend-y-tick { position: absolute; right: 0; color: var(--faint); font: 9px/1 var(--font-data); transform: translateY(50%); white-space: nowrap; }
+    .trend-plot { position: relative; min-width: 0; margin-left: 58px; }
+    .trend-grid { position: absolute; z-index: 0; inset: 18px 16px 31px 0; pointer-events: none; }
+    .trend-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .44); }
+    .trend-chart { position: relative; z-index: 1; display: flex; min-height: 252px; align-items: end; gap: 4px; margin-top: 8px; padding: 12px 16px 16px 0; overflow-x: auto; }
+    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; min-height: 220px; padding: 0 0 18px; border: 0; background: transparent; color: inherit; cursor: crosshair; }
     .trend-column:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 2px; }
+    .trend-column.selected .trend-bar { border-color: var(--text); box-shadow: 0 0 0 1px rgba(240, 237, 229, .16); }
     .trend-column.unknown::after { position: absolute; right: 0; bottom: 19px; left: 0; height: 3px; border: 1px solid var(--warm); background: transparent; content: ""; }
     .trend-track { position: relative; display: flex; height: 190px; align-items: end; }
     .trend-bar { display: flex; width: 100%; min-height: 2px; flex-direction: column-reverse; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 2px 2px 0 0; background: #20251e; transform-origin: bottom; animation: chart-rise 460ms cubic-bezier(.2, .75, .25, 1) both; animation-delay: calc(var(--index) * 6ms); }
@@ -1778,8 +1861,12 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .trend-part.input { background: var(--accent-dim); }
     .trend-part.cached { background: var(--accent); }
     .trend-part.output { background: var(--warm); }
-    .trend-label { overflow: hidden; color: var(--faint); font: 9px/1 var(--font-data); opacity: 0; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
-    .period-7d .trend-label, .period-24h .trend-column:nth-child(4n + 1) .trend-label, .period-30d .trend-column:nth-child(5n + 1) .trend-label, .period-90d .trend-column:nth-child(15n + 1) .trend-label, .period-all .trend-column:nth-child(3n + 1) .trend-label { opacity: 1; }
+    .trend-label { position: absolute; bottom: 1px; left: 50%; width: max-content; color: var(--muted); font: 10px/1 var(--font-data); opacity: 0; transform: translateX(-50%); white-space: nowrap; }
+    .trend-column.tick .trend-label { opacity: 1; }
+    .trend-column.tick-start .trend-label { left: 0; transform: none; }
+    .trend-column.tick-end .trend-label { right: 0; left: auto; transform: none; }
+    .trend-annotation { position: absolute; z-index: 3; top: 0; left: 50%; display: grid; min-width: 58px; gap: 2px; padding: 3px 5px; border: 1px solid var(--warm); border-radius: 3px; background: var(--surface); color: var(--warm); font: 700 8px/1 var(--font-data); letter-spacing: .06em; text-align: center; transform: translateX(-50%); white-space: nowrap; }
+    .trend-annotation strong { color: var(--text); font-size: 9px; letter-spacing: 0; }
     .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
     .trend-panel, .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
     .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
@@ -1831,6 +1918,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       .section-meta { text-align: left; }
       .trend-readout { grid-template-columns: 1fr; gap: 5px; }
       .readout-mix { text-align: left; white-space: normal; }
+      .trend-y-axis { width: 39px; }
+      .trend-plot { margin-left: 51px; }
       footer { flex-direction: column; gap: 4px; }
     }
     @media (max-width: 430px) {
@@ -1930,19 +2019,23 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
       {{if .Points}}
       <div class="trend-readout" aria-live="polite">
-        <span class="readout-kicker">Selected bucket</span>
+        <span class="readout-kicker" id="trend-readout-kicker">Peak bucket</span>
         <strong class="readout-value" id="trend-readout-value">{{.PeakPoint.Label}} · {{commas .PeakPoint.Tokens}} tokens</strong>
         <span class="readout-mix" id="trend-readout-mix">Input {{commas .PeakPoint.InputTokens}} · Cached {{commas .PeakPoint.CachedTokens}} · Output {{commas .PeakPoint.OutputTokens}}</span>
       </div>
       <div class="trend-visual">
-        <div class="trend-grid" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-        <div class="trend-chart period-{{.Filter.Period}}" aria-label="Token volume over the selected window">
-          {{range $index, $point := .Points}}
-          <button class="trend-column{{if .UnknownEvents}} unknown{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
-            <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.MaxTokens}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
-            <span class="trend-label">{{.Label}}</span>
-          </button>
-          {{end}}
+        <div class="trend-y-axis" aria-label="Token scale"><span class="trend-axis-unit">TOKENS</span>{{range .AxisTicks}}<span class="trend-y-tick" style="bottom: {{.Position}}%">{{compact .Value}}</span>{{end}}</div>
+        <div class="trend-plot">
+          <div class="trend-grid" aria-hidden="true">{{range .AxisTicks}}<i style="bottom: {{.Position}}%"></i>{{end}}</div>
+          <div class="trend-chart period-{{.Filter.Period}}" aria-label="Token volume over the selected window">
+            {{range $index, $point := .Points}}
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+              {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
+              <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
+              <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
+            </button>
+            {{end}}
+          </div>
         </div>
       </div>
       {{else}}<div class="empty-chart">No token activity in this window.</div>{{end}}
@@ -2002,8 +2095,12 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 
     const value = document.getElementById('trend-readout-value');
     const mix = document.getElementById('trend-readout-mix');
+    const kicker = document.getElementById('trend-readout-kicker');
     const showPoint = (column) => {
       if (!value || !mix) return;
+      document.querySelectorAll('.trend-column.selected').forEach((selected) => selected.classList.remove('selected'));
+      column.classList.add('selected');
+      if (kicker) kicker.textContent = column.classList.contains('peak') ? 'Peak bucket' : 'Selected bucket';
       value.textContent = column.dataset.label + ' · ' + number.format(Number(column.dataset.tokens)) + ' tokens';
       mix.textContent = 'Input ' + number.format(Number(column.dataset.input)) + ' · Cached ' + number.format(Number(column.dataset.cached)) + ' · Output ' + number.format(Number(column.dataset.output));
     };
