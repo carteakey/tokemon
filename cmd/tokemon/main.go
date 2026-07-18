@@ -30,7 +30,11 @@ import (
 	"github.com/tokemon/tokemon/internal/usage"
 )
 
-const defaultDatabase = "tokemon.db"
+const (
+	defaultDatabase        = "tokemon.db"
+	minAgentFailureBackoff = 5 * time.Second
+	maxAgentFailureBackoff = 5 * time.Minute
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -392,14 +396,8 @@ func runAgent(args []string) error {
 	for {
 		err := pass(ctx)
 		if err != nil && ctx.Err() == nil {
-			fmt.Fprintln(os.Stderr, "tokemon agent:", err)
-			currentInterval = currentInterval * 2
-			if currentInterval > 5*time.Minute {
-				currentInterval = 5 * time.Minute
-			}
-			if currentInterval < *interval {
-				currentInterval = *interval
-			}
+			currentInterval = nextAgentFailureInterval(*interval, currentInterval)
+			fmt.Fprintf(os.Stderr, "tokemon agent: %v (retrying in %s)\n", err, currentInterval)
 		} else {
 			currentInterval = *interval
 		}
@@ -413,6 +411,24 @@ func runAgent(args []string) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func nextAgentFailureInterval(configured, current time.Duration) time.Duration {
+	baseline := configured
+	if baseline < minAgentFailureBackoff {
+		baseline = minAgentFailureBackoff
+	}
+	ceiling := maxAgentFailureBackoff
+	if ceiling < baseline {
+		ceiling = baseline
+	}
+	if current < baseline {
+		return baseline
+	}
+	if current >= ceiling || current > ceiling/2 {
+		return ceiling
+	}
+	return current * 2
 }
 
 type stringListFlag []string
