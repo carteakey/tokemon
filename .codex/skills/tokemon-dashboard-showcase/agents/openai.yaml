@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tokemon Dashboard Showcase"
+  short_description: "Capture polished Tokemon dashboard screenshots"
+  default_prompt: "Use $tokemon-dashboard-showcase to capture and package polished Tokemon dashboard screenshots for sharing."

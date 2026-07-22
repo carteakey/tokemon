@@ -15,19 +15,16 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/tokemon/tokemon/internal/adapters"
-	"github.com/tokemon/tokemon/internal/adapters/antigravity"
-	"github.com/tokemon/tokemon/internal/adapters/claude"
-	"github.com/tokemon/tokemon/internal/adapters/codex"
-	"github.com/tokemon/tokemon/internal/adapters/copilot"
-	"github.com/tokemon/tokemon/internal/adapters/generic"
-	"github.com/tokemon/tokemon/internal/adapters/opencode"
+	"github.com/tokemon/tokemon/internal/adapters/builtin"
 	localagent "github.com/tokemon/tokemon/internal/agent"
 	"github.com/tokemon/tokemon/internal/api"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/usage"
+	"github.com/tokemon/tokemon/internal/version"
 )
 
 const (
@@ -45,7 +42,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, or purge")
+		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, version, or purge")
 	}
 	switch args[0] {
 	case "serve":
@@ -64,12 +61,22 @@ func run(args []string) error {
 		return runAgent(args[1:])
 	case "catalog":
 		return runCatalog(args[1:])
+	case "version":
+		return runVersion(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runVersion(args []string) error {
+	if len(args) != 0 {
+		return errors.New("usage: tokemon version")
+	}
+	fmt.Println(version.Current().String())
+	return nil
 }
 
 func runCatalog(args []string) error {
@@ -98,6 +105,7 @@ func runServe(args []string) error {
 	databasePath := flags.String("database", envOr("TOKEMON_DATABASE", defaultDatabase), "SQLite database path")
 	ingestToken := flags.String("ingest-token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared token for event ingestion")
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
+	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -113,12 +121,16 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath)
+	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
 	modelCatalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
 	}
-	store, err := database.Open(*databasePath, modelCatalog)
+	location, err := loadTimezone(*timezone)
+	if err != nil {
+		return err
+	}
+	store, err := database.OpenWithLocation(*databasePath, modelCatalog, location)
 	if err != nil {
 		return err
 	}
@@ -257,6 +269,7 @@ func runDiscover(args []string) error {
 		{"GitHub Copilot CLI", filepath.Join(home, ".copilot", "session-state"), true},
 		{"OpenCode", filepath.Join(home, ".local", "share", "opencode", "opencode.db"), true},
 		{"Antigravity CLI", filepath.Join(home, ".gemini", "antigravity-cli", "conversations"), true},
+		{"OpenClaw", filepath.Join(home, ".openclaw", "agents"), true},
 		{"Config", filepath.Join(home, ".config"), false},
 		{"Local data", filepath.Join(home, ".local", "share"), false},
 		{"Application Support", filepath.Join(home, "Library", "Application Support"), false},
@@ -288,8 +301,10 @@ func runAgent(args []string) error {
 	token := flags.String("token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared ingestion token")
 	machineID := flags.String("machine-id", envOr("TOKEMON_MACHINE_ID", ""), "stable machine identifier (defaults to hostname)")
 	home := flags.String("home", envOr("TOKEMON_HOME", ""), "home directory to scan (defaults to the current user's home)")
+	adapterSelection := flags.String("adapters", envOr("TOKEMON_ADAPTERS", ""), "comma-separated adapter IDs (default: all built-ins)")
 	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
 	onceTimeout := flags.Duration("timeout", 5*time.Minute, "maximum duration for a one-shot scan and upload")
+	verbose := flags.Bool("verbose", false, "show every source during a scan")
 	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
 	statePath := flags.String("state", envOr("TOKEMON_STATE", ""), "local state database (defaults to ~/.local/share/tokemon/state.db)")
 	once := flags.Bool("once", false, "scan and upload once, then exit")
@@ -317,7 +332,16 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, interval, statePath)
+	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, adapterSelection, interval, statePath)
+	if len(jsonlPaths) == 0 {
+		configuredJSONL := strings.TrimSpace(os.Getenv("TOKEMON_JSONL_PATHS"))
+		if configuredJSONL == "" {
+			configuredJSONL = configValues["TOKEMON_JSONL_PATHS"]
+		}
+		for _, path := range splitConfiguredPaths(configuredJSONL) {
+			_ = jsonlPaths.Set(path)
+		}
+	}
 	if *machineID == "" {
 		var err error
 		*machineID, err = os.Hostname()
@@ -334,11 +358,18 @@ func runAgent(args []string) error {
 	}
 	defer stateStore.Close()
 
-	list := []adapters.Adapter{claude.New(*home), codex.New(*home), copilot.New(*home), opencode.New(*home), antigravity.New(*home)}
-	if len(jsonlPaths) > 0 {
-		list = append(list, generic.New(jsonlPaths...))
+	list, definitions, err := builtin.Build(builtin.Config{Home: *home, JSONLPaths: append([]string(nil), jsonlPaths...)}, splitConfiguredList(*adapterSelection))
+	if err != nil {
+		return err
 	}
 	client := localagent.Client{ServerURL: *serverURL, Token: *token}
+	runtimeVersion := version.Current()
+	heartbeatAdapters := make([]localagent.AdapterHeartbeat, 0, len(definitions))
+	for index, definition := range definitions {
+		heartbeatAdapters = append(heartbeatAdapters, localagent.AdapterHeartbeat{
+			ID: definition.ID, Version: definition.Version, Capabilities: list[index].Capabilities(),
+		})
+	}
 	pass := func(ctx context.Context) error {
 		snapshot, err := stateStore.Snapshot(ctx, *machineID)
 		if err != nil {
@@ -346,20 +377,43 @@ func runAgent(args []string) error {
 		}
 		events, reports := adapters.CollectWithCursors(ctx, list, *machineID, snapshot.Cursors)
 		var sourceErrors []error
+		sourceCount := 0
 		for _, report := range reports {
+			if report.Path != "" {
+				sourceCount++
+			}
 			if report.Err != nil {
 				err := fmt.Errorf("%s %s: %w", report.Adapter, displayHome(report.Path, *home), report.Err)
 				sourceErrors = append(sourceErrors, err)
 				fmt.Fprintln(os.Stderr, "tokemon agent:", err)
 				continue
 			}
-			fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
+			if *verbose {
+				fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
+			}
+		}
+		snapshotCount := len(events)
+		if !*verbose {
+			fmt.Printf("scanned %d sources (%d session snapshots)\n", len(reports), snapshotCount)
+		}
+		if err := client.Heartbeat(ctx, localagent.HeartbeatRequest{
+			MachineID:        *machineID,
+			AgentVersion:     runtimeVersion.Version,
+			OperatingSystem:  runtimeVersion.OS,
+			Architecture:     runtimeVersion.Arch,
+			Adapters:         heartbeatAdapters,
+			SourceCount:      sourceCount,
+			SourceErrorCount: len(sourceErrors),
+		}); err != nil {
+			// Heartbeats are diagnostic and must never prevent a successful data
+			// upload or advance/rollback local cursor state.
+			fmt.Fprintln(os.Stderr, "tokemon agent: heartbeat:", err)
 		}
 		pending, err := stateStore.Pending(ctx, *machineID, events)
 		if err != nil {
 			return err
 		}
-		eventCount := len(events)
+		eventCount := snapshotCount
 		events = nil
 		if len(pending) > 0 {
 			result, err := client.Ingest(ctx, pending)
@@ -444,7 +498,7 @@ func (values *stringListFlag) Set(value string) error {
 	return nil
 }
 
-func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home *string, interval *time.Duration, statePath *string) {
+func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home, adapterSelection *string, interval *time.Duration, statePath *string) {
 	if !flagWasSet(flags, "server") && os.Getenv("TOKEMON_SERVER_URL") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_URL"]); value != "" {
 			*serverURL = value
@@ -465,6 +519,11 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 			*home = value
 		}
 	}
+	if !flagWasSet(flags, "adapters") && os.Getenv("TOKEMON_ADAPTERS") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_ADAPTERS"]); value != "" {
+			*adapterSelection = value
+		}
+	}
 	if !flagWasSet(flags, "interval") && os.Getenv("TOKEMON_SCAN_INTERVAL") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SCAN_INTERVAL"]); value != "" {
 			if parsed, err := time.ParseDuration(value); err == nil {
@@ -479,7 +538,7 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 	}
 }
 
-func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath *string) {
+func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath, timezone *string) {
 	if !flagWasSet(flags, "addr") && os.Getenv("TOKEMON_SERVER_ADDR") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_ADDR"]); value != "" {
 			*addr = value
@@ -498,6 +557,11 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 	if !flagWasSet(flags, "catalog") && os.Getenv("TOKEMON_MODEL_CATALOG") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_MODEL_CATALOG"]); value != "" {
 			*catalogPath = value
+		}
+	}
+	if !flagWasSet(flags, "timezone") && os.Getenv("TOKEMON_ANALYTICS_TIMEZONE") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_ANALYTICS_TIMEZONE"]); value != "" {
+			*timezone = value
 		}
 	}
 }
@@ -522,6 +586,42 @@ func configDurationEnv(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func splitConfiguredList(value string) []string {
+	var result []string
+	for _, item := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	}) {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func splitConfiguredPaths(value string) []string {
+	var result []string
+	for _, item := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func loadTimezone(value string) (*time.Location, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "UTC"
+	}
+	location, err := time.LoadLocation(value)
+	if err != nil {
+		return nil, fmt.Errorf("load timezone %q: %w", value, err)
+	}
+	return location, nil
 }
 
 func readEvents(path string) ([]usage.Event, error) {
@@ -600,7 +700,8 @@ func printUsage() {
 
 Commands:
   serve       start the HTTP API and dashboard
-	 agent       scan local Claude Code/Codex/Copilot/OpenCode usage and upload metadata
+  agent       scan local provider usage and upload metadata
+  version     print build and platform identity
   import      ingest normalized JSONL into SQLite
   export      export normalized JSONL from SQLite
   inspect     validate and print the outgoing JSONL payload
@@ -610,7 +711,8 @@ Commands:
 
 Examples:
   tokemon serve --config ~/.config/tokemon/server.env
-  tokemon agent --server http://127.0.0.1:8080 --once
+  tokemon agent --server http://127.0.0.1:8080 --adapters claude-code,codex --once
+  tokemon version
   tokemon import --database ./data/tokemon.db usage.jsonl
   tokemon inspect usage.jsonl
   tokemon catalog validate --catalog catalog/models.yaml`)

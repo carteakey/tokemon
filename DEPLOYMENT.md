@@ -46,8 +46,8 @@ Use one Go binary and one normalized event contract, with a platform-appropriate
 
 | Platform | Distribution | Supervisor | Default source access |
 | --- | --- | --- | --- |
-| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
-| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations` |
+| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations`, `~/.openclaw/agents/*/sessions` |
+| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations`, `~/.openclaw/agents/*/sessions` |
 | Minimal/managed hosts | signed release archive | systemd or an existing orchestrator | explicit configured paths |
 
 The server remains a separate deployment from the agents. It owns SQLite, ingestion authentication, analytics, and the dashboard. An agent only reads local usage metadata and makes outbound requests.
@@ -87,11 +87,37 @@ TOKEMON_MACHINE_ID=mac-mini
 TOKEMON_SCAN_INTERVAL=1m
 TOKEMON_HOME=/Users/example
 TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
+TOKEMON_ADAPTERS=claude-code,codex
+TOKEMON_JSONL_PATHS=~/ai-usage/*.jsonl
 ```
 
 Resolution order is explicit flags, environment variables, the config file, then safe defaults. Secrets must not be placed in process arguments or container image layers. Config files containing tokens are user-readable only (`0600`).
 
-The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, `--home`, and `--state`, plus the corresponding `TOKEMON_*` environment variables. The macOS installer writes this file and launches the service with `--config`. If no state path is supplied, the agent uses `~/.local/share/tokemon/state.db`.
+The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, `--home`, `--state`, and `--adapters`, plus the corresponding `TOKEMON_*` environment variables. `TOKEMON_ADAPTERS` is an optional comma-separated allowlist; an empty value enables all native adapters. Configured `TOKEMON_JSONL_PATHS` opts the generic JSONL adapter in. The macOS and Linux installers write this file and launch the service with `--config`; they also accept `--state` so an upgrade preserves a non-default cursor database. If no state path is supplied, the agent uses `~/.local/share/tokemon/state.db`.
+
+The agent sends a metadata-only heartbeat after each scan to `/api/v1/agents/heartbeat`. It reports its build version, operating system, architecture, selected adapter IDs, source count, and source-error count. It never sends local paths or provider record content in a heartbeat. `GET /api/v1/machines` exposes the resulting deployment metadata for verification.
+
+## One install path for macOS and Linux
+
+The same release archive works for macOS and Linux on arm64 and amd64. The installer runs as the current user, writes a mode-0600 config, verifies release checksums, and installs a user-level launchd or systemd supervisor without requiring Go, Docker, or root:
+
+```bash
+bash deploy/install-agent.sh \
+  --version 0.3.0 \
+  --server https://tokemon.example.ts.net \
+  --token 'replace-with-a-generated-secret' \
+  --adapters claude-code,codex
+```
+
+For local development or an unreleased build, replace `--version 0.3.0` with `--binary ./tokemon`. Use `--no-supervisor` when an existing orchestrator owns the process. The installer preserves `~/.local/share/tokemon/state.db` on uninstall.
+
+Release artifacts use the names `tokemon_VERSION_OS_ARCH.tar.gz` plus `checksums.txt`. Build the four native agent artifacts with:
+
+```bash
+bash deploy/build-release.sh 0.3.0
+```
+
+Attach the generated archives and checksum file to the matching `v0.3.0` release. Agents then have one stable, checksum-verified installation flow across supported Unix systems.
 
 ## Machine onboarding flow
 
@@ -135,14 +161,14 @@ The agent must:
 
 File and append-only sources advance their cursors incrementally, including safe one-line context lookback for Claude duration metadata. Database-backed and context-dependent snapshot adapters cache unchanged file/database signatures and retain only cursor metadata, never parsed event slices. The agent state store loads cursors at the start of a pass and looks up fingerprints only for that pass's event IDs in bounded chunks; it does not load the lifetime fingerprint table into memory. Failed uploads leave both cursors and fingerprints uncommitted; replacement, truncation, and rotation reset file cursors safely. This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
 
-The Antigravity adapter caches the direct `conversations` directory listing by directory metadata, caches SQLite capability checks by database file signature, and skips reopening an unchanged source when its cursor is already current. The main database and its `-wal` sidecar are included in the signature, so active writes invalidate the cache while unchanged or malformed files do not trigger repeated SQLite probes. The cache retains only cursors and signatures, never parsed event slices. Agent upload failures wait at least five seconds, double the retry delay after each failure, and cap it at five minutes.
+The Antigravity adapter caches the direct `conversations` directory listing by directory metadata, caches SQLite capability checks by database file signature, and skips reopening an unchanged source when its cursor is already current. It reads the metadata-only trajectory project URI, retains only its normalized basename, and never sends the full local path. The parser version is part of the cursor identity, so metadata additions can backfill existing snapshots once without changing deterministic event IDs. The main database and its `-wal` sidecar are included in the signature, so active writes invalidate the cache while unchanged or malformed files do not trigger repeated SQLite probes. The cache retains only cursors and signatures, never parsed event slices. Agent upload failures wait at least five seconds, double the retry delay after each failure, and cap it at five minutes.
 
 ## Phase 3: prove provider coverage
 
 Complete the adapters against representative fixtures, then validate one real Claude Code transcript without retaining its content. The evidence set should cover:
 
 - Claude Code assistant usage records, cache fields, duration when present, and unknown values;
-- Codex, GitHub Copilot CLI, and OpenCode model aliases, token fields, sessions, and source discovery;
+- Codex, GitHub Copilot CLI, OpenCode, and OpenClaw model aliases, token fields, sessions, and source discovery;
 - exact `inspect` output for each provider;
 - assertions that prompts, responses, titles, repository paths, and source code never enter outgoing events.
 
@@ -209,6 +235,7 @@ ${HOME}/.claude/projects     → /agent-home/.claude/projects:ro
 ${HOME}/.codex               → /agent-home/.codex:ro
 ${HOME}/.copilot/session-state → /agent-home/.copilot/session-state:ro
 ${HOME}/.local/share/opencode → /agent-home/.local/share/opencode:ro
+${HOME}/.openclaw/agents     → /agent-home/.openclaw/agents:ro
 ```
 
 The server can be kept running as a detached Compose service from the repository
@@ -219,6 +246,11 @@ docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 curl http://127.0.0.1:18787/healthz
 ```
+
+The Compose service defaults to the image's non-root UID. When `./data` is a
+bind mount whose SQLite files are owned by a different host user, set
+`TOKEMON_UID` and `TOKEMON_GID` for that deployment so SQLite can write its
+database and WAL files without making the data directory world-writable.
 
 The service restarts unless explicitly stopped, and SQLite persists in
 `./data/tokemon.db`. The default host port is `18787` and binds all host

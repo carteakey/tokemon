@@ -157,9 +157,14 @@ func TestParseGenerationMetadataWithoutReadingConversationContent(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
 CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
 INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?);
 INSERT INTO steps (idx, step_payload) VALUES (0, 'secret prompt and response');`, 7, fixtureMetadata(), len(fixtureMetadata())); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)`, "main", fixtureTrajectoryMetadata()); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -200,24 +205,40 @@ INSERT INTO steps (idx, step_payload) VALUES (0, 'secret prompt and response');`
 	if event.Timestamp != time.Date(2026, 7, 12, 21, 30, 0, 123, time.UTC) || event.TokenAccuracy != usage.AccuracyReported {
 		t.Fatalf("unexpected timestamp or accuracy: %+v", event)
 	}
-	if event.Project != "" || event.Metadata != nil || event.Source.Identity == sources[0].Path || event.SessionID != "session-private-title" {
+	if event.Project != "carteakey.dev" || event.Metadata != nil || event.Source.Identity == sources[0].Path || event.SessionID != "session-private-title" {
 		t.Fatalf("privacy boundary failed: %+v", event)
 	}
 	if err := event.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if len(opened) != 1 {
-		t.Fatalf("opened SQLite handles = %d, want 1", len(opened))
+	legacyCursor := adapters.Cursor{Identity: adapters.HashIdentity(sources[0].Path), Offset: result.Cursor.Offset}
+	backfill, err := a.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: legacyCursor})
+	if err != nil || len(backfill.Events) != 1 {
+		t.Fatalf("legacy cursor backfill = %+v, error: %v", backfill, err)
 	}
-	stats := opened[0].Stats()
-	if stats.InUse != 0 || stats.OpenConnections != 0 || stats.Idle != 0 {
-		t.Fatalf("SQLite handles leaked: %+v", stats)
+	if backfill.Events[0].EventID != event.EventID || backfill.Events[0].Project != event.Project {
+		t.Fatalf("legacy cursor changed event identity or project: first=%+v backfill=%+v", event, backfill.Events[0])
+	}
+	if len(opened) != 2 {
+		t.Fatalf("opened SQLite handles = %d, want 2", len(opened))
+	}
+	for _, db := range opened {
+		stats := db.Stats()
+		if stats.InUse != 0 || stats.OpenConnections != 0 || stats.Idle != 0 {
+			t.Fatalf("SQLite handles leaked: %+v", stats)
+		}
 	}
 }
 
 func TestDecodeGenerationMetadataRejectsMalformedData(t *testing.T) {
 	if _, ok := decodeGenerationMetadata([]byte("secret transcript")); ok {
 		t.Fatal("malformed protobuf was accepted")
+	}
+}
+
+func TestDecodeTrajectoryProjectNormalizesFileURI(t *testing.T) {
+	if project := decodeTrajectoryProject(fixtureTrajectoryMetadata()); project != "carteakey.dev" {
+		t.Fatalf("project = %q, want carteakey.dev", project)
 	}
 }
 
@@ -291,6 +312,10 @@ func fixtureMetadata() []byte {
 	timestamp := message(varintField(1, uint64(time.Date(2026, 7, 12, 21, 30, 0, 123, time.UTC).Unix())), varintField(2, 123))
 	generation := message(bytesField(4, stats), bytesField(9, bytesField(4, timestamp)), bytesField(19, []byte("gemini-3.5-pro")))
 	return message(bytesField(1, generation))
+}
+
+func fixtureTrajectoryMetadata() []byte {
+	return message(bytesField(1, bytesField(1, []byte("file:///Users/alice/repos/Carteakey.dev"))))
 }
 
 func message(fields ...[]byte) []byte {

@@ -2,7 +2,12 @@ services:
   tokemon:
     build:
       context: ..
+      args:
+        TOKEMON_VERSION: ${TOKEMON_VERSION:-dev}
+        TOKEMON_COMMIT: ${TOKEMON_COMMIT:-unknown}
+        TOKEMON_BUILD_DATE: ${TOKEMON_BUILD_DATE:-unknown}
     command: ["serve", "--database", "/data/tokemon.db", "--catalog", "/config/models.yaml"]
+    user: "${TOKEMON_UID:-65532}:${TOKEMON_GID:-65532}"
     ports:
       # The host port is remote-accessible on the private network by default.
       # Override TOKEMON_PORT when this port is already in use.
@@ -14,6 +19,7 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     environment:
       TOKEMON_INGEST_TOKEN: ${TOKEMON_INGEST_TOKEN:?Set TOKEMON_INGEST_TOKEN before deploying}
+      TOKEMON_ANALYTICS_TIMEZONE: ${TOKEMON_ANALYTICS_TIMEZONE:-UTC}
     restart: unless-stopped
     init: true
     read_only: true

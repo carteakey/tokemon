@@ -33,7 +33,7 @@ func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Close()
-	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v2-*.db"))
+	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v4-*.db"))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("backups = %v, err = %v", backups, err)
 	}
@@ -70,6 +70,54 @@ func TestOpenUsesWALForFileDatabase(t *testing.T) {
 	}
 	if !strings.EqualFold(journalMode, "wal") {
 		t.Fatalf("journal mode = %q, want wal", journalMode)
+	}
+}
+
+func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	err = store.RecordHeartbeat(context.Background(), AgentHeartbeat{
+		MachineID: "machine", AgentVersion: "0.3.0", OperatingSystem: "darwin", Architecture: "arm64",
+		Adapters: []string{"openclaw", "codex", "codex"}, SourceCount: 3, SourceErrorCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines, err := store.Machines(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || machines[0].AgentVersion != "0.3.0" || machines[0].OperatingSystem != "darwin" || machines[0].Architecture != "arm64" || machines[0].SourceCount != 3 || machines[0].SourceErrorCount != 1 {
+		t.Fatalf("machines = %+v", machines)
+	}
+	if got := strings.Join(machines[0].DetectedAdapters, ","); got != "codex,openclaw" {
+		t.Fatalf("detected adapters = %q", got)
+	}
+	heartbeatSeenAt := machines[0].LastSeenAt
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "historical-event",
+		Timestamp:     time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		MachineID:     "machine",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		TotalTokens:   usage.Int64(1),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "0.6.0"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	machines, err = store.Machines(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || machines[0].LastSeenAt != heartbeatSeenAt {
+		t.Fatalf("historical event moved heartbeat last_seen_at: %+v", machines)
 	}
 }
 
@@ -184,6 +232,90 @@ func TestIngestIsIdempotentAndDerivesEvolution(t *testing.T) {
 	}
 	if overview.EstimatedCost.Amount != 0.00018 || overview.EstimatedCost.PricedTokens != 10 || overview.EstimatedCost.UnpricedTokens != 0 {
 		t.Fatalf("unexpected estimated cost summary: %+v", overview.EstimatedCost)
+	}
+}
+
+func TestDetailedCodexUsageDeduplicatesMatchingRecords(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	timestamp := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	detailed := func(id, session string) usage.Event {
+		return usage.Event{
+			SchemaVersion:    usage.SchemaVersion,
+			EventID:          id,
+			Timestamp:        timestamp,
+			MachineID:        "machine",
+			SessionID:        session,
+			Provider:         "openai",
+			Model:            "gpt-5.6",
+			Tool:             "codex",
+			InputTokens:      usage.Int64(2),
+			OutputTokens:     usage.Int64(2),
+			CacheReadTokens:  usage.Int64(8),
+			CacheWriteTokens: usage.Int64(0),
+			ReasoningTokens:  usage.Int64(1),
+			TotalTokens:      usage.Int64(12),
+			TokenAccuracy:    usage.AccuracyReported,
+			Source:           usage.Source{Adapter: "codex", AdapterVersion: "0.4.0"},
+		}
+	}
+	first := detailed("codex-first", "session-1")
+	duplicate := detailed("codex-duplicate", "session-1")
+	separateSession := detailed("codex-separate-session", "session-2")
+	result, err := store.Ingest(context.Background(), []usage.Event{first, duplicate, separateSession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Accepted != 2 || result.Duplicates != 1 || result.CurrentTotal != 24 {
+		t.Fatalf("unexpected deduplication result: %+v", result)
+	}
+	events, err := store.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("stored events = %d, want 2: %+v", len(events), events)
+	}
+}
+
+func TestDetailedCodexUsageMergesDedupConflictDuringRefresh(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	timestamp := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	makeEvent := func(id string, total int64) usage.Event {
+		return usage.Event{
+			SchemaVersion: usage.SchemaVersion, EventID: id, Timestamp: timestamp,
+			MachineID: "machine", SessionID: "session", Provider: "openai", Model: "gpt-5.6", Tool: "codex",
+			InputTokens: usage.Int64(total), OutputTokens: usage.Int64(0), CacheReadTokens: usage.Int64(0),
+			CacheWriteTokens: usage.Int64(0), ReasoningTokens: usage.Int64(0), TotalTokens: usage.Int64(total),
+			TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "0.6.0"},
+		}
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{makeEvent("old-event", 10), makeEvent("other-event", 20)}); err != nil {
+		t.Fatal(err)
+	}
+	refreshed := makeEvent("old-event", 20)
+	result, err := store.Ingest(context.Background(), []usage.Event{refreshed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Accepted != 0 || result.Duplicates != 1 || result.CurrentTotal != 20 {
+		t.Fatalf("unexpected merged refresh: %+v", result)
+	}
+	events, err := store.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "old-event" || events[0].TotalTokens == nil || *events[0].TotalTokens != 20 {
+		t.Fatalf("dedup conflict was not merged: %+v", events)
 	}
 }
 
@@ -475,6 +607,51 @@ func TestActivityBuildsPixelCalendarAndPreservesUnknownTotals(t *testing.T) {
 	future, ok := findDay("2026-07-13")
 	if !ok || !future.Future {
 		t.Fatalf("expected future cells after the current day: %+v", future)
+	}
+}
+
+func TestConfiguredTimezoneControlsCalendarBuckets(t *testing.T) {
+	location := time.FixedZone("Toronto", -4*60*60)
+	store, err := OpenWithLocation(t.TempDir()+"/tokemon.db", catalog.Empty(), location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "timezone-before-midnight", Timestamp: time.Date(2026, 7, 18, 2, 30, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "timezone-after-midnight", Timestamp: time.Date(2026, 7, 18, 5, 0, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+
+	daily, err := store.DailyUsage(context.Background(), time.Date(2026, 7, 17, 0, 0, 0, 0, location), time.Date(2026, 7, 19, 0, 0, 0, 0, location))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(daily) != 2 || daily[0].Date != "2026-07-17" || daily[0].Tokens != 10 || daily[1].Date != "2026-07-18" || daily[1].Tokens != 20 {
+		t.Fatalf("daily buckets ignored configured timezone: %+v", daily)
+	}
+
+	analytics, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "projects", Now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if analytics.Timezone != "Toronto" || analytics.Summary.ActiveDays != 2 {
+		t.Fatalf("analytics timezone or active days = %+v", analytics)
+	}
+	var july17, july18 AnalyticsPoint
+	for _, point := range analytics.Points {
+		switch point.Date {
+		case "2026-07-17":
+			july17 = point
+		case "2026-07-18":
+			july18 = point
+		}
+	}
+	if july17.Tokens != 10 || july18.Tokens != 20 {
+		t.Fatalf("analytics buckets ignored configured timezone: Jul17=%+v Jul18=%+v", july17, july18)
 	}
 }
 

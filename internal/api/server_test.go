@@ -75,6 +75,49 @@ func TestBatchIngestRequiresTokenAndUpdatesEvolution(t *testing.T) {
 	}
 }
 
+func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"machine_id":"linux-box","agent_version":"0.3.0","operating_system":"linux","architecture":"arm64","adapters":[{"id":"codex","version":"0.6.0"},{"id":"openclaw","version":"0.1.0"}],"source_count":4,"source_error_count":1}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(payload))
+	unauthorized := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthorized, request)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer secret")
+	accepted := httptest.NewRecorder()
+	server.Handler().ServeHTTP(accepted, request)
+	if accepted.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d, want %d: %s", accepted.Code, http.StatusOK, accepted.Body.String())
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("machines status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var machines []database.MachineInfo
+	if err := json.Unmarshal(response.Body.Bytes(), &machines); err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || machines[0].ID != "linux-box" || machines[0].AgentVersion != "0.3.0" || machines[0].OperatingSystem != "linux" || machines[0].Architecture != "arm64" || machines[0].SourceCount != 4 || machines[0].SourceErrorCount != 1 {
+		t.Fatalf("machines = %+v", machines)
+	}
+	if strings.Join(machines[0].DetectedAdapters, ",") != "codex,openclaw" {
+		t.Fatalf("detected adapters = %v", machines[0].DetectedAdapters)
+	}
+}
+
 func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
@@ -435,6 +478,7 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 		"copilot-cli": "copilot",
 		"opencode":    "opencode",
 		"antigravity": "gemini",
+		"openclaw":    "openclaw",
 	} {
 		glyph := glyphForHarness(tool)
 		if glyph.Kind != "harness" || glyph.Preset != preset {

@@ -211,6 +211,8 @@ func glyphForHarness(tool string) pixelGlyph {
 		return glyphFromRows("harness", "copilot", 3, "d...d", ".ddd.", "ddddd", ".ddd.", "d...d")
 	case "antigravity", "gemini":
 		return glyphFromRows("harness", "gemini", 0, "..o..", ".odo.", "ododo", ".odo.", "..o..")
+	case "openclaw":
+		return glyphFromRows("harness", "openclaw", 1, ".ooo.", "o...o", "ooooo", "o...o", ".ooo.")
 	case "grok", "xai":
 		return glyphFromRows("harness", "grok", 1, "o...o", ".o.o.", "..o..", ".o.o.", "o...o")
 	case "deepseek":
@@ -248,6 +250,8 @@ func harnessName(tool string) string {
 		return "GitHub Copilot CLI"
 	case "antigravity":
 		return "Antigravity"
+	case "openclaw":
+		return "OpenClaw"
 	case "generic-jsonl":
 		return "Generic JSONL"
 	default:
@@ -417,11 +421,11 @@ func analyticsDateTickLabel(point database.AnalyticsPoint, period string) string
 	if period != "24h" {
 		return point.Label
 	}
-	parsed, err := time.Parse(time.RFC3339, point.Date)
-	if err != nil {
-		return point.Label
+	parts := strings.Fields(point.Label)
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
 	}
-	return parsed.UTC().Format("15:04")
+	return point.Label
 }
 
 func analyticsPeakPoint(points []database.AnalyticsPoint) database.AnalyticsPoint {
@@ -656,6 +660,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("POST /settings/aliases", s.saveSettings)
 	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
+	mux.HandleFunc("POST /api/v1/agents/heartbeat", s.heartbeat)
+	mux.HandleFunc("GET /api/v1/machines", s.machines)
 	mux.HandleFunc("GET /api/v1/evolution", s.evolution)
 	mux.HandleFunc("GET /api/v1/analytics/overview", s.overview)
 	mux.HandleFunc("GET /api/v1/analytics", s.analyticsAPI)
@@ -677,6 +683,21 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 type batchRequest struct {
 	Events []usage.Event `json:"events"`
+}
+
+type heartbeatAdapter struct {
+	ID      string `json:"id"`
+	Version string `json:"version"`
+}
+
+type heartbeatRequest struct {
+	MachineID        string             `json:"machine_id"`
+	AgentVersion     string             `json:"agent_version"`
+	OperatingSystem  string             `json:"operating_system"`
+	Architecture     string             `json:"architecture"`
+	Adapters         []heartbeatAdapter `json:"adapters"`
+	SourceCount      int                `json:"source_count"`
+	SourceErrorCount int                `json:"source_error_count"`
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
@@ -707,6 +728,61 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.store.Ingest(r.Context(), request.Events)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var request heartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(request.MachineID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine_id is required"})
+		return
+	}
+	if request.SourceCount < 0 || request.SourceErrorCount < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source counts cannot be negative"})
+		return
+	}
+	if len(request.Adapters) > 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many adapters"})
+		return
+	}
+	adapterIDs := make([]string, 0, len(request.Adapters))
+	for _, adapter := range request.Adapters {
+		if strings.TrimSpace(adapter.ID) == "" || len(adapter.ID) > 128 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter IDs must be non-empty and at most 128 characters"})
+			return
+		}
+		adapterIDs = append(adapterIDs, adapter.ID)
+	}
+	if err := s.store.RecordHeartbeat(r.Context(), database.AgentHeartbeat{
+		MachineID:        request.MachineID,
+		AgentVersion:     request.AgentVersion,
+		OperatingSystem:  request.OperatingSystem,
+		Architecture:     request.Architecture,
+		Adapters:         adapterIDs,
+		SourceCount:      request.SourceCount,
+		SourceErrorCount: request.SourceErrorCount,
+	}); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Machines(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

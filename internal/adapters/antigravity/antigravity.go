@@ -1,4 +1,4 @@
-// Package antigravity reads metadata-only generation counters from Antigravity
+// Package antigravity reads metadata-only generation counters and project labels from Antigravity
 // conversation databases. It deliberately never reads the transcript tables or
 // the prompt/response payloads stored elsewhere in Antigravity's data directory.
 package antigravity
@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,7 +22,7 @@ import (
 
 const (
 	adapterID      = "antigravity"
-	adapterVersion = "0.1.0"
+	adapterVersion = "0.2.0"
 )
 
 type fileSignature struct {
@@ -103,7 +104,7 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 			seen[path] = struct{}{}
 			// We skip the expensive database probe here.
 			// Just assume every candidate .db is a source, and we will verify table existence in Parse.
-			sources = append(sources, adapters.Source{Path: path, Identity: adapters.HashIdentity(path)})
+			sources = append(sources, adapters.Source{Path: path, Identity: cursorIdentity(path)})
 		}
 	}
 	a.mu.Lock()
@@ -179,10 +180,8 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	identity := source.Identity
-	if identity == "" {
-		identity = adapters.HashIdentity(source.Path)
-	}
+	identity := cursorIdentity(source.Path)
+	eventIdentity := adapters.HashIdentity(source.Path)
 	start := request.Cursor.Offset
 	if (request.Cursor.Identity != "" && request.Cursor.Identity != identity) || start < 0 {
 		start = 0
@@ -223,6 +222,10 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return result, nil
 	}
 
+	project, err := projectFromDatabase(ctx, db)
+	if err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
 	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
 	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
 	if err != nil {
@@ -247,10 +250,11 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		}
 		events = append(events, usage.Event{
 			SchemaVersion: usage.SchemaVersion,
-			EventID:       usage.DeterministicID(request.MachineID, adapterID, identity, idx, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
+			EventID:       usage.DeterministicID(request.MachineID, adapterID, eventIdentity, idx, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
 			Timestamp:     metadata.Timestamp,
 			MachineID:     request.MachineID,
 			SessionID:     sessionID,
+			Project:       project,
 			Provider:      providerForModel(metadata.Model),
 			Model:         a.NormalizeModel(metadata.Model),
 			Tool:          "antigravity",
@@ -259,7 +263,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			TotalTokens:   usage.Int64(metadata.InputTokens + metadata.OutputTokens),
 			Currency:      "USD",
 			TokenAccuracy: usage.AccuracyReported,
-			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: identity, Offset: idx},
+			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: idx},
 		})
 	}
 	result := adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}
@@ -279,6 +283,52 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	a.parsed[source.Path] = parseEntry{signature: signature, identity: identity, resultCursor: result.Cursor}
 	a.mu.Unlock()
 	return result, nil
+}
+
+func cursorIdentity(path string) string {
+	return adapters.HashIdentity(adapterID + "\x00" + adapterVersion + "\x00" + path)
+}
+
+func projectFromDatabase(ctx context.Context, db *sql.DB) (string, error) {
+	hasTable, err := adapters.HasTable(ctx, db, "trajectory_metadata_blob")
+	if err != nil {
+		return "", err
+	}
+	if !hasTable {
+		return "", nil
+	}
+	var data []byte
+	err = db.QueryRowContext(ctx, `SELECT data FROM trajectory_metadata_blob WHERE id = 'main'`).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read Antigravity project metadata: %w", err)
+	}
+	return decodeTrajectoryProject(data), nil
+}
+
+func decodeTrajectoryProject(data []byte) string {
+	uriBytes, ok := protobufBytesField(data, 1, 1)
+	if !ok {
+		return ""
+	}
+	rawURI := strings.TrimSpace(string(uriBytes))
+	if rawURI == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return ""
+	}
+	projectPath := rawURI
+	if strings.EqualFold(parsed.Scheme, "file") {
+		projectPath = parsed.Path
+	} else if parsed.Scheme != "" {
+		return ""
+	}
+	return usage.NormalizeProject(projectPath)
 }
 
 func (a *Adapter) rememberParse(path string, signature sourceSignature, identity string, cursor adapters.Cursor, result adapters.ParseResult, err error) (adapters.ParseResult, error) {

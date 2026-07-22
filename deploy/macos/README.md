@@ -16,7 +16,7 @@ bash deploy/macos/install-server.sh \
   --token 'replace-with-a-generated-secret'
 ```
 
-The default listen address is `0.0.0.0:18080`. The server config supports `TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`, and `TOKEMON_INGEST_TOKEN`. Its LaunchAgent is `com.tokemon.server`.
+The default listen address is `0.0.0.0:18080`. The server config supports `TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`, `TOKEMON_INGEST_TOKEN`, and `TOKEMON_ANALYTICS_TIMEZONE` (an IANA name such as `America/Toronto`; default `UTC`). Its LaunchAgent is `com.tokemon.server`.
 
 The installer writes:
 
@@ -40,7 +40,8 @@ Build or obtain the matching Tokemon binary, then run:
 bash deploy/macos/install-agent.sh \
   --binary ./tokemon \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret'
+  --token 'replace-with-a-generated-secret' \
+  --adapters claude-code,codex
 ```
 
 The installer writes:
@@ -51,7 +52,9 @@ The installer writes:
 - `~/Library/LaunchAgents/com.tokemon.agent.plist`
 - `~/Library/Logs/Tokemon/agent.log`
 
-The endpoint is the server base URL. The agent appends `/api/v1/events/batch` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments.
+The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments.
+
+For the same install flow on macOS and Linux, use `deploy/install-agent.sh` with a release version. It downloads the architecture-matched archive, verifies `checksums.txt`, writes the adapter profile, and installs the native user supervisor. `deploy/macos/install-agent.sh` remains as a compatibility entry point and delegates to that shared installer.
 
 Remove the service and its config with:
 

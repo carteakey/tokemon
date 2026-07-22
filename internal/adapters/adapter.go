@@ -45,13 +45,13 @@ type ParseResult struct {
 
 // Capabilities describes which fields an adapter can report safely.
 type Capabilities struct {
-	InputTokens     bool
-	OutputTokens    bool
-	CacheTokens     bool
-	ReasoningTokens bool
-	Cost            bool
-	SessionID       bool
-	Duration        bool
+	InputTokens     bool `json:"input_tokens"`
+	OutputTokens    bool `json:"output_tokens"`
+	CacheTokens     bool `json:"cache_tokens"`
+	ReasoningTokens bool `json:"reasoning_tokens"`
+	Cost            bool `json:"cost"`
+	SessionID       bool `json:"session_id"`
+	Duration        bool `json:"duration"`
 }
 
 // Adapter discovers one provider's local usage records and normalizes them.

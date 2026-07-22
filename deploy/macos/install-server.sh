@@ -6,6 +6,7 @@ server_addr="${TOKEMON_SERVER_ADDR:-0.0.0.0:18080}"
 ingest_token="${TOKEMON_INGEST_TOKEN:-}"
 database="${TOKEMON_DATABASE:-}"
 catalog="${TOKEMON_MODEL_CATALOG:-}"
+timezone="${TOKEMON_ANALYTICS_TIMEZONE:-UTC}"
 home="${HOME:?HOME is required}"
 binary="$(command -v tokemon 2>/dev/null || true)"
 uninstall=0
@@ -20,6 +21,7 @@ Options:
   --addr ADDRESS     listen address (default: 0.0.0.0:18080)
   --database PATH    SQLite database path (default: ~/Library/Application Support/Tokemon/tokemon.db)
   --catalog PATH     model catalog YAML to copy into the managed app directory
+  --timezone NAME    IANA timezone used for dashboard calendar buckets (default: UTC)
   --uninstall        unload and remove the server LaunchAgent and config
 EOF
 }
@@ -66,6 +68,11 @@ while (($#)); do
       catalog="$2"
       shift 2
       ;;
+    --timezone)
+      (($# >= 2)) || die "--timezone requires an IANA timezone"
+      timezone="$2"
+      shift 2
+      ;;
     --uninstall)
       uninstall=1
       shift
@@ -100,6 +107,7 @@ fi
 [[ -n "$binary" && -x "$binary" ]] || die "tokemon binary not found; pass --binary PATH"
 [[ "$server_addr" != *$'\n'* && "$server_addr" != *$'\r'* ]] || die "listen address contains a newline"
 [[ "$ingest_token" != *$'\n'* && "$ingest_token" != *$'\r'* ]] || die "token contains a newline"
+[[ "$timezone" != *$'\n'* && "$timezone" != *$'\r'* ]] || die "timezone contains a newline"
 
 if [[ -z "$database" ]]; then
   database="$app_dir/tokemon.db"
@@ -128,6 +136,7 @@ mv "$managed_catalog.tmp" "$managed_catalog"
   printf 'TOKEMON_DATABASE=%s\n' "$database"
   printf 'TOKEMON_MODEL_CATALOG=%s\n' "$managed_catalog"
   printf 'TOKEMON_INGEST_TOKEN=%s\n' "$ingest_token"
+  printf 'TOKEMON_ANALYTICS_TIMEZONE=%s\n' "$timezone"
 } > "$config_path"
 chmod 0600 "$config_path"
 

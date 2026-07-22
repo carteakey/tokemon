@@ -33,29 +33,32 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 	t.Setenv("TOKEMON_DATABASE", "")
 	t.Setenv("TOKEMON_INGEST_TOKEN", "")
 	t.Setenv("TOKEMON_MODEL_CATALOG", "")
+	t.Setenv("TOKEMON_ANALYTICS_TIMEZONE", "")
 
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", ":8080", "")
 	databasePath := flags.String("database", "tokemon.db", "")
 	ingestToken := flags.String("ingest-token", "", "")
 	catalogPath := flags.String("catalog", "catalog/models.yaml", "")
+	timezone := flags.String("timezone", "UTC", "")
 	if err := flags.Parse([]string{}); err != nil {
 		t.Fatal(err)
 	}
 	applyServerConfig(flags, map[string]string{
-		"TOKEMON_SERVER_ADDR":   "0.0.0.0:18080",
-		"TOKEMON_DATABASE":      "/tmp/tokemon.db",
-		"TOKEMON_INGEST_TOKEN":  "file-token",
-		"TOKEMON_MODEL_CATALOG": "/tmp/models.yaml",
-	}, addr, databasePath, ingestToken, catalogPath)
-	if *addr != "0.0.0.0:18080" || *databasePath != "/tmp/tokemon.db" || *ingestToken != "file-token" || *catalogPath != "/tmp/models.yaml" {
-		t.Fatalf("config values not applied: addr=%q database=%q token=%q catalog=%q", *addr, *databasePath, *ingestToken, *catalogPath)
+		"TOKEMON_SERVER_ADDR":        "0.0.0.0:18080",
+		"TOKEMON_DATABASE":           "/tmp/tokemon.db",
+		"TOKEMON_INGEST_TOKEN":       "file-token",
+		"TOKEMON_MODEL_CATALOG":      "/tmp/models.yaml",
+		"TOKEMON_ANALYTICS_TIMEZONE": "America/Toronto",
+	}, addr, databasePath, ingestToken, catalogPath, timezone)
+	if *addr != "0.0.0.0:18080" || *databasePath != "/tmp/tokemon.db" || *ingestToken != "file-token" || *catalogPath != "/tmp/models.yaml" || *timezone != "America/Toronto" {
+		t.Fatalf("config values not applied: addr=%q database=%q token=%q catalog=%q timezone=%q", *addr, *databasePath, *ingestToken, *catalogPath, *timezone)
 	}
 
 	if err := flags.Set("addr", "127.0.0.1:9999"); err != nil {
 		t.Fatal(err)
 	}
-	applyServerConfig(flags, map[string]string{"TOKEMON_SERVER_ADDR": "0.0.0.0:18080"}, addr, databasePath, ingestToken, catalogPath)
+	applyServerConfig(flags, map[string]string{"TOKEMON_SERVER_ADDR": "0.0.0.0:18080"}, addr, databasePath, ingestToken, catalogPath, timezone)
 	if *addr != "127.0.0.1:9999" {
 		t.Fatalf("explicit flag was overwritten: %q", *addr)
 	}
@@ -74,6 +77,14 @@ func TestRunAgentPersistsStateAndRetriesAfterFailedUpload(t *testing.T) {
 
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/agents/heartbeat" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		if r.URL.Path != "/api/v1/events/batch" {
+			t.Fatalf("unexpected agent request path: %q", r.URL.Path)
+		}
 		calls++
 		if calls == 1 {
 			http.Error(w, "temporary failure", http.StatusServiceUnavailable)

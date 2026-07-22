@@ -87,6 +87,7 @@ Version 0.2 consists of:
 - Claude Code adapter
 - Codex adapter
 - Generic JSONL adapter
+- OpenClaw adapter
 - Incremental polling
 - Idempotent ingestion
 - One-page analytics dashboard
@@ -366,6 +367,7 @@ Finds supported tools and reports detected paths.
 ✓ Codex detected at ~/.codex
 – Gemini CLI not detected
 – OpenCode not detected
+– OpenClaw not detected
 ```
 
 ### `tokemon inspect`
@@ -422,6 +424,13 @@ Agents can run as:
 
 Native installation is preferred because local dotfiles and application data are easier to access safely.
 
+The supported install flow uses one release binary for macOS and Linux on
+arm64 and amd64. A user-level installer verifies the release checksum, writes
+the mode-0600 agent configuration, and installs launchd or systemd without
+requiring Go, Docker, or root. The same binary contains the built-in adapters;
+`TOKEMON_ADAPTERS` selects a per-machine allowlist, while an explicit generic
+JSONL path opts the generic adapter in.
+
 ### Authentication
 
 For v0.2:
@@ -472,6 +481,11 @@ The agent:
 - Retries failed uploads later
 - Reports machine status
 - Never sends conversation content
+
+The agent reports build version, operating system, architecture, selected
+adapter IDs, source counts, and source-error counts through the authenticated
+`/api/v1/agents/heartbeat` endpoint. Heartbeats contain no local paths or
+provider record content.
 
 ### Server Responsibilities
 
@@ -724,8 +738,11 @@ Ship only:
 2. Codex
 3. Generic JSONL
 4. GitHub Copilot CLI
+5. OpenClaw
 
 GitHub Copilot CLI usage is read from `~/.copilot/session-state/*/events.jsonl`. The adapter consumes only durable `session.shutdown.modelMetrics.usage` aggregates and the final directory name from session context. Prompts, responses, tool arguments, titles, repository paths, and modified-file lists are never included in normalized events. One stable snapshot is emitted per model and session; active sessions become visible after Copilot writes their shutdown aggregate.
+
+OpenClaw usage is read from `~/.openclaw/agents/*/sessions/*.jsonl`. The adapter consumes only assistant message usage metadata, provider, model, timestamps, and the session header's normalized project basename. Transcript content, tool calls, tool arguments, trajectory mirrors, and full working-directory paths are never included in normalized events. Zero-token delivery and error records are ignored, and incomplete final records remain eligible for the next poll.
 
 ### Generic JSONL
 
@@ -736,7 +753,6 @@ Any script can emit normalized events into a configured JSONL file. This gives T
 ### Later Candidates
 
 - Gemini CLI
-- OpenCode
 - Aider
 - Cursor
 - Continue
@@ -1329,6 +1345,23 @@ Example:
 }
 ```
 
+### Agent Heartbeat
+
+The heartbeat is authenticated with the same ingest credential and contains
+deployment metadata only:
+
+```json
+{
+  "machine_id": "linux-box",
+  "agent_version": "0.3.0",
+  "operating_system": "linux",
+  "architecture": "arm64",
+  "adapters": [{"id": "codex", "version": "0.6.0"}],
+  "source_count": 4,
+  "source_error_count": 0
+}
+```
+
 ---
 
 ## 30. Database Entities
@@ -1340,6 +1373,9 @@ Example:
 - `operating_system`
 - `architecture`
 - `agent_version`
+- `detected_adapters`
+- `source_count`
+- `source_error_count`
 - `first_seen_at`
 - `last_seen_at`
 
@@ -1409,6 +1445,7 @@ tokemon/
 │   ├── adapters/
 │   │   ├── claude/
 │   │   ├── codex/
+│   │   ├── builtin/
 │   │   └── genericjsonl/
 │   ├── agent/
 │   ├── analytics/
@@ -1416,6 +1453,7 @@ tokemon/
 │   ├── catalog/
 │   ├── database/
 │   ├── evolution/
+│   ├── version/
 │   ├── ingestion/
 │   ├── privacy/
 │   └── server/
@@ -1432,6 +1470,8 @@ tokemon/
 ├── migrations/
 ├── deploy/
 │   ├── docker-compose.yml
+│   ├── install-agent.sh
+│   ├── build-release.sh
 │   ├── systemd/
 │   └── launchd/
 ├── docs/
