@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests with the race detector
+        run: go test -race ./...
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Build the CLI
+        run: CGO_ENABLED=0 go build -trimpath ./cmd/tokemon
+
+      - name: Validate the model catalog
+        run: go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
+
+      - name: Validate Compose configuration
+        env:
+          TOKEMON_INGEST_TOKEN: ci-only-token
+          TOKEMON_UID: 65532
+          TOKEMON_GID: 65532
+        run: docker compose -f deploy/docker-compose.yml config --quiet

@@ -60,15 +60,13 @@ docker compose -f deploy/docker-compose.yml logs -f tokemon
 docker compose -f deploy/docker-compose.yml down
 ```
 
-The default port is `18787`; set `TOKEMON_PORT` to change it. Keep the port on a private network such as Tailscale or a VPN because the dashboard does not provide user login. See the [deployment guide](DEPLOYMENT.md) for multi-machine agents, macOS supervisors, and release installation.
+The default port is `18787`; set `TOKEMON_PORT` to change it. Keep the port on a private network such as Tailscale or a VPN because the dashboard does not provide user login. See the [public deployment guide](DEPLOYMENT.md) for multi-machine agents, macOS supervisors, and release installation.
 
 ## Roadmap
 
 - **Current:** reliable multi-machine collection, metadata-only privacy, analytics, and the evolving Tokemon dashboard.
 - **Next:** broader provider fixtures, release verification, and a smoother install path.
 - **Later:** signed macOS and Linux distribution, more providers, and deeper evolution art.
-
-Committed work lives in the [Tokemon v0.2 Linear project](https://linear.app/carteakey/project/tokemon-v02-ef3cefe83acc); the [deployment guide](DEPLOYMENT.md) contains the detailed operational roadmap.
 
 ## Develop
 
@@ -81,7 +79,7 @@ Run `go run ./cmd/tokemon --help` for the full command list.
 
 ## Documentation
 
-- [v0.2 product spec](docs/tokemon-spec-v0.2.md)
-- [Historical token-bandit spec](docs/token-bandit-spec.md)
-- [Visual style guide](STYLE_GUIDE.md)
-- [Deployment guide](DEPLOYMENT.md)
+- [v0.2 product spec](https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md)
+- [Historical token-bandit spec](https://github.com/carteakey/tokemon/blob/main/docs/token-bandit-spec.md)
+- [Visual style guide](https://github.com/carteakey/tokemon/blob/main/STYLE_GUIDE.md)
+- [Changelog](CHANGELOG.md)

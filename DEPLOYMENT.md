@@ -1,376 +1,150 @@
-# Tokemon multi-machine deployment roadmap
+# Tokemon deployment
 
-**Status:** v0.2 rollout plan
-**Last updated:** 2026-07-13
+This guide covers the supported public deployment paths for Tokemon: a persistent dashboard hub and optional agents on other trusted machines.
 
-This document is the implementation roadmap for running one Tokemon server with agents on multiple machines. Linear remains the source of truth for committed work; this document defines the architecture, rollout order, and operational checks rather than creating a second backlog.
+Tokemon has two roles:
 
-Current slice status: the shared agent config loader, macOS server/agent LaunchAgent installers, Claude Code adapter, and durable agent state are implemented and covered by tests. A second Apple Silicon Mac is installed and syncing through the primary Mac's persistent authenticated hub. Live provider validation, release publishing, and the Linux container template remain ahead.
+- **Hub:** stores usage metadata in SQLite, serves the dashboard, and accepts authenticated agent uploads.
+- **Agent:** reads supported local provider metadata, keeps local sync state, and sends metadata-only batches to the hub.
 
-## Topology and roles
+Agents are outbound-only. The hub is the only component that needs a reachable port.
 
-```mermaid
-flowchart LR
-    A[macOS agent] -->|authenticated metadata batches| S[Tokemon server]
-    B[Linux or container agent] -->|authenticated metadata batches| S
-    C[future machine agent] -->|authenticated metadata batches| S
-    S --> D[(SQLite)]
-    S --> E[Dashboard and evolution]
+## Choose a setup
+
+| Setup | Best for |
+| --- | --- |
+| Docker Compose hub | A persistent local or private-network dashboard |
+| Native agent installer | Syncing a macOS or Linux machine to an existing hub |
+| macOS LaunchAgent scripts | Running a locally built binary under launchd |
+
+Keep the hub behind a private network such as Tailscale, WireGuard, or an authenticated reverse proxy. The dashboard does not provide user login.
+
+## Requirements
+
+For the hub, install Docker Engine or Docker Desktop with Compose support. For native agents, use macOS or Linux on arm64 or amd64. A Go installation is only needed when building from source.
+
+## Run the hub with Docker Compose
+
+From the repository root, set an ingest token and start the service:
+
+```bash
+export TOKEMON_INGEST_TOKEN="$(openssl rand -hex 32)"
+export TOKEMON_UID="$(id -u)"
+export TOKEMON_GID="$(id -g)"
+
+docker compose -f deploy/docker-compose.yml up -d --build
+curl --fail http://localhost:18787/healthz
 ```
 
-| Role | Responsibility | Initial placement |
-| --- | --- | --- |
-| Server | Authenticated ingestion, SQLite, analytics, dashboard, evolution | Primary Mac, then a stable Linux host if needed |
-| Agent | Read local provider metadata, normalize, upload, retain local cursor state | Primary Mac and the second Mac already deployed |
-| Endpoint | One private base URL reachable by every trusted machine | Tailscale/WireGuard address or HTTPS hostname |
+Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port. The container listens on port `8080` internally.
 
-Agents are outbound-only. The server is the only component that needs a reachable listening port. A machine is enrolled by installing the same binary, writing the endpoint and token to its local config, and starting its platform supervisor.
+The SQLite database persists at `./data/tokemon.db`. The Compose service mounts the model catalog read-only, runs without root privileges by default, and keeps its root filesystem read-only. If the host data directory is owned by a different user, set `TOKEMON_UID` and `TOKEMON_GID` as shown above so SQLite can write its database and WAL files.
 
-## Roadmap at a glance
+Useful service commands:
 
-| Phase | State | Outcome | Linear work |
-| --- | --- | --- | --- |
-| 0. First multi-machine slice | Validated | Authenticated server endpoint and second macOS agent sync real metadata | CAR-63, CAR-64, CAR-65 |
-| 1. Durable hub | Implemented | Server survives LaunchAgent restart with protected config, WAL-backed SQLite, and health checks | macOS deployment slice |
-| 2. Failure-safe agents | Implemented | Cursors, retries, rotation, and local state obey the v0.2 contract | CAR-65 |
-| 3. Provider evidence | Planned | Live Claude fixture plus complete Codex/OpenCode fixture and inspect coverage | CAR-63, CAR-64 |
-| 4. Release gate | Planned | Cross-provider privacy, authentication, idempotency, and two-machine tests pass | CAR-67 |
-| 5. Distribution | Planned | Signed macOS archive/Homebrew path and Linux multi-architecture image/service templates | Deployment follow-up |
-| 6. Product finish | In progress | Counter-first analytics and evolution-art release acceptance | CAR-69, CAR-66 |
-
-The immediate implementation order is Phase 3, Phase 4, and Phase 5. Distribution follows once the provider evidence and release gate are trustworthy; adding more platforms before that would multiply support paths around an unstable adapter surface.
-
-## Decision
-
-Use one Go binary and one normalized event contract, with a platform-appropriate supervisor:
-
-| Platform | Distribution | Supervisor | Default source access |
-| --- | --- | --- | --- |
-| macOS | Homebrew or signed release archive | user LaunchAgent | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations`, `~/.openclaw/agents/*/sessions` |
-| Linux | Docker/Podman image | Compose, Quadlet, or systemd | `~/.claude/projects`, `~/.codex`, `~/.copilot/session-state`, OpenCode data, `~/.gemini/antigravity-cli/conversations`, `~/.openclaw/agents/*/sessions` |
-| Minimal/managed hosts | signed release archive | systemd or an existing orchestrator | explicit configured paths |
-
-The server remains a separate deployment from the agents. It owns SQLite, ingestion authentication, analytics, and the dashboard. An agent only reads local usage metadata and makes outbound requests.
-
-## Endpoint and configuration contract
-
-The agent is configured with the server **base URL**, not the API route:
-
-```text
-TOKEMON_SERVER_URL=https://tokemon.example.ts.net
+```bash
+docker compose -f deploy/docker-compose.yml ps
+docker compose -f deploy/docker-compose.yml logs --tail=100 tokemon
+docker compose -f deploy/docker-compose.yml down
 ```
 
-The agent posts normalized batches to:
+Stopping the service does not remove `./data`. Back up the database before making manual repairs or moving it to another host, and never replace it while Tokemon is running.
 
-```text
-${TOKEMON_SERVER_URL}/api/v1/events/batch
-```
+## Install an agent
 
-The shared v0.2 ingest credential is configured separately:
-
-```text
-TOKEMON_INGEST_TOKEN=replace-with-a-generated-secret
-```
-
-The canonical file for managed installs is:
-
-```text
-~/.config/tokemon/agent.env
-```
-
-The final configuration surface is:
-
-```env
-TOKEMON_SERVER_URL=https://tokemon.example.ts.net
-TOKEMON_INGEST_TOKEN=...
-TOKEMON_MACHINE_ID=mac-mini
-TOKEMON_SCAN_INTERVAL=1m
-TOKEMON_HOME=/Users/example
-TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
-TOKEMON_ADAPTERS=claude-code,codex
-TOKEMON_JSONL_PATHS=~/ai-usage/*.jsonl
-```
-
-Resolution order is explicit flags, environment variables, the config file, then safe defaults. Secrets must not be placed in process arguments or container image layers. Config files containing tokens are user-readable only (`0600`).
-
-The agent supports `--config`, `--server`, `--token`, `--machine-id`, `--interval`, `--home`, `--state`, and `--adapters`, plus the corresponding `TOKEMON_*` environment variables. `TOKEMON_ADAPTERS` is an optional comma-separated allowlist; an empty value enables all native adapters. Configured `TOKEMON_JSONL_PATHS` opts the generic JSONL adapter in. The macOS and Linux installers write this file and launch the service with `--config`; they also accept `--state` so an upgrade preserves a non-default cursor database. If no state path is supplied, the agent uses `~/.local/share/tokemon/state.db`.
-
-The agent sends a metadata-only heartbeat after each scan to `/api/v1/agents/heartbeat`. It reports its build version, operating system, architecture, selected adapter IDs, source count, and source-error count. It never sends local paths or provider record content in a heartbeat. `GET /api/v1/machines` exposes the resulting deployment metadata for verification.
-
-## One install path for macOS and Linux
-
-The same release archive works for macOS and Linux on arm64 and amd64. The installer runs as the current user, writes a mode-0600 config, verifies release checksums, and installs a user-level launchd or systemd supervisor without requiring Go, Docker, or root:
+Use the shared installer to install a checksum-verified release binary and a user-level supervisor:
 
 ```bash
 bash deploy/install-agent.sh \
-  --version 0.3.0 \
+  --version 0.3.1 \
+  --server https://tokemon.example.ts.net \
+  --token 'replace-with-a-generated-secret' \
+  --machine-id laptop \
+  --adapters claude-code,codex
+```
+
+The installer selects the matching macOS or Linux architecture, writes a mode-`0600` configuration, preserves the local state database across upgrades, and installs launchd or systemd without requiring root. Use a private server base URL; the installer adds the API paths itself.
+
+For a locally built binary, replace `--version 0.3.1` with `--binary ./tokemon`:
+
+```bash
+bash deploy/install-agent.sh \
+  --binary ./tokemon \
   --server https://tokemon.example.ts.net \
   --token 'replace-with-a-generated-secret' \
   --adapters claude-code,codex
 ```
 
-For a private GitHub release, also set `TOKEMON_RELEASE_TOKEN` or pass `--release-token`; public releases can download without it. For local development or an unreleased build, replace `--version 0.3.0` with `--binary ./tokemon`. Use `--no-supervisor` when an existing orchestrator owns the process. The installer preserves `~/.local/share/tokemon/state.db` on uninstall.
-
-Release artifacts use the names `tokemon_VERSION_OS_ARCH.tar.gz` plus `checksums.txt`. Build the four native agent artifacts with:
+Use `--no-supervisor` when another process manager owns the agent. Remove the user-level service and its configuration with:
 
 ```bash
-bash deploy/build-release.sh 0.3.0
+bash deploy/install-agent.sh --uninstall
 ```
 
-Attach the generated archives and checksum file to the matching `v0.3.0` release. Agents then have one stable, checksum-verified installation flow across supported Unix systems.
+The local cursor database is preserved by uninstall so reinstalling the agent does not require a full rescan.
 
-## Machine onboarding flow
+## macOS-specific installation
 
-Every new machine follows the same sequence:
+For a locally built hub or agent managed by launchd, see the [macOS installer guide](deploy/macos/README.md).
 
-1. Confirm the server is healthy on the private endpoint.
-2. Generate or retrieve the deployment ingest token through a protected channel.
-3. Install a matching Tokemon binary for the machine architecture.
-4. Write `TOKEMON_SERVER_URL`, `TOKEMON_INGEST_TOKEN`, and `TOKEMON_MACHINE_ID` to the local mode-0600 config.
-5. Start the native supervisor or container with the local provider paths mounted read-only.
-6. Verify one authenticated sync, then verify that the next sync refreshes rather than duplicates events.
-7. Confirm the new machine appears in the dashboard with a recent heartbeat.
+The server installer creates a user-level `com.tokemon.server` LaunchAgent. The agent installer creates `com.tokemon.agent`. Both run as the logged-in user and keep secrets in mode-`0600` configuration files rather than in supervisor arguments.
 
-The server endpoint and token are the only shared deployment inputs. Provider paths, machine IDs, local state, and supervisor configuration remain machine-local.
+## Agent configuration
 
-## Phase 1: make the hub durable
+The most common settings are:
 
-The primary Mac now runs the hub as a user-level server LaunchAgent with:
-
-- a protected server env file containing the database path and ingest token;
-- `RunAtLoad` and `KeepAlive` behavior;
-- a stable SQLite path outside temporary build output;
-- stdout/stderr logs under `~/Library/Logs/Tokemon`;
-- a `/healthz` check after boot and after restart;
-- Tailscale/WireGuard or HTTPS-only reachability from enrolled agents.
-
-The installed service uses `tokemon serve --config ~/.config/tokemon/server.env`, preserves the existing SQLite database, enables SQLite WAL mode with a busy timeout for concurrent agent uploads, and keeps the token out of LaunchAgent arguments. The server process is the only writer; stop it before using restore or repair tooling. This keeps the current no-Docker macOS path while removing the session-lifetime failure mode. The server remains a single hub; agents do not become peer servers.
-
-## Phase 2: make agents failure-safe
-
-The agent now implements the v0.2 local state contract in `~/.local/share/tokemon/state.db`. State contains only source identity, cursor, machine ID, last successful sync, and hashes of normalized event snapshots so aggregate adapters can remain delta-only across restarts.
-
-The agent must:
-
-- read only new records from each source;
-- advance a cursor only after the server accepts the batch;
-- retain the cursor and retry after a failed upload;
-- detect truncation, replacement, missing files, and rotation;
-- resume safely after a process or machine restart;
-- rely on deterministic event IDs to make rescans idempotent.
-
-File and append-only sources advance their cursors incrementally, including safe one-line context lookback for Claude duration metadata. Database-backed and context-dependent snapshot adapters cache unchanged file/database signatures and retain only cursor metadata, never parsed event slices. The agent state store loads cursors at the start of a pass and looks up fingerprints only for that pass's event IDs in bounded chunks; it does not load the lifetime fingerprint table into memory. Failed uploads leave both cursors and fingerprints uncommitted; replacement, truncation, and rotation reset file cursors safely. This is the core of CAR-65 and is the boundary between a useful demo and a trustworthy multi-machine counter.
-
-The Antigravity adapter caches the direct `conversations` directory listing by directory metadata, caches SQLite capability checks by database file signature, and skips reopening an unchanged source when its cursor is already current. It reads the metadata-only trajectory project URI, retains only its normalized basename, and never sends the full local path. The parser version is part of the cursor identity, so metadata additions can backfill existing snapshots once without changing deterministic event IDs. The main database and its `-wal` sidecar are included in the signature, so active writes invalidate the cache while unchanged or malformed files do not trigger repeated SQLite probes. The cache retains only cursors and signatures, never parsed event slices. Agent upload failures wait at least five seconds, double the retry delay after each failure, and cap it at five minutes.
-
-## Phase 3: prove provider coverage
-
-Complete the adapters against representative fixtures, then validate one real Claude Code transcript without retaining its content. The evidence set should cover:
-
-- Claude Code assistant usage records, cache fields, duration when present, and unknown values;
-- Codex, GitHub Copilot CLI, OpenCode, and OpenClaw model aliases, token fields, sessions, and source discovery;
-- exact `inspect` output for each provider;
-- assertions that prompts, responses, titles, repository paths, and source code never enter outgoing events.
-
-Synthetic fixtures remain useful for deterministic tests, but one live Claude capture is needed to catch format drift before release.
-
-## Phase 4: release gate
-
-CAR-67 should exercise the complete path on at least two machines:
-
-```text
-provider files → local adapter → agent state → authenticated batch API → SQLite → dashboard
+```env
+TOKEMON_SERVER_URL=https://tokemon.example.ts.net
+TOKEMON_INGEST_TOKEN=replace-with-a-generated-secret
+TOKEMON_MACHINE_ID=laptop
+TOKEMON_SCAN_INTERVAL=1m
+TOKEMON_ADAPTERS=claude-code,codex
+TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
 ```
 
-The release gate passes only when it verifies authentication failure, retry without cursor advancement, rotation, duplicate refresh, restart recovery, privacy redaction, machine attribution, and correct evolution totals.
+Explicit command-line flags override environment variables. The agent state contains cursors and sync metadata only. Provider files are read locally and are never uploaded as source content.
 
-## macOS first
+## Verify a deployment
 
-The first supported install path is a user-level LaunchAgent. It does not require root or Docker. The primary Mac uses `deploy/macos/install-server.sh` for the hub; every other Mac uses `deploy/macos/install-agent.sh` for an outbound-only agent.
+After starting the hub:
 
-The server uses `tokemon serve --config ~/.config/tokemon/server.env`, while agents use `tokemon agent --config ~/.config/tokemon/agent.env`. Both config files are parsed as data-only dotenv files and are mode `0600`.
+1. Check that `/healthz` returns successfully.
+2. Confirm the dashboard loads from the private hub address.
+3. Run one agent sync and confirm that the machine appears in the dashboard.
+4. Run the next sync and confirm that existing usage is refreshed rather than duplicated.
 
-Target layout:
-
-```text
-~/.local/bin/tokemon
-~/.config/tokemon/agent.env       # mode 0600
-~/.config/tokemon/server.env      # mode 0600 on the hub
-~/Library/LaunchAgents/com.tokemon.agent.plist
-~/Library/LaunchAgents/com.tokemon.server.plist
-~/Library/Logs/Tokemon/agent.log
-~/Library/Logs/Tokemon/server.log
-```
-
-The installer will:
-
-1. Detect Apple Silicon versus Intel.
-2. Install or update the signed Tokemon binary through Homebrew or a release archive.
-3. Write the endpoint and token configuration.
-4. Generate a user LaunchAgent with `RunAtLoad` and a one-minute interval.
-5. Load the service with `launchctl` and run one immediate sync.
-6. Report the service state and the server response.
-
-The launchd process runs as the logged-in user, reads provider databases read-only, and writes only its own logs. It will not recursively scan the home directory.
-
-## Linux and container path
-
-Publish one multi-architecture OCI image, initially `linux/amd64` and `linux/arm64`. The image uses the existing `tokemon agent` command; a separate agent codebase is unnecessary.
-
-The Compose template will:
-
-- use `restart: unless-stopped`;
-- run as the host user's UID/GID where practical;
-- use a read-only root filesystem;
-- drop Linux capabilities and set `no-new-privileges`;
-- mount only explicit provider paths read-only;
-- accept `TOKEMON_INGEST_TOKEN` from the deployment environment rather than an image layer;
-- expose no inbound agent port;
-- avoid host networking and the Docker socket because Tokemon does not collect host metrics.
-
-The initial Linux mounts are:
-
-```text
-${HOME}/.claude/projects     → /agent-home/.claude/projects:ro
-${HOME}/.codex               → /agent-home/.codex:ro
-${HOME}/.copilot/session-state → /agent-home/.copilot/session-state:ro
-${HOME}/.local/share/opencode → /agent-home/.local/share/opencode:ro
-${HOME}/.openclaw/agents     → /agent-home/.openclaw/agents:ro
-```
-
-The server can be kept running as a detached Compose service from the repository
-root:
+For a one-time local sync:
 
 ```bash
-docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
-docker compose --env-file .env -f deploy/docker-compose.yml ps
-curl http://127.0.0.1:18787/healthz
+go run ./cmd/tokemon agent \
+  --server https://tokemon.example.ts.net \
+  --token 'replace-with-a-generated-secret' \
+  --once
 ```
 
-The Compose service defaults to the image's non-root UID. When `./data` is a
-bind mount whose SQLite files are owned by a different host user, set
-`TOKEMON_UID` and `TOKEMON_GID` for that deployment so SQLite can write its
-database and WAL files without making the data directory world-writable.
+For a managed agent, inspect the native supervisor logs after installation. The agent reports source health and deployment metadata through its authenticated heartbeat without sending local paths or provider record content.
 
-The service restarts unless explicitly stopped, and SQLite persists in
-`./data/tokemon.db`. The default host port is `18787` and binds all host
-interfaces for private-network access; the container still listens on 8080
-internally. Set `TOKEMON_PORT` to change it, and set the required
-`TOKEMON_INGEST_TOKEN` in a local `.env` file or deployment environment. Keep
-the port behind Tailscale, a VPN, or an authenticated reverse proxy; the
-dashboard itself has no user login. Deploying a new build on request is the
-same `up -d --build` command; stop it with
-`docker compose --env-file .env -f deploy/docker-compose.yml down`.
+## Upgrade and stop
 
-The Compose service keeps its root filesystem read-only and provides a bounded,
-non-executable `/tmp` tmpfs for SQLite's transient query work. Persistent data
-remains under `./data` only.
-
-Before applying a newer SQLite schema version, Tokemon runs an integrity check
-and creates a consistent snapshot with SQLite's `VACUUM INTO`. Compose installs
-store these snapshots under `./data/backups/`; filenames record the previous
-and target schema versions. Tokemon retains the newest ten snapshots and does
-not create another backup on ordinary restarts at the same schema version. To
-restore, stop the server, preserve the current database separately, copy the
-selected snapshot to `./data/tokemon.db`, and start the server so migrations can
-run again. Never restore over a running server.
-
-The agent runs with `--home /agent-home`, so provider discovery stays identical inside and outside the container. A read-only mount limits mutation, not visibility; a compromised container could still read mounted files. The explicit mount allowlist and metadata-only parser are therefore both required.
-
-Standalone binaries plus systemd are the fallback for machines without Docker or
-Podman. The repository includes a user-level unit at
-`deploy/linux/tokemon-agent.service`. Install the matching binary at
-`~/.local/bin/tokemon`, write the mode-0600 `~/.config/tokemon/agent.env` using
-the endpoint contract above, then run:
+To rebuild the Compose hub from the current checkout:
 
 ```bash
-install -d -m 700 ~/.config/tokemon ~/.local/share/tokemon
-install -m 644 deploy/linux/tokemon-agent.service \
-  ~/.config/systemd/user/tokemon-agent.service
-systemctl --user daemon-reload
-systemctl --user enable --now tokemon-agent.service
-systemctl --user status tokemon-agent.service
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-The unit has no inbound listener, uses the user-owned state directory, and
-restarts after transient failures. Enable user lingering when the agent must
-run without an interactive login:
+To upgrade a native agent, rerun `deploy/install-agent.sh` with the new release version. The installer keeps the existing state database and configuration path.
+
+To stop the Compose hub:
 
 ```bash
-loginctl enable-linger "$USER"
+docker compose -f deploy/docker-compose.yml down
 ```
 
-Ansible can install either path across a fleet later.
+## Security and privacy
 
-## Claude Code integration
-
-Claude Code usage is stored in session JSONL files under:
-
-```text
-~/.claude/projects/<encoded-project>/<session-id>.jsonl
-```
-
-The adapter streams those files and inspects assistant records containing `message.usage`, plus the metadata-only `system` / `turn_duration` record that Claude Code writes after a turn. It extracts:
-
-- timestamp;
-- session ID;
-- model;
-- input tokens;
-- output tokens;
-- cache-read tokens;
-- cache-creation/write tokens.
-- turn duration in milliseconds when present.
-
-It will not send message content, tool content, project names, encoded project paths, titles, or repository paths. File identity is hashed before it participates in an event ID or source identity. Missing token fields remain unknown; totals are derived only when the required components are present.
-
-Each assistant API response becomes one deterministic usage event. Stable identity is based on the hashed transcript identity, line offset, timestamp, and session ID. This permits rescans without duplicate lifetime totals while the durable cursor state is completed.
-
-The adapter is covered by synthetic privacy fixtures and an exact normalized-payload test. Its record and usage-field shapes were also checked against live Claude Code transcripts on an enrolled machine without retaining or displaying conversation content, titles, working directories, or source paths.
-
-## GitHub Copilot CLI integration
-
-GitHub Copilot CLI usage is stored in durable session event streams under:
-
-```text
-~/.copilot/session-state/<session-id>/events.jsonl
-```
-
-The adapter reads only the `session.shutdown` event's per-model `modelMetrics.usage` aggregate and the metadata-only session context needed to normalize a project basename. It emits one stable usage snapshot per model and session, preserving input, output, cache-read, cache-write, and reasoning token fields when reported. It does not read or send prompts, responses, tool arguments, titles, repository paths, or modified-file lists. Active sessions are picked up after Copilot writes their durable shutdown aggregate.
-
-## Security baseline
-
-- Keep ingestion behind Tailscale/WireGuard or HTTPS; do not expose the raw HTTP port publicly.
-- Require `TOKEMON_INGEST_TOKEN` on any multi-machine server. Do not deploy with `change-me`.
-- Prefer one token per trusted deployment until per-agent credentials and revocation exist.
-- Store tokens in `0600` files or the platform secret store; do not put them in command lines, images, or Git.
-- Keep agents outbound-only. No inbound agent listener is required.
-- Run native agents as the user and containers as non-root.
-- Open provider data read-only and mount only known paths.
-- Keep `inspect` and export behavior privacy-verifiable.
-- Pin release checksums and container image digests for managed deployments.
-
-## Verification gates
-
-Every deployment path must verify:
-
-1. The supervisor reports the agent running.
-2. The agent can reach the configured server endpoint.
-3. The server accepts a valid token and rejects an invalid one.
-4. A second sync refreshes existing snapshots instead of adding duplicates.
-5. The dashboard attributes usage to the new machine.
-6. A captured normalized payload contains no prompt, response, title, source-code, or repository-path content.
-7. The agent survives a restart and retries when the server is temporarily unavailable.
-
-## Distribution after the release gate
-
-Once the two-machine release gate passes:
-
-1. Publish signed macOS arm64 and amd64 archives, then add the Homebrew formula.
-2. Publish a multi-architecture OCI image for `linux/amd64` and `linux/arm64`.
-3. Add a Compose template with explicit read-only provider mounts and a non-root runtime.
-4. Add systemd/Quadlet instructions for Linux hosts that do not use Docker or Podman.
-5. Add Ansible or another fleet wrapper only after the native and container contracts are stable.
-
-The Mac path remains native and Docker-free. Containers are a Linux distribution option, not a requirement for small agents.
-
-Relevant committed work is tracked in the Tokemon v0.2 Linear milestone: CAR-63, CAR-64, CAR-65, CAR-66, CAR-67, CAR-68, and CAR-69. Distribution work is intentionally sequenced after the reliability and release gates so every platform shares one tested agent contract.
+- Keep the hub on a private network or behind an authenticated proxy.
+- Set a strong `TOKEMON_INGEST_TOKEN` for every multi-machine deployment.
+- Store tokens in mode-`0600` files or a platform secret store; do not commit them or bake them into images.
+- Run native agents as the local user and containers as non-root.
+- Mount provider data read-only when using containers.
+- Tokemon collects usage metadata only; prompts, responses, source code, conversation titles, and full repository paths are not part of the default event payload.

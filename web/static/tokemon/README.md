@@ -1,6 +1,6 @@
 # Tokemon evolution art
 
-These are original raster pixel-art assets for the Tokemon evolution forms. They are generated as a starting art direction for CAR-66 and must remain free of Pokémon or other franchise references.
+These are original raster pixel-art assets for the Tokemon evolution forms. They must remain free of Pokémon or other franchise references.
 
 The `token-dex.png` asset is the project mark: a small handheld token field guide in the same pixel-art language as the evolution forms. It is used by the dashboard as its favicon and header icon.
 

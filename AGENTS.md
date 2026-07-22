@@ -1,16 +1,5 @@
 # Tokemon Repository Instructions
 
-## Planning
-
-Linear is the source of truth for committed planned work in this repository.
-
-- Team: `carteakey`
-- Project: [Tokemon v0.2](https://linear.app/carteakey/project/tokemon-v02-ef3cefe83acc)
-- Active milestone: `v0.2 Integrations & Evolution Art`
-- Initial issues: CAR-68, CAR-65, CAR-63, CAR-64, CAR-67, and CAR-66
-
-Do not duplicate committed work in GitHub Issues or `TODO.md`.
-
 ## Product guardrails
 
 - Treat `docs/tokemon-spec-v0.2.md` as authoritative; `docs/token-bandit-spec.md` is historical context.
