@@ -6,6 +6,7 @@ set -euo pipefail
 # release archive so enrolled machines do not need Go, Docker, or a checkout.
 
 repository="${TOKEMON_RELEASE_REPOSITORY:-carteakey/tokemon}"
+release_token="${TOKEMON_RELEASE_TOKEN:-${GITHUB_TOKEN:-}}"
 version="${TOKEMON_VERSION:-}"
 server_url="${TOKEMON_SERVER_URL:-}"
 ingest_token="${TOKEMON_INGEST_TOKEN:-}"
@@ -19,6 +20,8 @@ install_dir="${TOKEMON_INSTALL_DIR:-$home/.local/bin}"
 binary=""
 no_supervisor=0
 uninstall=0
+state_explicit=0
+install_dir_explicit=0
 
 usage() {
   cat <<'EOF'
@@ -32,6 +35,7 @@ Options:
   --binary PATH         existing Tokemon binary
   --version VERSION     download vVERSION from the GitHub release repository
   --repo OWNER/REPO     release repository (default: carteakey/tokemon)
+  --release-token TOKEN GitHub token for private release downloads
   --machine-id ID       stable machine ID (default: host name)
   --interval DUR        polling interval (default: 1m)
   --adapters IDS        comma-separated built-in adapter IDs
@@ -98,6 +102,11 @@ while (($#)); do
       repository="$2"
       shift 2
       ;;
+    --release-token)
+      (($# >= 2)) || die "--release-token requires a value"
+      release_token="$2"
+      shift 2
+      ;;
     --machine-id)
       (($# >= 2)) || die "--machine-id requires an ID"
       machine_id="$2"
@@ -126,11 +135,13 @@ while (($#)); do
     --state)
       (($# >= 2)) || die "--state requires a path"
       state_path="$2"
+      state_explicit=1
       shift 2
       ;;
     --install-dir)
       (($# >= 2)) || die "--install-dir requires a path"
       install_dir="$2"
+      install_dir_explicit=1
       shift 2
       ;;
     --no-supervisor)
@@ -150,6 +161,13 @@ while (($#)); do
       ;;
   esac
 done
+
+if (( !state_explicit )) && [[ -z "${TOKEMON_STATE:-}" ]]; then
+  state_path="$home/.local/share/tokemon/state.db"
+fi
+if (( !install_dir_explicit )) && [[ -z "${TOKEMON_INSTALL_DIR:-}" ]]; then
+  install_dir="$home/.local/bin"
+fi
 
 case "$(uname -s)" in
   Darwin) platform="darwin" ;;
@@ -218,8 +236,22 @@ if [[ -z "$binary" ]]; then
   temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/tokemon-agent.XXXXXX")"
   archive_name="tokemon_${version}_${platform}_${architecture}.tar.gz"
   release_base="https://github.com/${repository}/releases/download/v${version}"
-  curl --fail --location --silent --show-error "$release_base/$archive_name" -o "$temporary_dir/$archive_name"
-  curl --fail --location --silent --show-error "$release_base/checksums.txt" -o "$temporary_dir/checksums.txt"
+  if [[ -n "$release_token" ]]; then
+    command -v jq >/dev/null 2>&1 || die "jq is required for private release downloads"
+    api_base="https://api.github.com/repos/${repository}"
+    auth_header="Authorization: Bearer $release_token"
+    accept_header="Accept: application/vnd.github+json"
+    curl --fail --location --silent --show-error -H "$auth_header" -H "$accept_header" "$api_base/releases/tags/v${version}" -o "$temporary_dir/release.json"
+    archive_url="$(jq -r --arg name "$archive_name" '.assets[] | select(.name == $name) | .url' "$temporary_dir/release.json" | head -1)"
+    checksum_url="$(jq -r '.assets[] | select(.name == "checksums.txt") | .url' "$temporary_dir/release.json" | head -1)"
+    [[ -n "$archive_url" && "$archive_url" != "null" ]] || die "release asset not found: $archive_name"
+    [[ -n "$checksum_url" && "$checksum_url" != "null" ]] || die "release asset not found: checksums.txt"
+    curl --fail --location --silent --show-error -H "$auth_header" -H 'Accept: application/octet-stream' "$archive_url" -o "$temporary_dir/$archive_name"
+    curl --fail --location --silent --show-error -H "$auth_header" -H 'Accept: application/octet-stream' "$checksum_url" -o "$temporary_dir/checksums.txt"
+  else
+    curl --fail --location --silent --show-error "$release_base/$archive_name" -o "$temporary_dir/$archive_name" || die "release download failed; set TOKEMON_RELEASE_TOKEN for private GitHub releases"
+    curl --fail --location --silent --show-error "$release_base/checksums.txt" -o "$temporary_dir/checksums.txt" || die "checksum download failed; set TOKEMON_RELEASE_TOKEN for private GitHub releases"
+  fi
   expected="$(awk -v file="$archive_name" '$2 == file || $2 == "*" file {print $1; exit}' "$temporary_dir/checksums.txt")"
   actual="$(sha256_of "$temporary_dir/$archive_name")"
   [[ -n "$expected" && "$expected" == "$actual" ]] || die "release checksum verification failed for $archive_name"

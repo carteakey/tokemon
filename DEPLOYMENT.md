@@ -109,7 +109,7 @@ bash deploy/install-agent.sh \
   --adapters claude-code,codex
 ```
 
-For local development or an unreleased build, replace `--version 0.3.0` with `--binary ./tokemon`. Use `--no-supervisor` when an existing orchestrator owns the process. The installer preserves `~/.local/share/tokemon/state.db` on uninstall.
+For a private GitHub release, also set `TOKEMON_RELEASE_TOKEN` or pass `--release-token`; public releases can download without it. For local development or an unreleased build, replace `--version 0.3.0` with `--binary ./tokemon`. Use `--no-supervisor` when an existing orchestrator owns the process. The installer preserves `~/.local/share/tokemon/state.db` on uninstall.
 
 Release artifacts use the names `tokemon_VERSION_OS_ARCH.tar.gz` plus `checksums.txt`. Build the four native agent artifacts with:
 
