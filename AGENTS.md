@@ -13,7 +13,7 @@ Do not duplicate committed work in GitHub Issues or `TODO.md`.
 
 ## Product guardrails
 
-- Treat `tokemon-spec-v0.2.md` as authoritative; `token-bandit-spec.md` is historical context.
+- Treat `docs/tokemon-spec-v0.2.md` as authoritative; `docs/token-bandit-spec.md` is historical context.
 - Store usage metadata only. Do not collect prompts, responses, source code, repository contents, or conversation titles by default.
 - Prefer the existing Go, SQLite, server-rendered HTML, and deterministic evolution architecture.
 - Keep provider quirks inside adapters and preserve unknown values as unknown.
