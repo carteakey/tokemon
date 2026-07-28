@@ -31,6 +31,12 @@ jobs:
       - name: Build the CLI
         run: CGO_ENABLED=0 go build -trimpath ./cmd/tokemon
 
+      - name: Verify release archives
+        run: |
+          release_dir="$(mktemp -d)"
+          bash deploy/build-release.sh ci "$release_dir"
+          (cd "$release_dir" && sha256sum -c checksums.txt)
+
       - name: Validate the model catalog
         run: go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
 
