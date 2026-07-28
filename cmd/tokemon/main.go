@@ -371,6 +371,9 @@ func runAgent(args []string) error {
 		})
 	}
 	pass := func(ctx context.Context) error {
+		if err := client.Health(ctx); err != nil {
+			return fmt.Errorf("hub health check: %w", err)
+		}
 		snapshot, err := stateStore.Snapshot(ctx, *machineID)
 		if err != nil {
 			return err

@@ -77,6 +77,10 @@ func TestRunAgentPersistsStateAndRetriesAfterFailedUpload(t *testing.T) {
 
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.URL.Path == "/api/v1/agents/heartbeat" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -113,5 +117,27 @@ func TestRunAgentPersistsStateAndRetriesAfterFailedUpload(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("unchanged restart uploaded again: calls = %d", calls)
+	}
+}
+
+func TestRunAgentSkipsCollectionWhenHubIsUnavailable(t *testing.T) {
+	healthCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			t.Fatalf("agent continued past failed health check: %s", r.URL.Path)
+		}
+		healthCalls++
+		http.Error(w, "offline", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	home := t.TempDir()
+	statePath := filepath.Join(t.TempDir(), "agent-state.db")
+	err := run([]string{"agent", "--server", server.URL, "--home", home, "--machine-id", "machine", "--state", statePath, "--once", "--timeout", "5s"})
+	if err == nil || !strings.Contains(err.Error(), "hub health check") {
+		t.Fatalf("agent error = %v, want hub health failure", err)
+	}
+	if healthCalls != 1 {
+		t.Fatalf("health calls = %d, want 1", healthCalls)
 	}
 }

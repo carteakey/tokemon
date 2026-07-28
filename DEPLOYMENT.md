@@ -104,6 +104,8 @@ TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
 
 Explicit command-line flags override environment variables. The agent state contains cursors and sync metadata only. Provider files are read locally and are never uploaded as source content.
 
+Before each collection pass, the agent checks the hub's `/healthz` endpoint. If the hub is offline, the agent applies its bounded failure backoff without scanning provider histories; cursor state remains unchanged and collection resumes when the hub is healthy.
+
 ## Verify a deployment
 
 After starting the hub:

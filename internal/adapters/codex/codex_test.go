@@ -138,6 +138,97 @@ func TestParseSessionLogPriceDefiningTokensWithoutConversationContent(t *testing
 	}
 }
 
+func TestDiscoveringNewSessionDoesNotInvalidateUnchangedSession(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	firstPath := filepath.Join(root, "first.jsonl")
+	firstLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"first-session","model_provider":"openai"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"cached_input_tokens":20,"output_tokens":20,"total_tokens":100}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(firstPath, []byte(firstLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("initial parse = %+v, error: %v", first, err)
+	}
+
+	secondPath := filepath.Join(root, "second.jsonl")
+	secondLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:01:00Z","type":"session_meta","payload":{"id":"second-session","model_provider":"openai"}}`,
+		`{"timestamp":"2026-07-12T12:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40,"cached_input_tokens":10,"output_tokens":10,"total_tokens":50}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(secondPath, []byte(secondLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sources, err = adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unchanged, err := adapter.Parse(context.Background(), adapters.Source{Path: firstPath, Identity: adapters.HashIdentity(firstPath)}, adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil || len(unchanged.Events) != 0 || unchanged.Cursor != first.Cursor {
+		t.Fatalf("new session invalidated unchanged session: %+v, error: %v", unchanged, err)
+	}
+}
+
+func TestLateForkParentInvalidatesOnlyDependentChild(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	childPath := filepath.Join(root, "child.jsonl")
+	childLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:03Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","timestamp":"2026-07-12T12:00:01Z","model_provider":"openai"}}`,
+		`{"timestamp":"2026-07-12T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"cached_input_tokens":20,"output_tokens":20,"total_tokens":100}}}}`,
+		`{"timestamp":"2026-07-12T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":104,"cached_input_tokens":26,"output_tokens":26,"total_tokens":130}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(childPath, []byte(childLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeParent, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(beforeParent.Events) != 2 {
+		t.Fatalf("initial child parse = %+v, error: %v", beforeParent, err)
+	}
+
+	parentPath := filepath.Join(root, "parent.jsonl")
+	parentLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"parent-session","model_provider":"openai"}}`,
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"cached_input_tokens":20,"output_tokens":20,"total_tokens":100}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(parentPath, []byte(parentLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	withParent, err := adapter.Parse(context.Background(), adapters.Source{Path: childPath, Identity: adapters.HashIdentity(childPath)}, adapters.ParseRequest{MachineID: "machine", Cursor: beforeParent.Cursor})
+	if err != nil || len(withParent.Events) != 2 {
+		t.Fatalf("dependent child was not reparsed: %+v, error: %v", withParent, err)
+	}
+	if withParent.Events[0].TotalTokens == nil || *withParent.Events[0].TotalTokens != 0 || withParent.Events[1].TotalTokens == nil || *withParent.Events[1].TotalTokens != 30 {
+		t.Fatalf("late parent baseline was not applied: %+v", withParent.Events)
+	}
+}
+
 func TestParseSessionLogUsesCumulativeUsageDeltas(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".codex", "sessions", "2026", "07", "12")

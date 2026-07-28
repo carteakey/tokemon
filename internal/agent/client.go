@@ -119,6 +119,36 @@ func (c Client) Heartbeat(ctx context.Context, heartbeat HeartbeatRequest) error
 	return c.postJSON(ctx, "/api/v1/agents/heartbeat", heartbeat, nil)
 }
 
+// Health verifies that the hub is reachable before the agent performs an
+// expensive local collection pass. Offline hubs therefore trigger the normal
+// failure backoff without repeatedly parsing unchanged provider histories.
+func (c Client) Health(ctx context.Context) error {
+	if strings.TrimSpace(c.ServerURL) == "" {
+		return fmt.Errorf("server URL is required")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	if c.Token != "" {
+		request.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return fmt.Errorf("server returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 func (c Client) postJSON(ctx context.Context, path string, payload any, result any) error {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")

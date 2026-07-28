@@ -23,11 +23,11 @@ const (
 )
 
 type Adapter struct {
-	root                    string
-	cache                   *adapters.SnapshotCache
-	directories             *adapters.DirectoryCache
-	sessionFiles            map[string]string
-	sessionIndexFingerprint string
+	root           string
+	cache          *adapters.SnapshotCache
+	directories    *adapters.DirectoryCache
+	sessionFiles   map[string]string
+	metadataByPath map[string]sessionMetadata
 }
 
 func New(home string) *Adapter {
@@ -278,7 +278,7 @@ func readSessionMetadata(ctx context.Context, path string) (sessionMetadata, boo
 
 func (a *Adapter) refreshSessionIndex(ctx context.Context, sources []adapters.Source) error {
 	files := make(map[string]string)
-	var fingerprint strings.Builder
+	metadataByPath := make(map[string]sessionMetadata)
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -290,10 +290,10 @@ func (a *Adapter) refreshSessionIndex(ctx context.Context, sources []adapters.So
 			}
 			continue
 		}
-		fmt.Fprintf(&fingerprint, "%s\x00%s\x00%s\x00%s\n", source.Path, metadata.ID, metadata.forkParentID(), metadata.Timestamp)
 		if !ok {
 			continue
 		}
+		metadataByPath[source.Path] = metadata
 		id := firstNonEmpty(metadata.ID, metadata.SessionID)
 		if id != "" {
 			if _, exists := files[id]; !exists {
@@ -301,13 +301,47 @@ func (a *Adapter) refreshSessionIndex(ctx context.Context, sources []adapters.So
 			}
 		}
 	}
-	newFingerprint := adapters.HashIdentity(fingerprint.String())
-	if newFingerprint != a.sessionIndexFingerprint {
-		a.cache = adapters.NewSnapshotCache()
-		a.sessionIndexFingerprint = newFingerprint
-	}
 	a.sessionFiles = files
+	a.metadataByPath = metadataByPath
 	return nil
+}
+
+func (a *Adapter) sourceMetadata(ctx context.Context, path string) (sessionMetadata, bool) {
+	if metadata, ok := a.metadataByPath[path]; ok {
+		return metadata, true
+	}
+	metadata, ok, err := readSessionMetadata(ctx, path)
+	return metadata, ok && err == nil
+}
+
+func (a *Adapter) logCacheIdentity(ctx context.Context, source adapters.Source, identity string) string {
+	metadata, ok := a.sourceMetadata(ctx, source.Path)
+	if !ok {
+		return identity
+	}
+	parentID := metadata.forkParentID()
+	if parentID == "" {
+		return identity
+	}
+	parentPath := a.sessionFiles[parentID]
+	if parentPath == "" || parentPath == source.Path {
+		return adapters.HashIdentity(identity + "\x00fork\x00" + parentID + "\x00unresolved")
+	}
+	parentSignature, err := adapters.Signature(parentPath)
+	if err != nil {
+		return adapters.HashIdentity(identity + "\x00fork\x00" + parentID + "\x00" + parentPath + "\x00unavailable")
+	}
+	return adapters.HashIdentity(fmt.Sprintf(
+		"%s\x00fork\x00%s\x00%s\x00%d\x00%d\x00%d\x00%d\x00%t",
+		identity,
+		parentID,
+		parentPath,
+		parentSignature.Size,
+		parentSignature.ModTime,
+		parentSignature.SidecarSize,
+		parentSignature.SidecarTime,
+		parentSignature.Sidecar,
+	))
 }
 
 func (a *Adapter) inheritedCumulativeUsage(ctx context.Context, path, forkTimestamp string) (normalizedTokenUsage, bool, error) {
@@ -386,11 +420,12 @@ func (a *Adapter) parseLog(ctx context.Context, source adapters.Source, request 
 	if identity == "" {
 		identity = adapters.HashIdentity(source.Path)
 	}
-	if cached, err, ok := a.cache.Lookup(source.Path, signature, identity, request.Cursor); ok {
+	cacheIdentity := a.logCacheIdentity(ctx, source, identity)
+	if cached, err, ok := a.cache.Lookup(source.Path, signature, cacheIdentity, request.Cursor); ok {
 		return cached, err
 	}
 	result, err := a.parseLogUncached(ctx, source, request)
-	a.cache.Store(source.Path, signature, identity, request.Cursor, result, err)
+	a.cache.Store(source.Path, signature, cacheIdentity, request.Cursor, result, err)
 	return result, err
 }
 
@@ -407,7 +442,7 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 	var sessionID, sourceSessionID string
 	var events []usage.Event
 	seenUsage := make(map[string]struct{})
-	metadata, _, _ := readSessionMetadata(ctx, source.Path)
+	metadata, _ := a.sourceMetadata(ctx, source.Path)
 	forkBaseline, forkResolved := a.resolveForkBaseline(ctx, source.Path, metadata)
 	remainingForkPrefix := forkBaseline
 	previousCumulative := normalizedTokenUsage{}

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Prevented new or archived Codex sessions from invalidating every unchanged session snapshot.
+- Added a hub health preflight so offline hubs back off without repeatedly scanning local provider histories.
+
 ## 0.3.2
 
 - Published the first MIT-licensed, public-ready Tokemon release.

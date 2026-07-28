@@ -84,3 +84,32 @@ func TestClientHeartbeatSendsDeploymentMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClientHealthChecksHubBeforeCollection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/healthz" {
+			t.Fatalf("health request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("authorization header = %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	if err := (Client{ServerURL: server.URL, Token: "secret"}).Health(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientHealthRejectsUnavailableHub(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	err := (Client{ServerURL: server.URL}).Health(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
+		t.Fatalf("health error = %v, want unavailable status", err)
+	}
+}
