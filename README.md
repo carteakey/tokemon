@@ -83,3 +83,7 @@ Run `go run ./cmd/tokemon --help` for the full command list.
 - [Historical token-bandit spec](https://github.com/carteakey/tokemon/blob/main/docs/token-bandit-spec.md)
 - [Visual style guide](https://github.com/carteakey/tokemon/blob/main/STYLE_GUIDE.md)
 - [Changelog](CHANGELOG.md)
+
+## License
+
+Tokemon is released under the [MIT License](LICENSE).

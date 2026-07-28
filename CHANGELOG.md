@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- Published the first MIT-licensed, public-ready Tokemon release.
+- Added polished public documentation, deployment guidance, security policy, and release notes.
+- Added CI coverage for race tests, static analysis, Compose validation, and all four release archives.
+- Consolidated the current provider adapters, metadata-only privacy model, multi-machine dashboard, analytics views, and checksum-verified installers into one release line.
+
 ## 0.3.1
 
 - Added authenticated downloads for private GitHub release assets.
