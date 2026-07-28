@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -330,6 +331,114 @@ func TestEvolutionEndpointIncludesTokenComposition(t *testing.T) {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("evolution response does not contain %q: %s", want, response.Body.String())
 		}
+	}
+}
+
+func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "cache-initial", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{initial}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := server.Handler()
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if first.Code != http.StatusOK || server.evolutionCache == nil {
+		t.Fatalf("initial evolution response = %d %s, cache = %#v", first.Code, first.Body.String(), server.evolutionCache)
+	}
+	cached := server.evolutionCache
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if second.Code != http.StatusOK || server.evolutionCache != cached || second.Body.String() != first.Body.String() {
+		t.Fatalf("repeated evolution response missed cache: first=%s second=%s", first.Body.String(), second.Body.String())
+	}
+
+	update := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "cache-update", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(15), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	payload, err := json.Marshal(batchRequest{Events: []usage.Event{update}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer secret")
+	accepted := httptest.NewRecorder()
+	handler.ServeHTTP(accepted, request)
+	if accepted.Code != http.StatusOK || server.evolutionCache != nil {
+		t.Fatalf("ingest response = %d %s, cache was not invalidated", accepted.Code, accepted.Body.String())
+	}
+
+	refreshed := httptest.NewRecorder()
+	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) || server.evolutionCache == nil || server.evolutionCache == cached {
+		t.Fatalf("refreshed evolution response = %d %s, cache = %#v", refreshed.Code, refreshed.Body.String(), server.evolutionCache)
+	}
+}
+
+func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "concurrent-cache", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(42), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := server.Handler()
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for worker := 0; worker < 16; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for requestIndex := 0; requestIndex < 20; requestIndex++ {
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+				body := response.Body.String()
+				if response.Code != http.StatusOK || (!strings.Contains(body, `"lifetime_tokens":42`) && !strings.Contains(body, `"lifetime_tokens":43`)) {
+					t.Errorf("concurrent evolution response = %d %s", response.Code, response.Body.String())
+					return
+				}
+			}
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		update := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "concurrent-update", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(1), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+		payload, err := json.Marshal(batchRequest{Events: []usage.Event{update}})
+		if err != nil {
+			t.Errorf("marshal concurrent update: %v", err)
+			return
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload)))
+		if response.Code != http.StatusOK {
+			t.Errorf("concurrent ingest response = %d %s", response.Code, response.Body.String())
+		}
+	}()
+	close(start)
+	wait.Wait()
+
+	final := httptest.NewRecorder()
+	handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if final.Code != http.StatusOK || !strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
+		t.Fatalf("final evolution response = %d %s", final.Code, final.Body.String())
 	}
 }
 

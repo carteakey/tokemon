@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/database"
@@ -23,10 +24,17 @@ import (
 )
 
 type Server struct {
-	store       *database.Store
-	ingestToken string
-	template    *template.Template
-	static      http.Handler
+	store          *database.Store
+	ingestToken    string
+	template       *template.Template
+	static         http.Handler
+	evolutionMu    sync.Mutex
+	evolutionCache *evolutionResponse
+}
+
+type evolutionResponse struct {
+	evolution.Snapshot
+	Composition database.TokenComposition `json:"composition"`
 }
 
 type dashboardPage struct {
@@ -732,6 +740,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.invalidateEvolutionCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -799,20 +808,37 @@ func validToken(r *http.Request, expected string) bool {
 }
 
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Evolution(r.Context())
+	result, err := s.cachedEvolution(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	composition, err := s.store.TokenComposition(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error) {
+	s.evolutionMu.Lock()
+	defer s.evolutionMu.Unlock()
+	if s.evolutionCache != nil {
+		return *s.evolutionCache, nil
 	}
-	writeJSON(w, http.StatusOK, struct {
-		evolution.Snapshot
-		Composition database.TokenComposition `json:"composition"`
-	}{Snapshot: result, Composition: composition})
+	snapshot, err := s.store.Evolution(ctx)
+	if err != nil {
+		return evolutionResponse{}, err
+	}
+	composition, err := s.store.TokenComposition(ctx)
+	if err != nil {
+		return evolutionResponse{}, err
+	}
+	result := evolutionResponse{Snapshot: snapshot, Composition: composition}
+	s.evolutionCache = &result
+	return result, nil
+}
+
+func (s *Server) invalidateEvolutionCache() {
+	s.evolutionMu.Lock()
+	s.evolutionCache = nil
+	s.evolutionMu.Unlock()
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
