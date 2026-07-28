@@ -27,6 +27,11 @@ test("server-renders the Tokemon landing page", async () => {
   assert.match(html, /1–2–5 checkpoints/);
   assert.match(html, /The Singularity/);
   assert.match(html, /PRIVACY BY DEFAULT/);
+  assert.match(html, /GITHUB COPILOT CLI/);
+  assert.match(html, /OPENCLAW/);
+  assert.match(html, /Latest release/);
+  assert.match(html, /MIT licensed/);
+  assert.match(html, /v0\.3\.2/);
   assert.match(html, /property="og:image" content="https?:\/\/[^\"]+\/og\.png"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });

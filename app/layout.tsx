@@ -11,11 +11,11 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     metadataBase: base,
     title: "Tokemon — Your coding tokens are evolving",
-    description: "A tiny, local-first token garden for your coding agents.",
+    description: "Metadata-only token analytics for coding agents, with an evolving creature, calm dashboard, and multi-machine collection.",
     icons: { icon: "/tokemon/token-dex.png", shortcut: "/tokemon/token-dex.png" },
     openGraph: {
       title: "Tokemon — Your coding tokens are evolving",
-      description: "A tiny, local-first token garden for your coding agents.",
+      description: "Metadata-only token analytics for coding agents, with an evolving creature, calm dashboard, and multi-machine collection.",
       type: "website",
       images: [{ url: new URL("/og.png", base), width: 1729, height: 910, alt: "Tokemon — your coding tokens are evolving" }],
     },
