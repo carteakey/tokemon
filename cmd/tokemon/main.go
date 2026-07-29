@@ -270,6 +270,7 @@ func runDiscover(args []string) error {
 		{"OpenCode", filepath.Join(home, ".local", "share", "opencode", "opencode.db"), true},
 		{"Antigravity CLI", filepath.Join(home, ".gemini", "antigravity-cli", "conversations"), true},
 		{"OpenClaw", filepath.Join(home, ".openclaw", "agents"), true},
+		{"Hermes Agent", filepath.Join(home, ".hermes"), true},
 		{"Config", filepath.Join(home, ".config"), false},
 		{"Local data", filepath.Join(home, ".local", "share"), false},
 		{"Application Support", filepath.Join(home, "Library", "Application Support"), false},

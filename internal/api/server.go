@@ -221,6 +221,8 @@ func glyphForHarness(tool string) pixelGlyph {
 		return glyphFromRows("harness", "gemini", 0, "..o..", ".odo.", "ododo", ".odo.", "..o..")
 	case "openclaw":
 		return glyphFromRows("harness", "openclaw", 1, ".ooo.", "o...o", "ooooo", "o...o", ".ooo.")
+	case "hermes-agent", "hermes":
+		return glyphFromRows("harness", "hermes", 2, "..o..", ".odo.", "oodoo", ".odo.", "o...o")
 	case "grok", "xai":
 		return glyphFromRows("harness", "grok", 1, "o...o", ".o.o.", "..o..", ".o.o.", "o...o")
 	case "deepseek":
@@ -260,6 +262,8 @@ func harnessName(tool string) string {
 		return "Antigravity"
 	case "openclaw":
 		return "OpenClaw"
+	case "hermes-agent", "hermes":
+		return "Hermes Agent"
 	case "generic-jsonl":
 		return "Generic JSONL"
 	default:

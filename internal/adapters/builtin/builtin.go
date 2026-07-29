@@ -14,6 +14,7 @@ import (
 	"github.com/tokemon/tokemon/internal/adapters/codex"
 	"github.com/tokemon/tokemon/internal/adapters/copilot"
 	"github.com/tokemon/tokemon/internal/adapters/generic"
+	"github.com/tokemon/tokemon/internal/adapters/hermes"
 	"github.com/tokemon/tokemon/internal/adapters/openclaw"
 	"github.com/tokemon/tokemon/internal/adapters/opencode"
 )
@@ -49,6 +50,9 @@ var definitions = []Definition{
 	}},
 	{ID: "openclaw", DisplayName: "OpenClaw", Version: "0.1.0", DefaultEnabled: true, New: func(config Config) adapters.Adapter {
 		return openclaw.New(config.Home)
+	}},
+	{ID: "hermes-agent", DisplayName: "Hermes Agent", Version: "0.1.0", DefaultEnabled: true, New: func(config Config) adapters.Adapter {
+		return hermes.New(config.Home)
 	}},
 	{ID: "generic-jsonl", DisplayName: "Generic JSONL", Version: "0.2.0", DefaultEnabled: false, New: func(config Config) adapters.Adapter {
 		return generic.New(config.JSONLPaths...)

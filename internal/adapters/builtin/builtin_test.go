@@ -10,8 +10,8 @@ func TestDefaultSelectionKeepsNativeAdaptersAndAddsConfiguredGenericJSONL(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(selected) != 7 {
-		t.Fatalf("selected %d adapters, want 7: %+v", len(selected), selected)
+	if len(selected) != 8 {
+		t.Fatalf("selected %d adapters, want 8: %+v", len(selected), selected)
 	}
 	if selected[len(selected)-1].ID != "generic-jsonl" {
 		t.Fatalf("generic adapter is not last in stable registry order: %+v", selected)

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a metadata-only Hermes Agent adapter for default and named-profile SQLite usage stores.
 - Prevented new or archived Codex sessions from invalidating every unchanged session snapshot.
 - Added a hub health preflight so offline hubs back off without repeatedly scanning local provider histories.
 - Cached the dashboard evolution summary between ingests so two-second live polling no longer rescans the full usage history.

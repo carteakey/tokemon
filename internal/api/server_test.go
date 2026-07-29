@@ -582,12 +582,13 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 	}
 
 	for tool, preset := range map[string]string{
-		"codex":       "codex",
-		"claude-code": "claude",
-		"copilot-cli": "copilot",
-		"opencode":    "opencode",
-		"antigravity": "gemini",
-		"openclaw":    "openclaw",
+		"codex":        "codex",
+		"claude-code":  "claude",
+		"copilot-cli":  "copilot",
+		"opencode":     "opencode",
+		"antigravity":  "gemini",
+		"openclaw":     "openclaw",
+		"hermes-agent": "hermes",
 	} {
 		glyph := glyphForHarness(tool)
 		if glyph.Kind != "harness" || glyph.Preset != preset {
@@ -596,6 +597,9 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 	}
 	if got := harnessName("copilot-cli"); got != "GitHub Copilot CLI" {
 		t.Fatalf("Copilot harness label = %q", got)
+	}
+	if got := harnessName("hermes-agent"); got != "Hermes Agent" {
+		t.Fatalf("Hermes harness label = %q", got)
 	}
 }
 
