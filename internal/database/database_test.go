@@ -725,3 +725,61 @@ func TestAnalyticsSupportsPeriodsFiltersBreakdownsAndUnknownTotals(t *testing.T)
 		t.Fatalf("unexpected analytics facets: %+v", allTime.Facets)
 	}
 }
+
+func TestAnalyticsShareTimelineKeepsTopFiveAndGroupsOther(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	events := make([]usage.Event, 0, 8)
+	for index, tokens := range []int64{60, 50, 40, 30, 20, 10} {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("share-%d", index),
+			Timestamp:     time.Date(2026, 7, 13, 10, index, 0, 0, time.UTC),
+			MachineID:     "machine",
+			Provider:      "provider",
+			Model:         fmt.Sprintf("model-%d", index),
+			Tool:          "codex",
+			TotalTokens:   usage.Int64(tokens),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	events = append(events,
+		usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "share-other-previous", Timestamp: time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model-5", Tool: "codex", TotalTokens: usage.Int64(5), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "share-unknown", Timestamp: time.Date(2026, 7, 13, 11, 0, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model-0", Tool: "codex", TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	)
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+
+	analytics, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "models", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analytics.ShareSeries) != 6 {
+		t.Fatalf("share series = %+v, want five named series and Other", analytics.ShareSeries)
+	}
+	for index := 0; index < 5; index++ {
+		if want := fmt.Sprintf("model-%d", index); analytics.ShareSeries[index].Name != want {
+			t.Fatalf("share series %d = %q, want %q: %+v", index, analytics.ShareSeries[index].Name, want, analytics.ShareSeries)
+		}
+	}
+	if other := analytics.ShareSeries[5]; other.Name != "Other" || other.Tokens != 15 {
+		t.Fatalf("Other series = %+v, want 15 tokens", other)
+	}
+	if len(analytics.SharePoints) != 7 {
+		t.Fatalf("share points = %d, want seven zero-filled days: %+v", len(analytics.SharePoints), analytics.SharePoints)
+	}
+	active := analytics.SharePoints[len(analytics.SharePoints)-1]
+	if active.Date != "2026-07-13" || active.Tokens != 210 || active.UnknownEvents != 1 || len(active.Values) != 6 || active.Values[5].Tokens != 10 {
+		t.Fatalf("unexpected active share point: %+v", active)
+	}
+	if analytics.SharePoints[0].Tokens != 0 || len(analytics.SharePoints[0].Values) != 6 {
+		t.Fatalf("quiet share bucket was not filled with the series shape: %+v", analytics.SharePoints[0])
+	}
+}

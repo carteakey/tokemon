@@ -752,10 +752,25 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if pageResponse.Code != http.StatusOK {
 		t.Fatalf("analytics page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
 	}
-	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Recent sessions", "name=\"period\"", "All machines", ">24H</a>", ">Providers</a>", "data-count=", "data-label=", "prefers-reduced-motion", "trend-y-axis", "trend-annotation", "Peak bucket", "tick-start"} {
+	for _, want := range []string{"<title>Tokemon · Analytics</title>", "Export analytics JSON", "Token trend", "Usage share", "Models · top 5", "share-bars", "share-column", "share-stack", "share-segment", "share-hit-grid", "aria-label=\"Share scale\"", "share-tooltip", "role=\"tooltip\"", "data-share-tooltip-date", "data-share-tooltip-total", "data-share-tooltip-series", "Unknown totals present", "data-share-value", "aria-describedby=\"share-tooltip\"", "point.addEventListener('pointerenter'", "point.addEventListener('focus'", "point.addEventListener('click'", "Recent sessions", "name=\"period\"", "All machines", ">24H</a>", ">Providers</a>", "data-count=", "data-label=", "prefers-reduced-motion", "trend-y-axis", "trend-annotation", "Peak bucket", "tick-start"} {
 		if !bytes.Contains(pageResponse.Body.Bytes(), []byte(want)) {
 			t.Fatalf("analytics page does not contain %q: %s", want, pageResponse.Body.String())
 		}
+	}
+	if bytes.Contains(pageResponse.Body.Bytes(), []byte("share-readout")) {
+		t.Fatal("analytics page still renders the persistent usage-share readout")
+	}
+	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`<svg class="share-svg"`)) || bytes.Contains(pageResponse.Body.Bytes(), []byte("share-area")) {
+		t.Fatal("analytics page still renders continuous usage-share paths")
+	}
+	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`class="share-point selected`)) {
+		t.Fatal("analytics page still renders a permanently selected usage-share bucket")
+	}
+	if got := strings.Count(pageResponse.Body.String(), `class="share-column`); got != 7 {
+		t.Fatalf("usage-share columns = %d, want seven discrete buckets", got)
+	}
+	if got := strings.Count(pageResponse.Body.String(), `class="share-column empty`); got != 6 {
+		t.Fatalf("empty usage-share buckets = %d, want six intentional empty buckets", got)
 	}
 	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`/api/v1/analytics/overview">Data</a>`)) {
 		t.Fatal("analytics navigation still points directly at the overview JSON")
@@ -773,7 +788,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if err := json.Unmarshal(exportResponse.Body.Bytes(), &exported); err != nil {
 		t.Fatalf("decode analytics export: %v", err)
 	}
-	if exported.Filter.Period != "7d" || exported.Summary.Tokens != 100 || exported.Filter.Dimension != "models" {
+	if exported.Filter.Period != "7d" || exported.Summary.Tokens != 100 || exported.Filter.Dimension != "models" || len(exported.ShareSeries) != 1 || exported.ShareSeries[0].Name != "gpt" || len(exported.SharePoints) != 7 {
 		t.Fatalf("unexpected exported analytics: %+v", exported)
 	}
 }

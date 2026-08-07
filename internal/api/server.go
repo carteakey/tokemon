@@ -440,6 +440,32 @@ func analyticsDateTickLabel(point database.AnalyticsPoint, period string) string
 	return point.Label
 }
 
+func analyticsShareDateTickLabel(point database.AnalyticsSharePoint, period string) string {
+	if period != "24h" {
+		return point.Label
+	}
+	parts := strings.Fields(point.Label)
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+	return point.Label
+}
+
+func analyticsDimensionLabel(dimension string) string {
+	switch dimension {
+	case "harnesses":
+		return "Harnesses"
+	case "providers":
+		return "Providers"
+	case "models":
+		return "Models"
+	case "machines":
+		return "Machines"
+	default:
+		return "Projects"
+	}
+}
+
 func analyticsPeakPoint(points []database.AnalyticsPoint) database.AnalyticsPoint {
 	if len(points) == 0 {
 		return database.AnalyticsPoint{}
@@ -634,6 +660,8 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 		"analyticsPart":        analyticsPartPercent,
 		"analyticsDateTick":    analyticsDateTickClass,
 		"analyticsDateLabel":   analyticsDateTickLabel,
+		"shareDateLabel":       analyticsShareDateTickLabel,
+		"dimensionLabel":       analyticsDimensionLabel,
 		"analyticsTime":        analyticsShortTime,
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
@@ -1973,8 +2001,58 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .trend-column.tick-end .trend-label { right: 0; left: auto; transform: none; }
     .trend-annotation { position: absolute; z-index: 3; top: 0; left: 50%; display: grid; min-width: 58px; gap: 2px; padding: 3px 5px; border: 1px solid var(--warm); border-radius: 3px; background: var(--surface); color: var(--warm); font: 700 8px/1 var(--font-data); letter-spacing: .06em; text-align: center; transform: translateX(-50%); white-space: nowrap; }
     .trend-annotation strong { color: var(--text); font-size: 9px; letter-spacing: 0; }
+    .share-panel { position: relative; min-width: 0; margin-top: 10px; overflow: hidden; }
+    .share-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 10px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
+    .share-legend .legend-item strong { color: var(--text); font-weight: 600; }
+    .share-swatch { width: 9px; height: 9px; border: 1px solid rgba(240, 237, 229, .2); border-radius: 2px; background: var(--series-color); }
+    .series-0 { --series-color: #77a57e; }
+    .series-1 { --series-color: #8fba94; }
+    .series-2 { --series-color: #bfd1ab; }
+    .series-3 { --series-color: #b19570; }
+    .series-4 { --series-color: #d1a975; }
+    .series-5 { --series-color: #5d6a63; }
+    .share-legend .legend-item.other { color: var(--faint); }
+    .share-legend .legend-item.other strong { color: var(--muted); }
+    .share-legend .legend-item.other .share-swatch { opacity: .62; }
+    .share-visual { position: relative; min-height: 226px; border-bottom: 1px solid var(--line); }
+    .share-y-axis { position: absolute; z-index: 3; top: 14px; bottom: 30px; left: 8px; width: 42px; pointer-events: none; }
+    .share-y-axis span { position: absolute; right: 0; color: var(--faint); font: 9px/1 var(--font-data); transform: translateY(50%); }
+    .share-scroll { margin-left: 58px; overflow-x: auto; }
+    .share-chart { position: relative; min-width: 620px; height: 226px; margin-right: 16px; }
+    .share-grid { position: absolute; z-index: 0; inset: 14px 0 30px; }
+    .share-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .42); }
+    .share-bars { position: absolute; z-index: 1; inset: 14px 0 30px; display: grid; grid-template-columns: repeat(var(--points), minmax(10px, 1fr)); gap: 4px; pointer-events: none; }
+    .share-column { min-width: 0; height: 100%; }
+    .share-stack { display: flex; width: calc(100% - 2px); height: 100%; flex-direction: column-reverse; margin: 0 auto; overflow: hidden; border: 1px solid rgba(240, 237, 229, .18); border-radius: 3px 3px 1px 1px; background: rgba(32, 37, 30, .76); }
+    .share-column.empty .share-stack { border-style: dashed; border-color: var(--line-bright); background: repeating-linear-gradient(135deg, rgba(240, 237, 229, .035) 0 2px, transparent 2px 6px); }
+    .share-segment { display: block; width: 100%; min-height: 0; flex: 0 0 auto; background: var(--series-color); box-shadow: inset 0 1px rgba(16, 21, 17, .34); transform-origin: bottom; animation: share-rise 420ms cubic-bezier(.2, .75, .25, 1) both; }
+    .share-segment.series-5 { opacity: .62; }
+    .share-tooltip { position: absolute; z-index: 5; top: 8px; left: 50%; display: grid; width: min(250px, calc(100% - 16px)); padding: 10px 11px; border: 1px solid var(--accent-dim); border-radius: 5px; background: var(--surface-raised); box-shadow: 0 8px 24px rgba(0, 0, 0, .28); pointer-events: none; transform: translateX(-50%); }
+    .share-tooltip::before { position: absolute; top: 100%; left: var(--share-tooltip-anchor, 50%); width: 1px; height: 14px; background: var(--accent-dim); content: ""; }
+    .share-tooltip::after { position: absolute; bottom: -4px; left: var(--share-tooltip-anchor, 50%); width: 7px; height: 7px; border-right: 1px solid var(--accent-dim); border-bottom: 1px solid var(--accent-dim); background: var(--surface-raised); content: ""; transform: translateX(-50%) rotate(45deg); }
+    .share-tooltip-date { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .06em; }
+    .share-tooltip-total { margin-top: 5px; color: var(--text); font: 700 14px/1.1 var(--font-data); }
+    .share-tooltip-warning { margin-top: 5px; color: var(--warm); font: 10px/1.2 var(--font-data); }
+    .share-tooltip-series { display: grid; gap: 4px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); }
+    .share-tooltip-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: baseline; gap: 6px; color: var(--muted); font: 10px/1.2 var(--font-data); }
+    .share-tooltip-row strong { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    .share-tooltip-value { white-space: nowrap; }
+    .share-tooltip-swatch { width: 8px; height: 8px; border-radius: 2px; background: var(--series-color); }
+    .share-hit-grid { position: absolute; z-index: 2; inset: 14px 0 0; display: grid; grid-template-columns: repeat(var(--points), minmax(10px, 1fr)); }
+    .share-point { position: relative; min-width: 0; padding: 0 0 22px; border: 0; background: transparent; color: inherit; cursor: crosshair; }
+    .share-point::before { position: absolute; top: 0; bottom: 30px; left: 50%; border-left: 1px solid transparent; content: ""; }
+    .share-point:hover, .share-point:focus-visible { background: rgba(240, 237, 229, .025); }
+    .share-point:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: -2px; }
+    .share-point:hover::before, .share-point:focus-visible::before, .share-point.active::before { border-left-color: var(--text); }
+    .share-point.unknown::after { position: absolute; right: 1px; bottom: 29px; left: 1px; height: 3px; border: 1px solid var(--warm); content: ""; }
+    .share-label { position: absolute; right: auto; bottom: 6px; left: 50%; width: max-content; color: var(--muted); font: 10px/1 var(--font-data); opacity: 0; transform: translateX(-50%); white-space: nowrap; }
+    .share-point.tick .share-label { opacity: 1; }
+    .share-point.tick-start .share-label { left: 0; transform: none; }
+    .share-point.tick-end .share-label { right: 0; left: auto; transform: none; }
+    .share-point-data { display: none; }
     .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
     .trend-panel, .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
+    .sessions-panel { margin-top: 10px; }
     .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
     .dimension-link { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font: 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
     .dimension-link.active { border-color: var(--accent); color: var(--accent); }
@@ -1999,6 +2077,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .unknown-flag { display: inline-grid; width: 14px; height: 14px; place-items: center; margin-left: 4px; border: 1px solid var(--warm); border-radius: 50%; color: var(--warm); font-size: 9px; }
     footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
     @keyframes chart-rise { from { opacity: .65; transform: scaleY(.12); } to { opacity: 1; transform: scaleY(1); } }
+    @keyframes share-rise { from { opacity: .35; transform: scaleY(.1); } to { opacity: 1; transform: scaleY(1); } }
     @keyframes meter-grow { from { width: 0; } }
     @keyframes stat-in { from { opacity: .72; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 1080px) {
@@ -2166,6 +2245,44 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     </article>
   </section>
 
+  <section class="panel share-panel" aria-labelledby="share-title">
+    <div class="section-head"><div class="section-title" id="share-title">Usage share</div><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
+    {{if .SharePoints}}
+    <div class="share-legend" aria-label="Usage share legend">
+      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $series.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $series.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $series.Name}}{{else}}{{$series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
+    </div>
+    <div class="share-visual">
+      <div class="share-y-axis" aria-label="Share scale"><span style="bottom: 100%">100%</span><span style="bottom: 50%">50%</span><span style="bottom: 0">0%</span></div>
+      <div class="share-scroll">
+        <div class="share-chart" style="--points: {{len .SharePoints}}">
+          <div class="share-grid" aria-hidden="true"><i style="bottom: 100%"></i><i style="bottom: 50%"></i><i style="bottom: 0"></i></div>
+          <div class="share-bars" aria-hidden="true">
+            {{range $index, $point := .SharePoints}}<div class="share-column{{if eq .Tokens 0}} empty{{end}}{{if .UnknownEvents}} unknown{{end}}" style="--index: {{$index}}">
+              <div class="share-stack">
+                {{range $seriesIndex, $value := .Values}}<span class="share-segment series-{{$seriesIndex}}" style="height: {{mul $value.Share 100}}%"></span>{{end}}
+              </div>
+            </div>{{end}}
+          </div>
+          <div class="share-tooltip" id="share-tooltip" role="tooltip" aria-live="polite" aria-atomic="true" hidden>
+            <div class="share-tooltip-date" data-share-tooltip-date></div>
+            <div class="share-tooltip-total" data-share-tooltip-total></div>
+            <div class="share-tooltip-warning" data-share-tooltip-warning hidden>Unknown totals present</div>
+            <div class="share-tooltip-series" data-share-tooltip-series role="list"></div>
+          </div>
+          <div class="share-hit-grid">
+            {{range $index, $point := .SharePoints}}
+            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
+              {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
+              <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
+            </button>
+            {{end}}
+          </div>
+        </div>
+      </div>
+    </div>
+    {{else}}<div class="empty-chart">No known token totals to compare in this window.</div>{{end}}
+  </section>
+
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
     <div class="section-head"><div class="section-title" id="sessions-title">Recent sessions</div><div class="section-meta">Metadata only · latest 12</div></div>
     <div class="table-scroll">
@@ -2214,6 +2331,72 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       column.addEventListener('mouseenter', () => showPoint(column));
       column.addEventListener('focus', () => showPoint(column));
       column.addEventListener('click', () => showPoint(column));
+    });
+
+    const shareTooltip = document.getElementById('share-tooltip');
+    const shareTooltipDate = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-date]');
+    const shareTooltipTotal = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-total]');
+    const shareTooltipWarning = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-warning]');
+    const shareTooltipSeries = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-series]');
+    const positionShareTooltip = (point) => {
+      if (!shareTooltip) return;
+      const chart = point.closest('.share-chart');
+      if (!chart) return;
+      const tooltipWidth = shareTooltip.offsetWidth || 250;
+      const center = point.offsetLeft + point.offsetWidth / 2;
+      const minimum = tooltipWidth / 2 + 8;
+      const maximum = chart.clientWidth - tooltipWidth / 2 - 8;
+      const left = maximum < minimum ? chart.clientWidth / 2 : Math.max(minimum, Math.min(maximum, center));
+      shareTooltip.style.left = left + 'px';
+      shareTooltip.style.setProperty('--share-tooltip-anchor', center - left + 'px');
+    };
+    const hideShareTooltip = () => {
+      if (!shareTooltip) return;
+      shareTooltip.hidden = true;
+      document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
+    };
+    const showSharePoint = (point) => {
+      if (!shareTooltip || !shareTooltipDate || !shareTooltipTotal || !shareTooltipSeries) return;
+      document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
+      point.classList.add('active');
+      shareTooltipDate.textContent = point.dataset.label;
+      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' known tokens';
+      const unknownEvents = Number(point.dataset.unknown);
+      if (shareTooltipWarning) {
+        shareTooltipWarning.hidden = unknownEvents <= 0;
+        shareTooltipWarning.textContent = unknownEvents > 0 ? number.format(unknownEvents) + ' event' + (unknownEvents === 1 ? '' : 's') + ' with unknown total' + (unknownEvents === 1 ? '' : 's') : '';
+      }
+      shareTooltipSeries.replaceChildren(...Array.from(point.querySelectorAll('[data-share-value]')).map((item) => {
+        const row = document.createElement('div');
+        row.className = 'share-tooltip-row';
+        row.setAttribute('role', 'listitem');
+        const swatch = document.createElement('i');
+        swatch.className = 'share-tooltip-swatch series-' + item.dataset.series;
+        const name = document.createElement('strong');
+        name.textContent = item.dataset.name;
+        const value = document.createElement('span');
+        value.className = 'share-tooltip-value';
+        value.textContent = number.format(Number(item.dataset.tokens)) + ' · ' + item.dataset.share + '%';
+        row.append(swatch, name, value);
+        return row;
+      }));
+      shareTooltip.hidden = false;
+      positionShareTooltip(point);
+    };
+    document.querySelectorAll('.share-point').forEach((point) => {
+      point.addEventListener('pointerenter', () => showSharePoint(point));
+      point.addEventListener('focus', () => showSharePoint(point));
+      point.addEventListener('click', () => showSharePoint(point));
+      point.addEventListener('pointerleave', (event) => {
+        if (event.pointerType === 'mouse' && !point.matches(':focus')) hideShareTooltip();
+      });
+      point.addEventListener('blur', () => {
+        if (!point.matches(':hover')) hideShareTooltip();
+      });
+    });
+    window.addEventListener('resize', () => {
+      const active = document.querySelector('.share-point.active');
+      if (active && shareTooltip && !shareTooltip.hidden) positionShareTooltip(active);
     });
   })();
 </script>

@@ -217,6 +217,20 @@ type AnalyticsBreakdown struct {
 	Share    float64 `json:"share"`
 }
 
+type AnalyticsShareSeries struct {
+	Name   string  `json:"name"`
+	Tokens int64   `json:"tokens"`
+	Share  float64 `json:"share"`
+}
+
+type AnalyticsSharePoint struct {
+	Date          string                 `json:"date"`
+	Label         string                 `json:"label"`
+	Tokens        int64                  `json:"tokens"`
+	UnknownEvents int64                  `json:"unknown_events,omitempty"`
+	Values        []AnalyticsShareSeries `json:"values"`
+}
+
 type AnalyticsSession struct {
 	SessionID     string `json:"session_id,omitempty"`
 	Timestamp     string `json:"timestamp"`
@@ -238,19 +252,21 @@ type AnalyticsFacets struct {
 }
 
 type Analytics struct {
-	LifetimeTokens int64                `json:"lifetime_tokens"`
-	Timezone       string               `json:"timezone"`
-	Filter         AnalyticsQuery       `json:"filter"`
-	StartDate      string               `json:"start_date"`
-	EndDate        string               `json:"end_date"`
-	Bucket         string               `json:"bucket"`
-	Summary        AnalyticsSummary     `json:"summary"`
-	Comparison     *AnalyticsComparison `json:"comparison,omitempty"`
-	Points         []AnalyticsPoint     `json:"points"`
-	MaxTokens      int64                `json:"max_tokens"`
-	Breakdown      []AnalyticsBreakdown `json:"breakdown"`
-	Sessions       []AnalyticsSession   `json:"recent_sessions"`
-	Facets         AnalyticsFacets      `json:"facets"`
+	LifetimeTokens int64                  `json:"lifetime_tokens"`
+	Timezone       string                 `json:"timezone"`
+	Filter         AnalyticsQuery         `json:"filter"`
+	StartDate      string                 `json:"start_date"`
+	EndDate        string                 `json:"end_date"`
+	Bucket         string                 `json:"bucket"`
+	Summary        AnalyticsSummary       `json:"summary"`
+	Comparison     *AnalyticsComparison   `json:"comparison,omitempty"`
+	Points         []AnalyticsPoint       `json:"points"`
+	MaxTokens      int64                  `json:"max_tokens"`
+	Breakdown      []AnalyticsBreakdown   `json:"breakdown"`
+	ShareSeries    []AnalyticsShareSeries `json:"share_series"`
+	SharePoints    []AnalyticsSharePoint  `json:"share_points"`
+	Sessions       []AnalyticsSession     `json:"recent_sessions"`
+	Facets         AnalyticsFacets        `json:"facets"`
 }
 
 func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
@@ -1232,6 +1248,10 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 	if err != nil {
 		return Analytics{}, err
 	}
+	result.ShareSeries, result.SharePoints, err = s.analyticsShareTimeline(ctx, query, where, args, start, end, result.Breakdown, result.Summary.Tokens)
+	if err != nil {
+		return Analytics{}, err
+	}
 	result.Sessions, err = s.analyticsSessions(ctx, where, args)
 	if err != nil {
 		return Analytics{}, err
@@ -1541,6 +1561,131 @@ FROM usage_events WHERE `+where+` GROUP BY 1 ORDER BY 2 DESC, 1`, args...)
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) analyticsShareTimeline(ctx context.Context, query AnalyticsQuery, where string, args []any, start, end time.Time, breakdown []AnalyticsBreakdown, total int64) ([]AnalyticsShareSeries, []AnalyticsSharePoint, error) {
+	const visibleSeries = 5
+	series := make([]AnalyticsShareSeries, 0, visibleSeries+1)
+	selected := make(map[string]int, visibleSeries)
+	for _, item := range breakdown {
+		if len(series) >= visibleSeries {
+			break
+		}
+		selected[item.Name] = len(series)
+		entry := AnalyticsShareSeries{Name: item.Name, Tokens: item.Tokens}
+		if total > 0 {
+			entry.Share = float64(item.Tokens) / float64(total)
+		}
+		series = append(series, entry)
+	}
+	if len(breakdown) > visibleSeries {
+		other := AnalyticsShareSeries{Name: "Other"}
+		for _, item := range breakdown[visibleSeries:] {
+			other.Tokens += item.Tokens
+		}
+		if total > 0 {
+			other.Share = float64(other.Tokens) / float64(total)
+		}
+		series = append(series, other)
+	}
+	if len(series) == 0 {
+		return nil, nil, nil
+	}
+
+	expression := "COALESCE(" + analyticsBreakdownExpression(query.Dimension) + ", 'Unknown')"
+	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens, `+expression+`
+FROM usage_events WHERE `+where, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	byDate := make(map[string]AnalyticsSharePoint)
+	for rows.Next() {
+		var timestamp, name string
+		var tokens sql.NullInt64
+		if err := rows.Scan(&timestamp, &tokens, &name); err != nil {
+			return nil, nil, err
+		}
+		parsed, err := timeParse(timestamp)
+		if err != nil {
+			return nil, nil, err
+		}
+		bucket := analyticsBucketKey(parsed.In(s.reportingLocation()), query.Period, s.reportingLocation())
+		point := byDate[bucket]
+		point.Date = bucket
+		if len(point.Values) == 0 {
+			point.Values = make([]AnalyticsShareSeries, len(series))
+			copy(point.Values, series)
+			for index := range point.Values {
+				point.Values[index].Tokens = 0
+				point.Values[index].Share = 0
+			}
+		}
+		if !tokens.Valid {
+			point.UnknownEvents++
+			byDate[bucket] = point
+			continue
+		}
+		point.Tokens += tokens.Int64
+		index, ok := selected[name]
+		if !ok && len(series) > visibleSeries {
+			index = len(series) - 1
+			ok = true
+		}
+		if ok {
+			point.Values[index].Tokens += tokens.Int64
+		}
+		byDate[bucket] = point
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	points := s.fillAnalyticsSharePoints(byDate, series, query, start, end)
+	return series, points, nil
+}
+
+func analyticsBucketKey(local time.Time, period string, location *time.Location) string {
+	switch period {
+	case "24h":
+		hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, location)
+		return hour.UTC().Format(time.RFC3339)
+	case "all":
+		return local.Format("2006-01") + "-01"
+	default:
+		return local.Format("2006-01-02")
+	}
+}
+
+func (s *Store) fillAnalyticsSharePoints(byDate map[string]AnalyticsSharePoint, series []AnalyticsShareSeries, query AnalyticsQuery, start, end time.Time) []AnalyticsSharePoint {
+	if len(byDate) == 0 {
+		return nil
+	}
+	seed := make([]AnalyticsPoint, 0, len(byDate))
+	for _, point := range byDate {
+		seed = append(seed, AnalyticsPoint{Date: point.Date})
+	}
+	sort.Slice(seed, func(left, right int) bool { return seed[left].Date < seed[right].Date })
+	filled := s.fillAnalyticsPoints(seed, query, start, end)
+	result := make([]AnalyticsSharePoint, 0, len(filled))
+	for _, base := range filled {
+		point, ok := byDate[base.Date]
+		if !ok {
+			point = AnalyticsSharePoint{Date: base.Date, Values: make([]AnalyticsShareSeries, len(series))}
+			copy(point.Values, series)
+			for index := range point.Values {
+				point.Values[index].Tokens = 0
+				point.Values[index].Share = 0
+			}
+		}
+		point.Label = analyticsPointLabel(point.Date, query.Period, s.reportingLocation())
+		if point.Tokens > 0 {
+			for index := range point.Values {
+				point.Values[index].Share = float64(point.Values[index].Tokens) / float64(point.Tokens)
+			}
+		}
+		result = append(result, point)
+	}
+	return result
 }
 
 func (s *Store) analyticsSessions(ctx context.Context, where string, args []any) ([]AnalyticsSession, error) {
