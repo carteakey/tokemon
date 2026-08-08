@@ -10,6 +10,14 @@ const forms = [
   { stage: "18", name: "The Singularity", threshold: "1T+", image: "/tokemon/stage-18.png" },
 ];
 
+const visibleStages = new Set(["00", "08", "13", "18"]);
+const visibleForms = forms.filter((form) => visibleStages.has(form.stage));
+const sealedGroups = [
+  { stage: "01–07", label: "EARLY DOSSIER", threshold: "10 → 10M", copy: "The first mutations stay sealed." },
+  { stage: "09–12", label: "TITAN DOSSIER", threshold: "1B → 10B", copy: "The appetite gets stranger from here." },
+  { stage: "14–17", label: "COSMIC DOSSIER", threshold: "50B → 500B", copy: "Four late forms are not public yet." },
+];
+
 const providers = [
   "CLAUDE CODE",
   "CODEX",
@@ -129,13 +137,18 @@ export default function Home() {
             <p>Powers of ten carry the creature through one billion tokens. After that, denser 1–2–5 checkpoints keep the late forms moving: leviathan, colossus, weaver, architect, engine, singularity.</p>
           </div>
           <div className="forms">
-            {forms.map((form) => <article className="form" key={form.stage}>
+            {visibleForms.map((form) => <article className="form" key={form.stage}>
               <div className="formMeta"><span>STAGE {form.stage}</span><span>{form.name} · {form.threshold}</span></div>
               <img src={form.image} alt={`Original Tokemon evolution artifact, stage ${form.stage}`} width="640" height="640" />
               <div className="formTicks">+ + + + + + + + + + + +</div>
             </article>)}
+            {sealedGroups.map((group) => <article className="formTeaser" key={group.stage} aria-label={`Sealed Tokemon forms, stages ${group.stage}`}>
+              <div className="teaserMark">◈</div>
+              <div><span className="teaserStage">STAGES {group.stage}</span><strong>{group.label}</strong><p>{group.copy}</p></div>
+              <div className="teaserFooter"><span>{group.threshold} TOKENS</span><span>CLASSIFIED</span></div>
+            </article>)}
           </div>
-          <p className="archiveNote">Nine specimen assets from the complete 19-form archive · final form at 1T tokens.</p>
+          <p className="archiveNote">Four specimen assets shown · fifteen forms remain sealed as a teaser from the complete 19-form archive.</p>
         </div>
       </section>
 

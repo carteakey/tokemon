@@ -27,6 +27,9 @@ test("server-renders the Tokemon landing page", async () => {
   assert.match(html, /1–2–5 checkpoints/);
   assert.match(html, /The Singularity/);
   assert.match(html, /Context Dragon/);
+  assert.match(html, /CLASSIFIED/);
+  assert.match(html, /fifteen forms remain sealed/);
+  assert.doesNotMatch(html, /stage-14\.png/);
   assert.match(html, /TODEX \+ ESTIMATES/);
   assert.match(html, /static YAML model catalog/);
   assert.match(html, /usage share/);
