@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
 - Added a metadata-only Hermes Agent adapter for default and named-profile SQLite usage stores.
-- Prevented new or archived Codex sessions from invalidating every unchanged session snapshot.
+- Added an analytics usage-share timeline showing the top five harnesses, providers, models, or machines per window plus aggregated Others.
+- Prevented new or archived Codex sessions from invalidating every unchanged session snapshot; late forks now reparse only the dependent child.
 - Added a hub health preflight so offline hubs back off without repeatedly scanning local provider histories.
-- Cached the dashboard evolution summary between ingests so two-second live polling no longer rescans the full usage history.
+- Cached the dashboard evolution summary between ingests with a bounded freshness window, while keeping writes visible immediately and collapsing concurrent polling into one recompute.
+- Hardened evolution and analytics accounting with schema drift warnings, missing-token attribution tests, and regression coverage for share timeline invariants.
 
 ## 0.3.2
 
