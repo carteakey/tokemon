@@ -442,6 +442,50 @@ func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 	}
 }
 
+func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "ttl-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(7), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := server.Handler()
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if first.Code != http.StatusOK || server.evolutionCache == nil {
+		t.Fatalf("initial evolution response = %d %s", first.Code, first.Body.String())
+	}
+	original := server.evolutionCache
+	if _, err := server.cachedEvolution(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.evolutionCache != original || time.Since(original.fetched) > time.Second {
+		t.Fatalf("fresh cache was overwritten: %#v", server.evolutionCache)
+	}
+
+	server.evolutionCache.fetched = time.Now().Add(-evolutionCacheTTL - time.Second)
+	backdatedEntry := server.evolutionCache
+	refreshed := httptest.NewRecorder()
+	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":7`) {
+		t.Fatalf("expired evolution response = %d %s", refreshed.Code, refreshed.Body.String())
+	}
+	server.evolutionMu.Lock()
+	recomputed := server.evolutionCache
+	server.evolutionMu.Unlock()
+	if recomputed == nil || recomputed == backdatedEntry || time.Since(recomputed.fetched) > time.Second {
+		t.Fatalf("expired cache was not recomputed: %#v", server.evolutionCache)
+	}
+}
+
 func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) {
 	inputPrice := 10.0
 	outputPrice := 0.0

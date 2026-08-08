@@ -782,4 +782,105 @@ func TestAnalyticsShareTimelineKeepsTopFiveAndGroupsOther(t *testing.T) {
 	if analytics.SharePoints[0].Tokens != 0 || len(analytics.SharePoints[0].Values) != 6 {
 		t.Fatalf("quiet share bucket was not filled with the series shape: %+v", analytics.SharePoints[0])
 	}
+	// Every bucket's per-series tokens must account for all known tokens, so the
+	// stacked bars always total to the bucket total even when a bucket's local
+	// ranking differs from the window-wide top five.
+	for _, point := range analytics.SharePoints {
+		var total int64
+		for _, value := range point.Values {
+			total += value.Tokens
+		}
+		if total != point.Tokens {
+			t.Fatalf("bucket %s series token sum = %d, want %d: %+v", point.Date, total, point.Tokens, point)
+		}
+	}
+}
+
+func TestAnalyticsShareTimelineBucketOutsideTopFiveRanksIntoOther(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	events := make([]usage.Event, 0, 12)
+	for index, tokens := range []int64{60, 50, 40, 30, 20, 10} {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("rank-%d", index),
+			Timestamp:     time.Date(2026, 7, 12, 10, index, 0, 0, time.UTC),
+			MachineID:     "machine",
+			Provider:      "provider",
+			Model:         fmt.Sprintf("model-%d", index),
+			Tool:          "codex",
+			TotalTokens:   usage.Int64(tokens),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	// On day 12 the models below the global top five dominate the bucket, so
+	// their tokens must still be fully attributed to the Other series.
+	for index, tokens := range []int64{1, 2} {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("rank-other-%d", index),
+			Timestamp:     time.Date(2026, 7, 12, 11, index, 0, 0, time.UTC),
+			MachineID:     "machine",
+			Provider:      "provider",
+			Model:         fmt.Sprintf("model-%d", 5+index),
+			Tool:          "codex",
+			TotalTokens:   usage.Int64(tokens),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	for index, tokens := range []int64{5, 4, 3, 1, 0} {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("rank-day13-%d", index),
+			Timestamp:     time.Date(2026, 7, 13, 9, index, 0, 0, time.UTC),
+			MachineID:     "machine",
+			Provider:      "provider",
+			Model:         fmt.Sprintf("model-%d", index),
+			Tool:          "codex",
+			TotalTokens:   usage.Int64(tokens),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+
+	analytics, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "models", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analytics.ShareSeries) != 6 {
+		t.Fatalf("share series = %+v, want five named series and Other", analytics.ShareSeries)
+	}
+	for _, point := range analytics.SharePoints {
+		var total int64
+		for _, value := range point.Values {
+			total += value.Tokens
+		}
+		if total != point.Tokens {
+			t.Fatalf("bucket %s series token sum = %d, want %d: %+v", point.Date, total, point.Tokens, point)
+		}
+	}
+	for _, date := range []string{"2026-07-12", "2026-07-13"} {
+		if point := pointForDate(analytics.SharePoints, date); point == nil {
+			t.Fatalf("missing share bucket for %s: %+v", date, analytics.SharePoints)
+		}
+	}
+}
+
+func pointForDate(points []AnalyticsSharePoint, date string) *AnalyticsSharePoint {
+	for index := range points {
+		if points[index].Date == date {
+			return &points[index]
+		}
+	}
+	return nil
 }

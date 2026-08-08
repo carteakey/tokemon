@@ -29,7 +29,14 @@ type Server struct {
 	template       *template.Template
 	static         http.Handler
 	evolutionMu    sync.Mutex
-	evolutionCache *evolutionResponse
+	evolutionCache *evolutionCacheEntry
+	evolutionReady chan struct{}
+}
+
+type evolutionCacheEntry struct {
+	result  evolutionResponse
+	err     error
+	fetched time.Time
 }
 
 type evolutionResponse struct {
@@ -848,12 +855,43 @@ func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// evolutionCacheTTL bounds how long cached evolution data may be served without
+// any ingest writing to the store; the ingest path still invalidates immediately.
+const evolutionCacheTTL = time.Minute
+
 func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error) {
-	s.evolutionMu.Lock()
-	defer s.evolutionMu.Unlock()
-	if s.evolutionCache != nil {
-		return *s.evolutionCache, nil
+	for {
+		s.evolutionMu.Lock()
+		if cached := s.evolutionCache; cached != nil && time.Since(cached.fetched) < evolutionCacheTTL {
+			result, err := cached.result, cached.err
+			s.evolutionMu.Unlock()
+			return result, err
+		}
+		if ready := s.evolutionReady; ready != nil {
+			s.evolutionMu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return evolutionResponse{}, ctx.Err()
+			}
+		}
+		s.evolutionReady = make(chan struct{})
+		s.evolutionMu.Unlock()
+
+		result, err := s.computeEvolution(ctx)
+
+		s.evolutionMu.Lock()
+		ready := s.evolutionReady
+		s.evolutionReady = nil
+		s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		s.evolutionMu.Unlock()
+		close(ready)
+		return result, err
 	}
+}
+
+func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error) {
 	snapshot, err := s.store.Evolution(ctx)
 	if err != nil {
 		return evolutionResponse{}, err
@@ -862,9 +900,7 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 	if err != nil {
 		return evolutionResponse{}, err
 	}
-	result := evolutionResponse{Snapshot: snapshot, Composition: composition}
-	s.evolutionCache = &result
-	return result, nil
+	return evolutionResponse{Snapshot: snapshot, Composition: composition}, nil
 }
 
 func (s *Server) invalidateEvolutionCache() {

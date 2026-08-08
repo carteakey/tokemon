@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -162,6 +163,10 @@ func (a *Adapter) parseUncached(ctx context.Context, path, machineID, identity, 
 	}
 	for _, required := range []string{"id", "started_at", "input_tokens", "output_tokens"} {
 		if !sessionColumns[required] {
+			// An older or local schema means usage metadata cannot be read.
+			// Warn once per poll so agents do not silently report zero usage.
+			slog.Warn("hermes state schema lacks required session columns; usage metadata skipped",
+				"path", path, "missing", required)
 			return result, nil
 		}
 	}
