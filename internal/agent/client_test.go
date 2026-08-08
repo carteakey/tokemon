@@ -12,7 +12,7 @@ import (
 	"github.com/tokemon/tokemon/internal/usage"
 )
 
-func TestClientIngestSplitsLargeBatches(t *testing.T) {
+func TestClientIngestRedactsMetadataBeforeUpload(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
@@ -28,6 +28,11 @@ func TestClientIngestSplitsLargeBatches(t *testing.T) {
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Errorf("decode request: %v", err)
 			return
+		}
+		for _, event := range request.Events {
+			if event.Metadata != nil {
+				t.Errorf("uploaded event %q retained metadata", event.EventID)
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(database.IngestResult{Accepted: len(request.Events), CurrentTotal: int64(requests)})
@@ -51,8 +56,8 @@ func TestClientIngestSplitsLargeBatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != len(events) || result.Accepted != len(events) || result.CurrentTotal != int64(len(events)) {
-		t.Fatalf("requests = %d, result = %+v, want %d bounded requests and all events accepted", requests, result, len(events))
+	if requests != 1 || result.Accepted != len(events) || result.CurrentTotal != 1 {
+		t.Fatalf("requests = %d, result = %+v, want one redacted request and all events accepted", requests, result)
 	}
 }
 

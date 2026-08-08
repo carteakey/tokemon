@@ -123,7 +123,7 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecord(reader)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}

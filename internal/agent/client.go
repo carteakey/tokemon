@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/database"
@@ -21,14 +22,14 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-type batchRequest struct {
-	Events []usage.Event `json:"events"`
-}
-
 type AdapterHeartbeat struct {
 	ID           string                `json:"id"`
 	Version      string                `json:"version"`
 	Capabilities adapters.Capabilities `json:"capabilities"`
+}
+
+type batchRequest struct {
+	Events []usage.Event `json:"events"`
 }
 
 type HeartbeatRequest struct {
@@ -41,7 +42,20 @@ type HeartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
-const maxIngestBatchBytes = 4 << 20
+const (
+	maxIngestBatchBytes = 4 << 20
+	// requestTimeout bounds each hub request unless the caller already supplied
+	// a shorter deadline, so a stuck hub cannot hang the agent forever.
+	requestTimeout = 30 * time.Second
+	// healthTimeout keeps an offline hub from delaying collection passes.
+	healthTimeout = 10 * time.Second
+)
+
+// defaultClient applies the request bounds to hub traffic when the caller did
+// not provide a custom HTTP client.
+func defaultClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
 
 func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.IngestResult, error) {
 	if strings.TrimSpace(c.ServerURL) == "" {
@@ -50,6 +64,11 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 	if len(events) == 0 {
 		return database.IngestResult{}, fmt.Errorf("events must not be empty")
 	}
+	safeEvents := make([]usage.Event, len(events))
+	for index, event := range events {
+		safeEvents[index] = usage.SanitizeOutbound(event)
+	}
+	events = safeEvents
 	batches, err := splitIngestBatches(events)
 	if err != nil {
 		return database.IngestResult{}, err
@@ -126,16 +145,18 @@ func (c Client) Health(ctx context.Context) error {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")
 	}
+	client := c.HTTPClient
+	if client == nil {
+		client = defaultClient(healthTimeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
 	if err != nil {
 		return err
 	}
 	if c.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -153,6 +174,12 @@ func (c Client) postJSON(ctx context.Context, path string, payload any, result a
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")
 	}
+	client := c.HTTPClient
+	if client == nil {
+		client = defaultClient(requestTimeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -164,10 +191,6 @@ func (c Client) postJSON(ctx context.Context, path string, payload any, result a
 	request.Header.Set("Content-Type", "application/json")
 	if c.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
 	}
 	response, err := client.Do(request)
 	if err != nil {

@@ -120,6 +120,80 @@ func TestRunAgentPersistsStateAndRetriesAfterFailedUpload(t *testing.T) {
 	}
 }
 
+func TestRunAgentDoesNotCommitRejectedEvents(t *testing.T) {
+	home := t.TempDir()
+	transcriptDir := filepath.Join(home, ".claude", "projects", "project")
+	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := `{"type":"assistant","timestamp":"2026-07-13T12:00:00Z","sessionId":"session-1","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(transcriptDir, "session.jsonl"), []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/agents/heartbeat":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/api/v1/events/batch":
+			calls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rejected":1,"errors":["event 1: invalid"]}`))
+		default:
+			t.Fatalf("unexpected agent request path: %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	statePath := filepath.Join(t.TempDir(), "agent-state.db")
+	args := []string{"agent", "--server", server.URL, "--home", home, "--machine-id", "machine", "--state", statePath, "--once", "--timeout", "5s"}
+	for attempt := 0; attempt < 2; attempt++ {
+		err := run(args)
+		if err == nil || !strings.Contains(err.Error(), "hub rejected 1") {
+			t.Fatalf("attempt %d error = %v, want rejected-event error", attempt+1, err)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("rejected event upload calls = %d, want retry on the next run", calls)
+	}
+}
+
+func TestRunServeFailsClosedWithoutIngestToken(t *testing.T) {
+	t.Setenv("TOKEMON_INGEST_TOKEN", "")
+	config := filepath.Join(t.TempDir(), "server.env")
+	err := run([]string{"serve", "--addr", "127.0.0.1:0", "--config", config, "--database", filepath.Join(t.TempDir(), "tokemon.db")})
+	if err == nil || !strings.Contains(err.Error(), "TOKEMON_INGEST_TOKEN is required") {
+		t.Fatalf("serve without a token = %v, want a token requirement error", err)
+	}
+}
+
+func TestRunServeDevModeRequiresLoopback(t *testing.T) {
+	t.Setenv("TOKEMON_INGEST_TOKEN", "")
+	config := filepath.Join(t.TempDir(), "server.conf")
+	err := run([]string{"serve", "--dev", "--addr", "0.0.0.0:0", "--config", config, "--database", filepath.Join(t.TempDir(), "tokemon.db")})
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("dev mode on a non-loopback address = %v, want a loopback error", err)
+	}
+}
+
+func TestIsLoopbackAddr(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8080": true,
+		"localhost:8080": true,
+		"[::1]:8080":     true,
+		":8080":          false,
+		"0.0.0.0:8080":   false,
+		"10.0.0.5:8080":  false,
+	} {
+		if got := isLoopbackAddr(addr); got != want {
+			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
 func TestRunAgentSkipsCollectionWhenHubIsUnavailable(t *testing.T) {
 	healthCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

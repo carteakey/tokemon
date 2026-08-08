@@ -115,7 +115,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecord(reader)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}

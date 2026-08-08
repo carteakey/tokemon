@@ -3,7 +3,13 @@ package api
 import (
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -73,13 +79,129 @@ type aliasRow struct {
 }
 
 type settingsPage struct {
-	Models   []aliasRow
-	Machines []aliasRow
-	Saved    bool
-	Error    string
+	Models    []aliasRow
+	Machines  []aliasRow
+	Saved     bool
+	Error     string
+	CSRF      string
+	LogoutURL bool
 }
 
 const dashboardUsageRowsLimit = 5
+
+const (
+	maxIngestBodyBytes         = 10 << 20
+	maxIngestDecompressedBytes = 32 << 20
+	maxEventsPerBatch          = 5000
+	maxHeartbeatBodyBytes      = 1 << 20
+)
+
+// Dashboard settings authentication. A successful login exchanges the ingest
+// token for a signed, non-persistent session cookie, and every write must
+// submit the matching CSRF nonce. Without a configured ingest token, the
+// dashboard is treated as a loopback-only development instance.
+const (
+	dashboardSessionCookieName = "tokemon_session"
+	dashboardSessionDuration   = 24 * time.Hour
+	dashboardCSRFField         = "_csrf"
+)
+
+type dashboardSession struct {
+	value     string
+	csrfValue string
+	issuedAt  time.Time
+}
+
+// sessionCookieValue embeds the raw session/CSRF nonce, issue time, and its
+// HMAC signature in one cookie value. newDashboardSession mints an unsigned
+// session; setDashboardSession signs it before sending it to the browser.
+func newDashboardSession() dashboardSession {
+	return dashboardSession{value: randomToken(), issuedAt: time.Now().UTC()}
+}
+
+func sessionCookieValue(session dashboardSession, signature string) string {
+	return session.value + "." + strconv.FormatInt(session.issuedAt.UTC().Unix(), 10) + "." + signature
+}
+
+func (s *Server) signSession(value string, issuedAt int64) string {
+	mac := hmac.New(sha256.New, []byte(s.ingestToken))
+	mac.Write([]byte("tokemon-dashboard-session\x00"))
+	mac.Write([]byte(value + "\x00" + strconv.FormatInt(issuedAt, 10)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// verifySession recomputes the cookie signature so the session value is only
+// accepted when it was issued by this server instance keyed on the ingest
+// token. The raw value doubles as the CSRF nonce submitted back with writes.
+func (s *Server) verifySession(cookieValue string) (dashboardSession, bool) {
+	parts := strings.Split(cookieValue, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return dashboardSession{}, false
+	}
+	issuedAt, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return dashboardSession{}, false
+	}
+	issued := time.Unix(issuedAt, 0).UTC()
+	now := time.Now().UTC()
+	if issued.After(now.Add(5*time.Minute)) || now.After(issued.Add(dashboardSessionDuration)) {
+		return dashboardSession{}, false
+	}
+	if !hmac.Equal([]byte(s.signSession(parts[0], issuedAt)), []byte(parts[2])) {
+		return dashboardSession{}, false
+	}
+	return dashboardSession{value: parts[0], csrfValue: parts[0], issuedAt: issued}, true
+}
+
+func (s *Server) requestSession(r *http.Request) (dashboardSession, bool) {
+	cookie, err := r.Cookie(dashboardSessionCookieName)
+	if err != nil {
+		return dashboardSession{}, false
+	}
+	return s.verifySession(cookie.Value)
+}
+
+func (s *Server) setDashboardSession(w http.ResponseWriter, r *http.Request, session dashboardSession) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     dashboardSessionCookieName,
+		Value:    sessionCookieValue(session, s.signSession(session.value, session.issuedAt.UTC().Unix())),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(dashboardSessionDuration / time.Second),
+		Expires:  time.Now().Add(dashboardSessionDuration),
+	})
+}
+
+func (s *Server) clearDashboardSession(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     dashboardSessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func randomToken() string {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes)
+}
+
+func constantTimeEqual(a, b string) bool {
+	return hmac.Equal([]byte(a), []byte(b))
+}
 
 const (
 	glyphOff uint8 = iota
@@ -687,6 +809,9 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 	if _, err := page.Parse(settingsTemplate); err != nil {
 		return nil, err
 	}
+	if _, err := page.Parse(settingsLoginTemplate); err != nil {
+		return nil, err
+	}
 	if _, err := page.Parse(analyticsTemplate); err != nil {
 		return nil, err
 	}
@@ -704,8 +829,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /", s.dashboard)
 	mux.HandleFunc("GET /analytics", s.analyticsPage)
 	mux.HandleFunc("GET /data", s.analyticsPage)
-	mux.HandleFunc("GET /settings", s.settings)
-	mux.HandleFunc("POST /settings/aliases", s.saveSettings)
+	mux.HandleFunc("GET /settings", s.requireDashboardSession(s.settings))
+	mux.HandleFunc("GET /settings/login", s.settingsLogin)
+	mux.HandleFunc("POST /settings/login", s.saveSettingsLogin)
+	mux.HandleFunc("POST /settings/logout", s.requireDashboardSession(s.saveSettingsLogout))
+	mux.HandleFunc("POST /settings/aliases", s.requireSettings(s.saveSettings))
 	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
 	mux.HandleFunc("POST /api/v1/agents/heartbeat", s.heartbeat)
 	mux.HandleFunc("GET /api/v1/machines", s.machines)
@@ -724,7 +852,53 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) settingsEnabled() bool {
+	return s.ingestToken != ""
+}
+
+func (s *Server) requireDashboardSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.settingsEnabled() {
+			next(w, r)
+			return
+		}
+		if _, ok := s.requestSession(r); ok {
+			next(w, r)
+			return
+		}
+		http.Redirect(w, r, "/settings/login", http.StatusSeeOther)
+	}
+}
+
+// requireSettings authenticates settings writes and verifies the CSRF nonce.
+// It is only enforced when an ingest token is configured; otherwise the
+// dashboard is running in loopback-only development mode.
+func (s *Server) requireSettings(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.settingsEnabled() {
+			next(w, r)
+			return
+		}
+		session, ok := s.requestSession(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "settings authentication required"})
+			return
+		}
+		if !constantTimeEqual(r.FormValue(dashboardCSRFField), session.csrfValue) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ready(ctx); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": "database is not ready"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -747,12 +921,53 @@ type heartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
+var errRequestBodyTooLarge = errors.New("request body exceeds the size limit")
+
+type countingReader struct {
+	reader io.Reader
+	count  int64
+}
+
+func (r *countingReader) Read(buffer []byte) (int, error) {
+	read, err := r.reader.Read(buffer)
+	r.count += int64(read)
+	return read, err
+}
+
+// decodeJSONBody accepts exactly one JSON value and bounds the number of
+// bytes consumed, including trailing input. This prevents valid JSON followed
+// by an unbounded suffix from bypassing request limits.
+func decodeJSONBody(reader io.Reader, limit int64, target any) error {
+	counted := &countingReader{reader: io.LimitReader(reader, limit+1)}
+	decoder := json.NewDecoder(counted)
+	if err := decoder.Decode(target); err != nil {
+		if counted.count > limit {
+			return errRequestBodyTooLarge
+		}
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if counted.count > limit {
+			return errRequestBodyTooLarge
+		}
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	if counted.count > limit {
+		return errRequestBodyTooLarge
+	}
+	return nil
+}
+
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBodyBytes)
 	var reader io.Reader = r.Body
 	var compressed *gzip.Reader
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
@@ -766,12 +981,24 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		reader = compressed
 	}
 	var request batchRequest
-	if err := json.NewDecoder(reader).Decode(&request); err != nil {
+	limit := int64(maxIngestBodyBytes)
+	if compressed != nil {
+		limit = maxIngestDecompressedBytes
+	}
+	if err := decodeJSONBody(reader, limit, &request); err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) || strings.Contains(err.Error(), "request body too large") {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "batch exceeds the request size limit"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
 		return
 	}
 	if len(request.Events) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "events must contain at least one event"})
+		return
+	}
+	if len(request.Events) > maxEventsPerBatch {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": fmt.Sprintf("batch contains %d events; limit is %d", len(request.Events), maxEventsPerBatch)})
 		return
 	}
 	result, err := s.store.Ingest(r.Context(), request.Events)
@@ -788,14 +1015,26 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxHeartbeatBodyBytes)
 	var request heartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	if err := decodeJSONBody(r.Body, maxHeartbeatBodyBytes, &request); err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) || strings.Contains(err.Error(), "request body too large") {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "heartbeat exceeds the request size limit"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
 		return
 	}
 	if strings.TrimSpace(request.MachineID) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine_id is required"})
+		return
+	}
+	if len(request.MachineID) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine_id is too long"})
+		return
+	}
+	if len(request.AgentVersion) > 64 || len(request.OperatingSystem) > 32 || len(request.Architecture) > 16 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "heartbeat metadata field is too long"})
 		return
 	}
 	if request.SourceCount < 0 || request.SourceErrorCount < 0 {
@@ -810,6 +1049,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	for _, adapter := range request.Adapters {
 		if strings.TrimSpace(adapter.ID) == "" || len(adapter.ID) > 128 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter IDs must be non-empty and at most 128 characters"})
+			return
+		}
+		if len(adapter.Version) > 64 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter version is too long"})
 			return
 		}
 		adapterIDs = append(adapterIDs, adapter.ID)
@@ -843,7 +1086,7 @@ func validToken(r *http.Request, expected string) bool {
 	if provided == "" {
 		provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	}
-	return provided == expected
+	return constantTimeEqual(provided, expected)
 }
 
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
@@ -992,6 +1235,71 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
+func (s *Server) settingsLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.settingsEnabled() {
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		return
+	}
+	if _, ok := s.requestSession(r); ok {
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		return
+	}
+	csrf := randomToken()
+	w.Header().Set("Cache-Control", "no-store")
+	http.SetCookie(w, &http.Cookie{
+		Name:     "login_csrf",
+		Value:    csrf,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   10 * 60,
+		Expires:  time.Now().Add(10 * time.Minute),
+	})
+	page := struct{ CSRF string }{CSRF: csrf}
+	if err := s.template.ExecuteTemplate(w, "settings-login", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) saveSettingsLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.settingsEnabled() {
+		http.Redirect(w, r, "/settings", http.StatusSeeOther)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid login form", http.StatusBadRequest)
+		return
+	}
+	csrf, err := r.Cookie("login_csrf")
+	if err != nil || !constantTimeEqual(r.FormValue(dashboardCSRFField), csrf.Value) {
+		http.Error(w, "invalid login form", http.StatusBadRequest)
+		return
+	}
+	if !constantTimeEqual(r.FormValue("token"), s.ingestToken) {
+		http.Error(w, "incorrect ingest token", http.StatusUnauthorized)
+		return
+	}
+	s.setDashboardSession(w, r, newDashboardSession())
+	http.SetCookie(w, &http.Cookie{
+		Name:     "login_csrf",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+	http.Redirect(w, r, "/settings", http.StatusSeeOther)
+}
+
+func (s *Server) saveSettingsLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearDashboardSession(w, r)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.Overview(r.Context())
 	if err != nil {
@@ -1004,10 +1312,16 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
+	csrf := ""
+	if session, ok := s.requestSession(r); ok {
+		csrf = session.csrfValue
+	}
 	page := settingsPage{
-		Models:   modelAliasRows(result.ByModel, modelAliases),
-		Machines: machineAliasRows(result.ByMachine, machineAliases),
-		Saved:    r.URL.Query().Get("saved") == "1",
+		Models:    modelAliasRows(result.ByModel, modelAliases),
+		Machines:  machineAliasRows(result.ByMachine, machineAliases),
+		Saved:     r.URL.Query().Get("saved") == "1",
+		CSRF:      csrf,
+		LogoutURL: s.settingsEnabled(),
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -1872,6 +2186,8 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
     .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
     button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: none; }
+    .logout-form { display: inline-block; margin-right: 12px; }
+    .logout { border-color: var(--faint); color: var(--faint); }
     .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
     footer { margin-top: 20px; color: var(--faint); font-size: 10px; }
     @media (max-width: 620px) {
@@ -1884,11 +2200,16 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
 <main>
   <header class="topbar">
     <h1>Settings</h1>
-    <a class="back-link" href="/">← Overview</a>
+    <div>
+      {{if .LogoutURL}}<form action="/settings/logout" method="post" class="logout-form"><button type="submit" class="logout">Sign out</button></form>{{end}}
+      <a class="back-link" href="/">← Overview</a>
+    </div>
   </header>
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
+  {{if .Error}}<div class="notice" role="alert">{{.Error}}</div>{{end}}
   <form action="/settings/aliases" method="post">
+    {{if .CSRF}}<input type="hidden" name="_csrf" value="{{.CSRF}}">{{end}}
     <h2>Models</h2>
     {{if .Models}}
     <div class="alias-list">
@@ -1916,6 +2237,44 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
     <div class="actions"><button type="submit">Save aliases</button></div>
   </form>
   <footer>Aliases affect dashboard presentation only; usage records and analytics identifiers remain unchanged.</footer>
+</main>
+</body>
+</html>{{end}}`
+
+const settingsLoginTemplate = `{{define "settings-login"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Settings Sign In</title>
+  <style>
+    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --text: #f0ede5; --muted: #a2a69b; --faint: #6f766b; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --warm: #d2a477; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    main { width: min(420px, calc(100% - 24px)); margin: 12vh auto; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+    h1 { margin: 0 0 6px; color: var(--accent); font: 700 16px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    p { margin: 0 0 18px; color: var(--muted); }
+    label { display: block; margin-bottom: 8px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    input { width: 100%; padding: 10px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
+    input:focus { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    button { margin-top: 16px; padding: 10px 16px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: none; }
+    footer { margin-top: 18px; color: var(--faint); font-size: 10px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Settings</h1>
+  <p>Enter the ingest token to manage display aliases. The session lasts 24 hours.</p>
+  <form action="/settings/login" method="post">
+    <input type="hidden" name="_csrf" value="{{.CSRF}}">
+    <label for="token">Ingest token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <footer><a href="/">← Back to dashboard</a></footer>
 </main>
 </body>
 </html>{{end}}`

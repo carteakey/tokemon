@@ -147,7 +147,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecord(reader)
 		position += int64(len(line))
 		if len(strings.TrimSpace(string(line))) > 0 {
 			var event usage.Event

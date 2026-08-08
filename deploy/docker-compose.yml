@@ -9,9 +9,9 @@ services:
     command: ["serve", "--database", "/data/tokemon.db", "--catalog", "/config/models.yaml"]
     user: "${TOKEMON_UID:-65532}:${TOKEMON_GID:-65532}"
     ports:
-      # The host port is remote-accessible on the private network by default.
-      # Override TOKEMON_PORT when this port is already in use.
-      - "0.0.0.0:${TOKEMON_PORT:-18787}:8080"
+      # Keep the dashboard local by default. Set TOKEMON_BIND_ADDRESS to a
+      # private-network address only when remote agents need to reach the hub.
+      - "${TOKEMON_BIND_ADDRESS:-127.0.0.1}:${TOKEMON_PORT:-18787}:8080"
     volumes:
       - ../data:/data
       - ../catalog/models.yaml:/config/models.yaml:ro

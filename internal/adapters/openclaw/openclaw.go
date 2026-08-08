@@ -133,7 +133,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecord(reader)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -357,7 +357,7 @@ func readHeader(file *os.File) (transcriptHeader, []byte, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return transcriptHeader{}, nil, err
 	}
-	line, err := bufio.NewReaderSize(file, 64*1024).ReadBytes('\n')
+	line, err := adapters.ReadRecord(bufio.NewReaderSize(file, 64*1024))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return transcriptHeader{}, nil, err
 	}

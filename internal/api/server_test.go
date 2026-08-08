@@ -119,6 +119,32 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestHealthReportsDatabaseReadiness(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(store, "secret")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+
+	ready := httptest.NewRecorder()
+	server.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("ready health status = %d, want %d", ready.Code, http.StatusOK)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unavailable, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if unavailable.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed health status = %d, want %d", unavailable.Code, http.StatusServiceUnavailable)
+	}
+}
+
 func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
@@ -860,5 +886,280 @@ func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	}
 	if got := analyticsDateTickClass(6, 30, "30d"); got != "" {
 		t.Fatalf("unexpected intermediate 30-day tick class: %q", got)
+	}
+}
+
+func TestSettingsRequireAuthenticationAndCSRF(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+
+	anonymous := httptest.NewRecorder()
+	handler.ServeHTTP(anonymous, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if anonymous.Code != http.StatusSeeOther || anonymous.Header().Get("Location") != "/settings/login" {
+		t.Fatalf("anonymous settings status = %d, location %q", anonymous.Code, anonymous.Header().Get("Location"))
+	}
+
+	form := url.Values{"model_identity": {"claude-sonnet-4"}, "model_alias": {"Sonnet 4"}}
+	request := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, request)
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated save status = %d, want %d", unauthenticated.Code, http.StatusUnauthorized)
+	}
+
+	loginPage := httptest.NewRecorder()
+	handler.ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, "/settings/login", nil))
+	cookies := loginPage.Result().Cookies()
+	if loginPage.Code != http.StatusOK {
+		t.Fatalf("login page status = %d", loginPage.Code)
+	}
+	var csrfCookie *http.Cookie
+	for _, cookie := range cookies {
+		if cookie.Name == "login_csrf" {
+			csrfCookie = cookie
+		}
+	}
+	if csrfCookie == nil {
+		t.Fatal("login page did not set a login_csrf cookie")
+	}
+
+	login := url.Values{"token": {"wrong"}, "_csrf": {csrfCookie.Value}}
+	loginRequest := httptest.NewRequest(http.MethodPost, "/settings/login", strings.NewReader(login.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRequest.AddCookie(csrfCookie)
+	wrongToken := httptest.NewRecorder()
+	handler.ServeHTTP(wrongToken, loginRequest)
+	if wrongToken.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong-token login status = %d, want %d", wrongToken.Code, http.StatusUnauthorized)
+	}
+
+	login = url.Values{"token": {"secret"}, "_csrf": {csrfCookie.Value}}
+	loginRequest = httptest.NewRequest(http.MethodPost, "/settings/login", strings.NewReader(login.Encode()))
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRequest.AddCookie(csrfCookie)
+	success := httptest.NewRecorder()
+	handler.ServeHTTP(success, loginRequest)
+	if success.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want %d", success.Code, http.StatusSeeOther)
+	}
+	var sessionCookie *http.Cookie
+	for _, cookie := range success.Result().Cookies() {
+		if cookie.Name == dashboardSessionCookieName {
+			sessionCookie = cookie
+		}
+	}
+	if sessionCookie == nil || sessionCookie.HttpOnly != true || sessionCookie.SameSite != http.SameSiteLaxMode || sessionCookie.Expires.IsZero() {
+		t.Fatalf("login did not issue a secure session cookie: %+v", sessionCookie)
+	}
+
+	settingsPage := httptest.NewRecorder()
+	settingsRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	settingsRequest.AddCookie(sessionCookie)
+	handler.ServeHTTP(settingsPage, settingsRequest)
+	if settingsPage.Code != http.StatusOK {
+		t.Fatalf("authenticated settings status = %d", settingsPage.Code)
+	}
+	sessionParts := strings.Split(sessionCookie.Value, ".")
+	if len(sessionParts) != 3 || !strings.Contains(settingsPage.Body.String(), `name="_csrf" value="`+sessionParts[0]+`"`) {
+		t.Fatalf("settings page does not embed the session CSRF nonce: %s", settingsPage.Body.String())
+	}
+
+	form = url.Values{"model_identity": {"claude-sonnet-4"}, "model_alias": {"Sonnet 4"}, "_csrf": {"forged"}}
+	request = httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(sessionCookie)
+	forged := httptest.NewRecorder()
+	handler.ServeHTTP(forged, request)
+	if forged.Code != http.StatusForbidden {
+		t.Fatalf("CSRF-forged save status = %d, want %d", forged.Code, http.StatusForbidden)
+	}
+
+	form = url.Values{"model_identity": {"claude-sonnet-4"}, "model_alias": {"Sonnet 4"}, "_csrf": {sessionParts[0]}}
+	request = httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(sessionCookie)
+	saved := httptest.NewRecorder()
+	handler.ServeHTTP(saved, request)
+	if saved.Code != http.StatusSeeOther {
+		t.Fatalf("authenticated save status = %d, want %d", saved.Code, http.StatusSeeOther)
+	}
+
+	logout := httptest.NewRecorder()
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/settings/logout", nil)
+	logoutRequest.AddCookie(sessionCookie)
+	handler.ServeHTTP(logout, logoutRequest)
+	if logout.Code != http.StatusSeeOther {
+		t.Fatalf("logout status = %d, want %d", logout.Code, http.StatusSeeOther)
+	}
+	var expired bool
+	for _, cookie := range logout.Result().Cookies() {
+		if cookie.Name == dashboardSessionCookieName && cookie.MaxAge < 0 {
+			expired = true
+		}
+	}
+	if !expired {
+		t.Fatal("logout did not expire the session cookie")
+	}
+}
+
+func TestSettingsStayOpenWithoutIngestToken(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("tokenless settings status = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
+func TestExpiredDashboardSessionIsRejected(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := dashboardSession{value: "expired-session", issuedAt: time.Now().UTC().Add(-dashboardSessionDuration - time.Minute)}
+	issuedAt := expired.issuedAt.Unix()
+	cookie := sessionCookieValue(expired, server.signSession(expired.value, issuedAt))
+	request := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	request.AddCookie(&http.Cookie{Name: dashboardSessionCookieName, Value: cookie})
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/settings/login" {
+		t.Fatalf("expired session status = %d, location %q", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestIngestRejectsOversizedBatches(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make([]usage.Event, 0, maxEventsPerBatch+1)
+	for index := 0; index < maxEventsPerBatch+1; index++ {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("oversized-%d", index),
+			Timestamp:     time.Now(),
+			MachineID:     "machine",
+			Provider:      "provider",
+			Model:         "model",
+			Tool:          "tool",
+			TotalTokens:   usage.Int64(1),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+		})
+	}
+	payload, err := json.Marshal(batchRequest{Events: events})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized batch status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestIngestRejectsTrailingJSON(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "trailing-json",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "machine",
+		Provider:      "provider",
+		Model:         "model",
+		Tool:          "tool",
+		TotalTokens:   usage.Int64(1),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+	}
+	payload, err := json.Marshal(batchRequest{Events: []usage.Event{event}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, []byte(`{"events":[]}`)...)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("trailing JSON status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestBatchIngestRejectsInvalidEvents(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "bad-event",
+		Timestamp:     time.Now(),
+		MachineID:     "machine",
+		Provider:      "provider",
+		Model:         "model",
+		Tool:          "tool",
+		InputTokens:   usage.Int64(60),
+		TotalTokens:   usage.Int64(30),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+	}
+	payload, err := json.Marshal(batchRequest{Events: []usage.Event{event}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	var result database.IngestResult
+	if response.Code != http.StatusOK {
+		t.Fatalf("batch status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Rejected != 1 || result.Accepted != 0 {
+		t.Fatalf("invalid event was not rejected: %+v", result)
 	}
 }

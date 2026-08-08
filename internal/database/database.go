@@ -339,6 +339,16 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Ready verifies that the SQLite handle can execute a trivial query. It is
+// intentionally separate from Close so the HTTP health endpoint can report
+// database readiness instead of only process liveness.
+func (s *Store) Ready(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return errors.New("database is not open")
+	}
+	return s.db.PingContext(ctx)
+}
+
 func (s *Store) Timezone() string {
 	if s.location == nil {
 		return time.UTC.String()
@@ -1119,7 +1129,10 @@ FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleToken
 	if err != nil {
 		return Overview{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model), COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0) FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
+COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0)
+FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	if err != nil {
 		return result, err
 	}
@@ -1164,7 +1177,10 @@ FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleToken
 	if err := rows.Close(); err != nil {
 		return result, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0), COUNT(DISTINCT NULLIF(session_id, '')), COUNT(DISTINCT machine_id) FROM usage_events WHERE project <> '' GROUP BY project ORDER BY 2 DESC`)
+	rows, err = s.db.QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
+COUNT(DISTINCT machine_id)
+FROM usage_events WHERE project <> '' GROUP BY project ORDER BY 2 DESC`)
 	if err != nil {
 		return result, err
 	}

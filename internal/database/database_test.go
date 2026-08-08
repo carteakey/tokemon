@@ -428,6 +428,34 @@ func TestOverviewGroupsUsageByTool(t *testing.T) {
 	}
 }
 
+func TestOverviewUsesDistinctSessionIdentityCounts(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-1", Timestamp: now, MachineID: "laptop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-2", Timestamp: now.Add(time.Second), MachineID: "laptop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-b", Timestamp: now.Add(2 * time.Second), MachineID: "desktop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(30), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByModel) != 1 || overview.ByModel[0].Sessions != 2 {
+		t.Fatalf("model sessions = %+v, want two machine-scoped sessions", overview.ByModel)
+	}
+	if len(overview.ByProject) != 1 || overview.ByProject[0].Sessions != 2 {
+		t.Fatalf("project sessions = %+v, want two machine-scoped sessions", overview.ByProject)
+	}
+}
+
 func TestIngestRefreshesAnExistingSnapshot(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

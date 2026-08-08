@@ -8,12 +8,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	_ "time/tzdata"
 
@@ -107,6 +109,7 @@ func runServe(args []string) error {
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
 	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
+	devMode := flags.Bool("dev", envBool("TOKEMON_DEV_MODE"), "loopback-only development mode with no ingest token required")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -122,6 +125,12 @@ func runServe(args []string) error {
 		return err
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
+	if strings.TrimSpace(*ingestToken) == "" && !*devMode {
+		return errors.New("TOKEMON_INGEST_TOKEN is required; run with --dev for loopback-only development mode")
+	}
+	if *devMode && !isLoopbackAddr(*addr) {
+		return errors.New("--dev mode requires a loopback-only listen address such as 127.0.0.1:8080")
+	}
 	modelCatalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
@@ -140,7 +149,27 @@ func runServe(args []string) error {
 		return err
 	}
 	fmt.Printf("Tokemon listening on http://%s\n", *addr)
-	return http.ListenAndServe(*addr, server.Handler())
+	httpServer := &http.Server{
+		Addr:              *addr,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 func runImport(args []string) error {
@@ -219,7 +248,7 @@ func runInspect(args []string) error {
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	for _, event := range events {
-		if err := encoder.Encode(event); err != nil {
+		if err := encoder.Encode(usage.SanitizeOutbound(event)); err != nil {
 			return err
 		}
 	}
@@ -424,6 +453,13 @@ func runAgent(args []string) error {
 			if err != nil {
 				return err
 			}
+			if result.Rejected > 0 {
+				message := fmt.Sprintf("hub rejected %d of %d events", result.Rejected, len(pending))
+				if len(result.Errors) > 0 {
+					message += ": " + strings.Join(result.Errors, "; ")
+				}
+				return errors.New(message)
+			}
 			fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
 		}
 		if err := stateStore.Commit(ctx, *machineID, reports, pending, time.Now().UTC()); err != nil {
@@ -590,6 +626,30 @@ func configDurationEnv(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func splitConfiguredList(value string) []string {
