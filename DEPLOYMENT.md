@@ -150,6 +150,10 @@ docker compose -f deploy/docker-compose.yml down
 
 ## Security and privacy
 
+For lost/corrupt data, credential rotation, privacy reports, evidence
+preservation, and a disposable recovery tabletop, use the public
+[incident-response runbook](docs/incident-response.md).
+
 - Keep the hub on a private network or behind an authenticated proxy.
 - Set a strong `TOKEMON_INGEST_TOKEN` for every multi-machine deployment.
 - Health is intentionally unauthenticated for liveness checks; protect every
