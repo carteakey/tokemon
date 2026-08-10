@@ -883,7 +883,7 @@ Subscription products must not pretend to have exact per-token cost.
 Navigation:
 
 ```text
-Overview | Tokedex | Settings
+Overview | Analytics | Tokedex | Sessions | Settings
 ```
 
 `Settings` may initially be configuration documentation instead of a full interface.
@@ -915,6 +915,12 @@ Time ranges:
 Custom ranges can wait.
 
 The Tokemon form is always based on unfiltered lifetime usage. Filters must not make it temporarily devolve.
+
+The overview keeps the lifetime counter global and exposes explicit **Today** and
+**This week** context summaries beside it. Machine health uses heartbeat age to
+classify each machine as Connected (≤5 minutes), Stale (>5 and ≤30 minutes), or
+Offline (>30 minutes). Recent sessions remain metadata-only and show known versus
+unavailable token, cost, duration, and accuracy fields without conversation data.
 
 ---
 
@@ -1307,6 +1313,7 @@ GET  /api/v1/models
 GET  /api/v1/machines
 GET  /api/v1/sessions
 GET  /api/v1/catalog
+GET  /api/v1/sessions/export
 ```
 
 ### Evolution Response

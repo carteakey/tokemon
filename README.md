@@ -36,7 +36,9 @@ go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
 
 Leave off `--once` to keep the agent polling. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
 
-The overview shows lifetime tokens, token mix, a 53-week activity field, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export.
+The overview shows lifetime tokens, today/week context, token mix, a 53-week activity field, machine health, recent metadata-only sessions, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export. `/tokedex` renders the bundled YAML model tiers, aliases, pricing provenance, and observed usage context; `/sessions` provides a filterable metadata-only session timeline.
+
+Read APIs include `/api/v1/analytics/timeline`, `/api/v1/sessions` (plus `/api/v1/sessions/export`), `/api/v1/machines`, `/api/v1/catalog`, and `/api/v1/models`. Filters affect only the requested analytics/session view; lifetime evolution and the primary token counter remain global.
 
 ## Deploy with Docker Compose
 

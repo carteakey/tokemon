@@ -70,6 +70,11 @@ type MachineInfo struct {
 	SourceErrorCount int      `json:"source_error_count"`
 	FirstSeenAt      string   `json:"first_seen_at"`
 	LastSeenAt       string   `json:"last_seen_at"`
+	Status           string   `json:"status"`
+	SyncContext      string   `json:"sync_context"`
+	TodayTokens      int64    `json:"today_tokens"`
+	WeekTokens       int64    `json:"week_tokens"`
+	LifetimeTokens   int64    `json:"lifetime_tokens"`
 }
 
 type ToolTotal struct {
@@ -155,6 +160,8 @@ type ActivityHeatmap struct {
 type Overview struct {
 	LifetimeTokens int64                    `json:"lifetime_tokens"`
 	Timezone       string                   `json:"timezone"`
+	Today          PeriodSummary            `json:"today"`
+	Week           PeriodSummary            `json:"week"`
 	Evolution      evolution.Snapshot       `json:"evolution"`
 	Activity       ActivityHeatmap          `json:"activity"`
 	ByModel        []ModelTotal             `json:"by_model"`
@@ -807,30 +814,7 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 func (s *Store) Machines(ctx context.Context) ([]MachineInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, operating_system, architecture, agent_version,
-       detected_adapters, source_count, source_error_count, first_seen_at, last_seen_at
-FROM machines
-ORDER BY last_seen_at DESC, id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []MachineInfo
-	for rows.Next() {
-		var machine MachineInfo
-		var adapterList string
-		if err := rows.Scan(
-			&machine.ID, &machine.Name, &machine.OperatingSystem, &machine.Architecture,
-			&machine.AgentVersion, &adapterList, &machine.SourceCount, &machine.SourceErrorCount,
-			&machine.FirstSeenAt, &machine.LastSeenAt,
-		); err != nil {
-			return nil, err
-		}
-		machine.DetectedAdapters = splitAdapterIDs(adapterList)
-		result = append(result, machine)
-	}
-	return result, rows.Err()
+	return s.MachinesAt(ctx, time.Now())
 }
 
 func normalizeAdapterIDs(values []string) []string {
@@ -1094,6 +1078,16 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 		return Overview{}, err
 	}
 	result := Overview{LifetimeTokens: total, Timezone: s.Timezone(), Evolution: evolution.SnapshotFor(total), Accuracy: make(map[usage.Accuracy]int64)}
+	today := s.dateOnly(time.Now())
+	result.Today, err = s.PeriodSummary(ctx, today, today.AddDate(0, 0, 1))
+	if err != nil {
+		return Overview{}, err
+	}
+	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	result.Week, err = s.PeriodSummary(ctx, weekStart, today.AddDate(0, 0, 1))
+	if err != nil {
+		return Overview{}, err
+	}
 	if err := s.db.QueryRowContext(ctx, `SELECT
 COALESCE(SUM(cost), 0),
 COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
