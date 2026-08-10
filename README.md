@@ -62,6 +62,11 @@ docker compose -f deploy/docker-compose.yml down
 
 The default port is `18787`; set `TOKEMON_PORT` to change it. Keep the port on a private network such as Tailscale or a VPN because the dashboard does not provide user login. See the [public deployment guide](DEPLOYMENT.md) for multi-machine agents, macOS supervisors, and release installation.
 
+Versioned releases publish architecture-specific, checksum- and Cosign-signed
+archives plus an SPDX SBOM. Installers reject unsigned or tampered assets; the
+release deployment overlay requires a semver image digest and never uses a
+mutable `latest` tag. See [release integrity and safe upgrades](DEPLOYMENT.md#release-integrity-and-safe-upgrades).
+
 ## Roadmap
 
 - **Current:** reliable multi-machine collection, metadata-only privacy, analytics, and the evolving Tokemon dashboard.

@@ -19,8 +19,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          # Track the latest patched 1.26 release; go.mod still records the
+          # minimum toolchain for reproducible local builds.
+          go-version: '1.26.x'
           cache: true
+
+      - name: Guard tracked release context
+        run: bash deploy/release-guard.sh --tracked
+
+      - name: Guard complete Docker context
+        run: bash deploy/release-guard.sh --context .
 
       - name: Run tests with the race detector
         run: go test -race ./...
@@ -28,14 +36,26 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+      - name: Exercise migration compatibility gate
+        run: go test ./internal/database -run 'TestOpenBacksUpExistingDatabaseBeforeMigration|TestOpenUsesWALForFileDatabase'
+
       - name: Build the CLI
         run: CGO_ENABLED=0 go build -trimpath ./cmd/tokemon
 
       - name: Verify release archives
         run: |
           release_dir="$(mktemp -d)"
-          bash deploy/build-release.sh ci "$release_dir"
+          bash deploy/build-release.sh 0.0.0-ci "$release_dir"
           (cd "$release_dir" && sha256sum -c checksums.txt)
+
+      - name: Verify installer upgrade and permissions
+        run: bash deploy/test-installer.sh
+
+      - name: Verify tamper and unsigned release rejection
+        run: bash deploy/test-release-integrity.sh
+
+      - name: Refuse zeroed or non-SQLite deployment data
+        run: bash deploy/test-database-guard.sh
 
       - name: Validate the model catalog
         run: go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
@@ -46,3 +66,51 @@ jobs:
           TOKEMON_UID: 65532
           TOKEMON_GID: 65532
         run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Build the pinned Docker image
+        run: docker build --pull --tag tokemon:ci .
+
+      - name: Check the image version command
+        run: docker run --rm --entrypoint /tokemon tokemon:ci version
+
+      - name: Generate required source SBOM
+        run: |
+          docker run --rm -v "$PWD:/src:ro" anchore/syft:v1.33.0 \
+            dir:/src --exclude './data/**' --exclude '**/*.db*' --output spdx-json=/dev/stdout \
+            > "$RUNNER_TEMP/tokemon-sbom.spdx.json"
+          test -s "$RUNNER_TEMP/tokemon-sbom.spdx.json"
+
+      - name: Dependency scan (HIGH/CRITICAL is a hard failure)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+          docker run --rm -v "$PWD:/src:ro" aquasec/trivy:0.56.2 \
+            fs --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed /src
+
+      - name: Container scan (HIGH/CRITICAL is a hard failure)
+        run: |
+          docker run --rm aquasec/trivy:0.56.2 \
+            image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed tokemon:ci
+
+  installer-matrix:
+    name: Installer smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS Intel and Apple Silicon are both hosted; Linux arm64 is
+        # covered by the cross-build matrix in release.yml and the binary
+        # archive checksum gate above.
+        os: [ubuntu-latest, macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Run no-supervisor installer and upgrade smoke
+        run: bash deploy/test-installer.sh
