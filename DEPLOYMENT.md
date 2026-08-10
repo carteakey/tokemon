@@ -61,6 +61,80 @@ docker compose -f deploy/docker-compose.yml down
 
 Stopping the service does not remove `./data`. Back up the database before making manual repairs or moving it to another host, and never replace it while Tokemon is running.
 
+## Back up and restore SQLite
+
+Use the built-in backup command for a standalone, versioned snapshot:
+
+```bash
+tokemon backup create \
+  --database ./data/tokemon.db \
+  --destination /mnt/tokemon-off-host \
+  --retention 10
+tokemon backup verify /mnt/tokemon-off-host/tokemon-backup-v4-20260810T000000.000000000Z.db
+```
+
+`backup create` uses SQLite `VACUUM INTO`, so committed rows still in the
+source WAL are included. It never copies `tokemon.db` or its `-wal`/`-shm`
+sidecars. Files are named with the schema version and a UTC timestamp, and
+only the newest `--retention` files for that backup destination are retained.
+The destination should be an encrypted, mounted off-host volume or another
+operator-managed replication target; a successful command exits zero and a
+failed destination, integrity check, or equivalence check exits non-zero.
+
+For a repeatable scheduled job, use the portable wrapper and make the
+destination available before the scheduler runs it:
+
+```bash
+TOKEMON_DATABASE=/var/lib/tokemon/data/tokemon.db \
+TOKEMON_BACKUP_DESTINATION=/mnt/tokemon-off-host \
+TOKEMON_BACKUP_RETENTION=10 \
+  deploy/tokemon-backup.sh
+```
+
+For example, a daily cron entry can call the same script (with absolute paths)
+and alert on its exit status:
+
+```cron
+17 2 * * * TOKEMON_DATABASE=/var/lib/tokemon/data/tokemon.db TOKEMON_BACKUP_DESTINATION=/mnt/tokemon-off-host /var/lib/tokemon/deploy/tokemon-backup.sh >>/var/log/tokemon-backup.log 2>&1
+```
+
+Restore only while the service is stopped so the destination lock can be
+acquired. Verify the source first, then require `--force` to replace an
+existing database:
+
+```bash
+docker compose --env-file .env -f deploy/docker-compose.yml stop tokemon
+tokemon backup verify /mnt/tokemon-off-host/tokemon-backup-v4-20260810T000000.000000000Z.db
+tokemon backup restore \
+  --source /mnt/tokemon-off-host/tokemon-backup-v4-20260810T000000.000000000Z.db \
+  --database ./data/tokemon.db --force
+docker compose --env-file .env -f deploy/docker-compose.yml up -d
+curl --fail http://localhost:18787/healthz
+```
+
+Before a forced restore, Tokemon creates a verified
+`data/backups/tokemon-before-restore-*.db` snapshot. CAR-79 migration snapshots
+(`tokemon-v<old>-before-v<new>-*.db`) remain separate and are never pruned by
+scheduled-backup retention. A restored older schema is migrated on the next
+`serve`/CLI open, with the existing pre-migration snapshot and integrity check
+preserved; this is the supported rollback path.
+
+### Database process and retention policy
+
+File-backed Tokemon opens hold an advisory `<database>.lock` for the lifetime
+of the server or CLI process. `serve`, `import`, `export`, `purge`, and schema
+migrations therefore serialize and deterministically reject a concurrent
+database process. Stop the service before restore or other external file
+replacement. `backup create` and `backup verify` are read-only SQLite
+operations and can run while the server is serving.
+
+`purge --before YYYY-MM-DD` interprets the boundary as midnight UTC and deletes
+only events strictly before it. Evolution is derived from the remaining event
+total, so deleting history can lower the displayed evolution stage; that is
+expected and is covered by the restore/purge checks. Purging events does not
+delete any SQLite or off-host backup, so retention cleanup remains an explicit
+backup policy rather than an implicit data deletion.
+
 ## Install an agent
 
 Use the shared installer to install a checksum-verified release binary and a user-level supervisor:

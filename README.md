@@ -83,6 +83,11 @@ its source CIDR is configured in `TOKEMON_TRUSTED_PROXY_CIDRS`; strip that
 header from untrusted requests. See the [public deployment guide](DEPLOYMENT.md)
 for multi-machine agents, macOS supervisors, and release installation.
 
+For WAL-safe, versioned SQLite snapshots, run `tokemon backup create` with an
+off-host destination (or schedule `deploy/tokemon-backup.sh`). See the
+[backup and restore runbook](DEPLOYMENT.md#back-up-and-restore-sqlite) for
+retention, integrity verification, and offline restore steps.
+
 ## Roadmap
 
 - **Current:** reliable multi-machine collection, metadata-only privacy, analytics, and the evolving Tokemon dashboard.

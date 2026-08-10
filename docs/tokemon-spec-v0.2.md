@@ -343,6 +343,9 @@ tokemon inspect
 tokemon import usage.jsonl
 tokemon export usage.jsonl
 tokemon purge --before 2026-01-01
+tokemon backup create --destination /mnt/off-host/tokemon
+tokemon backup verify /mnt/off-host/tokemon/tokemon-backup-v4-<utc>.db
+tokemon backup restore --source /mnt/off-host/tokemon/tokemon-backup-v4-<utc>.db --force
 ```
 
 ### `tokemon serve`
@@ -388,7 +391,24 @@ Exports normalized JSONL events.
 
 ### `tokemon purge`
 
-Deletes usage events older than a specified date.
+Deletes usage events strictly before a specified UTC date boundary. Evolution
+is derived from the remaining total and may move to a lower stage after a
+purge.
+
+### `tokemon backup`
+
+`backup create` uses SQLite `VACUUM INTO` to produce a standalone, integrity-
+checked snapshot that includes committed rows in the source WAL without
+copying `-wal` or `-shm` sidecars. Versioned UTC files are retained according
+to the configured bound. `backup verify` checks integrity and event/token
+equivalence; `backup restore` requires an offline destination and `--force` to
+replace an existing database, retaining a pre-restore rollback snapshot.
+
+File-backed server and mutating CLI opens hold an inter-process lock for the
+database lifetime, so migrations, imports, exports, purge, and restore cannot
+run concurrently. Scheduled `backup create` remains a read-only online
+operation. The deployment runbook defines scheduling, off-host retention, and
+rollback procedure.
 
 CSV import and export are not required for v0.2.
 

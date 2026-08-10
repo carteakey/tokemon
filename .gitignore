@@ -2,8 +2,10 @@
 .env
 .venv/
 *.db
+*.db.lock
 *.db-shm
 *.db-wal
+*.db.restore-*
 /tokemon
 /site/
 *.DS_Store
