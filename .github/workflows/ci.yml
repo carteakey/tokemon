@@ -89,8 +89,9 @@ jobs:
 
       - name: Container scan (HIGH/CRITICAL is a hard failure)
         run: |
-          docker run --rm aquasec/trivy:0.56.2 \
-            image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed tokemon:ci
+          docker save tokemon:ci --output "$RUNNER_TEMP/tokemon-ci.tar"
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" aquasec/trivy:0.56.2 \
+            image --input /scan/tokemon-ci.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
 
   installer-matrix:
     name: Installer smoke (${{ matrix.os }})
