@@ -561,6 +561,10 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 	defer tx.Rollback()
 
 	for index, event := range events {
+		// Normalize project labels before validation and persistence so local
+		// ingestion never stores a filesystem path. The API rejects paths before
+		// this point; this also protects direct import callers.
+		event.Project = usage.NormalizeProject(event.Project)
 		if err := event.Validate(); err != nil {
 			result.Rejected++
 			result.Errors = append(result.Errors, fmt.Sprintf("event %d: %v", index+1, err))

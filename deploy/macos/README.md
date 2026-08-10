@@ -16,7 +16,13 @@ bash deploy/macos/install-server.sh \
   --token 'replace-with-a-generated-secret'
 ```
 
-The default listen address is `0.0.0.0:18080`. The server config supports `TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`, `TOKEMON_INGEST_TOKEN`, and `TOKEMON_ANALYTICS_TIMEZONE` (an IANA name such as `America/Toronto`; default `UTC`). Its LaunchAgent is `com.tokemon.server`.
+The default listen address is `0.0.0.0:18080`; non-loopback listeners require
+`TOKEMON_INGEST_TOKEN`. The server config supports
+`TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`,
+`TOKEMON_INGEST_TOKEN`, `TOKEMON_DASHBOARD_TOKEN`,
+`TOKEMON_TRUSTED_PROXY_CIDRS`, and `TOKEMON_ANALYTICS_TIMEZONE` (an IANA name
+such as `America/Toronto`; default `UTC`). Its LaunchAgent is
+`com.tokemon.server`.
 
 The installer writes:
 
