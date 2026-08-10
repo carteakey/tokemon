@@ -24,6 +24,13 @@ The default listen address is `0.0.0.0:18080`; non-loopback listeners require
 such as `America/Toronto`; default `UTC`). Its LaunchAgent is
 `com.tokemon.server`.
 
+The server also accepts `TOKEMON_SERVER_READ_TIMEOUT`,
+`TOKEMON_SERVER_READ_HEADER_TIMEOUT`, `TOKEMON_SERVER_WRITE_TIMEOUT`,
+`TOKEMON_SERVER_IDLE_TIMEOUT`, and `TOKEMON_SERVER_SHUTDOWN_TIMEOUT`. These
+bound request processing and graceful shutdown. `/healthz` performs a SQLite
+readiness check and returns `503` when the store is unavailable; authenticated
+`/metrics` exposes redacted operational counters.
+
 The installer writes:
 
 - `~/.local/bin/tokemon`
@@ -59,6 +66,10 @@ The installer writes:
 - `~/Library/Logs/Tokemon/agent.log`
 
 The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments.
+
+Set `TOKEMON_AGENT_REQUEST_TIMEOUT` (default `30s`) to bound each health,
+heartbeat, and ingest request. A timed-out upload leaves the local cursor
+unchanged for a safe retry.
 
 For the same install flow on macOS and Linux, use `deploy/install-agent.sh` with a release version. It downloads the architecture-matched archive, verifies `checksums.txt`, writes the adapter profile, and installs the native user supervisor. `deploy/macos/install-agent.sh` remains as a compatibility entry point and delegates to that shared installer.
 

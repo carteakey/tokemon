@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -26,6 +27,8 @@ import (
 type Server struct {
 	store                *database.Store
 	config               Config
+	logger               *slog.Logger
+	metrics              *Metrics
 	csrfSecret           []byte
 	trustedProxyNetworks []*net.IPNet
 	template             *template.Template
@@ -713,6 +716,8 @@ func NewWithConfig(store *database.Store, config Config) (*Server, error) {
 	return &Server{
 		store:                store,
 		config:               config,
+		logger:               config.Logger,
+		metrics:              config.Metrics,
 		csrfSecret:           csrfSecret,
 		trustedProxyNetworks: trustedProxyNetworks,
 		template:             page,
@@ -722,22 +727,86 @@ func NewWithConfig(store *database.Store, config Config) (*Server, error) {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.health)
+	mux.Handle("GET /healthz", s.withDeadline(s.config.HealthTimeout, http.HandlerFunc(s.health)))
 	mux.Handle("GET /static/", http.StripPrefix("/static/", s.static))
-	mux.Handle("GET /", s.dashboardAuth(http.HandlerFunc(s.dashboard)))
-	mux.Handle("GET /analytics", s.dashboardAuth(http.HandlerFunc(s.analyticsPage)))
-	mux.Handle("GET /data", s.dashboardAuth(http.HandlerFunc(s.analyticsPage)))
-	mux.Handle("GET /settings", s.dashboardAuth(http.HandlerFunc(s.settings)))
-	mux.Handle("GET /settings/aliases", s.dashboardAuth(http.HandlerFunc(s.settings)))
-	mux.Handle("POST /settings/aliases", s.dashboardAuth(http.HandlerFunc(s.saveSettings)))
-	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
-	mux.HandleFunc("POST /api/v1/agents/heartbeat", s.heartbeat)
-	mux.Handle("GET /api/v1/machines", s.dashboardAuth(http.HandlerFunc(s.machines)))
-	mux.Handle("GET /api/v1/evolution", s.dashboardAuth(http.HandlerFunc(s.evolution)))
-	mux.Handle("GET /api/v1/analytics/overview", s.dashboardAuth(http.HandlerFunc(s.overview)))
-	mux.Handle("GET /api/v1/analytics", s.dashboardAuth(http.HandlerFunc(s.analyticsAPI)))
-	mux.Handle("GET /api/v1/analytics/export", s.dashboardAuth(http.HandlerFunc(s.analyticsExport)))
-	return securityHeaders(mux)
+	dashboard := func(handler http.Handler) http.Handler {
+		return s.withDeadline(s.config.RequestTimeout, s.dashboardAuth(handler))
+	}
+	mux.Handle("GET /", dashboard(http.HandlerFunc(s.dashboard)))
+	mux.Handle("GET /analytics", dashboard(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /data", dashboard(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /settings", dashboard(http.HandlerFunc(s.settings)))
+	mux.Handle("GET /settings/aliases", dashboard(http.HandlerFunc(s.settings)))
+	mux.Handle("POST /settings/aliases", dashboard(http.HandlerFunc(s.saveSettings)))
+	mux.Handle("POST /api/v1/events/batch", s.withDeadline(s.config.IngestTimeout, http.HandlerFunc(s.ingest)))
+	mux.Handle("POST /api/v1/agents/heartbeat", s.withDeadline(s.config.HeartbeatTimeout, http.HandlerFunc(s.heartbeat)))
+	mux.Handle("GET /api/v1/machines", dashboard(http.HandlerFunc(s.machines)))
+	mux.Handle("GET /api/v1/evolution", dashboard(http.HandlerFunc(s.evolution)))
+	mux.Handle("GET /api/v1/analytics/overview", dashboard(http.HandlerFunc(s.overview)))
+	mux.Handle("GET /api/v1/analytics", dashboard(http.HandlerFunc(s.analyticsAPI)))
+	mux.Handle("GET /api/v1/analytics/export", dashboard(http.HandlerFunc(s.analyticsExport)))
+	mux.Handle("GET /metrics", dashboard(http.HandlerFunc(s.metricsHandler)))
+	return s.requestLogging(securityHeaders(mux))
+}
+
+func (s *Server) withDeadline(timeout time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if timeout <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+type responseStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseStatusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseStatusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+// Unwrap preserves access to optional ResponseWriter capabilities through
+// middleware (for example, http.NewResponseController). The server currently
+// renders bounded responses, but retaining the underlying writer avoids
+// surprising handlers when the API grows streaming endpoints.
+func (w *responseStatusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (s *Server) requestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		response := &responseStatusWriter{ResponseWriter: w}
+		s.metrics.requestsTotal.Add(1)
+		next.ServeHTTP(response, r)
+		status := response.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if status >= http.StatusInternalServerError {
+			s.metrics.requestFailures.Add(1)
+		}
+		s.logger.Info("http_request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -748,8 +817,29 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	err := s.store.Ready(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		s.logger.Warn("readiness_failed", "status", http.StatusServiceUnavailable)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	stale, err := s.store.StaleAgents(r.Context(), time.Now().Add(-s.config.StaleAgentAfter))
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metrics unavailable"})
+		return
+	}
+	snapshot := s.metrics.snapshot()
+	snapshot.StaleAgents = stale
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 type batchRequest struct {
@@ -772,8 +862,9 @@ type heartbeatRequest struct {
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
+	s.metrics.ingestRequests.Add(1)
 	if !s.ingestAuthorized(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
+		s.rejectIngest(w, http.StatusUnauthorized, "invalid ingest token", 1)
 		return
 	}
 	var request batchRequest
@@ -782,32 +873,48 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
 			status = http.StatusRequestEntityTooLarge
 		}
-		writeJSON(w, status, map[string]string{"error": "invalid or oversized event batch"})
+		s.rejectIngest(w, status, "invalid or oversized event batch", 1)
 		return
 	}
 	if len(request.Events) == 0 || len(request.Events) > maxBatchEvents {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "event batch count is outside the permitted range"})
+		s.rejectIngest(w, http.StatusBadRequest, "event batch count is outside the permitted range", len(request.Events))
 		return
 	}
 	encodedBatch, err := json.Marshal(request)
 	if err != nil || int64(len(encodedBatch)) > maxBatchBodyBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "event batch is too large"})
+		s.rejectIngest(w, http.StatusRequestEntityTooLarge, "event batch is too large", len(request.Events))
 		return
 	}
 	for index, event := range request.Events {
 		if err := event.Validate(); err != nil {
 			// Do not echo validation details or payload fields to a remote caller.
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("event %d is invalid", index+1)})
+			s.rejectIngest(w, http.StatusBadRequest, fmt.Sprintf("event %d is invalid", index+1), len(request.Events))
 			return
 		}
 	}
+	started := time.Now()
 	result, err := s.store.Ingest(r.Context(), request.Events)
+	s.metrics.observeDB(started)
 	if err != nil {
+		s.logger.Error("ingest_failed", "events", len(request.Events))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist event batch"})
 		return
 	}
+	s.metrics.ingestAccepted.Add(uint64(result.Accepted))
+	s.metrics.ingestDuplicates.Add(uint64(result.Duplicates))
+	s.metrics.ingestRejected.Add(uint64(result.Rejected))
+	s.logger.Info("ingest_completed", "events", len(request.Events), "accepted", result.Accepted, "duplicates", result.Duplicates, "rejected", result.Rejected)
 	s.invalidateEvolutionCache()
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) rejectIngest(w http.ResponseWriter, status int, message string, count int) {
+	if count < 1 {
+		count = 1
+	}
+	s.metrics.ingestRejected.Add(uint64(count))
+	s.logger.Warn("ingest_rejected", "rejected", count)
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -844,6 +951,11 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		adapterIDs = append(adapterIDs, adapter.ID)
 	}
+	s.metrics.sourceErrors.Add(uint64(request.SourceErrorCount))
+	if request.SourceErrorCount > 0 {
+		s.logger.Warn("source_errors", "count", request.SourceErrorCount)
+	}
+	started := time.Now()
 	if err := s.store.RecordHeartbeat(r.Context(), database.AgentHeartbeat{
 		MachineID:        request.MachineID,
 		AgentVersion:     request.AgentVersion,
@@ -853,14 +965,20 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		SourceCount:      request.SourceCount,
 		SourceErrorCount: request.SourceErrorCount,
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.metrics.observeDB(started)
+		s.logger.Error("heartbeat_failed")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist heartbeat"})
 		return
 	}
+	s.metrics.observeDB(started)
+	s.logger.Info("heartbeat_recorded", "source_errors", request.SourceErrorCount)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Machines(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -914,11 +1032,15 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 }
 
 func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error) {
+	started := time.Now()
 	snapshot, err := s.store.Evolution(ctx)
+	s.metrics.observeDB(started)
 	if err != nil {
 		return evolutionResponse{}, err
 	}
+	started = time.Now()
 	composition, err := s.store.TokenComposition(ctx)
+	s.metrics.observeDB(started)
 	if err != nil {
 		return evolutionResponse{}, err
 	}
@@ -932,7 +1054,9 @@ func (s *Server) invalidateEvolutionCache() {
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -941,12 +1065,16 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	started = time.Now()
 	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -960,12 +1088,16 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
+	started := time.Now()
 	result, err := s.store.Analytics(r.Context(), query)
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	started = time.Now()
 	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -988,7 +1120,9 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -997,7 +1131,9 @@ func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1015,12 +1151,16 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	started = time.Now()
 	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1047,14 +1187,20 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
+	started := time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindModel, r.Form["model_identity"], r.Form["model_alias"]); err != nil {
+		s.metrics.observeDB(started)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.metrics.observeDB(started)
+	started = time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindMachine, r.Form["machine_identity"], r.Form["machine_alias"]); err != nil {
+		s.metrics.observeDB(started)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.metrics.observeDB(started)
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
 

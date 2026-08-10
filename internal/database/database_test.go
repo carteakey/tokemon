@@ -121,6 +121,32 @@ func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestReadyAndStaleAgentsUseSQLiteState(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(context.Background()); err != nil {
+		store.Close()
+		t.Fatalf("ready before close: %v", err)
+	}
+	if err := store.RecordHeartbeat(context.Background(), AgentHeartbeat{MachineID: "machine"}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	stale, err := store.StaleAgents(context.Background(), time.Now().UTC().Add(time.Minute))
+	if err != nil || stale != 1 {
+		store.Close()
+		t.Fatalf("stale agents = %d, err = %v, want 1", stale, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(context.Background()); err == nil {
+		t.Fatal("ready after close unexpectedly succeeded")
+	}
+}
+
 func TestDisplayAliasesRoundTrip(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

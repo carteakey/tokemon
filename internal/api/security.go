@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 var (
@@ -39,11 +41,47 @@ type Config struct {
 	DashboardToken    string
 	AllowLoopbackDev  bool
 	TrustedProxyCIDRs []string
+	Logger            *slog.Logger
+	Metrics           *Metrics
+	RequestTimeout    time.Duration
+	HealthTimeout     time.Duration
+	HeartbeatTimeout  time.Duration
+	IngestTimeout     time.Duration
+	StaleAgentAfter   time.Duration
 }
+
+const (
+	DefaultRequestTimeout   = 30 * time.Second
+	DefaultHealthTimeout    = 5 * time.Second
+	DefaultHeartbeatTimeout = 15 * time.Second
+	DefaultIngestTimeout    = 30 * time.Second
+	DefaultStaleAgentAfter  = 5 * time.Minute
+)
 
 func (c Config) normalized() Config {
 	if c.DashboardToken == "" {
 		c.DashboardToken = c.IngestToken
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+	if c.Metrics == nil {
+		c.Metrics = NewMetrics()
+	}
+	if c.RequestTimeout <= 0 {
+		c.RequestTimeout = DefaultRequestTimeout
+	}
+	if c.HealthTimeout <= 0 {
+		c.HealthTimeout = DefaultHealthTimeout
+	}
+	if c.HeartbeatTimeout <= 0 {
+		c.HeartbeatTimeout = DefaultHeartbeatTimeout
+	}
+	if c.IngestTimeout <= 0 {
+		c.IngestTimeout = DefaultIngestTimeout
+	}
+	if c.StaleAgentAfter <= 0 {
+		c.StaleAgentAfter = DefaultStaleAgentAfter
 	}
 	return c
 }

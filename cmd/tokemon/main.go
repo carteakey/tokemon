@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	_ "time/tzdata"
 
@@ -29,9 +31,14 @@ import (
 )
 
 const (
-	defaultDatabase        = "tokemon.db"
-	minAgentFailureBackoff = 5 * time.Second
-	maxAgentFailureBackoff = 5 * time.Minute
+	defaultDatabase          = "tokemon.db"
+	minAgentFailureBackoff   = 5 * time.Second
+	maxAgentFailureBackoff   = 5 * time.Minute
+	defaultReadTimeout       = 30 * time.Second
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultWriteTimeout      = 30 * time.Second
+	defaultIdleTimeout       = 60 * time.Second
+	defaultShutdownTimeout   = 10 * time.Second
 )
 
 func main() {
@@ -108,6 +115,11 @@ func runServe(args []string) error {
 	dashboardToken := flags.String("dashboard-token", os.Getenv("TOKEMON_DASHBOARD_TOKEN"), "token for dashboard and read API access (defaults to ingest token)")
 	devLoopback := flags.Bool("dev-loopback", envBool("TOKEMON_DEV_LOOPBACK"), "allow empty ingest token only on an explicit loopback listener")
 	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", os.Getenv("TOKEMON_TRUSTED_PROXY_CIDRS"), "comma-separated proxy CIDRs allowed to assert X-Forwarded-User")
+	readTimeout := flags.Duration("read-timeout", configDurationEnv("TOKEMON_SERVER_READ_TIMEOUT", defaultReadTimeout), "maximum duration for reading a request")
+	readHeaderTimeout := flags.Duration("read-header-timeout", configDurationEnv("TOKEMON_SERVER_READ_HEADER_TIMEOUT", defaultReadHeaderTimeout), "maximum duration for reading request headers")
+	writeTimeout := flags.Duration("write-timeout", configDurationEnv("TOKEMON_SERVER_WRITE_TIMEOUT", defaultWriteTimeout), "maximum duration for writing a response")
+	idleTimeout := flags.Duration("idle-timeout", configDurationEnv("TOKEMON_SERVER_IDLE_TIMEOUT", defaultIdleTimeout), "maximum keep-alive idle duration")
+	shutdownTimeout := flags.Duration("shutdown-timeout", configDurationEnv("TOKEMON_SERVER_SHUTDOWN_TIMEOUT", defaultShutdownTimeout), "bounded graceful shutdown duration")
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
 	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
@@ -127,6 +139,10 @@ func runServe(args []string) error {
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
 	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs)
+	applyServerTimeoutConfig(flags, configValues, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout)
+	if *readTimeout <= 0 || *readHeaderTimeout <= 0 || *writeTimeout <= 0 || *idleTimeout <= 0 || *shutdownTimeout <= 0 {
+		return errors.New("server timeouts must be positive")
+	}
 	if err := api.ValidateServeConfig(*addr, *ingestToken, *devLoopback); err != nil {
 		return err
 	}
@@ -148,12 +164,23 @@ func runServe(args []string) error {
 		DashboardToken:    *dashboardToken,
 		AllowLoopbackDev:  *devLoopback,
 		TrustedProxyCIDRs: splitConfiguredPaths(*trustedProxyCIDRs),
+		Logger:            slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Tokemon listening on http://%s\n", *addr)
-	return http.ListenAndServe(*addr, server.Handler())
+	httpServer := &http.Server{
+		Addr:              *addr,
+		Handler:           server.Handler(),
+		ReadTimeout:       *readTimeout,
+		ReadHeaderTimeout: *readHeaderTimeout,
+		WriteTimeout:      *writeTimeout,
+		IdleTimeout:       *idleTimeout,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveHTTP(ctx, httpServer, *shutdownTimeout)
 }
 
 func runImport(args []string) error {
@@ -310,6 +337,7 @@ func runDiscover(args []string) error {
 
 func runAgent(args []string) error {
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	var jsonlPaths stringListFlag
 	serverURL := flags.String("server", envOr("TOKEMON_SERVER_URL", "http://127.0.0.1:8080"), "Tokemon server URL")
 	token := flags.String("token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared ingestion token")
@@ -318,6 +346,7 @@ func runAgent(args []string) error {
 	adapterSelection := flags.String("adapters", envOr("TOKEMON_ADAPTERS", ""), "comma-separated adapter IDs (default: all built-ins)")
 	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
 	onceTimeout := flags.Duration("timeout", 5*time.Minute, "maximum duration for a one-shot scan and upload")
+	requestTimeout := flags.Duration("request-timeout", configDurationEnv("TOKEMON_AGENT_REQUEST_TIMEOUT", localagent.DefaultRequestTimeout), "per-request health, heartbeat, and ingest deadline")
 	verbose := flags.Bool("verbose", false, "show every source during a scan")
 	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
 	statePath := flags.String("state", envOr("TOKEMON_STATE", ""), "local state database (defaults to ~/.local/share/tokemon/state.db)")
@@ -347,6 +376,7 @@ func runAgent(args []string) error {
 		return err
 	}
 	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, adapterSelection, interval, statePath)
+	applyAgentRequestTimeoutConfig(flags, configValues, requestTimeout)
 	if len(jsonlPaths) == 0 {
 		configuredJSONL := strings.TrimSpace(os.Getenv("TOKEMON_JSONL_PATHS"))
 		if configuredJSONL == "" {
@@ -376,7 +406,10 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	client := localagent.Client{ServerURL: *serverURL, Token: *token}
+	if *requestTimeout <= 0 {
+		return errors.New("--request-timeout must be positive")
+	}
+	client := localagent.Client{ServerURL: *serverURL, Token: *token, RequestTimeout: *requestTimeout}
 	runtimeVersion := version.Current()
 	heartbeatAdapters := make([]localagent.AdapterHeartbeat, 0, len(definitions))
 	for index, definition := range definitions {
@@ -400,9 +433,9 @@ func runAgent(args []string) error {
 				sourceCount++
 			}
 			if report.Err != nil {
-				err := fmt.Errorf("%s %s: %w", report.Adapter, displayHome(report.Path, *home), report.Err)
+				err := fmt.Errorf("%s source collection failed", report.Adapter)
 				sourceErrors = append(sourceErrors, err)
-				fmt.Fprintln(os.Stderr, "tokemon agent:", err)
+				slog.Default().Warn("source_error", "adapter", report.Adapter, "path_present", report.Path != "")
 				continue
 			}
 			if *verbose {
@@ -424,7 +457,7 @@ func runAgent(args []string) error {
 		}); err != nil {
 			// Heartbeats are diagnostic and must never prevent a successful data
 			// upload or advance/rollback local cursor state.
-			fmt.Fprintln(os.Stderr, "tokemon agent: heartbeat:", err)
+			slog.Default().Warn("heartbeat_error")
 		}
 		pending, err := stateStore.Pending(ctx, *machineID, events)
 		if err != nil {
@@ -468,7 +501,7 @@ func runAgent(args []string) error {
 		err := pass(ctx)
 		if err != nil && ctx.Err() == nil {
 			currentInterval = nextAgentFailureInterval(*interval, currentInterval)
-			fmt.Fprintf(os.Stderr, "tokemon agent: %v (retrying in %s)\n", err, currentInterval)
+			slog.Default().Warn("agent_pass_error", "retry_in_ms", currentInterval.Milliseconds(), "source_error", len(strings.Split(err.Error(), "\n")))
 		} else {
 			currentInterval = *interval
 		}
@@ -555,6 +588,17 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 	}
 }
 
+func applyAgentRequestTimeoutConfig(flags *flag.FlagSet, values map[string]string, timeout *time.Duration) {
+	if flagWasSet(flags, "request-timeout") || os.Getenv("TOKEMON_AGENT_REQUEST_TIMEOUT") != "" {
+		return
+	}
+	if value := strings.TrimSpace(values["TOKEMON_AGENT_REQUEST_TIMEOUT"]); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			*timeout = parsed
+		}
+	}
+}
+
 func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath, timezone *string) {
 	if !flagWasSet(flags, "addr") && os.Getenv("TOKEMON_SERVER_ADDR") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_ADDR"]); value != "" {
@@ -600,6 +644,63 @@ func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, da
 		if value := strings.TrimSpace(values["TOKEMON_TRUSTED_PROXY_CIDRS"]); value != "" {
 			*trustedProxyCIDRs = value
 		}
+	}
+}
+
+func applyServerTimeoutConfig(flags *flag.FlagSet, values map[string]string, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout *time.Duration) {
+	items := []struct {
+		flagName string
+		envName  string
+		key      string
+		target   *time.Duration
+	}{
+		{"read-timeout", "TOKEMON_SERVER_READ_TIMEOUT", "TOKEMON_SERVER_READ_TIMEOUT", readTimeout},
+		{"read-header-timeout", "TOKEMON_SERVER_READ_HEADER_TIMEOUT", "TOKEMON_SERVER_READ_HEADER_TIMEOUT", readHeaderTimeout},
+		{"write-timeout", "TOKEMON_SERVER_WRITE_TIMEOUT", "TOKEMON_SERVER_WRITE_TIMEOUT", writeTimeout},
+		{"idle-timeout", "TOKEMON_SERVER_IDLE_TIMEOUT", "TOKEMON_SERVER_IDLE_TIMEOUT", idleTimeout},
+		{"shutdown-timeout", "TOKEMON_SERVER_SHUTDOWN_TIMEOUT", "TOKEMON_SERVER_SHUTDOWN_TIMEOUT", shutdownTimeout},
+	}
+	for _, item := range items {
+		if flagWasSet(flags, item.flagName) || os.Getenv(item.envName) != "" {
+			continue
+		}
+		if value := strings.TrimSpace(values[item.key]); value != "" {
+			if parsed, err := time.ParseDuration(value); err == nil {
+				*item.target = parsed
+			}
+		}
+	}
+}
+
+func serveHTTP(ctx context.Context, server *http.Server, shutdownTimeout time.Duration) error {
+	result := make(chan error, 1)
+	go func() {
+		result <- server.ListenAndServe()
+	}()
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		shutdownErr := server.Shutdown(shutdownCtx)
+		if shutdownErr != nil {
+			// Shutdown leaves handlers that ignore their context running after the
+			// deadline. Force-close those connections before the caller closes
+			// SQLite so a stuck request cannot outlive the store.
+			_ = server.Close()
+		}
+		serveErr := <-result
+		if shutdownErr != nil {
+			return shutdownErr
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
+		return nil
 	}
 }
 
