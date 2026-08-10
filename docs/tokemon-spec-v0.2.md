@@ -1181,6 +1181,15 @@ The exact values may change. Accessibility and consistency matter more than spec
 - Use a restrained idle state, or none
 - Support `prefers-reduced-motion`
 
+The server-rendered overview, settings, and analytics pages must remain usable
+without a pointer: provide a skip link, semantic headings and table names,
+explicit form labels, visible `:focus-visible` states, keyboard-operable chart
+points/tooltips, and a screen-reader table alternative for visual charts.
+Color tokens used for text must meet a WCAG AA contrast policy against the
+dashboard background. Empty and form-error states expose status text through
+semantic live/alert regions. The public [incident-response runbook](incident-response.md)
+covers recovery and privacy handling without collecting conversation content.
+
 ---
 
 ## 26. Responsive Design

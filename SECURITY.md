@@ -13,6 +13,9 @@ is available for this repository. If private reporting is unavailable, contact
 the maintainers through the Tokemon GitHub profile before opening a public
 issue.
 
+For operational containment, credential rotation, backup/restore, purge, and
+privacy-report handling, follow the public [incident-response runbook](docs/incident-response.md).
+
 Tokemon is designed for a trusted local or private network. Non-loopback
 listeners fail closed without `TOKEMON_INGEST_TOKEN`; local development must
 opt into `--dev-loopback` while binding explicitly to loopback. Dashboard,
