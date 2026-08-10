@@ -45,9 +45,24 @@ docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://localhost:18787/healthz
 # Authenticated dashboard smoke check (do not print the token):
 curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/
+# Authenticated operational counters (metadata only):
+curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/metrics
 ```
 
 Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port. The container listens on port `8080` internally.
+
+The server uses bounded HTTP read, header, write, idle, and graceful-shutdown
+timeouts. Set `TOKEMON_SERVER_READ_TIMEOUT`,
+`TOKEMON_SERVER_READ_HEADER_TIMEOUT`, `TOKEMON_SERVER_WRITE_TIMEOUT`,
+`TOKEMON_SERVER_IDLE_TIMEOUT`, or `TOKEMON_SERVER_SHUTDOWN_TIMEOUT` in the
+Compose environment when the defaults do not fit a trusted proxy. `SIGTERM`
+and `SIGINT` stop accepting new requests, drain in-flight work for the bounded
+shutdown window, and close SQLite. `/healthz` is an unauthenticated readiness
+probe backed by `SELECT 1`: it returns `200` only when SQLite is available and
+`503` otherwise. `GET /metrics` requires dashboard authentication and reports
+process-local request/ingest/source-error counters plus SQLite-derived stale
+agents and DB latency; logs are JSON and omit credentials, query strings,
+request bodies, and local paths.
 
 The SQLite database persists at `./data/tokemon.db`. The Compose service mounts the model catalog read-only, runs without root privileges by default, and keeps its root filesystem read-only. If the host data directory is owned by a different user, set `TOKEMON_UID` and `TOKEMON_GID` as shown above so SQLite can write its database and WAL files.
 
@@ -187,6 +202,7 @@ TOKEMON_ADAPTERS=claude-code,codex
 # Optional: set false to omit even normalized project basenames.
 TOKEMON_INCLUDE_PROJECTS=false
 TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
+TOKEMON_AGENT_REQUEST_TIMEOUT=30s
 ```
 
 Explicit command-line flags override environment variables. The agent state contains cursors and sync metadata only. Provider files are read locally and are never uploaded as source content.
@@ -211,6 +227,11 @@ unless a path is configured. Extension metadata must use the documented
 values.
 
 Before each collection pass, the agent checks the hub's `/healthz` endpoint. If the hub is offline, the agent applies its bounded failure backoff without scanning provider histories; cursor state remains unchanged and collection resumes when the hub is healthy.
+
+Health, heartbeat, and ingest calls each use the configured request deadline
+(`TOKEMON_AGENT_REQUEST_TIMEOUT`, or `--request-timeout`). A failed or timed
+out ingest never commits the local source cursor or event fingerprint, so the
+next pass retries the same metadata batch safely.
 
 ## Verify a deployment
 

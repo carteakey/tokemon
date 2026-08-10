@@ -80,8 +80,18 @@ The default port is `18787`; set `TOKEMON_PORT` to change it. Compose requires
 `TOKEMON_INGEST_TOKEN` and binds the dashboard to a private network. A reverse
 proxy may assert an authenticated identity with `X-Forwarded-User` only when
 its source CIDR is configured in `TOKEMON_TRUSTED_PROXY_CIDRS`; strip that
-header from untrusted requests. See the [public deployment guide](DEPLOYMENT.md)
-for multi-machine agents, macOS supervisors, and release installation.
+header from untrusted requests. The server applies bounded read, header, write,
+idle, and shutdown timeouts; override them with
+`TOKEMON_SERVER_READ_TIMEOUT`, `TOKEMON_SERVER_READ_HEADER_TIMEOUT`,
+`TOKEMON_SERVER_WRITE_TIMEOUT`, `TOKEMON_SERVER_IDLE_TIMEOUT`, and
+`TOKEMON_SERVER_SHUTDOWN_TIMEOUT` (or the matching `serve` flags). `SIGTERM`
+and `SIGINT` stop new work, drain in-flight requests for the bounded shutdown
+window, and close SQLite before exit. `/healthz` performs a read-only SQLite
+probe and returns `503` while the database is unavailable. Authenticated
+`GET /metrics` exposes deterministic request, ingest, source-error, stale-agent,
+and SQLite latency counters; it never includes event payloads or credentials.
+See the [public deployment guide](DEPLOYMENT.md) for multi-machine agents,
+macOS supervisors, and release installation.
 
 For WAL-safe, versioned SQLite snapshots, run `tokemon backup create` with an
 off-host destination (or schedule `deploy/tokemon-backup.sh`). See the

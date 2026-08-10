@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -142,5 +144,24 @@ func TestClientHealthRejectsUnavailableHub(t *testing.T) {
 	err := (Client{ServerURL: server.URL}).Health(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("health error = %v, want unavailable status", err)
+	}
+}
+
+func TestClientRequestTimeoutBoundsHealth(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := Client{ServerURL: server.URL, RequestTimeout: 20 * time.Millisecond}
+	if err := client.Health(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("health error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not receive health request")
 	}
 }

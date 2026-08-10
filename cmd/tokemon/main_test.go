@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,18 @@ func TestRunCatalogValidate(t *testing.T) {
 	path := filepath.Join("..", "..", "catalog", "models.yaml")
 	if err := run([]string{"catalog", "validate", "--catalog", path}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServeHTTPGracefulShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if err := serveHTTP(ctx, server, time.Second); err != nil {
+		t.Fatalf("serveHTTP shutdown: %v", err)
 	}
 }
 

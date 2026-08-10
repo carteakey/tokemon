@@ -381,6 +381,20 @@ func (s *Store) Close() error {
 	return s.closeErr
 }
 
+// Ready performs a small read-only query used by the HTTP readiness endpoint.
+// It deliberately checks the SQLite connection rather than reporting that
+// the process is alive while the database is unavailable.
+func (s *Store) Ready(ctx context.Context) error {
+	var result int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&result); err != nil {
+		return err
+	}
+	if result != 1 {
+		return errors.New("database readiness query returned an unexpected value")
+	}
+	return nil
+}
+
 func (s *Store) Timezone() string {
 	if s.location == nil {
 		return time.UTC.String()
@@ -877,6 +891,15 @@ ORDER BY last_seen_at DESC, id`)
 		result = append(result, machine)
 	}
 	return result, rows.Err()
+}
+
+// StaleAgents counts enrolled machines whose latest heartbeat is older than
+// cutoff. The count is derived from SQLite so it remains deterministic across
+// process restarts and does not require a second state store.
+func (s *Store) StaleAgents(ctx context.Context, cutoff time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM machines WHERE last_seen_at < ?`, cutoff.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&count)
+	return count, err
 }
 
 func normalizeAdapterIDs(values []string) []string {
