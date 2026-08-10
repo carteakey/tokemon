@@ -299,6 +299,9 @@ func TestRepresentativeScaleBackupRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.Exec(`PRAGMA wal_autocheckpoint = 1000000`); err != nil {
+		t.Fatal(err)
+	}
 	events := make([]usage.Event, 2500)
 	for index := range events {
 		events[index] = backupTestEvent(
@@ -309,14 +312,17 @@ func TestRepresentativeScaleBackupRestore(t *testing.T) {
 	if _, err := store.Ingest(context.Background(), events); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
+	if info, err := os.Stat(sourcePath + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("expected representative fixture WAL, info=%v, err=%v", info, err)
 	}
 	backup, err := CreateBackup(context.Background(), BackupOptions{
 		DatabasePath: sourcePath, DestinationDir: filepath.Join(directory, "off-host"), Retention: 2,
 		Now: time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	result, err := Restore(context.Background(), RestoreOptions{
