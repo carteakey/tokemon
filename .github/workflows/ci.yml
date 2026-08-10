@@ -51,11 +51,17 @@ jobs:
       - name: Verify installer upgrade and permissions
         run: bash deploy/test-installer.sh
 
+      - name: Verify server installer secret boundary
+        run: bash deploy/test-server-installer.sh
+
       - name: Verify tamper and unsigned release rejection
         run: bash deploy/test-release-integrity.sh
 
       - name: Refuse zeroed or non-SQLite deployment data
         run: bash deploy/test-database-guard.sh
+
+      - name: Refuse live or nested backup destinations
+        run: bash deploy/test-deploy-guard.sh
 
       - name: Validate the model catalog
         run: go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml

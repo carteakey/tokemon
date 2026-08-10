@@ -13,6 +13,7 @@ release_issuer="${TOKEMON_RELEASE_OIDC_ISSUER:-https://token.actions.githubuserc
 version="${TOKEMON_VERSION:-}"
 server_url="${TOKEMON_SERVER_URL:-}"
 ingest_token="${TOKEMON_INGEST_TOKEN:-}"
+token_stdin=0
 machine_id="${TOKEMON_MACHINE_ID:-}"
 interval="${TOKEMON_SCAN_INTERVAL:-1m}"
 adapters="${TOKEMON_ADAPTERS:-}"
@@ -28,17 +29,17 @@ install_dir_explicit=0
 
 usage() {
   cat <<'EOF'
-Usage: install-agent.sh --server URL --token TOKEN [options]
+Usage: install-agent.sh --server URL [options]
 
 Install a user-level Tokemon agent on macOS or Linux.
 
 Options:
   --server URL          Tokemon server base URL
-  --token TOKEN         ingest token (stored in a mode-0600 config file)
+  --token-stdin         read the ingest token from stdin (noninteractive)
   --binary PATH         existing Tokemon binary
   --version VERSION     download vVERSION from the GitHub release repository
   --repo OWNER/REPO     release repository (default: carteakey/tokemon)
-  --release-token TOKEN GitHub token for private release downloads
+  TOKEMON_RELEASE_TOKEN GitHub token for private release downloads (environment only)
   TOKEMON_RELEASE_BASE_URL override release download root for mirrors/tests
   TOKEMON_RELEASE_CERTIFICATE_IDENTITY trusted keyless signer identity
   --machine-id ID       stable machine ID (default: host name)
@@ -111,9 +112,11 @@ while (($#)); do
       shift 2
       ;;
     --token)
-      (($# >= 2)) || die "--token requires a value"
-      ingest_token="$2"
-      shift 2
+      die "inline --token is not accepted; use TOKEMON_INGEST_TOKEN or --token-stdin"
+      ;;
+    --token-stdin)
+      token_stdin=1
+      shift
       ;;
     --binary)
       (($# >= 2)) || die "--binary requires a path"
@@ -131,9 +134,7 @@ while (($#)); do
       shift 2
       ;;
     --release-token)
-      (($# >= 2)) || die "--release-token requires a value"
-      release_token="$2"
-      shift 2
+      die "inline --release-token is not accepted; use TOKEMON_RELEASE_TOKEN"
       ;;
     --machine-id)
       (($# >= 2)) || die "--machine-id requires an ID"
@@ -193,6 +194,12 @@ done
 if (( !state_explicit )) && [[ -z "${TOKEMON_STATE:-}" ]]; then
   state_path="$home/.local/share/tokemon/state.db"
 fi
+
+if ((token_stdin)); then
+  if ! IFS= read -r ingest_token; then
+    [[ -n "$ingest_token" ]] || die "--token-stdin received no token"
+  fi
+fi
 if (( !install_dir_explicit )) && [[ -z "${TOKEMON_INSTALL_DIR:-}" ]]; then
   install_dir="$home/.local/bin"
 fi
@@ -228,7 +235,7 @@ if ((uninstall)); then
 fi
 
 [[ -n "$server_url" ]] || die "--server or TOKEMON_SERVER_URL is required"
-[[ -n "$ingest_token" ]] || die "--token or TOKEMON_INGEST_TOKEN is required"
+[[ -n "$ingest_token" ]] || die "TOKEMON_INGEST_TOKEN or --token-stdin is required"
 [[ "$server_url" != *$'\n'* && "$server_url" != *$'\r'* ]] || die "server URL contains a newline"
 [[ "$ingest_token" != *$'\n'* && "$ingest_token" != *$'\r'* ]] || die "token contains a newline"
 [[ "$machine_id" != *$'\n'* && "$machine_id" != *$'\r'* ]] || die "machine ID contains a newline"

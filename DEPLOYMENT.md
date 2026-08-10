@@ -98,6 +98,11 @@ deploy/deploy-guard.sh postflight \
   --health http://127.0.0.1:18787/healthz
 ```
 
+Preflight canonicalizes both paths and refuses a backup destination that is
+the live database directory, the database itself, or any nested/symlinked path
+under that directory. Use a separate mounted/off-host destination; a merely
+non-empty path is not sufficient.
+
 `deploy/check-database.sh` refuses a zeroed/non-SQLite file before any Compose
 operation. `deploy/test-database-guard.sh` is the regression test for the
 incident failure mode.
@@ -131,9 +136,11 @@ Use the shared installer to install a checksum-verified release binary and a use
 bash deploy/install-agent.sh \
   --version 0.3.2 \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret' \
   --machine-id laptop \
-  --adapters claude-code,codex
+  --adapters claude-code,codex \
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
 The installer selects the matching macOS or Linux architecture, writes a mode-`0600` configuration, preserves the local state database across upgrades, and installs launchd or systemd without requiring root. Use a private server base URL; the installer adds the API paths itself.
@@ -144,8 +151,10 @@ For a locally built binary, replace `--version 0.3.2` with `--binary ./tokemon`:
 bash deploy/install-agent.sh \
   --binary ./tokemon \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret' \
-  --adapters claude-code,codex
+  --adapters claude-code,codex \
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
 Use `--no-supervisor` when another process manager owns the agent. Remove the user-level service and its configuration with:
@@ -154,7 +163,7 @@ Use `--no-supervisor` when another process manager owns the agent. Remove the us
 bash deploy/install-agent.sh --uninstall
 ```
 
-The local cursor database is preserved by uninstall so reinstalling the agent does not require a full rescan.
+The local cursor database is preserved by uninstall so reinstalling the agent does not require a full rescan. For noninteractive installs, provide `TOKEMON_INGEST_TOKEN` in the environment or pipe one line to `--token-stdin`; inline token arguments are rejected so secrets never appear in process arguments.
 
 ## macOS-specific installation
 
@@ -193,7 +202,6 @@ For a one-time local sync:
 ```bash
 go run ./cmd/tokemon agent \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret' \
   --once
 ```
 

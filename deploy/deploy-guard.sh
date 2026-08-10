@@ -20,8 +20,10 @@ Usage: deploy-guard.sh preflight|postflight [options]
   --health URL           health endpoint (postflight)
   --expected-schema N   schema accepted by the release (default: 4)
 
-preflight verifies the header/integrity/schema/counts and then requires a
-Tokemon binary with `backup create` to produce a verified off-host snapshot.
+preflight verifies the header/integrity/schema/counts, rejects destinations
+that resolve to the live database directory or any child of it, and then
+requires a Tokemon binary with `backup create` to produce a verified off-host
+snapshot. The destination must be a separate mounted/off-host path.
 postflight repeats the database guard and checks `/healthz`.
 EOF
 }
@@ -40,6 +42,83 @@ done
 [[ -n "$mode" ]] || { usage >&2; exit 2; }
 export TOKEMON_EXPECTED_SCHEMA="$expected_schema"
 
+canonical_path() {
+  local input="$1" path suffix candidate parent base
+  [[ -n "$input" ]] || return 1
+  if [[ "$input" == /* ]]; then
+    path="$input"
+  else
+    path="$PWD/$input"
+  fi
+
+  # Resolve the nearest existing ancestor so a new destination is checked
+  # against the real, symlink-resolved live data directory as well.
+  suffix=""
+  candidate="$path"
+  while [[ ! -e "$candidate" && "$candidate" != "/" ]]; do
+    base="${candidate##*/}"
+    suffix="/$base$suffix"
+    candidate="${candidate%/*}"
+    [[ -n "$candidate" ]] || candidate="/"
+  done
+  [[ -d "$candidate" ]] || return 1
+  parent="$(cd -P -- "$candidate" && pwd -P)" || return 1
+  printf '%s%s\n' "$parent" "$suffix"
+}
+
+canonical_file_path() {
+  local input="$1" path parent base
+  [[ -n "$input" ]] || return 1
+  if [[ "$input" == /* ]]; then
+    path="$input"
+  else
+    path="$PWD/$input"
+  fi
+  if [[ -e "$path" && ! -d "$path" ]]; then
+    parent="${path%/*}"
+    base="${path##*/}"
+    parent="$(cd -P -- "${parent:-/}" && pwd -P)" || return 1
+    printf '%s/%s\n' "$parent" "$base"
+  else
+    canonical_path "$path"
+  fi
+}
+
+path_is_same_or_nested() {
+  local base="$1" candidate="$2"
+  [[ "$candidate" == "$base" || "$candidate" == "$base"/* ]]
+}
+
+validate_backup_destination() {
+  local live_db live_data destination
+  live_db="$(canonical_file_path "$database")" || {
+    printf 'deploy guard: cannot canonicalize database path: %s\n' "$database" >&2
+    exit 1
+  }
+  live_data="${live_db%/*}"
+  destination="$(canonical_path "$backup_destination")" || {
+    printf 'deploy guard: backup destination parent is unavailable: %s\n' "$backup_destination" >&2
+    exit 2
+  }
+  [[ "$destination" != "/" ]] || {
+    printf 'deploy guard: backup destination cannot be filesystem root\n' >&2
+    exit 2
+  }
+  if path_is_same_or_nested "$live_data" "$destination" || [[ "$destination" == "$live_db" ]]; then
+    printf 'deploy guard: backup destination must be outside live database directory (%s)\n' "$live_data" >&2
+    exit 2
+  fi
+  if [[ -e "$backup_destination" && ! -d "$backup_destination" ]]; then
+    printf 'deploy guard: backup destination is not a directory: %s\n' "$backup_destination" >&2
+    exit 2
+  fi
+  TOKEMON_CANONICAL_DATABASE="$live_db"
+  TOKEMON_CANONICAL_BACKUP_DESTINATION="$destination"
+  export TOKEMON_CANONICAL_DATABASE TOKEMON_CANONICAL_BACKUP_DESTINATION
+  database="$live_db"
+  backup_destination="$destination"
+}
+
 "$root/deploy/check-database.sh" "$database"
 
 if [[ "$mode" == preflight ]]; then
@@ -47,6 +126,7 @@ if [[ "$mode" == preflight ]]; then
     printf 'deploy guard: preflight requires --backup-destination (off-host)\n' >&2
     exit 2
   }
+  validate_backup_destination
   backup_bin="${TOKEMON_BIN:-$(command -v tokemon 2>/dev/null || true)}"
   [[ -x "$backup_bin" ]] || {
     printf 'deploy guard: preflight requires TOKEMON_BIN with backup create\n' >&2
