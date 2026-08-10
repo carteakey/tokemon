@@ -23,9 +23,9 @@ func TestAnalyticsDesktopBrowserRegression(t *testing.T) {
 	body := renderAnalyticsRegressionPage(t)
 	for _, want := range []string{
 		`<meta name="viewport" content="width=device-width, initial-scale=1">`,
-		`<input type="hidden" name="period"`, `<select name="dimension">`, `<select name="machine">`, `<select name="provider">`, `<select name="model">`, `<select name="tool">`,
+		`<input type="hidden" name="period"`, `<select id="dimension-filter" name="dimension">`, `<select id="machine-filter" name="machine">`, `<select id="provider-filter" name="provider">`, `<select id="model-filter" name="model">`, `<select id="harness-filter" name="tool">`,
 		"Apply filters", "Reset", "Token trend", "Usage share", "Recent sessions",
-		`<table>`, `class="trend-column`, `class="share-point`, `type="button"`,
+		`<table aria-label="Analytics breakdown">`, `class="trend-column`, `class="share-point`, `type="button"`,
 		`aria-describedby="share-tooltip"`, `role="tooltip"`,
 		`.trend-chart { position: relative; z-index: 1; display: flex;`, `.table-scroll { overflow-x: auto;`,
 		`point.addEventListener('focus'`, `column.addEventListener('focus'`,

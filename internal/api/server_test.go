@@ -148,7 +148,7 @@ func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "secret")
+	server, err := newTestServer(store, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,9 @@ func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 	}
 	for _, check := range checks {
 		response := httptest.NewRecorder()
-		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, check.path, nil))
+		request := httptest.NewRequest(http.MethodGet, check.path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		server.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s status = %d: %s", check.path, response.Code, response.Body.String())
 		}
@@ -193,7 +195,9 @@ func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 
 	for _, path := range []string{"/", "/tokedex", "/sessions?period=24h&machine=machine"} {
 		response := httptest.NewRecorder()
-		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		server.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s status = %d", path, response.Code)
 		}
@@ -211,13 +215,17 @@ func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 		}
 	}
 	filtered := httptest.NewRecorder()
-	server.Handler().ServeHTTP(filtered, httptest.NewRequest(http.MethodGet, "/api/v1/analytics?period=24h&machine=other", nil))
+	filteredRequest := httptest.NewRequest(http.MethodGet, "/api/v1/analytics?period=24h&machine=other", nil)
+	filteredRequest.SetBasicAuth("tokemon", testDashboardToken)
+	server.Handler().ServeHTTP(filtered, filteredRequest)
 	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), `"lifetime_tokens":10`) || !strings.Contains(filtered.Body.String(), `"tokens":0`) {
 		t.Fatalf("filtered analytics changed global total: %d %s", filtered.Code, filtered.Body.String())
 	}
 
 	export := httptest.NewRecorder()
-	server.Handler().ServeHTTP(export, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?period=24h&machine=machine", nil))
+	exportRequest := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?period=24h&machine=machine", nil)
+	exportRequest.SetBasicAuth("tokemon", testDashboardToken)
+	server.Handler().ServeHTTP(export, exportRequest)
 	if export.Code != http.StatusOK || !strings.Contains(export.Header().Get("Content-Disposition"), "tokemon-sessions-24h.json") || !strings.Contains(export.Body.String(), `"session_id": "session"`) {
 		t.Fatalf("session export = %d %s %s", export.Code, export.Header().Get("Content-Disposition"), export.Body.String())
 	}
@@ -384,7 +392,7 @@ func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) 
 				t.Fatal(err)
 			}
 			defer store.Close()
-			server, err := New(store, "")
+			server, err := newTestServer(store, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -407,7 +415,7 @@ func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) 
 			}
 
 			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+			testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 			if response.Code != http.StatusOK {
 				t.Fatalf("dashboard status = %d, want 200: %s", response.Code, response.Body.String())
 			}
@@ -432,7 +440,7 @@ func TestDashboardMissingAssetFallbackRuntimeContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +452,7 @@ func TestDashboardMissingAssetFallbackRuntimeContract(t *testing.T) {
 	}
 
 	page := httptest.NewRecorder()
-	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
 	if page.Code != http.StatusOK {
 		t.Fatalf("dashboard status = %d, want 200", page.Code)
 	}
