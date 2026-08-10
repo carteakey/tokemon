@@ -613,6 +613,16 @@ state:
 
 The local state database stores cursors and machine state only.
 
+The native agent enforces this boundary again at the shared outbound client and
+the `inspect` command. Unknown fields and sensitive metadata are rejected
+before any upload. A working directory may be reduced to a lowercase basename
+for project analytics (for example, `/work/SecretClient` becomes
+`secretclient`); the basename can still be identifying. Users who do not want
+project labels can set `TOKEMON_INCLUDE_PROJECTS=false` or use
+`--include-projects=false`. `TOKEMON_ADAPTERS` is an explicit provider
+allowlist, and generic JSONL is opt-in through configured paths. Extension
+metadata is limited to keys in the `tokemon_` namespace.
+
 ---
 
 ## 13. Normalized Usage Format

@@ -23,6 +23,11 @@ non-loopback deployment. Dashboard and read APIs require Basic auth
 (`tokemon:<token>`) or a Bearer token; set `TOKEMON_DASHBOARD_TOKEN` for a
 separate credential. Direct public-internet exposure remains unsupported.
 
+For a supported containerized agent with read-only provider mounts, see
+[`deploy/agent-container.md`](deploy/agent-container.md) and its Compose
+example. The hub Compose service remains the default deployment for the
+dashboard.
+
 ## Requirements
 
 For the hub, install Docker Engine or Docker Desktop with Compose support. For native agents, use macOS or Linux on arm64 or amd64. A Go installation is only needed when building from source.
@@ -105,10 +110,31 @@ TOKEMON_INGEST_TOKEN=replace-with-a-generated-secret
 TOKEMON_MACHINE_ID=laptop
 TOKEMON_SCAN_INTERVAL=1m
 TOKEMON_ADAPTERS=claude-code,codex
+# Optional: set false to omit even normalized project basenames.
+TOKEMON_INCLUDE_PROJECTS=false
 TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
 ```
 
 Explicit command-line flags override environment variables. The agent state contains cursors and sync metadata only. Provider files are read locally and are never uploaded as source content.
+
+### Privacy boundary and project labels
+
+The agent applies one outbound guard to both `tokemon inspect` and every event
+upload. Unknown event fields, prompt/response text, source code, credentials,
+tool arguments, full paths, conversation titles, and unapproved metadata are
+rejected before the first request is opened. A rejected batch does not advance
+the local cursor or change the hub database.
+
+Provider adapters normalize a working directory to a lowercase basename (for
+example, `/Users/alice/work/SecretClient` becomes `secretclient`). This avoids
+disclosing a full path, but the basename itself can still identify a sensitive
+project. Set `TOKEMON_INCLUDE_PROJECTS=false` (or pass
+`--include-projects=false`) to omit project labels while retaining token and
+provider totals. You can also use `TOKEMON_ADAPTERS` as an explicit provider
+allowlist and leave `TOKEMON_JSONL_PATHS` empty; generic JSONL is never scanned
+unless a path is configured. Extension metadata must use the documented
+`tokemon_` namespace and must not contain content, path, credential, or URL
+values.
 
 Before each collection pass, the agent checks the hub's `/healthz` endpoint. If the hub is offline, the agent applies its bounded failure backoff without scanning provider histories; cursor state remains unchanged and collection resumes when the hub is healthy.
 

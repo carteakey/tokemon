@@ -203,6 +203,7 @@ fi
 [[ -n "$ingest_token" ]] || die "--token or TOKEMON_INGEST_TOKEN is required"
 [[ "$server_url" != *$'\n'* && "$server_url" != *$'\r'* ]] || die "server URL contains a newline"
 [[ "$ingest_token" != *$'\n'* && "$ingest_token" != *$'\r'* ]] || die "token contains a newline"
+[[ "$ingest_token" != *[[:space:]]* ]] || die "token contains whitespace"
 [[ "$machine_id" != *$'\n'* && "$machine_id" != *$'\r'* ]] || die "machine ID contains a newline"
 [[ "$home" != *$'\n'* && "$home" != *$'\r'* ]] || die "home path contains a newline"
 [[ "$state_path" != *$'\n'* && "$state_path" != *$'\r'* ]] || die "state path contains a newline"
@@ -262,6 +263,11 @@ fi
 
 mkdir -p "$install_dir" "$(dirname "$config_path")" "$(dirname "$state_path")"
 umask 077
+chmod 0700 "$(dirname "$config_path")" "$(dirname "$state_path")"
+if [[ ! -e "$state_path" ]]; then
+  : > "$state_path"
+fi
+chmod 0600 "$state_path"
 temporary_binary="$(mktemp "$install_dir/.tokemon.XXXXXX")"
 cp "$binary" "$temporary_binary"
 chmod 0755 "$temporary_binary"
