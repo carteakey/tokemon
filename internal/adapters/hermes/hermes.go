@@ -166,7 +166,7 @@ func (a *Adapter) parseUncached(ctx context.Context, path, machineID, identity, 
 			// An older or local schema means usage metadata cannot be read.
 			// Warn once per poll so agents do not silently report zero usage.
 			slog.Warn("hermes state schema lacks required session columns; usage metadata skipped",
-				"path", path, "missing", required)
+				"path_present", path != "", "missing", required)
 			return result, nil
 		}
 	}

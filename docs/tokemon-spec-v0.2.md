@@ -1385,6 +1385,25 @@ deployment metadata only:
 }
 ```
 
+### HTTP lifecycle and operational telemetry
+
+The hub uses a configured `http.Server` with read, read-header, write, idle,
+and bounded graceful-shutdown timeouts. `SIGTERM` and `SIGINT` stop accepting
+new requests, drain in-flight work until the shutdown deadline, and close the
+SQLite store before exit. Health, heartbeat, and ingest handlers derive
+request contexts from explicit per-route deadlines; the agent applies the same
+bounded request timeout to each health, heartbeat, and batch upload. A failed
+upload does not commit its local cursor or event fingerprint, so the next pass
+retries the batch.
+
+`GET /healthz` is intentionally unauthenticated for private-network probes but
+is readiness-backed: it executes a read-only SQLite query and returns `503`
+when the store is unavailable. Authenticated `GET /metrics` returns
+deterministic process counters for requests, server failures, ingest batches
+and accepted/duplicate/rejected events, source errors, SQLite operation count
+and latency, plus a SQLite-derived stale-agent count. JSON request and source
+error logs omit query strings, bodies, credentials, and local paths.
+
 ---
 
 ## 30. Database Entities
