@@ -17,6 +17,13 @@ func TestRunCatalogValidate(t *testing.T) {
 	}
 }
 
+func TestRunArtValidate(t *testing.T) {
+	path := filepath.Join("..", "..", "web", "static", "tokemon")
+	if err := run([]string{"art", "validate", "--dir", path}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunCatalogValidateRejectsInvalidCatalog(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "models.yaml")
 	if err := os.WriteFile(path, []byte("schema_version: 1\nmodels: {}\n"), 0o600); err != nil {
