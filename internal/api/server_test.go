@@ -363,6 +363,102 @@ func TestDashboardDoesNotDuplicateStageWatermarkBesideFormChip(t *testing.T) {
 	}
 }
 
+func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens int64
+		stage  int
+		form   string
+		label  string
+	}{
+		{name: "empty egg", tokens: 0, stage: 0, form: "egg", label: "Egg"},
+		{name: "populated context cub", tokens: 12_345, stage: 4, form: "context-cub", label: "Context Cub"},
+		{name: "before late threshold", tokens: 1_999_999_999, stage: 9, form: "token-titan", label: "Token Titan"},
+		{name: "late threshold", tokens: 2_000_000_000, stage: 10, form: "model-eater", label: "Model Eater"},
+		{name: "final singularity", tokens: 1_000_000_000_000, stage: 18, form: "the-singularity", label: "The Singularity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			server, err := New(store, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.tokens > 0 {
+				event := usage.Event{
+					SchemaVersion: usage.SchemaVersion,
+					EventID:       "art-stage-" + strings.ReplaceAll(test.name, " ", "-"),
+					Timestamp:     time.Now().UTC(),
+					MachineID:     "art-test-machine",
+					Provider:      "test",
+					Model:         "test-model",
+					Tool:          "test-tool",
+					TotalTokens:   usage.Int64(test.tokens),
+					TokenAccuracy: usage.AccuracyReported,
+					Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+				}
+				if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("dashboard status = %d, want 200: %s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			for _, want := range []string{
+				fmt.Sprintf(`data-stage="%d"`, test.stage),
+				fmt.Sprintf(`src="/static/tokemon/stage-%02d.png"`, test.stage),
+				fmt.Sprintf(`alt="%s, stage %d"`, test.label, test.stage),
+				fmt.Sprintf(`<div class="stage-chip">FORM / %02d</div>`, test.stage),
+			} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("dashboard missing %q: %s", want, body)
+				}
+			}
+		})
+	}
+}
+
+func TestDashboardMissingAssetFallbackRuntimeContract(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	missing := httptest.NewRecorder()
+	server.Handler().ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/static/tokemon/stage-99.png", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing stage status = %d, want 404", missing.Code)
+	}
+
+	page := httptest.NewRecorder()
+	server.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		`onerror="this.hidden=true;this.nextElementSibling.hidden=false"`,
+		`<div class="creature-fallback" hidden>STAGE 0</div>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard missing fallback contract %q: %s", want, body)
+		}
+	}
+}
+
 func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

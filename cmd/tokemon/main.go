@@ -24,6 +24,7 @@ import (
 	"github.com/tokemon/tokemon/internal/adapters/builtin"
 	localagent "github.com/tokemon/tokemon/internal/agent"
 	"github.com/tokemon/tokemon/internal/api"
+	"github.com/tokemon/tokemon/internal/art"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/usage"
@@ -50,7 +51,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, version, purge, or backup")
+		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, art, version, purge, or backup")
 	}
 	switch args[0] {
 	case "serve":
@@ -71,6 +72,8 @@ func run(args []string) error {
 		return runAgent(args[1:])
 	case "catalog":
 		return runCatalog(args[1:])
+	case "art":
+		return runArt(args[1:])
 	case "version":
 		return runVersion(args[1:])
 	case "help", "-h", "--help":
@@ -106,6 +109,26 @@ func runCatalog(args []string) error {
 		return err
 	}
 	fmt.Printf("catalog valid: schema %s, %d models, %d resolvable names\n", catalog.SchemaVersion, len(modelCatalog.Models), len(modelCatalog.Aliases))
+	return nil
+}
+
+func runArt(args []string) error {
+	if len(args) == 0 || args[0] != "validate" {
+		return errors.New("usage: tokemon art validate [--dir web/static/tokemon]")
+	}
+	flags := flag.NewFlagSet("art validate", flag.ContinueOnError)
+	directory := flags.String("dir", "web/static/tokemon", "evolution art directory")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: tokemon art validate [--dir web/static/tokemon]")
+	}
+	report, err := art.ValidateDir(*directory)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("art valid: %d stage assets, largest edge %dx%d, RGBA alpha verified\n", report.Assets, report.MaxWidth, report.MaxHeight)
 	return nil
 }
 
@@ -947,6 +970,7 @@ Commands:
   inspect     validate and print the outgoing JSONL payload
   discover    report supported local tool locations
   catalog     validate the model pricing catalog
+  art         validate evolution art assets and manifest
   purge       delete events before a date
   backup      create, verify, or restore SQLite snapshots
 
@@ -958,5 +982,6 @@ Examples:
   tokemon backup create --database ./data/tokemon.db --destination /mnt/off-host/tokemon
   tokemon backup verify /mnt/off-host/tokemon/tokemon-backup-v4-20260810T000000.000000000Z.db
   tokemon inspect usage.jsonl
-  tokemon catalog validate --catalog catalog/models.yaml`)
+  tokemon catalog validate --catalog catalog/models.yaml
+  tokemon art validate --dir web/static/tokemon`)
 }

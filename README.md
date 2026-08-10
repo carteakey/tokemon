@@ -111,6 +111,7 @@ retention, integrity verification, and offline restore steps.
 ```bash
 go test ./...
 go run ./cmd/tokemon catalog validate --catalog catalog/models.yaml
+go run ./cmd/tokemon art validate --dir web/static/tokemon
 ```
 
 Run `go run ./cmd/tokemon --help` for the full command list.
@@ -120,6 +121,7 @@ Run `go run ./cmd/tokemon --help` for the full command list.
 - [v0.2 product spec](https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md)
 - [Historical token-bandit spec](https://github.com/carteakey/tokemon/blob/main/docs/token-bandit-spec.md)
 - [Visual style guide](https://github.com/carteakey/tokemon/blob/main/STYLE_GUIDE.md)
+- [Evolution art QA and release checklist](docs/evolution-art-qa.md)
 - [Changelog](CHANGELOG.md)
 - [Incident-response runbook](docs/incident-response.md)
 
