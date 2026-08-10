@@ -44,7 +44,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, version, or purge")
+		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, version, purge, or backup")
 	}
 	switch args[0] {
 	case "serve":
@@ -59,6 +59,8 @@ func run(args []string) error {
 		return runDiscover(args[1:])
 	case "purge":
 		return runPurge(args[1:])
+	case "backup":
+		return runBackup(args[1:])
 	case "agent":
 		return runAgent(args[1:])
 	case "catalog":
@@ -276,6 +278,77 @@ func runPurge(args []string) error {
 	}
 	fmt.Printf("deleted %d events\n", deleted)
 	return nil
+}
+
+func runBackup(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: tokemon backup create|restore|verify [flags]")
+	}
+	switch args[0] {
+	case "create":
+		return runBackupCreate(args[1:])
+	case "restore":
+		return runBackupRestore(args[1:])
+	case "verify":
+		return runBackupVerify(args[1:])
+	default:
+		return fmt.Errorf("unknown backup command %q", args[0])
+	}
+}
+
+func runBackupCreate(args []string) error {
+	flags := flag.NewFlagSet("backup create", flag.ContinueOnError)
+	databasePath := flags.String("database", defaultDatabase, "SQLite database path")
+	destination := flags.String("destination", "", "versioned backup destination directory")
+	retention := flags.Int("retention", 10, "number of versioned backups to retain")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: tokemon backup create --destination DIR [--database PATH] [--retention N]")
+	}
+	result, err := database.CreateBackup(context.Background(), database.BackupOptions{
+		DatabasePath: *databasePath, DestinationDir: *destination, Retention: *retention,
+	})
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func runBackupRestore(args []string) error {
+	flags := flag.NewFlagSet("backup restore", flag.ContinueOnError)
+	databasePath := flags.String("database", defaultDatabase, "destination SQLite database path")
+	source := flags.String("source", "", "verified SQLite backup path")
+	force := flags.Bool("force", false, "replace an existing destination and retain a pre-restore snapshot")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*source) == "" {
+		return errors.New("usage: tokemon backup restore --source BACKUP.db [--database PATH] [--force]")
+	}
+	result, err := database.Restore(context.Background(), database.RestoreOptions{
+		DatabasePath: *databasePath, BackupPath: *source, Force: *force,
+	})
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func runBackupVerify(args []string) error {
+	flags := flag.NewFlagSet("backup verify", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: tokemon backup verify BACKUP.db")
+	}
+	result, err := database.VerifyBackup(context.Background(), flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
 }
 
 func runDiscover(args []string) error {
@@ -772,12 +845,15 @@ Commands:
   discover    report supported local tool locations
   catalog     validate the model pricing catalog
   purge       delete events before a date
+  backup      create, verify, or restore SQLite snapshots
 
 Examples:
   tokemon serve --config ~/.config/tokemon/server.env
   tokemon agent --server http://127.0.0.1:8080 --adapters claude-code,codex --once
   tokemon version
   tokemon import --database ./data/tokemon.db usage.jsonl
+  tokemon backup create --database ./data/tokemon.db --destination /mnt/off-host/tokemon
+  tokemon backup verify /mnt/off-host/tokemon/tokemon-backup-v4-20260810T000000.000000000Z.db
   tokemon inspect usage.jsonl
   tokemon catalog validate --catalog catalog/models.yaml`)
 }

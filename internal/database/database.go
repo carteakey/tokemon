@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/catalog"
@@ -18,9 +19,12 @@ import (
 )
 
 type Store struct {
-	db       *sql.DB
-	catalog  *catalog.Catalog
-	location *time.Location
+	db        *sql.DB
+	catalog   *catalog.Catalog
+	location  *time.Location
+	lock      *databaseLock
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type IngestResult struct {
@@ -283,6 +287,13 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 		location = time.UTC
 	}
 	fileBacked := !strings.HasPrefix(path, ":") && !strings.HasPrefix(path, "file:")
+	if fileBacked {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database path: %w", err)
+		}
+		path = absolute
+	}
 	existing := false
 	if fileBacked {
 		if info, err := os.Stat(path); err == nil {
@@ -296,48 +307,79 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 			}
 		}
 	}
+	var lock *databaseLock
+	if fileBacked {
+		var err error
+		lock, err = acquireDatabaseLock(path)
+		if err != nil {
+			return nil, err
+		}
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
 		db.Close()
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, fmt.Errorf("configure database busy timeout: %w", err)
 	}
 	if fileBacked {
 		var journalMode string
 		if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
 			db.Close()
+			if lock != nil {
+				_ = lock.Close()
+			}
 			return nil, fmt.Errorf("enable database WAL mode: %w", err)
 		}
 		if !strings.EqualFold(journalMode, "wal") {
 			db.Close()
+			if lock != nil {
+				_ = lock.Close()
+			}
 			return nil, fmt.Errorf("enable database WAL mode: got %q", journalMode)
 		}
 	}
-	store := &Store{db: db, catalog: modelCatalog, location: location}
+	store := &Store{db: db, catalog: modelCatalog, location: location, lock: lock}
 	if existing {
 		version, err := schemaVersion(context.Background(), db)
 		if err != nil {
-			db.Close()
+			_ = store.Close()
 			return nil, err
 		}
 		if version < databaseSchemaVersion {
 			if err := backupBeforeMigration(context.Background(), db, path, version, databaseSchemaVersion, time.Now().UTC()); err != nil {
-				db.Close()
+				_ = store.Close()
 				return nil, err
 			}
 		}
 	}
 	if err := store.migrate(context.Background()); err != nil {
-		db.Close()
+		_ = store.Close()
 		return nil, err
 	}
 	return store, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.closeErr = s.db.Close()
+		if s.lock != nil {
+			s.closeErr = errors.Join(s.closeErr, s.lock.Close())
+		}
+	})
+	return s.closeErr
+}
 
 // Ready verifies that the SQLite handle can execute a trivial query. It is
 // intentionally separate from Close so the HTTP health endpoint can report
