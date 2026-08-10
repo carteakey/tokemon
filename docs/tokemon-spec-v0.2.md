@@ -437,9 +437,19 @@ JSONL path opts the generic adapter in.
 
 For v0.2:
 
-- Use one shared ingest token.
-- Do not implement dashboard accounts.
-- Recommend Tailscale, Cloudflare Access, or reverse-proxy authentication outside a trusted network.
+- Require a non-empty shared ingest token on every non-loopback listener.
+- Allow an empty token only with the explicit `--dev-loopback` mode and an
+  explicit loopback bind (`127.0.0.1`, `::1`, or `localhost`).
+- Protect dashboard, settings, analytics, export, machines, and evolution
+  routes with Basic auth (`tokemon:<token>`) or Bearer auth. The dashboard
+  token defaults to the ingest token and may be separated with
+  `TOKEMON_DASHBOARD_TOKEN`.
+- A reverse proxy may provide `X-Forwarded-User` only when its source is in
+  the configured `TOKEMON_TRUSTED_PROXY_CIDRS`; the proxy must strip incoming
+  copies of that header. Do not trust forwarded identity from arbitrary
+  clients.
+- Keep the service on Tailscale/WireGuard or behind an authenticated proxy;
+  direct public-internet exposure is unsupported.
 - Generate a stable machine ID for each agent.
 
 Per-agent credentials and revocation can come later.
@@ -1333,8 +1343,14 @@ Support:
 - JSON
 - Optional gzip compression
 - Idempotency
-- Partial validation errors
+- Whole-batch validation before SQLite mutation (a rejected event rejects the
+  complete request)
 - Maximum batch size
+- 10 MiB compressed request, 8 MiB decompressed request, 4 MiB serialized
+  event batch, and 1,000 events
+- Bounded field/string/metadata sizes; finite non-negative costs; bounded
+  timestamps; uppercase three-letter currencies; and consistent known token
+  components. Unknown provider values remain valid unknowns.
 - Accepted, duplicate, and rejected counts
 - Previous and new lifetime totals
 - Whether an evolution threshold was crossed

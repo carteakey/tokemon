@@ -17,7 +17,11 @@ Agents are outbound-only. The hub is the only component that needs a reachable p
 | Native agent installer | Syncing a macOS or Linux machine to an existing hub |
 | macOS LaunchAgent scripts | Running a locally built binary under launchd |
 
-Keep the hub behind a private network such as Tailscale, WireGuard, or an authenticated reverse proxy. The dashboard does not provide user login.
+Keep the hub behind a private network such as Tailscale or WireGuard, or an
+authenticated reverse proxy. The ingest token is required for every
+non-loopback deployment. Dashboard and read APIs require Basic auth
+(`tokemon:<token>`) or a Bearer token; set `TOKEMON_DASHBOARD_TOKEN` for a
+separate credential. Direct public-internet exposure remains unsupported.
 
 ## Requirements
 
@@ -34,6 +38,8 @@ export TOKEMON_GID="$(id -g)"
 
 docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://localhost:18787/healthz
+# Authenticated dashboard smoke check (do not print the token):
+curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/
 ```
 
 Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port. The container listens on port `8080` internally.
@@ -146,6 +152,15 @@ docker compose -f deploy/docker-compose.yml down
 
 - Keep the hub on a private network or behind an authenticated proxy.
 - Set a strong `TOKEMON_INGEST_TOKEN` for every multi-machine deployment.
+- Health is intentionally unauthenticated for liveness checks; protect every
+  other route with the dashboard credential. If a reverse proxy supplies
+  `X-Forwarded-User`, configure its exact source CIDR in
+  `TOKEMON_TRUSTED_PROXY_CIDRS` and make the proxy strip client-supplied copies.
+- Event requests are bounded before SQLite mutation: compressed body 10 MiB,
+  decompressed body 8 MiB, serialized event batch 4 MiB, and 1,000 events.
+  Invalid IDs/timestamps/currency/cost/components or sensitive/oversized
+  metadata are rejected as a whole batch, preserving the previous database
+  state.
 - Store tokens in mode-`0600` files or a platform secret store; do not commit them or bake them into images.
 - Run native agents as the local user and containers as non-root.
 - Mount provider data read-only when using containers.
