@@ -68,6 +68,17 @@ func TestEmptyIngestTokenFailsClosedOutsideLoopback(t *testing.T) {
 	if response := postBatch(t, dev, []usage.Event{securityEvent("loopback")}, "", "127.0.0.1:1"); response.Code != http.StatusOK {
 		t.Fatalf("loopback dev empty-token status = %d: %s", response.Code, response.Body.String())
 	}
+	withToken, err := NewWithConfig(store, Config{IngestToken: "secret", AllowLoopbackDev: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "127.0.0.1:1"
+	response := httptest.NewRecorder()
+	withToken.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("loopback with configured token dashboard status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
 }
 
 func TestServeConfigRejectsUnsafeEmptyToken(t *testing.T) {

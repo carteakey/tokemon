@@ -199,7 +199,7 @@ func (s *Server) ingestAuthorized(r *http.Request) bool {
 }
 
 func (s *Server) dashboardAuthorized(r *http.Request) bool {
-	if s.config.AllowLoopbackDev && requestIsLoopback(r) {
+	if s.config.AllowLoopbackDev && s.config.IngestToken == "" && requestIsLoopback(r) {
 		return true
 	}
 	if s.trustedProxyUser(r) != "" {
