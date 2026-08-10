@@ -1180,24 +1180,24 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid settings form", http.StatusBadRequest)
+		writeAccessibleError(w, http.StatusBadRequest, "Invalid settings form.")
 		return
 	}
 	if !validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
-		http.Error(w, "invalid CSRF token", http.StatusForbidden)
+		writeAccessibleError(w, http.StatusForbidden, "The settings form could not be verified. Reload the page and try again.")
 		return
 	}
 	started := time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindModel, r.Form["model_identity"], r.Form["model_alias"]); err != nil {
 		s.metrics.observeDB(started)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAccessibleError(w, http.StatusBadRequest, "Could not save model aliases. Check each alias and try again.")
 		return
 	}
 	s.metrics.observeDB(started)
 	started = time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindMachine, r.Form["machine_identity"], r.Form["machine_alias"]); err != nil {
 		s.metrics.observeDB(started)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAccessibleError(w, http.StatusBadRequest, "Could not save machine aliases. Check each alias and try again.")
 		return
 	}
 	s.metrics.observeDB(started)
@@ -1220,6 +1220,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeAccessibleError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Tokemon error</title></head><body><main><h1>Settings error</h1><div role=\"alert\" tabindex=\"-1\">%s</div><p><a href=\"/settings\">Return to settings</a></p></main></body></html>", template.HTMLEscapeString(message))
 }
 
 const dashboardTemplate = `<!doctype html>
@@ -1248,7 +1254,7 @@ const dashboardTemplate = `<!doctype html>
       --surface-soft: #22261f;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -1259,6 +1265,10 @@ const dashboardTemplate = `<!doctype html>
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body {
       margin: 0;
       background: var(--bg);
@@ -1276,7 +1286,7 @@ const dashboardTemplate = `<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
@@ -1369,7 +1379,7 @@ const dashboardTemplate = `<!doctype html>
     .content-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
     .data-panel { min-height: 0; padding: 12px 16px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
-    .section-title { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .section-title { margin: 0; color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 2px; }
     th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
@@ -1442,20 +1452,22 @@ const dashboardTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
       <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
       <span class="brand-name">TOKEMON</span>
     </a>
     <nav class="nav" aria-label="Primary navigation">
-      <a class="nav-link active" href="/">Overview</a>
+      <a class="nav-link active" href="/" aria-current="page">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
   </header>
 
-  <section class="hero" aria-label="Current Tokemon and lifetime usage">
+  <section class="hero" aria-labelledby="hero-title">
+    <h1 id="hero-title" class="sr-only">Current Tokemon and lifetime usage</h1>
     <article class="panel creature-panel" data-stage="{{.Evolution.Stage}}">
       <div class="creature-art-wrap">
         <img class="creature-art" src="{{assetPath .Evolution.Stage}}" alt="{{.Evolution.FormName}}, stage {{.Evolution.Stage}}" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
@@ -1499,10 +1511,10 @@ const dashboardTemplate = `<!doctype html>
 
   <section class="panel activity-panel" aria-labelledby="activity-title">
     <div class="section-head">
-      <div class="section-title" id="activity-title">Token activity</div>
+      <h2 class="section-title" id="activity-title">Token activity</h2>
       {{if .Activity.ActiveDays}}<div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>{{end}}
     </div>
-    <div class="activity-shell" aria-label="Daily token activity for the last 53 weeks">
+    <div class="activity-shell" role="grid" aria-label="Daily token activity for the last 53 weeks">
       <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
       <div class="activity-scroll">
         <div class="activity-grid">
@@ -1520,22 +1532,23 @@ const dashboardTemplate = `<!doctype html>
     {{end}}
   </section>
 
-  <section class="content-grid" aria-label="Usage breakdowns">
+  <section class="content-grid" aria-labelledby="breakdowns-title">
+    <h2 id="breakdowns-title" class="sr-only">Usage breakdowns</h2>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Projects</div></div>
-      <table><thead><tr><th>Project</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Projects</h2></div>
+      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Harnesses</div></div>
-      <table><thead><tr><th>Harness</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Harnesses</h2></div>
+      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Models</div></div>
-      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Models</h2></div>
+      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Machines</div></div>
-      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Machines</h2></div>
+      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
   </section>
 
@@ -2017,7 +2030,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --surface: #171916;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -2025,6 +2038,10 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
     * { box-sizing: border-box; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     a { color: inherit; text-decoration: none; }
     button, input { font: inherit; }
@@ -2041,29 +2058,36 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
     .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
     .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
-    input:focus { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    input:focus { border-color: var(--accent); }
+    input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
     button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: none; }
+    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
     .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
     footer { margin-top: 20px; color: var(--faint); font-size: 10px; }
     @media (max-width: 620px) {
       main { margin: 8px auto; padding: 12px; }
       .alias-row { grid-template-columns: 1fr; gap: 8px; }
     }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+    }
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <h1>Settings</h1>
     <a class="back-link" href="/">← Overview</a>
   </header>
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
-  <form action="/settings/aliases" method="post">
+  {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
+  <form action="/settings/aliases" method="post" aria-labelledby="settings-form-title">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-    <h2>Models</h2>
+    <h2 id="settings-form-title">Models</h2>
     {{if .Models}}
     <div class="alias-list">
       {{range $index, $row := .Models}}
@@ -2075,7 +2099,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       {{end}}
     </div>
     {{else}}<p class="empty">No models recorded yet.</p>{{end}}
-    <h2>Machines</h2>
+    <h2 id="machines-title">Machines</h2>
     {{if .Machines}}
     <div class="alias-list">
       {{range $index, $row := .Machines}}
@@ -2117,7 +2141,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       --surface-raised: #1d201b;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -2128,6 +2152,10 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     a { color: inherit; text-decoration: none; }
     button, select { font: inherit; }
@@ -2141,21 +2169,22 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .analytics-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
     .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    h2.section-title { margin: 0; }
     h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
     .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
     .heading-actions { display: flex; align-items: center; gap: 10px; }
     .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
     .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
-    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid rgba(155, 187, 160, .18); outline-offset: 1px; }
+    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
     .window-link.active { background: var(--accent); color: var(--bg); }
     .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid rgba(210, 164, 119, .22); outline-offset: 2px; }
+    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
     .filter-panel { padding: 14px 16px; }
     .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
     label { display: grid; gap: 7px; color: var(--faint); }
     select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
-    select:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
     .filter-actions { display: flex; align-items: end; gap: 8px; }
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
@@ -2326,7 +2355,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
       <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
@@ -2359,8 +2389,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   <section class="panel filter-panel" aria-label="Analytics filters">
     <form class="filter-form" method="get" action="/analytics">
       <input type="hidden" name="period" value="{{.Filter.Period}}">
-      <label>Breakdown
-        <select name="dimension">
+      <label for="dimension-filter">Breakdown
+        <select id="dimension-filter" name="dimension">
           <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
           <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
           <option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option>
@@ -2368,26 +2398,26 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
         </select>
       </label>
-      <label>Machine
-        <select name="machine">
+      <label for="machine-filter">Machine
+        <select id="machine-filter" name="machine">
           <option value="">All machines</option>
           {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
         </select>
       </label>
-      <label>Provider
-        <select name="provider">
+      <label for="provider-filter">Provider
+        <select id="provider-filter" name="provider">
           <option value="">All providers</option>
           {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
-      <label>Model
-        <select name="model">
+      <label for="model-filter">Model
+        <select id="model-filter" name="model">
           <option value="">All models</option>
           {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
         </select>
       </label>
-      <label>Harness
-        <select name="tool">
+      <label for="harness-filter">Harness
+        <select id="harness-filter" name="tool">
           <option value="">All harnesses</option>
           {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
         </select>
@@ -2410,7 +2440,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 
   <section class="analytics-grid">
     <article class="panel trend-panel" aria-labelledby="trend-title">
-      <div class="section-head"><div class="section-title" id="trend-title">Token trend</div><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
+      <div class="section-head"><h2 class="section-title" id="trend-title">Token trend</h2><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
       <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
       {{if .Points}}
       <div class="trend-readout" aria-live="polite">
@@ -2437,7 +2467,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     </article>
 
     <article class="panel breakdown-panel" aria-labelledby="breakdown-title">
-      <div class="section-head"><div class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</div><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
+      <div class="section-head"><h2 class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</h2><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
       <nav class="dimension-nav" aria-label="Breakdown dimension">
         <a class="dimension-link{{if eq .Filter.Dimension "projects"}} active{{end}}" href="{{analyticsURL .Filter "projects"}}">Projects</a>
         <a class="dimension-link{{if eq .Filter.Dimension "harnesses"}} active{{end}}" href="{{analyticsURL .Filter "harnesses"}}">Harnesses</a>
@@ -2446,7 +2476,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}">Machines</a>
       </nav>
       <div class="table-scroll breakdown-scroll">
-        <table><thead><tr><th>Name</th><th>Tokens</th><th>Share</th><th>Threads</th></tr></thead><tbody>
+        <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
           <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
@@ -2456,7 +2486,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   </section>
 
   <section class="panel share-panel" aria-labelledby="share-title">
-    <div class="section-head"><div class="section-title" id="share-title">Usage share</div><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
+    <div class="section-head"><h2 class="section-title" id="share-title">Usage share</h2><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
     {{if .SharePoints}}
     <div class="share-legend" aria-label="Usage share legend">
       {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $series.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $series.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $series.Name}}{{else}}{{$series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
@@ -2490,13 +2520,18 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         </div>
       </div>
     </div>
+    <div class="sr-only" id="share-data-table">
+      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Known tokens</th>{{range .ShareSeries}}<th scope="col">{{.Name}} share</th>{{end}}</tr></thead><tbody>
+        {{range .SharePoints}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td>{{range .Values}}<td>{{printf "%.1f%%" (mul .Share 100)}}</td>{{end}}</tr>{{end}}
+      </tbody></table>
+    </div>
     {{else}}<div class="empty-chart">No known token totals to compare in this window.</div>{{end}}
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
-    <div class="section-head"><div class="section-title" id="sessions-title">Recent sessions</div><div class="section-meta">Metadata only · latest 12</div></div>
+    <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><div class="section-meta">Metadata only · latest 12</div></div>
     <div class="table-scroll">
-      <table><thead><tr><th>When</th><th>Project / machine</th><th>Model</th><th>Harness</th><th>Tokens</th></tr></thead><tbody>
+      <table aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">When</th><th scope="col">Project / machine</th><th scope="col">Model</th><th scope="col">Harness</th><th scope="col">Tokens</th></tr></thead><tbody>
         {{range .Sessions}}
         <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}"><span class="session-project">{{modelDisplayName $.ModelAliases .Model}}</span><span class="session-machine">{{.Provider}}</span></td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
         {{else}}<tr class="empty-row"><td colspan="5">No sessions match these filters.</td></tr>{{end}}
