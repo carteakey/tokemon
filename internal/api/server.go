@@ -1,14 +1,14 @@
 package api
 
 import (
-	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -24,13 +24,15 @@ import (
 )
 
 type Server struct {
-	store          *database.Store
-	ingestToken    string
-	template       *template.Template
-	static         http.Handler
-	evolutionMu    sync.Mutex
-	evolutionCache *evolutionCacheEntry
-	evolutionReady chan struct{}
+	store                *database.Store
+	config               Config
+	csrfSecret           []byte
+	trustedProxyNetworks []*net.IPNet
+	template             *template.Template
+	static               http.Handler
+	evolutionMu          sync.Mutex
+	evolutionCache       *evolutionCacheEntry
+	evolutionReady       chan struct{}
 }
 
 type evolutionCacheEntry struct {
@@ -73,10 +75,11 @@ type aliasRow struct {
 }
 
 type settingsPage struct {
-	Models   []aliasRow
-	Machines []aliasRow
-	Saved    bool
-	Error    string
+	Models    []aliasRow
+	Machines  []aliasRow
+	CSRFToken string
+	Saved     bool
+	Error     string
 }
 
 const dashboardUsageRowsLimit = 5
@@ -641,6 +644,19 @@ func limitDashboardRows[T any](values []T) []T {
 }
 
 func New(store *database.Store, ingestToken string) (*Server, error) {
+	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: ingestToken})
+}
+
+func NewWithConfig(store *database.Store, config Config) (*Server, error) {
+	config = config.normalized()
+	trustedProxyNetworks, err := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	csrfSecret, err := newCSRFSecret(config.DashboardToken)
+	if err != nil {
+		return nil, err
+	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
 		"commas":          commas,
 		"commasPtr":       commasPtr,
@@ -694,25 +710,33 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{store: store, ingestToken: ingestToken, template: page, static: http.FileServer(http.FS(staticFiles))}, nil
+	return &Server{
+		store:                store,
+		config:               config,
+		csrfSecret:           csrfSecret,
+		trustedProxyNetworks: trustedProxyNetworks,
+		template:             page,
+		static:               http.FileServer(http.FS(staticFiles)),
+	}, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", s.static))
-	mux.HandleFunc("GET /", s.dashboard)
-	mux.HandleFunc("GET /analytics", s.analyticsPage)
-	mux.HandleFunc("GET /data", s.analyticsPage)
-	mux.HandleFunc("GET /settings", s.settings)
-	mux.HandleFunc("POST /settings/aliases", s.saveSettings)
+	mux.Handle("GET /", s.dashboardAuth(http.HandlerFunc(s.dashboard)))
+	mux.Handle("GET /analytics", s.dashboardAuth(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /data", s.dashboardAuth(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /settings", s.dashboardAuth(http.HandlerFunc(s.settings)))
+	mux.Handle("GET /settings/aliases", s.dashboardAuth(http.HandlerFunc(s.settings)))
+	mux.Handle("POST /settings/aliases", s.dashboardAuth(http.HandlerFunc(s.saveSettings)))
 	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
 	mux.HandleFunc("POST /api/v1/agents/heartbeat", s.heartbeat)
-	mux.HandleFunc("GET /api/v1/machines", s.machines)
-	mux.HandleFunc("GET /api/v1/evolution", s.evolution)
-	mux.HandleFunc("GET /api/v1/analytics/overview", s.overview)
-	mux.HandleFunc("GET /api/v1/analytics", s.analyticsAPI)
-	mux.HandleFunc("GET /api/v1/analytics/export", s.analyticsExport)
+	mux.Handle("GET /api/v1/machines", s.dashboardAuth(http.HandlerFunc(s.machines)))
+	mux.Handle("GET /api/v1/evolution", s.dashboardAuth(http.HandlerFunc(s.evolution)))
+	mux.Handle("GET /api/v1/analytics/overview", s.dashboardAuth(http.HandlerFunc(s.overview)))
+	mux.Handle("GET /api/v1/analytics", s.dashboardAuth(http.HandlerFunc(s.analyticsAPI)))
+	mux.Handle("GET /api/v1/analytics/export", s.dashboardAuth(http.HandlerFunc(s.analyticsExport)))
 	return securityHeaders(mux)
 }
 
@@ -748,35 +772,38 @@ type heartbeatRequest struct {
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
-	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
+	if !s.ingestAuthorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
-	var reader io.Reader = r.Body
-	var compressed *gzip.Reader
-	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		var err error
-		compressed, err = gzip.NewReader(r.Body)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid gzip body"})
+	var request batchRequest
+	if err := decodeJSONBody(w, r, maxDecompressedBodyBytes, &request); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, map[string]string{"error": "invalid or oversized event batch"})
+		return
+	}
+	if len(request.Events) == 0 || len(request.Events) > maxBatchEvents {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "event batch count is outside the permitted range"})
+		return
+	}
+	encodedBatch, err := json.Marshal(request)
+	if err != nil || int64(len(encodedBatch)) > maxBatchBodyBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "event batch is too large"})
+		return
+	}
+	for index, event := range request.Events {
+		if err := event.Validate(); err != nil {
+			// Do not echo validation details or payload fields to a remote caller.
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("event %d is invalid", index+1)})
 			return
 		}
-		defer compressed.Close()
-		reader = compressed
-	}
-	var request batchRequest
-	if err := json.NewDecoder(reader).Decode(&request); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
-		return
-	}
-	if len(request.Events) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "events must contain at least one event"})
-		return
 	}
 	result, err := s.store.Ingest(r.Context(), request.Events)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist event batch"})
 		return
 	}
 	s.invalidateEvolutionCache()
@@ -784,14 +811,17 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
-	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
+	if !s.ingestAuthorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var request heartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+	if err := decodeJSONBody(w, r, 1<<20, &request); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, map[string]string{"error": "invalid or oversized heartbeat"})
 		return
 	}
 	if strings.TrimSpace(request.MachineID) == "" {
@@ -808,7 +838,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	adapterIDs := make([]string, 0, len(request.Adapters))
 	for _, adapter := range request.Adapters {
-		if strings.TrimSpace(adapter.ID) == "" || len(adapter.ID) > 128 {
+		if strings.TrimSpace(adapter.ID) == "" || len([]rune(adapter.ID)) > 128 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter IDs must be non-empty and at most 128 characters"})
 			return
 		}
@@ -836,14 +866,6 @@ func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-func validToken(r *http.Request, expected string) bool {
-	provided := r.Header.Get("X-Tokemon-Ingest-Token")
-	if provided == "" {
-		provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	return provided == expected
 }
 
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
@@ -1005,9 +1027,10 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
 	page := settingsPage{
-		Models:   modelAliasRows(result.ByModel, modelAliases),
-		Machines: machineAliasRows(result.ByMachine, machineAliases),
-		Saved:    r.URL.Query().Get("saved") == "1",
+		Models:    modelAliasRows(result.ByModel, modelAliases),
+		Machines:  machineAliasRows(result.ByMachine, machineAliases),
+		CSRFToken: s.csrfToken(),
+		Saved:     r.URL.Query().Get("saved") == "1",
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -1018,6 +1041,10 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid settings form", http.StatusBadRequest)
+		return
+	}
+	if !validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
+		http.Error(w, "invalid CSRF token", http.StatusForbidden)
 		return
 	}
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindModel, r.Form["model_identity"], r.Form["model_alias"]); err != nil {
@@ -1889,6 +1916,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
   <form action="/settings/aliases" method="post">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <h2>Models</h2>
     {{if .Models}}
     <div class="alias-list">

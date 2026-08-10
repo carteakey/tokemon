@@ -25,8 +25,12 @@ Requires Go 1.26+.
 Start the dashboard:
 
 ```bash
-go run ./cmd/tokemon serve --database ./data/tokemon.db
+go run ./cmd/tokemon serve --addr 127.0.0.1:8080 --dev-loopback --database ./data/tokemon.db
 ```
+
+`--dev-loopback` is an explicit local-development exception: it permits an
+empty ingest token only when the server listens on loopback. A non-loopback
+listener must set `TOKEMON_INGEST_TOKEN`; the server fails closed otherwise.
 
 Open [localhost:8080](http://localhost:8080), then sync the current machine once:
 
@@ -34,7 +38,12 @@ Open [localhost:8080](http://localhost:8080), then sync the current machine once
 go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
 ```
 
-Leave off `--once` to keep the agent polling. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
+Leave off `--once` to keep the agent polling. For a multi-machine hub, set a
+strong `TOKEMON_INGEST_TOKEN`; the same secret (or
+`TOKEMON_DASHBOARD_TOKEN`) is required for dashboard and read-API access via
+Basic auth (`tokemon:<token>`) or Bearer auth. Keep the hub on Tailscale,
+WireGuard, or an authenticated reverse proxy. Direct public-internet exposure
+is unsupported.
 
 The overview shows lifetime tokens, token mix, a 53-week activity field, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export.
 
@@ -60,7 +69,12 @@ docker compose -f deploy/docker-compose.yml logs -f tokemon
 docker compose -f deploy/docker-compose.yml down
 ```
 
-The default port is `18787`; set `TOKEMON_PORT` to change it. Keep the port on a private network such as Tailscale or a VPN because the dashboard does not provide user login. See the [public deployment guide](DEPLOYMENT.md) for multi-machine agents, macOS supervisors, and release installation.
+The default port is `18787`; set `TOKEMON_PORT` to change it. Compose requires
+`TOKEMON_INGEST_TOKEN` and binds the dashboard to a private network. A reverse
+proxy may assert an authenticated identity with `X-Forwarded-User` only when
+its source CIDR is configured in `TOKEMON_TRUSTED_PROXY_CIDRS`; strip that
+header from untrusted requests. See the [public deployment guide](DEPLOYMENT.md)
+for multi-machine agents, macOS supervisors, and release installation.
 
 ## Roadmap
 

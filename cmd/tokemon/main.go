@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -104,6 +105,9 @@ func runServe(args []string) error {
 	addr := flags.String("addr", envOr("TOKEMON_SERVER_ADDR", ":8080"), "HTTP listen address")
 	databasePath := flags.String("database", envOr("TOKEMON_DATABASE", defaultDatabase), "SQLite database path")
 	ingestToken := flags.String("ingest-token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared token for event ingestion")
+	dashboardToken := flags.String("dashboard-token", os.Getenv("TOKEMON_DASHBOARD_TOKEN"), "token for dashboard and read API access (defaults to ingest token)")
+	devLoopback := flags.Bool("dev-loopback", envBool("TOKEMON_DEV_LOOPBACK"), "allow empty ingest token only on an explicit loopback listener")
+	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", os.Getenv("TOKEMON_TRUSTED_PROXY_CIDRS"), "comma-separated proxy CIDRs allowed to assert X-Forwarded-User")
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
 	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
@@ -122,6 +126,10 @@ func runServe(args []string) error {
 		return err
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
+	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs)
+	if err := api.ValidateServeConfig(*addr, *ingestToken, *devLoopback); err != nil {
+		return err
+	}
 	modelCatalog, err := loadCatalog(*catalogPath)
 	if err != nil {
 		return err
@@ -135,7 +143,12 @@ func runServe(args []string) error {
 		return err
 	}
 	defer store.Close()
-	server, err := api.New(store, *ingestToken)
+	server, err := api.NewWithConfig(store, api.Config{
+		IngestToken:       *ingestToken,
+		DashboardToken:    *dashboardToken,
+		AllowLoopbackDev:  *devLoopback,
+		TrustedProxyCIDRs: splitConfiguredPaths(*trustedProxyCIDRs),
+	})
 	if err != nil {
 		return err
 	}
@@ -568,6 +581,35 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 			*timezone = value
 		}
 	}
+}
+
+func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, dashboardToken *string, devLoopback *bool, trustedProxyCIDRs *string) {
+	if !flagWasSet(flags, "dashboard-token") && os.Getenv("TOKEMON_DASHBOARD_TOKEN") == "" {
+		if value := values["TOKEMON_DASHBOARD_TOKEN"]; value != "" {
+			*dashboardToken = value
+		}
+	}
+	if !flagWasSet(flags, "dev-loopback") && os.Getenv("TOKEMON_DEV_LOOPBACK") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_DEV_LOOPBACK"]); value != "" {
+			if parsed, err := strconv.ParseBool(value); err == nil {
+				*devLoopback = parsed
+			}
+		}
+	}
+	if !flagWasSet(flags, "trusted-proxy-cidrs") && os.Getenv("TOKEMON_TRUSTED_PROXY_CIDRS") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_TRUSTED_PROXY_CIDRS"]); value != "" {
+			*trustedProxyCIDRs = value
+		}
+	}
+}
+
+func envBool(name string) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return false
+	}
+	parsed, err := strconv.ParseBool(value)
+	return err == nil && parsed
 }
 
 func flagWasSet(flags *flag.FlagSet, name string) bool {

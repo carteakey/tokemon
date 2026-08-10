@@ -155,6 +155,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 				return adapters.ParseResult{}, fmt.Errorf("%s byte %d: %w", filepath.Base(source.Path), lineOffset, err)
 			}
 			event.MachineID = machineID
+			event.Project = usage.NormalizeProject(event.Project)
 			event.Model = a.NormalizeModel(event.Model)
 			event.Source = usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: identity, Offset: lineOffset}
 			if strings.TrimSpace(event.EventID) == "" {

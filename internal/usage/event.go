@@ -3,13 +3,34 @@ package usage
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const SchemaVersion = "1"
+
+const (
+	MaxEventIDLength      = 256
+	MaxMachineIDLength    = 256
+	MaxSessionIDLength    = 256
+	MaxProjectLength      = 256
+	MaxProviderLength     = 128
+	MaxModelLength        = 256
+	MaxCanonicalLength    = 256
+	MaxToolLength         = 128
+	MaxAdapterLength      = 128
+	MaxIdentityLength     = 256
+	MaxMetadataBytes      = 4 << 10
+	MaxMetadataEntries    = 32
+	MaxMetadataDepth      = 4
+	MaxMetadataStringSize = 256
+	MaxDurationMS         = int64(365 * 24 * time.Hour / time.Millisecond)
+)
 
 type Accuracy string
 
@@ -63,26 +84,48 @@ type Event struct {
 }
 
 func (e Event) Validate() error {
+	return e.validateAt(time.Now().UTC())
+}
+
+func (e Event) validateAt(now time.Time) error {
 	if e.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("schema_version must be %q", SchemaVersion)
 	}
-	if strings.TrimSpace(e.EventID) == "" {
-		return errors.New("event_id is required")
+	if err := validateIdentifier("event_id", e.EventID, MaxEventIDLength); err != nil {
+		return err
 	}
 	if e.Timestamp.IsZero() {
 		return errors.New("timestamp is required")
 	}
-	if strings.TrimSpace(e.MachineID) == "" {
-		return errors.New("machine_id is required")
+	if e.Timestamp.Before(time.Unix(0, 0)) {
+		return errors.New("timestamp cannot be before the Unix epoch")
 	}
-	if strings.TrimSpace(e.Provider) == "" {
-		return errors.New("provider is required")
+	if e.Timestamp.After(now.Add(24 * time.Hour)) {
+		return errors.New("timestamp is too far in the future")
 	}
-	if strings.TrimSpace(e.Model) == "" {
-		return errors.New("model is required")
+	if err := validateText("machine_id", e.MachineID, MaxMachineIDLength, false); err != nil {
+		return err
 	}
-	if strings.TrimSpace(e.Tool) == "" {
-		return errors.New("tool is required")
+	if err := validateText("session_id", e.SessionID, MaxSessionIDLength, true); err != nil {
+		return err
+	}
+	if err := validateText("project", e.Project, MaxProjectLength, true); err != nil {
+		return err
+	}
+	if strings.ContainsAny(e.Project, `/\\`) {
+		return errors.New("project must be a label, not a filesystem path")
+	}
+	if err := validateText("provider", e.Provider, MaxProviderLength, true); err != nil {
+		return err
+	}
+	if err := validateText("model", e.Model, MaxModelLength, true); err != nil {
+		return err
+	}
+	if err := validateText("canonical_model", e.CanonicalModel, MaxCanonicalLength, true); err != nil {
+		return err
+	}
+	if err := validateText("tool", e.Tool, MaxToolLength, true); err != nil {
+		return err
 	}
 	if !e.TokenAccuracy.Valid() {
 		return fmt.Errorf("invalid token_accuracy %q", e.TokenAccuracy)
@@ -97,8 +140,153 @@ func (e Event) Validate() error {
 			return fmt.Errorf("%s cannot be negative", name)
 		}
 	}
-	if e.Cost != nil && *e.Cost < 0 {
-		return errors.New("cost cannot be negative")
+	if e.DurationMS != nil && *e.DurationMS > MaxDurationMS {
+		return errors.New("duration_ms is too large")
+	}
+	if e.Cost != nil && (math.IsNaN(*e.Cost) || math.IsInf(*e.Cost, 0) || *e.Cost < 0) {
+		return errors.New("cost must be finite and non-negative")
+	}
+	if e.Currency != "" && (len(e.Currency) != 3 || e.Currency != strings.ToUpper(e.Currency) || !isASCIIAlpha(e.Currency)) {
+		return errors.New("currency must be a three-letter uppercase code")
+	}
+	if e.Source.Offset < 0 {
+		return errors.New("source offset cannot be negative")
+	}
+	if err := validateText("source.adapter", e.Source.Adapter, MaxAdapterLength, false); err != nil {
+		return err
+	}
+	if err := validateText("source.adapter_version", e.Source.AdapterVersion, MaxAdapterLength, true); err != nil {
+		return err
+	}
+	if err := validateText("source.identity", e.Source.Identity, MaxIdentityLength, true); err != nil {
+		return err
+	}
+	if e.TotalTokens != nil {
+		var components int64
+		for _, value := range []*int64{e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens} {
+			if value == nil {
+				continue
+			}
+			if components > math.MaxInt64-*value {
+				return errors.New("token components overflow")
+			}
+			components += *value
+		}
+		if components > *e.TotalTokens {
+			return errors.New("total_tokens is smaller than known token components")
+		}
+	}
+	if e.Metadata != nil {
+		payload, err := json.Marshal(e.Metadata)
+		if err != nil || len(payload) > MaxMetadataBytes {
+			return errors.New("metadata is too large or invalid")
+		}
+		if err := validateMetadata(e.Metadata, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateText(name, value string, max int, allowWhitespace bool) error {
+	if strings.TrimSpace(value) == "" {
+		if name == "session_id" || name == "project" || name == "canonical_model" || name == "source.identity" {
+			return nil
+		}
+		return fmt.Errorf("%s is required", name)
+	}
+	if len([]rune(value)) > max {
+		return fmt.Errorf("%s is too long", name)
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s cannot have leading or trailing whitespace", name)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || (!allowWhitespace && unicode.IsSpace(r)) {
+			return fmt.Errorf("%s contains invalid characters", name)
+		}
+	}
+	return nil
+}
+
+func validateIdentifier(name, value string, max int) error {
+	if err := validateText(name, value, max, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isASCIIAlpha(value string) bool {
+	for _, r := range value {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+func validateMetadata(value any, depth int) error {
+	if depth > MaxMetadataDepth {
+		return errors.New("metadata nesting is too deep")
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if len(typed) > MaxMetadataEntries {
+			return errors.New("metadata has too many entries")
+		}
+		for key, child := range typed {
+			if err := validateMetadataKey(key); err != nil {
+				return err
+			}
+			if err := validateMetadata(child, depth+1); err != nil {
+				return err
+			}
+		}
+	case []any:
+		if len(typed) > MaxMetadataEntries {
+			return errors.New("metadata array has too many entries")
+		}
+		for _, child := range typed {
+			if err := validateMetadata(child, depth+1); err != nil {
+				return err
+			}
+		}
+	case string:
+		if len([]rune(typed)) > MaxMetadataStringSize {
+			return errors.New("metadata string is too long")
+		}
+		for _, r := range typed {
+			if unicode.IsControl(r) {
+				return errors.New("metadata contains control characters")
+			}
+		}
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return errors.New("metadata number must be finite")
+		}
+	case nil, bool, int, int64, uint64:
+		// JSON decoding normally yields only nil, bool, float64, string, maps,
+		// and arrays. The integer cases keep direct callers safe as well.
+	default:
+		return errors.New("metadata contains an unsupported value")
+	}
+	return nil
+}
+
+func validateMetadataKey(key string) error {
+	if strings.TrimSpace(key) == "" || len([]rune(key)) > MaxMetadataStringSize {
+		return errors.New("metadata key is empty or too long")
+	}
+	for _, r := range key {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return errors.New("metadata key contains invalid characters")
+		}
+	}
+	lower := strings.ToLower(key)
+	for _, sensitive := range []string{"prompt", "response", "content", "source", "path", "title", "secret", "credential", "token", "repository", "repo", "code", "message", "conversation", "command", "cwd"} {
+		if strings.Contains(lower, sensitive) {
+			return errors.New("metadata key is not permitted")
+		}
 	}
 	return nil
 }

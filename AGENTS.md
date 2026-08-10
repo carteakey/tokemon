@@ -7,6 +7,13 @@
 - Prefer the existing Go, SQLite, server-rendered HTML, and deterministic evolution architecture.
 - Keep provider quirks inside adapters and preserve unknown values as unknown.
 
+## Planning authority
+
+Committed planned work for this repository is authoritative in Linear:
+[carteakey / Tokemon v0.2](https://linear.app/carteakey/project/tokemon-v02-ef3cefe83acc).
+The `carteakey` Linear team is the issue owner; `TODO.md` is reserved for
+speculative notes and must not duplicate committed Linear issues.
+
 ## Delivery rule
 
 Use the `ship` loop after every implementation change:
