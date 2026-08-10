@@ -43,7 +43,12 @@ type HeartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
-const maxIngestBatchBytes = 4 << 20
+const (
+	maxIngestBatchBytes = 4 << 20
+	// maxIngestBatchEvents mirrors the hub's per-batch event cap so the agent
+	// never assembles a batch the server would reject on count alone.
+	maxIngestBatchEvents = 1000
+)
 
 const DefaultRequestTimeout = 30 * time.Second
 
@@ -106,7 +111,7 @@ func splitIngestBatches(events []usage.Event) ([][]usage.Event, error) {
 		if len(batch) > 0 {
 			separatorBytes = 1
 		}
-		if len(batch) > 0 && batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes {
+		if len(batch) > 0 && (batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes || len(batch) >= maxIngestBatchEvents) {
 			batches = append(batches, batch)
 			batch = nil
 			batchBytes = envelopeBytes
