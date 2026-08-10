@@ -1,0 +1,68 @@
+# Supported containerized agent example.
+#
+# Provider stores are mounted read-only. Only /state is writable, so a
+# provider parser cannot modify a local conversation/history database even if
+# an upstream tool starts writing while Tokemon is polling it. Copy this file
+# and set TOKEMON_INGEST_TOKEN before running it.
+services:
+  tokemon-agent:
+    build:
+      context: ..
+      args:
+        TOKEMON_VERSION: ${TOKEMON_VERSION:-dev}
+        TOKEMON_COMMIT: ${TOKEMON_COMMIT:-unknown}
+        TOKEMON_BUILD_DATE: ${TOKEMON_BUILD_DATE:-unknown}
+    command: ["agent", "--config", "/config/agent.env"]
+    user: "${TOKEMON_UID:-65532}:${TOKEMON_GID:-65532}"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      TOKEMON_HOME: /home/tokemon
+      TOKEMON_STATE: /state/state.db
+      TOKEMON_INCLUDE_PROJECTS: ${TOKEMON_INCLUDE_PROJECTS:-true}
+    volumes:
+      - ${TOKEMON_AGENT_CONFIG:?Set TOKEMON_AGENT_CONFIG to a mode-0600 agent.env}:/config/agent.env:ro
+      - ${TOKEMON_AGENT_STATE_DIR:-./data/agent-state}:/state
+      - ${TOKEMON_CLAUDE_DIR:-${HOME}/.claude}:/home/tokemon/.claude:ro
+      - ${TOKEMON_CODEX_DIR:-${HOME}/.codex}:/home/tokemon/.codex:ro
+      - ${TOKEMON_COPILOT_DIR:-${HOME}/.copilot}:/home/tokemon/.copilot:ro
+      - ${TOKEMON_OPENCODE_DIR:-${HOME}/.local/share/opencode}:/home/tokemon/.local/share/opencode:ro
+      - ${TOKEMON_ANTIGRAVITY_DIR:-${HOME}/.gemini/antigravity-cli}:/home/tokemon/.gemini/antigravity-cli:ro
+      - ${TOKEMON_OPENCLAW_DIR:-${HOME}/.openclaw}:/home/tokemon/.openclaw:ro
+      - ${TOKEMON_HERMES_DIR:-${HOME}/.hermes}:/home/tokemon/.hermes:ro
+      - ${TOKEMON_GENERIC_JSONL_DIR:-./generic-jsonl}:/home/tokemon/generic:ro
+
+  # Optional smoke service. It must fail every provider write attempt; the
+  # service exits zero only when all mounts remain read-only.
+  tokemon-agent-permissions-smoke:
+    image: alpine:3.20
+    profiles: [smoke]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ${TOKEMON_CLAUDE_DIR:-${HOME}/.claude}:/home/tokemon/.claude:ro
+      - ${TOKEMON_CODEX_DIR:-${HOME}/.codex}:/home/tokemon/.codex:ro
+      - ${TOKEMON_COPILOT_DIR:-${HOME}/.copilot}:/home/tokemon/.copilot:ro
+      - ${TOKEMON_OPENCODE_DIR:-${HOME}/.local/share/opencode}:/home/tokemon/.local/share/opencode:ro
+      - ${TOKEMON_ANTIGRAVITY_DIR:-${HOME}/.gemini/antigravity-cli}:/home/tokemon/.gemini/antigravity-cli:ro
+      - ${TOKEMON_OPENCLAW_DIR:-${HOME}/.openclaw}:/home/tokemon/.openclaw:ro
+      - ${TOKEMON_HERMES_DIR:-${HOME}/.hermes}:/home/tokemon/.hermes:ro
+      - ${TOKEMON_GENERIC_JSONL_DIR:-./generic-jsonl}:/home/tokemon/generic:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for path in /home/tokemon/.claude /home/tokemon/.codex /home/tokemon/.copilot /home/tokemon/.local/share/opencode /home/tokemon/.gemini/antigravity-cli /home/tokemon/.openclaw /home/tokemon/.hermes /home/tokemon/generic; do
+          if touch "$$path/.tokemon-write-check" 2>/dev/null; then
+            echo "provider mount is writable: $$path" >&2
+            exit 1
+          fi
+        done
+        echo "all provider mounts are read-only"

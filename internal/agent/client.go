@@ -50,6 +50,11 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 	if len(events) == 0 {
 		return database.IngestResult{}, fmt.Errorf("events must not be empty")
 	}
+	// Validate the complete batch before encoding or opening the first HTTP
+	// request. A privacy rejection therefore cannot partially upload a batch.
+	if err := usage.ValidateOutboundBatch(events); err != nil {
+		return database.IngestResult{}, err
+	}
 	batches, err := splitIngestBatches(events)
 	if err != nil {
 		return database.IngestResult{}, err
