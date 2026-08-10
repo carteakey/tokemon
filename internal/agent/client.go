@@ -44,6 +44,9 @@ type HeartbeatRequest struct {
 
 const (
 	maxIngestBatchBytes = 4 << 20
+	// maxIngestBatchEvents mirrors the hub's per-batch event cap so the agent
+	// never assembles a batch the server would reject on count alone.
+	maxIngestBatchEvents = 1000
 	// requestTimeout bounds each hub request unless the caller already supplied
 	// a shorter deadline, so a stuck hub cannot hang the agent forever.
 	requestTimeout = 30 * time.Second
@@ -108,7 +111,7 @@ func splitIngestBatches(events []usage.Event) ([][]usage.Event, error) {
 		if len(batch) > 0 {
 			separatorBytes = 1
 		}
-		if len(batch) > 0 && batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes {
+		if len(batch) > 0 && (batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes || len(batch) >= maxIngestBatchEvents) {
 			batches = append(batches, batch)
 			batch = nil
 			batchBytes = envelopeBytes

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,47 @@ func TestClientIngestRedactsMetadataBeforeUpload(t *testing.T) {
 	}
 	if requests != 1 || result.Accepted != len(events) || result.CurrentTotal != 1 {
 		t.Fatalf("requests = %d, result = %+v, want one redacted request and all events accepted", requests, result)
+	}
+}
+
+func TestClientIngestSplitsBatchesBelowCountCap(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var request batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		if len(request.Events) > maxIngestBatchEvents {
+			t.Errorf("batch = %d events, want at most %d", len(request.Events), maxIngestBatchEvents)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(database.IngestResult{Accepted: len(request.Events), CurrentTotal: int64(requests)})
+	}))
+	defer server.Close()
+
+	events := make([]usage.Event, maxIngestBatchEvents*2+1)
+	for index := range events {
+		events[index] = usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "id" + fmt.Sprintf("%d", index),
+			MachineID:     "machine-" + string(rune('a'+index/10)),
+			Provider:      "provider",
+			Model:         "model",
+			Tool:          "codex",
+		}
+	}
+
+	result, err := (Client{ServerURL: server.URL}).Ingest(t.Context(), events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d, want 3 batches for %d events", requests, len(events))
+	}
+	if result.Accepted != len(events) {
+		t.Fatalf("accepted = %d, want %d", result.Accepted, len(events))
 	}
 }
 
