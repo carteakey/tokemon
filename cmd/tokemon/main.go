@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -306,6 +307,7 @@ func runAgent(args []string) error {
 	interval := flags.Duration("interval", configDurationEnv("TOKEMON_SCAN_INTERVAL", time.Minute), "poll interval")
 	onceTimeout := flags.Duration("timeout", 5*time.Minute, "maximum duration for a one-shot scan and upload")
 	verbose := flags.Bool("verbose", false, "show every source during a scan")
+	includeProjects := flags.Bool("include-projects", true, "include normalized project basenames (set false to opt out)")
 	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/agent.env)")
 	statePath := flags.String("state", envOr("TOKEMON_STATE", ""), "local state database (defaults to ~/.local/share/tokemon/state.db)")
 	once := flags.Bool("once", false, "scan and upload once, then exit")
@@ -333,7 +335,7 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, adapterSelection, interval, statePath)
+	applyAgentConfig(flags, configValues, serverURL, token, machineID, home, adapterSelection, interval, statePath, includeProjects)
 	if len(jsonlPaths) == 0 {
 		configuredJSONL := strings.TrimSpace(os.Getenv("TOKEMON_JSONL_PATHS"))
 		if configuredJSONL == "" {
@@ -397,6 +399,11 @@ func runAgent(args []string) error {
 			}
 		}
 		snapshotCount := len(events)
+		if !*includeProjects {
+			for index := range events {
+				events[index].Project = ""
+			}
+		}
 		if !*verbose {
 			fmt.Printf("scanned %d sources (%d session snapshots)\n", len(reports), snapshotCount)
 		}
@@ -502,7 +509,7 @@ func (values *stringListFlag) Set(value string) error {
 	return nil
 }
 
-func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home, adapterSelection *string, interval *time.Duration, statePath *string) {
+func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, token, machineID, home, adapterSelection *string, interval *time.Duration, statePath *string, includeProjects *bool) {
 	if !flagWasSet(flags, "server") && os.Getenv("TOKEMON_SERVER_URL") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_URL"]); value != "" {
 			*serverURL = value
@@ -538,6 +545,17 @@ func applyAgentConfig(flags *flag.FlagSet, values map[string]string, serverURL, 
 	if !flagWasSet(flags, "state") && os.Getenv("TOKEMON_STATE") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_STATE"]); value != "" {
 			*statePath = value
+		}
+	}
+	if !flagWasSet(flags, "include-projects") {
+		value := strings.TrimSpace(os.Getenv("TOKEMON_INCLUDE_PROJECTS"))
+		if value == "" {
+			value = strings.TrimSpace(values["TOKEMON_INCLUDE_PROJECTS"])
+		}
+		if value != "" {
+			if parsed, err := strconv.ParseBool(value); err == nil {
+				*includeProjects = parsed
+			}
 		}
 	}
 }
@@ -641,11 +659,14 @@ func readEvents(path string) ([]usage.Event, error) {
 		if strings.TrimSpace(scanner.Text()) == "" {
 			continue
 		}
-		var event usage.Event
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+		event, err := usage.DecodeOutboundEvent(scanner.Bytes())
+		if err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, line, err)
 		}
 		if err := event.Validate(); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", path, line, err)
+		}
+		if err := usage.ValidateOutbound(event); err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, line, err)
 		}
 		events = append(events, event)

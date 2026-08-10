@@ -38,6 +38,13 @@ Leave off `--once` to keep the agent polling. Set `TOKEMON_INGEST_TOKEN` before 
 
 The overview shows lifetime tokens, token mix, a 53-week activity field, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export.
 
+The agent rejects sensitive or unknown outbound fields before upload, and
+`tokemon inspect` applies the same check locally. Project labels are normalized
+basenames (never full paths); set `TOKEMON_INCLUDE_PROJECTS=false` or pass
+`--include-projects=false` when a basename could disclose a sensitive project.
+Use `TOKEMON_ADAPTERS` as a provider allowlist and configure generic JSONL only
+through explicit paths.
+
 ## Deploy with Docker Compose
 
 Compose runs Tokemon as a persistent dashboard hub with SQLite data stored under `./data`.
