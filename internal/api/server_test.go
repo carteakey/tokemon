@@ -138,6 +138,91 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
+	price := 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"test-model": {Provider: "provider", DisplayName: "Test Model", Aliases: []string{"raw-model", "provider/raw-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "api-session", Timestamp: now.Add(-time.Hour), MachineID: "machine", SessionID: "session", Project: "/private/project", Provider: "provider", Model: "raw-model", Tool: "codex", InputTokens: usage.Int64(4), OutputTokens: usage.Int64(6), TotalTokens: usage.Int64(10), DurationMS: usage.Int64(1200), Cost: usage.Float64(.12), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(`{"machine_id":"machine","agent_version":"test","operating_system":"linux","architecture":"amd64","adapters":[{"id":"codex"}],"source_count":1,"source_error_count":0}`))
+	heartbeat.Header.Set("Authorization", "Bearer secret")
+	heartbeatResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(heartbeatResponse, heartbeat)
+	if heartbeatResponse.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d: %s", heartbeatResponse.Code, heartbeatResponse.Body.String())
+	}
+
+	checks := []struct {
+		path string
+		want []string
+	}{
+		{path: "/api/v1/catalog", want: []string{`"schema_version":"2"`, `"tier":"S"`, `"aliases":["raw-model","provider/raw-model"]`, `"usage_tokens":10`}},
+		{path: "/api/v1/models", want: []string{`"display_name":"Test Model"`, `"context":"Observed in usage"`}},
+		{path: "/api/v1/sessions?period=24h&machine=machine", want: []string{`"session_id":"session"`, `"input_tokens":4`, `"output_tokens":6`, `"total_tokens":10`, `"project":"project"`}},
+		{path: "/api/v1/analytics/timeline?period=24h&machine=machine", want: []string{`"bucket":"hour"`, `"points"`}},
+		{path: "/api/v1/machines", want: []string{`"status":"Connected"`, `"today_tokens":10`, `"sync_context":"1 source synced"`}},
+	}
+	for _, check := range checks {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, check.path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", check.path, response.Code, response.Body.String())
+		}
+		for _, want := range check.want {
+			if !strings.Contains(response.Body.String(), want) {
+				t.Fatalf("%s missing %q: %s", check.path, want, response.Body.String())
+			}
+		}
+		if strings.Contains(response.Body.String(), "private/project") || strings.Contains(response.Body.String(), "conversation") {
+			t.Fatalf("%s leaked private metadata: %s", check.path, response.Body.String())
+		}
+	}
+
+	for _, path := range []string{"/", "/tokedex", "/sessions?period=24h&machine=machine"} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d", path, response.Code)
+		}
+		body := response.Body.String()
+		for _, want := range []string{"Today", "This week", "Machine health", "Recent sessions"} {
+			if path == "/" && !strings.Contains(body, want) {
+				t.Fatalf("overview missing %q", want)
+			}
+		}
+		if path == "/tokedex" && (!strings.Contains(body, "Tokedex") || !strings.Contains(body, "Aliases") || !strings.Contains(body, "Tier S")) {
+			t.Fatalf("tokedex missing catalog content: %s", body)
+		}
+		if strings.Contains(body, "private/project") {
+			t.Fatalf("%s leaked full project path", path)
+		}
+	}
+	filtered := httptest.NewRecorder()
+	server.Handler().ServeHTTP(filtered, httptest.NewRequest(http.MethodGet, "/api/v1/analytics?period=24h&machine=other", nil))
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), `"lifetime_tokens":10`) || !strings.Contains(filtered.Body.String(), `"tokens":0`) {
+		t.Fatalf("filtered analytics changed global total: %d %s", filtered.Code, filtered.Body.String())
+	}
+
+	export := httptest.NewRecorder()
+	server.Handler().ServeHTTP(export, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?period=24h&machine=machine", nil))
+	if export.Code != http.StatusOK || !strings.Contains(export.Header().Get("Content-Disposition"), "tokemon-sessions-24h.json") || !strings.Contains(export.Body.String(), `"session_id": "session"`) {
+		t.Fatalf("session export = %d %s %s", export.Code, export.Header().Get("Content-Disposition"), export.Body.String())
+	}
+}
+
 func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
