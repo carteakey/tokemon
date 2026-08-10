@@ -2,6 +2,7 @@ package usage
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,6 +77,18 @@ func TestNormalizeProjectDropsPathAndCase(t *testing.T) {
 	} {
 		if got := NormalizeProject(input); got != want {
 			t.Errorf("NormalizeProject(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestNormalizeSessionIDHashesUnsafeValuesDeterministically(t *testing.T) {
+	if got := NormalizeSessionID("session-123"); got != "session-123" {
+		t.Fatalf("safe session id = %q", got)
+	}
+	for _, value := range []string{"../private title", "/private/repo/session.jsonl", "sk-secret-token"} {
+		first := NormalizeSessionID(value)
+		if first == value || !strings.HasPrefix(first, "sha256:") || first != NormalizeSessionID(value) {
+			t.Fatalf("NormalizeSessionID(%q) = %q, want stable opaque hash", value, first)
 		}
 	}
 }

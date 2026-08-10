@@ -68,6 +68,9 @@ func ValidateDir(dir string) (Report, error) {
 	if manifest.MaxEdge <= 0 {
 		return Report{}, fmt.Errorf("art manifest max_edge must be positive")
 	}
+	if manifest.MaxEdge > DefaultMaxEdge {
+		return Report{}, fmt.Errorf("art manifest max_edge %d exceeds documented maximum %d", manifest.MaxEdge, DefaultMaxEdge)
+	}
 	if len(manifest.Assets) == 0 {
 		return Report{}, fmt.Errorf("art manifest assets must not be empty")
 	}

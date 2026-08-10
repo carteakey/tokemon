@@ -297,6 +297,54 @@ func DeterministicID(machineID, adapter, sourceIdentity string, offset int64, ti
 	return "sha256:" + hex.EncodeToString(hash[:])
 }
 
+// NormalizeSessionID preserves opaque provider IDs while replacing path-,
+// title-, and credential-like values with a deterministic non-sensitive ID.
+// Adapters use HashSessionID for filename fallbacks so a raw basename never
+// becomes an outbound session identifier.
+func NormalizeSessionID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if isSafeSessionID(value) {
+		return value
+	}
+	return HashSessionID(value)
+}
+
+// HashSessionID returns a stable opaque ID for a provider value that cannot be
+// safely allowlisted. The input is never included in the returned value.
+func HashSessionID(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(hash[:])
+}
+
+func isSafeSessionID(value string) bool {
+	if len([]rune(value)) > MaxSessionIDLength || strings.ContainsAny(value, "/\\\r\n\t ") {
+		return false
+	}
+	if strings.HasPrefix(value, "sha256:") {
+		if len(value) != len("sha256:")+sha256.Size*2 {
+			return false
+		}
+		_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+		return err == nil
+	}
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"bearer ", "sk-", "ghp_", "github_pat_"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func Int64(value int64) *int64 { return &value }
 
 func Float64(value float64) *float64 { return &value }

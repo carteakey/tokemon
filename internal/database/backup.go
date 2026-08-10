@@ -158,6 +158,10 @@ func VerifyBackup(ctx context.Context, path string) (VerifyResult, error) {
 // read through SQLite rather than copied byte-for-byte, which safely handles a
 // source WAL and produces a clean destination without sidecars.
 func Restore(ctx context.Context, options RestoreOptions) (RestoreResult, error) {
+	return restoreWithVerifier(ctx, options, VerifyBackup)
+}
+
+func restoreWithVerifier(ctx context.Context, options RestoreOptions, verify func(context.Context, string) (VerifyResult, error)) (RestoreResult, error) {
 	databasePath := strings.TrimSpace(options.DatabasePath)
 	backupPath := strings.TrimSpace(options.BackupPath)
 	if databasePath == "" {
@@ -224,7 +228,7 @@ func Restore(ctx context.Context, options RestoreOptions) (RestoreResult, error)
 		_ = os.Remove(tempPath)
 		return RestoreResult{}, fmt.Errorf("close backup: %w", err)
 	}
-	staged, err := VerifyBackup(ctx, tempPath)
+	staged, err := verify(ctx, tempPath)
 	if err != nil {
 		_ = os.Remove(tempPath)
 		return RestoreResult{}, fmt.Errorf("verify staged restore: %w", err)
@@ -259,7 +263,7 @@ func Restore(ctx context.Context, options RestoreOptions) (RestoreResult, error)
 		_ = os.Remove(tempPath)
 		return RestoreResult{}, fmt.Errorf("install restored database: %w", err)
 	}
-	verified, err := VerifyBackup(ctx, databasePath)
+	verified, err := verify(ctx, databasePath)
 	if err != nil || verified.EventCount != sourceStats.EventCount || verified.LifetimeTokens != sourceStats.LifetimeTokens {
 		if err == nil {
 			err = fmt.Errorf("restored database differs from backup: events %d/%d, tokens %d/%d", verified.EventCount, sourceStats.EventCount, verified.LifetimeTokens, sourceStats.LifetimeTokens)
@@ -269,6 +273,10 @@ func Restore(ctx context.Context, options RestoreOptions) (RestoreResult, error)
 			_ = os.Remove(databasePath + "-wal")
 			_ = os.Remove(databasePath + "-shm")
 			_ = copyFile(preRestore, databasePath)
+		} else {
+			_ = os.Remove(databasePath)
+			_ = os.Remove(databasePath + "-wal")
+			_ = os.Remove(databasePath + "-shm")
 		}
 		return RestoreResult{}, fmt.Errorf("verify restored database: %w", err)
 	}

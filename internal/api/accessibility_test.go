@@ -49,7 +49,7 @@ func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/", "/settings", "/analytics"} {
+	for _, path := range []string{"/", "/settings", "/analytics", "/sessions"} {
 		body := renderAccessiblePage(t, server, path)
 		assertAccessibleDocument(t, path, body)
 	}

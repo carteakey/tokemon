@@ -27,7 +27,9 @@ services:
       TOKEMON_INCLUDE_PROJECTS: ${TOKEMON_INCLUDE_PROJECTS:-true}
     volumes:
       - ${TOKEMON_AGENT_CONFIG:?Set TOKEMON_AGENT_CONFIG to a mode-0600 agent.env}:/config/agent.env:ro
-      - ${TOKEMON_AGENT_STATE_DIR:-./data/agent-state}:/state
+      # Create and chown TOKEMON_AGENT_STATE_DIR for TOKEMON_UID/GID first;
+      # Docker otherwise creates a root-owned bind directory.
+      - ${TOKEMON_AGENT_STATE_DIR:-./data/agent-state}:/state:rw
       - ${TOKEMON_CLAUDE_DIR:-${HOME}/.claude}:/home/tokemon/.claude:ro
       - ${TOKEMON_CODEX_DIR:-${HOME}/.codex}:/home/tokemon/.codex:ro
       - ${TOKEMON_COPILOT_DIR:-${HOME}/.copilot}:/home/tokemon/.copilot:ro
@@ -42,12 +44,15 @@ services:
   tokemon-agent-permissions-smoke:
     image: alpine:3.20
     profiles: [smoke]
+    user: "${TOKEMON_UID:-65532}:${TOKEMON_GID:-65532}"
     read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     volumes:
+      - ${TOKEMON_AGENT_CONFIG:?Set TOKEMON_AGENT_CONFIG to a mode-0600 agent.env}:/config/agent.env:ro
+      - ${TOKEMON_AGENT_STATE_DIR:-./data/agent-state}:/state:rw
       - ${TOKEMON_CLAUDE_DIR:-${HOME}/.claude}:/home/tokemon/.claude:ro
       - ${TOKEMON_CODEX_DIR:-${HOME}/.codex}:/home/tokemon/.codex:ro
       - ${TOKEMON_COPILOT_DIR:-${HOME}/.copilot}:/home/tokemon/.copilot:ro
@@ -59,6 +64,20 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
+        if [ ! -f /config/agent.env ]; then
+          echo "agent config is missing" >&2
+          exit 1
+        fi
+        config_mode=$$(stat -c '%a' /config/agent.env 2>/dev/null || stat -f '%Lp' /config/agent.env)
+        if [ "$$config_mode" != "600" ]; then
+          echo "agent config mode is $$config_mode, want 600" >&2
+          exit 1
+        fi
+        if ! ( : > /state/state.db ) 2>/dev/null; then
+          echo "agent state directory is not writable by the configured non-root UID" >&2
+          exit 1
+        fi
+        rm -f /state/state.db
         for path in /home/tokemon/.claude /home/tokemon/.codex /home/tokemon/.copilot /home/tokemon/.local/share/opencode /home/tokemon/.gemini/antigravity-cli /home/tokemon/.openclaw /home/tokemon/.hermes /home/tokemon/generic; do
           if touch "$$path/.tokemon-write-check" 2>/dev/null; then
             echo "provider mount is writable: $$path" >&2

@@ -49,6 +49,30 @@ func TestValidateRejectsHashMutation(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsManifestMaxEdgeAboveDocumentedLimit(t *testing.T) {
+	dir, _ := writeFixture(t, 0, true)
+	manifestPath := filepath.Join(dir, manifestName)
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.MaxEdge = DefaultMaxEdge + 1
+	manifestData, err = json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateDir(dir); err == nil || !strings.Contains(err.Error(), "exceeds documented maximum") {
+		t.Fatalf("tampered max_edge error = %v", err)
+	}
+}
+
 func TestValidateRejectsMissingAndOpaqueStages(t *testing.T) {
 	dir, _ := writeFixture(t, 0, true)
 	if err := os.Remove(filepath.Join(dir, "stage-00.png")); err != nil {

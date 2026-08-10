@@ -292,6 +292,51 @@ PRAGMA user_version = 3;`
 	}
 }
 
+func TestRestoreRemovesInvalidNewDestinationOnPostInstallVerificationFailure(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	store, err := Open(sourcePath, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{backupTestEvent("restore-cleanup", time.Now().UTC(), 42)}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := CreateBackup(context.Background(), BackupOptions{
+		DatabasePath: sourcePath, DestinationDir: filepath.Join(directory, "off-host"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	verify := func(ctx context.Context, path string) (VerifyResult, error) {
+		calls++
+		result, verifyErr := VerifyBackup(ctx, path)
+		if verifyErr != nil {
+			return VerifyResult{}, verifyErr
+		}
+		if calls == 2 {
+			return VerifyResult{}, errors.New("simulated post-install verification failure")
+		}
+		return result, nil
+	}
+	destination := filepath.Join(directory, "new", "tokemon.db")
+	_, err = restoreWithVerifier(context.Background(), RestoreOptions{DatabasePath: destination, BackupPath: backup.Path}, verify)
+	if err == nil || !strings.Contains(err.Error(), "verify restored database") {
+		t.Fatalf("post-install restore error = %v", err)
+	}
+	for _, path := range []string{destination, destination + "-wal", destination + "-shm"} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("post-install failure left %s: %v", path, statErr)
+		}
+	}
+}
+
 func TestRepresentativeScaleBackupRestore(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "large.db")

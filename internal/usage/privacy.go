@@ -100,6 +100,9 @@ func ValidateOutbound(event Event) error {
 			return fmt.Errorf("%w: %s resembles a path or credential", ErrSensitiveContent, name)
 		}
 	}
+	if event.SessionID != "" && NormalizeSessionID(event.SessionID) != event.SessionID {
+		return fmt.Errorf("%w: session_id is not an approved opaque identifier", ErrSensitiveContent)
+	}
 	if err := validateApprovedMetadata(event.Metadata); err != nil {
 		return err
 	}
