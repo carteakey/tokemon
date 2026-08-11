@@ -58,6 +58,53 @@ func TestAnalyticsMobile390BrowserRegression(t *testing.T) {
 	}
 }
 
+func TestMobileNavigation390BrowserRegression(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/mobile-nav.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "mobile-nav-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pages := []struct {
+		path  string
+		media string
+	}{
+		{path: "/", media: `@media (max-width: 500px)`},
+		{path: "/analytics", media: `@media (max-width: 700px)`},
+		{path: "/tokedex", media: `@media (max-width:620px)`},
+		{path: "/sessions", media: `@media (max-width:640px)`},
+	}
+	for _, page := range pages {
+		request := httptest.NewRequest(http.MethodGet, page.path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", page.path, response.Code, response.Body.String())
+		}
+		body := response.Body.Bytes()
+		if !bytes.Contains(body, []byte(page.media)) {
+			t.Fatalf("%s missing mobile breakpoint %q", page.path, page.media)
+		}
+		compactCSS := strings.NewReplacer(" ", "", "\n", "", "\r", "", "\t", "").Replace(response.Body.String())
+		if !strings.Contains(compactCSS, `.nav-link{padding:6px7px;font-size:10px;}`) {
+			t.Fatalf("%s missing compact mobile navigation contract", page.path)
+		}
+		for _, want := range []string{
+			`<nav class="nav"`,
+			`href="/analytics"`,
+		} {
+			if !bytes.Contains(body, []byte(want)) {
+				t.Fatalf("%s missing navigation contract %q", page.path, want)
+			}
+		}
+	}
+}
+
 func TestAnalyticsEmptyStateBrowserRegression(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/empty.db", catalog.Empty())
 	if err != nil {
