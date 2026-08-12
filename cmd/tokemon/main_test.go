@@ -170,6 +170,29 @@ func TestRunServeFailsClosedWithoutIngestToken(t *testing.T) {
 	}
 }
 
+func TestConfiguredInsightsValuesPreferEnvironment(t *testing.T) {
+	t.Setenv("TOKEMON_INSIGHTS_OPENAI_MODEL", "env-model")
+	t.Setenv("TOKEMON_INSIGHTS_OPENAI_API_KEY", "env-secret")
+	values := map[string]string{
+		"TOKEMON_INSIGHTS_OPENAI_MODEL":   "file-model",
+		"TOKEMON_INSIGHTS_OPENAI_API_KEY": "file-secret",
+	}
+	if got := configuredValue(values, "TOKEMON_INSIGHTS_OPENAI_MODEL"); got != "env-model" {
+		t.Fatalf("configured model = %q, want env-model", got)
+	}
+	if got := configuredSecret(values, "TOKEMON_INSIGHTS_OPENAI_API_KEY"); got != "env-secret" {
+		t.Fatalf("configured secret = %q, want env-secret", got)
+	}
+	t.Setenv("TOKEMON_INSIGHTS_OPENAI_MODEL", "")
+	t.Setenv("TOKEMON_INSIGHTS_OPENAI_API_KEY", "")
+	if got := configuredValue(values, "TOKEMON_INSIGHTS_OPENAI_MODEL"); got != "file-model" {
+		t.Fatalf("file model = %q, want file-model", got)
+	}
+	if got := configuredSecret(values, "TOKEMON_INSIGHTS_OPENAI_API_KEY"); got != "file-secret" {
+		t.Fatalf("file secret = %q, want file-secret", got)
+	}
+}
+
 func TestRunServeDevModeRequiresLoopback(t *testing.T) {
 	t.Setenv("TOKEMON_INGEST_TOKEN", "")
 	config := filepath.Join(t.TempDir(), "server.conf")

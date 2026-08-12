@@ -114,6 +114,17 @@ TOKEMON_STATE=/Users/example/.local/share/tokemon/state.db
 
 Explicit command-line flags override environment variables. The agent state contains cursors and sync metadata only. Provider files are read locally and are never uploaded as source content.
 
+## Optional AI insight recap
+
+The `/insights` page always works without an AI provider. To add a short, non-persistent interpretation of its deterministic cards, set these on the hub:
+
+```env
+TOKEMON_INSIGHTS_OPENAI_API_KEY=replace-with-a-dedicated-api-key
+TOKEMON_INSIGHTS_OPENAI_MODEL=gpt-5.6-luna
+```
+
+`TOKEMON_INSIGHTS_OPENAI_BASE_URL` may point at a compatible Responses API endpoint. This is an explicit outbound data flow: the hub sends a bounded aggregate card only, requests structured output with `store: false`, and keeps the result in memory for five minutes. It does not send raw events, exact timestamps, session IDs, project or machine names, provider/model/tool identifiers, prompts, responses, source code, titles, paths, or repository contents. Leave the API key unset to keep Insights fully local and deterministic.
+
 Before each collection pass, the agent checks the hub's `/healthz` endpoint. If the hub is offline, the agent applies its bounded failure backoff without scanning provider histories; cursor state remains unchanged and collection resumes when the hub is healthy.
 
 ## Verify a deployment

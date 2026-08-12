@@ -36,7 +36,9 @@ go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once
 
 Leave off `--once` to keep the agent polling. Set `TOKEMON_INGEST_TOKEN` before exposing the ingest endpoint beyond a trusted local network.
 
-The overview shows lifetime tokens, token mix, a 53-week activity field, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export.
+The overview shows lifetime tokens, token mix, a 53-week activity field, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export. Open `/insights` for evidence-backed momentum, concentration, token-mix, weekday, and time-of-day patterns.
+
+Insights are deterministic and local by default. An optional AI recap can be enabled with `TOKEMON_INSIGHTS_OPENAI_API_KEY`; Tokemon then sends only a bounded aggregate card to the OpenAI Responses API, with `store: false`. Raw events, exact timestamps, session IDs, project and machine names, model and provider names, prompts, responses, code, titles, paths, and repository contents are excluded. The model defaults to `gpt-5.6-luna` and can be changed with `TOKEMON_INSIGHTS_OPENAI_MODEL`; compatible gateways can use `TOKEMON_INSIGHTS_OPENAI_BASE_URL`.
 
 ## Deploy with Docker Compose
 

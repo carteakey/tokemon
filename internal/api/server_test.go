@@ -15,6 +15,7 @@ import (
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 )
 
@@ -1053,6 +1054,50 @@ func TestInsightsRenderHidesDatabaseErrorDetails(t *testing.T) {
 	body := response.Body.String()
 	if !strings.Contains(body, "Insights are temporarily unavailable.") || strings.Contains(body, "sql:") || strings.Contains(body, "database is closed") {
 		t.Fatalf("insights error leaked database details: %s", body)
+	}
+}
+
+type insightsSynthesizerStub struct {
+	input insightai.Input
+}
+
+func (stub *insightsSynthesizerStub) Synthesize(_ context.Context, input insightai.Input) (insightai.Output, error) {
+	stub.input = input
+	return insightai.Output{Title: "Usage pulse", Summary: "Your aggregate rhythm shifted.", EvidenceIDs: []string{"rhythm-peak-time"}}, nil
+}
+
+func TestAggregateAIRecapRedactsSelectedDimensionLabels(t *testing.T) {
+	stub := &insightsSynthesizerStub{}
+	result := database.Insights{
+		Period: "30d", Timezone: "America/Toronto",
+		Filter:      database.AnalyticsQuery{Period: "30d", Dimension: "projects", Machine: "private-machine"},
+		DataQuality: database.InsightDataQuality{Confidence: "high", Qualifier: "all event totals are known"},
+		Cards: []database.InsightCard{
+			{ID: "dimension-concentration", Category: "concentration", Observation: "secret-project: 81% of known tokens", Basis: "project share"},
+			{ID: "rhythm-peak-time", Category: "rhythm", Observation: "14:00 local hour is highest", Basis: "known tokens grouped by configured timezone"},
+		},
+	}
+	recap, err := aggregateAIRecapProvider{synthesizer: stub}.Generate(context.Background(), result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recap != "Usage pulse — Your aggregate rhythm shifted." {
+		t.Fatalf("recap = %q", recap)
+	}
+	payload, err := json.Marshal(stub.input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret-project", "private-machine", "project share"} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("aggregate AI input leaked %q: %s", forbidden, payload)
+		}
+	}
+	if _, err := insightai.ValidateInput(stub.input); err != nil {
+		t.Fatalf("aggregate AI input rejected by transport policy: %v", err)
+	}
+	if len(stub.input.Evidence) != 2 || stub.input.ScopeLabels[0].Label != insightai.ScopeFilteredView {
+		t.Fatalf("unexpected aggregate AI input: %+v", stub.input)
 	}
 }
 

@@ -998,6 +998,12 @@ Keep analytics focused:
 - Current evolution stage
 - Tokens until next evolution
 
+### Insights extension
+
+The post-v0.2 dashboard may derive an Insights view from the same metadata-only records. It should surface at most five ranked, reproducible observations plus local-time weekday and hour-of-day distributions. Every observation must expose its evidence, formula, filters, timezone, data-quality qualifiers, and a link to the corroborating Analytics slice. Unknown totals remain unknown; all-time views do not fabricate a comparison window; timing and volume never become claims about productivity, intent, quality, or causation.
+
+Optional AI synthesis is disabled by default. When explicitly configured, it receives only a bounded aggregate projection of the deterministic cards. Raw events, exact timestamps, session IDs, dimension labels or identifiers, prompts, responses, source code, conversation titles, paths, and repository contents must not leave the hub. Generated text is not persisted and must fail back to the deterministic view.
+
 ### Light Tokemon Copy
 
 Use sparingly:

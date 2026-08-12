@@ -25,6 +25,7 @@ import (
 	"github.com/tokemon/tokemon/internal/api"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/internal/version"
 )
@@ -144,7 +145,17 @@ func runServe(args []string) error {
 		return err
 	}
 	defer store.Close()
-	server, err := api.New(store, *ingestToken)
+	var server *api.Server
+	insightsAPIKey := configuredSecret(configValues, "TOKEMON_INSIGHTS_OPENAI_API_KEY")
+	if insightsAPIKey == "" {
+		server, err = api.New(store, *ingestToken)
+	} else {
+		server, err = api.NewWithInsightsAI(store, *ingestToken, insightai.New(insightai.Config{
+			APIKey:  insightsAPIKey,
+			Model:   configuredValue(configValues, "TOKEMON_INSIGHTS_OPENAI_MODEL"),
+			BaseURL: configuredValue(configValues, "TOKEMON_INSIGHTS_OPENAI_BASE_URL"),
+		}))
+	}
 	if err != nil {
 		return err
 	}
@@ -170,6 +181,20 @@ func runServe(args []string) error {
 		return err
 	}
 	return nil
+}
+
+func configuredValue(values map[string]string, name string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(values[name])
+}
+
+func configuredSecret(values map[string]string, name string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return values[name]
 }
 
 func runImport(args []string) error {
