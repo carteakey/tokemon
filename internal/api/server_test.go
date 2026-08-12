@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -736,6 +737,12 @@ func TestDashboardOmitsDuplicateAndTechnicalCopy(t *testing.T) {
 			t.Fatalf("dashboard still contains unnecessary copy %q", omitted)
 		}
 	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(body) {
+		t.Fatal("dashboard still exposes Insights in primary navigation")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(body) {
+		t.Fatalf("dashboard still renders known qualifier: %s", body)
+	}
 }
 
 func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
@@ -846,6 +853,12 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`/api/v1/analytics/overview">Data</a>`)) {
 		t.Fatal("analytics navigation still points directly at the overview JSON")
 	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(pageResponse.Body.Bytes()) {
+		t.Fatal("analytics page still exposes Insights in primary navigation")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(pageResponse.Body.Bytes()) {
+		t.Fatalf("analytics page still renders known qualifier: %s", pageResponse.Body.String())
+	}
 
 	exportResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(exportResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=7d&dimension=models", nil))
@@ -953,6 +966,12 @@ func TestInsightsPageAndAPIRespectAnalyticsFilters(t *testing.T) {
 	if strings.Contains(body, "private-session-id") || strings.Contains(body, "session_id") {
 		t.Fatal("insights page leaked session metadata")
 	}
+	if regexp.MustCompile(`(?i)\bknown\b`).MatchString(body) {
+		t.Fatalf("insights page still renders known qualifier: %s", body)
+	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).MatchString(body) {
+		t.Fatal("insights page still exposes Insights in primary navigation")
+	}
 
 	apiResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(apiResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights?period=7d&dimension=models&machine=insights-machine", nil))
@@ -974,6 +993,9 @@ func TestInsightsPageAndAPIRespectAnalyticsFilters(t *testing.T) {
 	}
 	if strings.Contains(apiResponse.Body.String(), "session_id") || strings.Contains(apiResponse.Body.String(), "private-session-id") {
 		t.Fatal("insights API leaked session metadata")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(apiResponse.Body.Bytes()) {
+		t.Fatalf("insights API still emits known qualifier: %s", apiResponse.Body.String())
 	}
 	defaultResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(defaultResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights", nil))
@@ -1071,10 +1093,10 @@ func TestAggregateAIRecapRedactsSelectedDimensionLabels(t *testing.T) {
 	result := database.Insights{
 		Period: "30d", Timezone: "America/Toronto",
 		Filter:      database.AnalyticsQuery{Period: "30d", Dimension: "projects", Machine: "private-machine"},
-		DataQuality: database.InsightDataQuality{Confidence: "high", Qualifier: "all event totals are known"},
+		DataQuality: database.InsightDataQuality{Confidence: "high", Qualifier: "all event totals are available"},
 		Cards: []database.InsightCard{
-			{ID: "dimension-concentration", Category: "concentration", Observation: "secret-project: 81% of known tokens", Basis: "project share"},
-			{ID: "rhythm-peak-time", Category: "rhythm", Observation: "14:00 local hour is highest", Basis: "known tokens grouped by configured timezone"},
+			{ID: "dimension-concentration", Category: "concentration", Observation: "secret-project: 81% of tokens", Basis: "project share"},
+			{ID: "rhythm-peak-time", Category: "rhythm", Observation: "14:00 local hour is highest", Basis: "tokens grouped by configured timezone"},
 		},
 	}
 	recap, err := aggregateAIRecapProvider{synthesizer: stub}.Generate(context.Background(), result)

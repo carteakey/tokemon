@@ -305,7 +305,7 @@ func runPurge(args []string) error {
 
 func runDiscover(args []string) error {
 	flags := flag.NewFlagSet("discover", flag.ContinueOnError)
-	verbose := flags.Bool("verbose", false, "show every known search path")
+	verbose := flags.Bool("verbose", false, "show every search path")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -336,7 +336,7 @@ func runDiscover(args []string) error {
 				fmt.Printf("✓ %s detected at %s\n", item.name, displayHome(item.path, home))
 				found = true
 			} else if *verbose {
-				fmt.Printf("· known search path at %s\n", displayHome(item.path, home))
+				fmt.Printf("· search path at %s\n", displayHome(item.path, home))
 			}
 		} else if *verbose && item.supported {
 			fmt.Printf("– %s not detected\n", item.name)

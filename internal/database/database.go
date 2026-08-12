@@ -1534,11 +1534,11 @@ func insightQuality(events, tokens, unknown int64, accuracy map[usage.Accuracy]i
 	qualifier := ""
 	switch confidence {
 	case "high":
-		qualifier = "all event totals are known in this window"
+		qualifier = "all event totals are available in this window"
 	case "medium", "limited":
-		qualifier = "some event totals are unknown; known-token aggregates exclude them"
+		qualifier = "some event totals are unavailable; token aggregates exclude them"
 	default:
-		qualifier = "no known token-total coverage is available"
+		qualifier = "no token-total coverage is available"
 	}
 	copyAccuracy := make(map[usage.Accuracy]int64, len(accuracy))
 	for key, value := range accuracy {
@@ -1558,10 +1558,10 @@ func insightQuality(events, tokens, unknown int64, accuracy map[usage.Accuracy]i
 func insightQualifiers(quality InsightDataQuality, aggregate insightAggregate, summary AnalyticsSummary) []string {
 	qualifiers := make([]string, 0, 4)
 	if quality.UnknownEvents > 0 {
-		qualifiers = append(qualifiers, fmt.Sprintf("%d event(s) have unknown token totals; known-token aggregates exclude them", quality.UnknownEvents))
+		qualifiers = append(qualifiers, fmt.Sprintf("%d event(s) have unavailable token totals; token aggregates exclude them", quality.UnknownEvents))
 	}
 	if aggregate.componentEvents < quality.KnownEvents {
-		qualifiers = append(qualifiers, "token components are incomplete for some known-total events")
+		qualifiers = append(qualifiers, "token components are incomplete for some events with totals")
 	}
 	if summary.EstimatedCost.PricedTokens == 0 {
 		qualifiers = append(qualifiers, "cost coverage is unavailable in this window")
@@ -1569,7 +1569,7 @@ func insightQualifiers(quality InsightDataQuality, aggregate insightAggregate, s
 		qualifiers = append(qualifiers, "cost coverage is partial; unpriced tokens remain excluded")
 	}
 	if len(qualifiers) == 0 {
-		qualifiers = append(qualifiers, "all event totals are known for this window")
+		qualifiers = append(qualifiers, "all event totals are available for this window")
 	}
 	return qualifiers
 }
@@ -1624,7 +1624,7 @@ func insightMomentumCard(query AnalyticsQuery, analytics Analytics, quality Insi
 	} else if change < 0 {
 		direction = "down"
 	}
-	qualifiers := []string{"comparison uses known totals in equal-length windows"}
+	qualifiers := []string{"comparison uses available totals in equal-length windows"}
 	if quality.UnknownEvents > 0 {
 		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
 	}
@@ -1632,10 +1632,10 @@ func insightMomentumCard(query AnalyticsQuery, analytics Analytics, quality Insi
 		ID:             "momentum-vs-prior",
 		Category:       insightCategoryMomentum,
 		Title:          "Momentum vs prior window",
-		Narrative:      fmt.Sprintf("Known token volume is %s relative to the equal prior window; this is a volume comparison, not a productivity or causal claim.", direction),
-		Observation:    fmt.Sprintf("%+.1f%% change in known tokens", change),
-		Evidence:       fmt.Sprintf("Known tokens: %d current vs %d equal prior (%+.1f%%).", analytics.Summary.Tokens, analytics.Comparison.PreviousTokens, change),
-		Basis:          "(current known tokens - equal-prior known tokens) / equal-prior known tokens; unknown totals excluded",
+		Narrative:      fmt.Sprintf("Token volume is %s relative to the equal prior window; this is a volume comparison, not a productivity or causal claim.", direction),
+		Observation:    fmt.Sprintf("%+.1f%% change in tokens", change),
+		Evidence:       fmt.Sprintf("Tokens: %d current vs %d equal prior (%+.1f%%).", analytics.Summary.Tokens, analytics.Comparison.PreviousTokens, change),
+		Basis:          "(current tokens - equal-prior tokens) / equal-prior tokens; unavailable totals excluded",
 		AnalyticsURL:   analyticsURL,
 		AnalyticsQuery: query,
 		Qualifiers:     qualifiers,
@@ -1670,10 +1670,10 @@ func insightRhythmCard(query AnalyticsQuery, aggregate insightAggregate, quality
 		ID:             "rhythm-peak-time",
 		Category:       insightCategoryRhythm,
 		Title:          "Peak time and day",
-		Narrative:      fmt.Sprintf("The largest known-token buckets occur around %s local time and on %s; this describes timing only.", peakHour, peakWeekday),
-		Observation:    fmt.Sprintf("%s local hour and %s are the highest known-token buckets", peakHour, peakWeekday),
+		Narrative:      fmt.Sprintf("The largest token buckets occur around %s local time and on %s; this describes timing only.", peakHour, peakWeekday),
+		Observation:    fmt.Sprintf("%s local hour and %s are the highest token buckets", peakHour, peakWeekday),
 		Evidence:       fmt.Sprintf("Peak local hour %s: %d tokens (%.1f%%); peak local day %s: %d tokens (%.1f%%).", peakHour, hourTokens, hourShare*100, peakWeekday, dayTokens, dayShare*100),
-		Basis:          "known tokens grouped by event timestamp converted to the configured timezone; ties use earliest hour and Sunday-first weekday order",
+		Basis:          "tokens grouped by event timestamp converted to the configured timezone; ties use earliest hour and Sunday-first weekday order",
 		AnalyticsURL:   analyticsURL,
 		AnalyticsQuery: query,
 		Qualifiers:     qualifiers,
@@ -1693,7 +1693,7 @@ func insightConcentrationCard(query AnalyticsQuery, analytics Analytics, quality
 	}
 	share := float64(top.Tokens) / float64(analytics.Summary.Tokens)
 	dimension := analyticsDimensionName(query.Dimension)
-	qualifiers := []string{"share is calculated from known tokens only"}
+	qualifiers := []string{"share is calculated from available token totals"}
 	if quality.UnknownEvents > 0 {
 		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
 	}
@@ -1701,10 +1701,10 @@ func insightConcentrationCard(query AnalyticsQuery, analytics Analytics, quality
 		ID:             "dimension-concentration",
 		Category:       insightCategoryConcentration,
 		Title:          fmt.Sprintf("Top %s concentration", dimension),
-		Narrative:      fmt.Sprintf("%s accounts for %.1f%% of known tokens in the selected %s dimension.", top.Name, share*100, strings.ToLower(dimension)),
-		Observation:    fmt.Sprintf("%s: %.1f%% of known tokens", top.Name, share*100),
-		Evidence:       fmt.Sprintf("Top %s %q: %d known tokens (%.1f%% of %d known tokens).", strings.ToLower(dimension), top.Name, top.Tokens, share*100, analytics.Summary.Tokens),
-		Basis:          "dimension known-token total / window known-token total; rows with unknown totals do not contribute",
+		Narrative:      fmt.Sprintf("%s accounts for %.1f%% of tokens in the selected %s dimension.", top.Name, share*100, strings.ToLower(dimension)),
+		Observation:    fmt.Sprintf("%s: %.1f%% of tokens", top.Name, share*100),
+		Evidence:       fmt.Sprintf("Top %s %q: %d tokens (%.1f%% of %d tokens).", strings.ToLower(dimension), top.Name, top.Tokens, share*100, analytics.Summary.Tokens),
+		Basis:          "dimension token total / window token total; rows with unavailable totals do not contribute",
 		AnalyticsURL:   analyticsURL,
 		AnalyticsQuery: query,
 		Qualifiers:     qualifiers,
@@ -1746,10 +1746,10 @@ func insightCompositionCard(query AnalyticsQuery, aggregate insightAggregate, su
 		ID:             "token-composition",
 		Category:       insightCategoryComposition,
 		Title:          "Token composition and coverage",
-		Narrative:      fmt.Sprintf("Known component fields are split %.1f%% input, %.1f%% cached input, and %.1f%% output; %s and %s.", inputShare*100, cachedShare*100, outputShare*100, cacheText, costText),
+		Narrative:      fmt.Sprintf("Component fields are split %.1f%% input, %.1f%% cached input, and %.1f%% output; %s and %s.", inputShare*100, cachedShare*100, outputShare*100, cacheText, costText),
 		Observation:    fmt.Sprintf("Input %.1f%% · cached %.1f%% · output %.1f%%", inputShare*100, cachedShare*100, outputShare*100),
 		Evidence:       fmt.Sprintf("Component totals: input %d, cached %d, output %d, unclassified %d; %s; %s.", aggregate.inputTokens, aggregate.cachedTokens, aggregate.outputTokens, aggregate.unclassified, cacheText, costText),
-		Basis:          "component / (input + cached + output + unclassified); cache hit = cached eligible tokens / eligible input+cache tokens; cost coverage = priced known tokens / priced+unpriced known tokens",
+		Basis:          "component / (input + cached + output + unclassified); cache hit = cached eligible tokens / eligible input+cache tokens; cost coverage = priced tokens / priced+unpriced tokens",
 		AnalyticsURL:   analyticsURL,
 		AnalyticsQuery: query,
 		Qualifiers:     qualifiers,
@@ -1777,7 +1777,7 @@ func insightConfidenceCard(query AnalyticsQuery, aggregate insightAggregate, sum
 			accuracyLabel = strings.Join(parts, ", ")
 		}
 	}
-	narrative := fmt.Sprintf("%d of %d events have known totals (%.1f%% coverage); data confidence is %s.", quality.KnownEvents, summary.Events, quality.EventCoverage*100, quality.Confidence)
+	narrative := fmt.Sprintf("%d of %d events include token totals (%.1f%% coverage); data confidence is %s.", quality.KnownEvents, summary.Events, quality.EventCoverage*100, quality.Confidence)
 	if quality.UnknownEvents > 0 {
 		narrative += " Unknown totals are excluded from token-volume conclusions."
 	}
@@ -1786,9 +1786,9 @@ func insightConfidenceCard(query AnalyticsQuery, aggregate insightAggregate, sum
 		Category:       insightCategoryConfidence,
 		Title:          "Data confidence",
 		Narrative:      narrative,
-		Observation:    fmt.Sprintf("%.1f%% of events have known totals", quality.EventCoverage*100),
-		Evidence:       fmt.Sprintf("Known events: %d; unknown events: %d; token accuracy classes: %s.", quality.KnownEvents, quality.UnknownEvents, accuracyLabel),
-		Basis:          "known-total events / all events; unknown totals remain unknown and do not become zero",
+		Observation:    fmt.Sprintf("%.1f%% of events include token totals", quality.EventCoverage*100),
+		Evidence:       fmt.Sprintf("Events with totals: %d; events without totals: %d; token accuracy classes: %s.", quality.KnownEvents, quality.UnknownEvents, accuracyLabel),
+		Basis:          "events with totals / all events; unavailable totals remain unavailable and do not become zero",
 		AnalyticsURL:   analyticsURL,
 		AnalyticsQuery: query,
 		Qualifiers:     []string{quality.Qualifier},

@@ -123,8 +123,8 @@ func aggregateAIInput(result database.Insights) insightai.Input {
 		observation := card.Observation
 		basis := card.Basis
 		if card.Category == "concentration" {
-			observation = "One selected-dimension category has the largest known-token share; its label stays local."
-			basis = "largest selected-dimension known-token share / window known-token total; category labels are withheld"
+			observation = "One selected-dimension category has the largest token share; its label stays local."
+			basis = "largest selected-dimension token share / window token total; category labels are withheld"
 		}
 		evidence = append(evidence, insightai.Evidence{
 			ID:          card.ID,
@@ -1832,7 +1832,6 @@ const dashboardTemplate = `<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link active" href="/">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
-      <a class="nav-link" href="/insights">Insights</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
   </header>
@@ -2281,9 +2280,6 @@ func activityTooltip(day database.ActivityDay) string {
 		fmt.Fprintf(&builder, "Token total unavailable · %s %s", commas(day.Events), eventWord)
 	} else {
 		tokenLabel := commas(day.Tokens)
-		if day.UnknownTokens > 0 {
-			tokenLabel += " known"
-		}
 		fmt.Fprintf(&builder, "%s tokens · %s %s", tokenLabel, commas(day.Events), eventWord)
 	}
 	if day.UnknownTokens > 0 {
@@ -2306,9 +2302,6 @@ func appendActivityBreakdown(builder *strings.Builder, heading string, values []
 			continue
 		}
 		tokenLabel := commas(value.Tokens)
-		if value.UnknownTokens > 0 {
-			tokenLabel += " known"
-		}
 		fmt.Fprintf(builder, "\n  %s · %s tokens", value.Name, tokenLabel)
 	}
 }
@@ -2761,7 +2754,6 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
-      <a class="nav-link" href="/insights">Insights</a>
     </nav>
   </header>
 
@@ -2851,7 +2843,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           <div class="trend-grid" aria-hidden="true">{{range .AxisTicks}}<i style="bottom: {{.Position}}%"></i>{{end}}</div>
           <div class="trend-chart period-{{.Filter.Period}}" aria-label="Token volume over the selected window">
             {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
               <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
               <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
@@ -2908,7 +2900,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           </div>
           <div class="share-hit-grid">
             {{range $index, $point := .SharePoints}}
-            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
               <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
             </button>
@@ -2917,7 +2909,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         </div>
       </div>
     </div>
-    {{else}}<div class="empty-chart">No known token totals to compare in this window.</div>{{end}}
+    {{else}}<div class="empty-chart">No token totals to compare in this window.</div>{{end}}
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
@@ -2997,7 +2989,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
       point.classList.add('active');
       shareTooltipDate.textContent = point.dataset.label;
-      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' known tokens';
+      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' tokens';
       const unknownEvents = Number(point.dataset.unknown);
       if (shareTooltipWarning) {
         shareTooltipWarning.hidden = unknownEvents <= 0;
@@ -3147,7 +3139,6 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
-      <a class="nav-link active" href="/insights" aria-current="page">Insights</a>
     </nav>
   </header>
 
@@ -3181,7 +3172,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     </form>
   </section>
 
-  <section class="panel quality" aria-label="Insight data quality"><span><strong>{{commas .DataQuality.KnownEvents}}</strong> known events</span><span><strong>{{commas .DataQuality.KnownTokens}}</strong> known tokens</span><span>Event-total coverage <strong>{{insightCoverage .DataQuality.EventCoverage}}</strong></span><span class="confidence">{{if .DataQuality.Confidence}}{{.DataQuality.Confidence}}{{else}}Unknown confidence{{end}}</span></section>
+  <section class="panel quality" aria-label="Insight data quality"><span><strong>{{commas .DataQuality.KnownEvents}}</strong> events</span><span><strong>{{commas .DataQuality.KnownTokens}}</strong> tokens</span><span>Event-total coverage <strong>{{insightCoverage .DataQuality.EventCoverage}}</strong></span><span class="confidence">{{if .DataQuality.Confidence}}{{.DataQuality.Confidence}}{{else}}Unknown confidence{{end}}</span></section>
   {{if .DataQuality.UnknownEvents}}<div class="state unknown" role="status">{{commas .DataQuality.UnknownEvents}} event{{if ne .DataQuality.UnknownEvents 1}}s{{end}} have unknown token totals. They remain unknown and are not treated as zero.</div>{{end}}
   {{if eq .Filter.Period "all"}}<div class="state baseline" role="status">No comparable baseline for the all-time window; growth signals are intentionally omitted.</div>{{end}}
 
@@ -3192,12 +3183,12 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     {{end}}
   </section>
   {{else}}
-  <section class="panel empty-cards" role="status"><strong>No strong signals in this window.</strong><span>{{if .DataQuality.KnownEvents}}There is not enough known metadata to form a deterministic card yet. Try a wider window or different filters.{{else}}No token metadata matches these filters yet. Insights will appear after usage is recorded.{{end}}</span></section>
+  <section class="panel empty-cards" role="status"><strong>No strong signals in this window.</strong><span>{{if .DataQuality.KnownEvents}}There is not enough metadata to form a deterministic card yet. Try a wider window or different filters.{{else}}No token metadata matches these filters yet. Insights will appear after usage is recorded.{{end}}</span></section>
   {{end}}
 
   <section class="distribution-grid" aria-label="Usage rhythm">
-    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Known tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} known tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
-    <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Known tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
   </section>
 
   <section class="panel ai-recap" aria-labelledby="ai-recap-title" data-ai-status="{{.Recap.Status}}"><div class="section-head"><h2 class="section-title" id="ai-recap-title">AI recap</h2><span class="ai-status {{.Recap.Status}}">{{insightRecapLabel .Recap.Status}}</span></div><div class="ai-recap-body">{{if eq .Recap.Status "generated"}}<p class="ai-status generated">Optional AI interpretation of aggregate evidence</p><p>{{.Recap.Text}}</p>{{else if eq .Recap.Status "unavailable"}}<p>The recap service is temporarily unavailable. Deterministic Insights remain available.</p>{{else}}<p>AI recap is disabled or unconfigured. This page uses deterministic aggregate signals only.</p>{{end}}</div></section>
