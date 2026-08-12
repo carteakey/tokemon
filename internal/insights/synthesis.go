@@ -538,6 +538,7 @@ func buildRequestBody(model string, input Input) ([]byte, error) {
 }
 
 var sensitiveKeyPattern = regexp.MustCompile(`(?i)(?:^|["'{}\s,])(?:session|project|machine|provider|model|tool|timestamp|prompt|response|repository|repo|path|hostname|username|email|api[_-]?key|secret|credential|token[_-]?id)(?:["'{}\s_-]*:)`)
+var sensitiveIdentifierPattern = regexp.MustCompile(`(?i)(?:^|[-_:])(session|project|machine|provider|model|tool|timestamp|prompt|response|repository|repo|path|hostname|username|email)(?:$|[-_:])`)
 var numberPattern = regexp.MustCompile(`(?i)\b\d[\d,]*(?:\.\d+)?(?:%|[kmgt])?\b`)
 
 func rejectSensitiveKey(name, value string) error {
@@ -633,6 +634,9 @@ func ValidateInput(input Input) (Input, error) {
 		if err != nil {
 			return Input{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 		}
+		if sensitiveIdentifierPattern.MatchString(evidence.Category) || isSensitiveCategory(evidence.Category) {
+			return Input{}, fmt.Errorf("%w: evidence[%d].category contains a sensitive dimension name", ErrInvalidInput, index)
+		}
 		evidence.Observation, err = validateText(fmt.Sprintf("evidence[%d].observation", index), evidence.Observation, maxObservation, true)
 		if err != nil {
 			return Input{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
@@ -643,6 +647,15 @@ func ValidateInput(input Input) (Input, error) {
 		}
 	}
 	return input, nil
+}
+
+func isSensitiveCategory(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "session", "project", "machine", "provider", "model", "tool", "timestamp", "repository", "repo", "path":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateEvidenceID(value string) (string, error) {
@@ -657,6 +670,9 @@ func validateEvidenceID(value string) (string, error) {
 		if character < 0x21 || character > 0x7e || character == '"' || character == '\\' {
 			return "", errors.New("must be printable opaque text")
 		}
+	}
+	if sensitiveIdentifierPattern.MatchString(value) {
+		return "", errors.New("must not contain a sensitive identifier name")
 	}
 	return value, nil
 }

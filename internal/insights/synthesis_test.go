@@ -210,6 +210,16 @@ func TestValidateInputAndOutputPrivacyBounds(t *testing.T) {
 		t.Fatalf("sensitive key error=%v", err)
 	}
 	input = testInput()
+	input.Evidence[0].ID = "session-opaque-id"
+	if _, err := ValidateInput(input); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("sensitive identifier error=%v", err)
+	}
+	input = testInput()
+	input.Evidence[0].Category = "machine"
+	if _, err := ValidateInput(input); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("sensitive category error=%v", err)
+	}
+	input = testInput()
 	input.Evidence[0].Observation = strings.Repeat("x", maxObservation+1)
 	if _, err := ValidateInput(input); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("overlong error=%v", err)
