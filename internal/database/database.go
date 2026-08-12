@@ -1614,7 +1614,7 @@ func insightWeekdays(aggregate insightAggregate, total int64) ([]InsightDistribu
 }
 
 func insightMomentumCard(query AnalyticsQuery, analytics Analytics, quality InsightDataQuality, analyticsURL string) (InsightCard, float64, bool) {
-	if query.Period == "all" || analytics.Comparison == nil || analytics.Comparison.PreviousTokens <= 0 {
+	if query.Period == "all" || quality.KnownEvents <= 0 || analytics.Summary.Tokens <= 0 || analytics.Comparison == nil || analytics.Comparison.PreviousTokens <= 0 {
 		return InsightCard{}, 0, false
 	}
 	change := float64(analytics.Summary.Tokens-analytics.Comparison.PreviousTokens) * 100 / float64(analytics.Comparison.PreviousTokens)
