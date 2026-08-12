@@ -1067,6 +1067,34 @@ func TestInsightsQualifiesUnknownTotalsAndSuppressesMissingBaseline(t *testing.T
 		}
 	}
 
+	// A prior known baseline cannot turn an all-unknown current window into a
+	// defensible growth signal; momentum must be suppressed rather than report
+	// a misleading -100% change.
+	baselineStore, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baselineStore.Close()
+	baselineEvents := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-unknown-current", Timestamp: time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC), MachineID: "unknown-machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TokenAccuracy: usage.AccuracyUnknown, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-known-prior", Timestamp: time.Date(2026, 7, 11, 11, 0, 0, 0, time.UTC), MachineID: "unknown-machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if ingest, err := baselineStore.Ingest(context.Background(), baselineEvents); err != nil || ingest.Accepted != len(baselineEvents) {
+		t.Fatalf("unexpected baseline ingest result: %+v, error: %v", ingest, err)
+	}
+	unknownCurrent, err := baselineStore.Insights(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "projects", Machine: "unknown-machine", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknownCurrent.DataQuality.KnownEvents != 0 || unknownCurrent.DataQuality.UnknownEvents != 1 {
+		t.Fatalf("unexpected unknown-only current quality: %+v", unknownCurrent.DataQuality)
+	}
+	for _, card := range unknownCurrent.Cards {
+		if card.Category == insightCategoryMomentum {
+			t.Fatalf("momentum must be suppressed for unknown-only current window despite prior baseline: %+v", card)
+		}
+	}
+
 	empty, err := store.Insights(context.Background(), AnalyticsQuery{Period: "24h", Dimension: "projects", Now: time.Date(2027, 1, 1, 12, 0, 0, 0, time.UTC)})
 	if err != nil {
 		t.Fatal(err)
