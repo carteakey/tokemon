@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -268,6 +269,72 @@ type Analytics struct {
 	Sessions       []AnalyticsSession     `json:"recent_sessions"`
 	Facets         AnalyticsFacets        `json:"facets"`
 }
+
+// InsightDistribution is a privacy-safe aggregate bucket. Labels are local
+// calendar labels (hour or weekday), never event timestamps.
+type InsightDistribution struct {
+	Label  string  `json:"label"`
+	Tokens int64   `json:"tokens"`
+	Events int64   `json:"events"`
+	Share  float64 `json:"share"`
+}
+
+// InsightDataQuality describes which portions of an Insights window are
+// directly supported by stored metadata. Unknown values remain unknown; they
+// are never converted to zero for a conclusion.
+type InsightDataQuality struct {
+	KnownEvents   int64                    `json:"known_events"`
+	UnknownEvents int64                    `json:"unknown_events"`
+	KnownTokens   int64                    `json:"known_tokens"`
+	EventCoverage float64                  `json:"event_coverage"`
+	Confidence    string                   `json:"confidence"`
+	Qualifier     string                   `json:"qualifier,omitempty"`
+	Accuracy      map[usage.Accuracy]int64 `json:"accuracy,omitempty"`
+}
+
+// InsightCard is an evidence-backed, privacy-safe local summary of one
+// aggregate signal. Evidence and Narrative intentionally contain no session
+// identifiers or raw event timestamps. AnalyticsQuery keeps a canonical
+// deep-linkable filter so a reader can inspect the underlying analytics view
+// without exposing records; an outbound AI projection may redact labels too.
+type InsightCard struct {
+	ID             string             `json:"id"`
+	Category       string             `json:"category"`
+	Title          string             `json:"title"`
+	Narrative      string             `json:"narrative"`
+	Observation    string             `json:"observation,omitempty"`
+	Evidence       string             `json:"evidence"`
+	Basis          string             `json:"basis"`
+	AnalyticsURL   string             `json:"analytics_url,omitempty"`
+	AnalyticsQuery AnalyticsQuery     `json:"analytics_query"`
+	DataQuality    InsightDataQuality `json:"data_quality"`
+	Qualifiers     []string           `json:"qualifiers,omitempty"`
+	PeakHour       string             `json:"peak_hour,omitempty"`
+	PeakWeekday    string             `json:"peak_weekday,omitempty"`
+}
+
+// Insights is the deterministic data projection consumed by the future
+// /insights page and by optional language-model summarizers. It contains only
+// aggregates and canonical analytics metadata.
+type Insights struct {
+	Period      string                `json:"period"`
+	Timezone    string                `json:"timezone"`
+	Scope       AnalyticsQuery        `json:"scope"`
+	Filter      AnalyticsQuery        `json:"filter"`
+	StartDate   string                `json:"start_date"`
+	EndDate     string                `json:"end_date"`
+	DataQuality InsightDataQuality    `json:"data_quality"`
+	Qualifiers  []string              `json:"qualifiers,omitempty"`
+	Hourly      []InsightDistribution `json:"hourly,omitempty"`
+	Weekdays    []InsightDistribution `json:"weekdays,omitempty"`
+	PeakHour    string                `json:"peak_hour,omitempty"`
+	PeakWeekday string                `json:"peak_weekday,omitempty"`
+	Cards       []InsightCard         `json:"cards"`
+}
+
+// InsightsResult is retained as a descriptive alias for callers that prefer
+// result-oriented naming.
+type InsightsResult = Insights
 
 func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
 	return OpenWithLocation(path, modelCatalog, time.UTC)
@@ -1277,6 +1344,515 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 		return Analytics{}, err
 	}
 	return result, nil
+}
+
+const (
+	insightCategoryMomentum      = "momentum"
+	insightCategoryRhythm        = "rhythm"
+	insightCategoryConcentration = "concentration"
+	insightCategoryComposition   = "composition"
+	insightCategoryConfidence    = "confidence"
+)
+
+type insightCandidate struct {
+	card  InsightCard
+	score float64
+}
+
+type insightAggregate struct {
+	hourTokens      [24]int64
+	hourEvents      [24]int64
+	weekdayTokens   [7]int64
+	weekdayEvents   [7]int64
+	knownEvents     int64
+	unknownEvents   int64
+	knownTokens     int64
+	componentEvents int64
+	inputTokens     int64
+	cachedTokens    int64
+	outputTokens    int64
+	unclassified    int64
+	accuracy        map[usage.Accuracy]int64
+}
+
+// Insights computes deterministic, privacy-safe cards over the same window
+// and filters used by Analytics. It intentionally does not use an all-time
+// prior for the "all" period: without an equal prior window, growth is not a
+// defensible conclusion.
+func (s *Store) Insights(ctx context.Context, query AnalyticsQuery) (Insights, error) {
+	analytics, err := s.Analytics(ctx, query)
+	if err != nil {
+		return Insights{}, err
+	}
+	canonical, start, end := s.normalizeAnalyticsQuery(query)
+	where, args := analyticsWhere(canonical, start, end)
+	aggregate, err := s.insightsAggregate(ctx, where, args)
+	if err != nil {
+		return Insights{}, err
+	}
+
+	quality := insightQuality(analytics.Summary.Events, analytics.Summary.Tokens, aggregate.unknownEvents, aggregate.accuracy)
+	result := Insights{
+		Period:      canonical.Period,
+		Timezone:    s.Timezone(),
+		Scope:       canonical,
+		Filter:      canonical,
+		StartDate:   analytics.StartDate,
+		EndDate:     analytics.EndDate,
+		DataQuality: quality,
+	}
+	result.Qualifiers = insightQualifiers(quality, aggregate, analytics.Summary)
+	result.Hourly, result.PeakHour = insightHourly(aggregate, aggregate.knownTokens, s.reportingLocation())
+	result.Weekdays, result.PeakWeekday = insightWeekdays(aggregate, aggregate.knownTokens)
+
+	url := analyticsInsightURL(canonical)
+	candidates := make([]insightCandidate, 0, 5)
+	if card, score, ok := insightMomentumCard(canonical, analytics, quality, url); ok {
+		candidates = append(candidates, insightCandidate{card: card, score: score})
+	}
+	if card, score, ok := insightRhythmCard(canonical, aggregate, quality, result.PeakHour, result.PeakWeekday, url); ok {
+		candidates = append(candidates, insightCandidate{card: card, score: score})
+	}
+	if card, score, ok := insightConcentrationCard(canonical, analytics, quality, url); ok {
+		candidates = append(candidates, insightCandidate{card: card, score: score})
+	}
+	if card, score, ok := insightCompositionCard(canonical, aggregate, analytics.Summary, quality, url); ok {
+		candidates = append(candidates, insightCandidate{card: card, score: score})
+	}
+	if card, score, ok := insightConfidenceCard(canonical, aggregate, analytics.Summary, quality, url); ok {
+		candidates = append(candidates, insightCandidate{card: card, score: score})
+	}
+
+	sort.SliceStable(candidates, func(left, right int) bool {
+		if candidates[left].score != candidates[right].score {
+			return candidates[left].score > candidates[right].score
+		}
+		return candidates[left].card.ID < candidates[right].card.ID
+	})
+	if len(candidates) > 5 {
+		candidates = candidates[:5]
+	}
+	result.Cards = make([]InsightCard, len(candidates))
+	for index, candidate := range candidates {
+		candidate.card.DataQuality = quality
+		candidate.card.AnalyticsQuery.Now = time.Time{}
+		result.Cards[index] = candidate.card
+	}
+	return result, nil
+}
+
+func (s *Store) insightsAggregate(ctx context.Context, where string, args []any) (insightAggregate, error) {
+	result := insightAggregate{accuracy: make(map[usage.Accuracy]int64)}
+	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens,
+input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, token_accuracy
+FROM usage_events WHERE `+where, args...)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var timestamp, accuracy string
+		var total, input, output, cached, cacheWrite sql.NullInt64
+		if err := rows.Scan(&timestamp, &total, &input, &output, &cached, &cacheWrite, &accuracy); err != nil {
+			return result, err
+		}
+		result.accuracy[usage.Accuracy(accuracy)]++
+		parsed, err := timeParse(timestamp)
+		if err != nil {
+			return result, err
+		}
+		local := parsed.In(s.reportingLocation())
+		hour := local.Hour()
+		weekday := int(local.Weekday())
+		result.hourEvents[hour]++
+		result.weekdayEvents[weekday]++
+		if !total.Valid {
+			result.unknownEvents++
+			continue
+		}
+		result.knownEvents++
+		result.knownTokens += total.Int64
+		result.hourTokens[hour] += total.Int64
+		result.weekdayTokens[weekday] += total.Int64
+
+		if input.Valid || output.Valid || cached.Valid || cacheWrite.Valid {
+			result.componentEvents++
+		}
+		if input.Valid {
+			result.inputTokens += input.Int64
+		}
+		if cached.Valid {
+			result.cachedTokens += cached.Int64
+		}
+		if cacheWrite.Valid {
+			result.cachedTokens += cacheWrite.Int64
+		}
+		if output.Valid {
+			result.outputTokens += output.Int64
+		}
+		knownComponents := int64(0)
+		if input.Valid {
+			knownComponents += input.Int64
+		}
+		if cached.Valid {
+			knownComponents += cached.Int64
+		}
+		if cacheWrite.Valid {
+			knownComponents += cacheWrite.Int64
+		}
+		if output.Valid {
+			knownComponents += output.Int64
+		}
+		if remainder := total.Int64 - knownComponents; remainder > 0 {
+			result.unclassified += remainder
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func insightQuality(events, tokens, unknown int64, accuracy map[usage.Accuracy]int64) InsightDataQuality {
+	known := events - unknown
+	if known < 0 {
+		known = 0
+	}
+	coverage := float64(0)
+	if events > 0 {
+		coverage = float64(known) / float64(events)
+	}
+	confidence := "unknown"
+	switch {
+	case events > 0 && coverage >= 0.99:
+		confidence = "high"
+	case events > 0 && coverage >= 0.9:
+		confidence = "medium"
+	case events > 0:
+		confidence = "limited"
+	}
+	qualifier := ""
+	switch confidence {
+	case "high":
+		qualifier = "all event totals are known in this window"
+	case "medium", "limited":
+		qualifier = "some event totals are unknown; known-token aggregates exclude them"
+	default:
+		qualifier = "no known token-total coverage is available"
+	}
+	copyAccuracy := make(map[usage.Accuracy]int64, len(accuracy))
+	for key, value := range accuracy {
+		copyAccuracy[key] = value
+	}
+	return InsightDataQuality{
+		KnownEvents:   known,
+		UnknownEvents: unknown,
+		KnownTokens:   tokens,
+		EventCoverage: coverage,
+		Confidence:    confidence,
+		Qualifier:     qualifier,
+		Accuracy:      copyAccuracy,
+	}
+}
+
+func insightQualifiers(quality InsightDataQuality, aggregate insightAggregate, summary AnalyticsSummary) []string {
+	qualifiers := make([]string, 0, 4)
+	if quality.UnknownEvents > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d event(s) have unknown token totals; known-token aggregates exclude them", quality.UnknownEvents))
+	}
+	if aggregate.componentEvents < quality.KnownEvents {
+		qualifiers = append(qualifiers, "token components are incomplete for some known-total events")
+	}
+	if summary.EstimatedCost.PricedTokens == 0 {
+		qualifiers = append(qualifiers, "cost coverage is unavailable in this window")
+	} else if summary.EstimatedCost.UnpricedTokens > 0 {
+		qualifiers = append(qualifiers, "cost coverage is partial; unpriced tokens remain excluded")
+	}
+	if len(qualifiers) == 0 {
+		qualifiers = append(qualifiers, "all event totals are known for this window")
+	}
+	return qualifiers
+}
+
+func insightHourly(aggregate insightAggregate, total int64, location *time.Location) ([]InsightDistribution, string) {
+	result := make([]InsightDistribution, 24)
+	peak := -1
+	for hour := 0; hour < len(result); hour++ {
+		result[hour] = InsightDistribution{Label: fmt.Sprintf("%02d:00", hour), Tokens: aggregate.hourTokens[hour], Events: aggregate.hourEvents[hour]}
+		if total > 0 {
+			result[hour].Share = float64(result[hour].Tokens) / float64(total)
+		}
+		if result[hour].Tokens > 0 && (peak < 0 || result[hour].Tokens > aggregate.hourTokens[peak]) {
+			peak = hour
+		}
+	}
+	if peak < 0 {
+		return result, ""
+	}
+	// Formatting through the configured location makes the timezone contract
+	// explicit while avoiding any raw event timestamp in the result.
+	return result, time.Date(2000, 1, 1, peak, 0, 0, 0, location).Format("15:04")
+}
+
+func insightWeekdays(aggregate insightAggregate, total int64) ([]InsightDistribution, string) {
+	result := make([]InsightDistribution, 7)
+	peak := -1
+	for weekday := 0; weekday < len(result); weekday++ {
+		label := time.Weekday(weekday).String()
+		result[weekday] = InsightDistribution{Label: label, Tokens: aggregate.weekdayTokens[weekday], Events: aggregate.weekdayEvents[weekday]}
+		if total > 0 {
+			result[weekday].Share = float64(result[weekday].Tokens) / float64(total)
+		}
+		if result[weekday].Tokens > 0 && (peak < 0 || result[weekday].Tokens > aggregate.weekdayTokens[peak]) {
+			peak = weekday
+		}
+	}
+	if peak < 0 {
+		return result, ""
+	}
+	return result, time.Weekday(peak).String()
+}
+
+func insightMomentumCard(query AnalyticsQuery, analytics Analytics, quality InsightDataQuality, analyticsURL string) (InsightCard, float64, bool) {
+	if query.Period == "all" || analytics.Comparison == nil || analytics.Comparison.PreviousTokens <= 0 {
+		return InsightCard{}, 0, false
+	}
+	change := float64(analytics.Summary.Tokens-analytics.Comparison.PreviousTokens) * 100 / float64(analytics.Comparison.PreviousTokens)
+	direction := "steady"
+	if change > 0 {
+		direction = "up"
+	} else if change < 0 {
+		direction = "down"
+	}
+	qualifiers := []string{"comparison uses known totals in equal-length windows"}
+	if quality.UnknownEvents > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
+	}
+	card := InsightCard{
+		ID:             "momentum-vs-prior",
+		Category:       insightCategoryMomentum,
+		Title:          "Momentum vs prior window",
+		Narrative:      fmt.Sprintf("Known token volume is %s relative to the equal prior window; this is a volume comparison, not a productivity or causal claim.", direction),
+		Observation:    fmt.Sprintf("%+.1f%% change in known tokens", change),
+		Evidence:       fmt.Sprintf("Known tokens: %d current vs %d equal prior (%+.1f%%).", analytics.Summary.Tokens, analytics.Comparison.PreviousTokens, change),
+		Basis:          "(current known tokens - equal-prior known tokens) / equal-prior known tokens; unknown totals excluded",
+		AnalyticsURL:   analyticsURL,
+		AnalyticsQuery: query,
+		Qualifiers:     qualifiers,
+	}
+	return card, absFloat(change) / 100, true
+}
+
+func insightRhythmCard(query AnalyticsQuery, aggregate insightAggregate, quality InsightDataQuality, peakHour, peakWeekday, analyticsURL string) (InsightCard, float64, bool) {
+	if aggregate.knownTokens <= 0 || peakHour == "" || peakWeekday == "" {
+		return InsightCard{}, 0, false
+	}
+	var hourTokens, dayTokens int64
+	for hour := 0; hour < 24; hour++ {
+		if fmt.Sprintf("%02d:00", hour) == peakHour {
+			hourTokens = aggregate.hourTokens[hour]
+			break
+		}
+	}
+	for weekday := 0; weekday < 7; weekday++ {
+		if time.Weekday(weekday).String() == peakWeekday {
+			dayTokens = aggregate.weekdayTokens[weekday]
+			break
+		}
+	}
+	hourShare := float64(hourTokens) / float64(aggregate.knownTokens)
+	dayShare := float64(dayTokens) / float64(aggregate.knownTokens)
+	qualifiers := []string{"local-time aggregate; timing alone does not establish intent or productivity"}
+	if quality.UnknownEvents > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
+	}
+	card := InsightCard{
+		ID:             "rhythm-peak-time",
+		Category:       insightCategoryRhythm,
+		Title:          "Peak time and day",
+		Narrative:      fmt.Sprintf("The largest known-token buckets occur around %s local time and on %s; this describes timing only.", peakHour, peakWeekday),
+		Observation:    fmt.Sprintf("%s local hour and %s are the highest known-token buckets", peakHour, peakWeekday),
+		Evidence:       fmt.Sprintf("Peak local hour %s: %d tokens (%.1f%%); peak local day %s: %d tokens (%.1f%%).", peakHour, hourTokens, hourShare*100, peakWeekday, dayTokens, dayShare*100),
+		Basis:          "known tokens grouped by event timestamp converted to the configured timezone; ties use earliest hour and Sunday-first weekday order",
+		AnalyticsURL:   analyticsURL,
+		AnalyticsQuery: query,
+		Qualifiers:     qualifiers,
+		PeakHour:       peakHour,
+		PeakWeekday:    peakWeekday,
+	}
+	return card, maxFloat(hourShare, dayShare), true
+}
+
+func insightConcentrationCard(query AnalyticsQuery, analytics Analytics, quality InsightDataQuality, analyticsURL string) (InsightCard, float64, bool) {
+	if analytics.Summary.Tokens <= 0 || len(analytics.Breakdown) == 0 {
+		return InsightCard{}, 0, false
+	}
+	top := analytics.Breakdown[0]
+	if top.Tokens <= 0 {
+		return InsightCard{}, 0, false
+	}
+	share := float64(top.Tokens) / float64(analytics.Summary.Tokens)
+	dimension := analyticsDimensionName(query.Dimension)
+	qualifiers := []string{"share is calculated from known tokens only"}
+	if quality.UnknownEvents > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
+	}
+	card := InsightCard{
+		ID:             "dimension-concentration",
+		Category:       insightCategoryConcentration,
+		Title:          fmt.Sprintf("Top %s concentration", dimension),
+		Narrative:      fmt.Sprintf("%s accounts for %.1f%% of known tokens in the selected %s dimension.", top.Name, share*100, strings.ToLower(dimension)),
+		Observation:    fmt.Sprintf("%s: %.1f%% of known tokens", top.Name, share*100),
+		Evidence:       fmt.Sprintf("Top %s %q: %d known tokens (%.1f%% of %d known tokens).", strings.ToLower(dimension), top.Name, top.Tokens, share*100, analytics.Summary.Tokens),
+		Basis:          "dimension known-token total / window known-token total; rows with unknown totals do not contribute",
+		AnalyticsURL:   analyticsURL,
+		AnalyticsQuery: query,
+		Qualifiers:     qualifiers,
+	}
+	return card, share, true
+}
+
+func insightCompositionCard(query AnalyticsQuery, aggregate insightAggregate, summary AnalyticsSummary, quality InsightDataQuality, analyticsURL string) (InsightCard, float64, bool) {
+	if aggregate.knownTokens <= 0 || aggregate.componentEvents == 0 {
+		return InsightCard{}, 0, false
+	}
+	componentTotal := aggregate.inputTokens + aggregate.cachedTokens + aggregate.outputTokens + aggregate.unclassified
+	if componentTotal <= 0 {
+		return InsightCard{}, 0, false
+	}
+	inputShare := float64(aggregate.inputTokens) / float64(componentTotal)
+	cachedShare := float64(aggregate.cachedTokens) / float64(componentTotal)
+	outputShare := float64(aggregate.outputTokens) / float64(componentTotal)
+	costCoverage := float64(0)
+	if summary.EstimatedCost.PricedTokens+summary.EstimatedCost.UnpricedTokens > 0 {
+		costCoverage = float64(summary.EstimatedCost.PricedTokens) / float64(summary.EstimatedCost.PricedTokens+summary.EstimatedCost.UnpricedTokens)
+	}
+	cacheText := "cache data unavailable"
+	if summary.Cache.EligibleTokens > 0 {
+		cacheText = fmt.Sprintf("cache hit %.1f%%", summary.Cache.HitRate*100)
+	}
+	costText := "cost coverage unavailable"
+	if summary.EstimatedCost.PricedTokens+summary.EstimatedCost.UnpricedTokens > 0 {
+		costText = fmt.Sprintf("cost coverage %.1f%%", costCoverage*100)
+	}
+	qualifiers := []string{"component shares are based on reported component fields; unclassified remainder is retained"}
+	if summary.EstimatedCost.UnpricedTokens > 0 || summary.EstimatedCost.PricedTokens == 0 {
+		qualifiers = append(qualifiers, "estimated cost is partial or unavailable")
+	}
+	if quality.UnknownEvents > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d unknown-total event(s) are excluded", quality.UnknownEvents))
+	}
+	card := InsightCard{
+		ID:             "token-composition",
+		Category:       insightCategoryComposition,
+		Title:          "Token composition and coverage",
+		Narrative:      fmt.Sprintf("Known component fields are split %.1f%% input, %.1f%% cached input, and %.1f%% output; %s and %s.", inputShare*100, cachedShare*100, outputShare*100, cacheText, costText),
+		Observation:    fmt.Sprintf("Input %.1f%% · cached %.1f%% · output %.1f%%", inputShare*100, cachedShare*100, outputShare*100),
+		Evidence:       fmt.Sprintf("Component totals: input %d, cached %d, output %d, unclassified %d; %s; %s.", aggregate.inputTokens, aggregate.cachedTokens, aggregate.outputTokens, aggregate.unclassified, cacheText, costText),
+		Basis:          "component / (input + cached + output + unclassified); cache hit = cached eligible tokens / eligible input+cache tokens; cost coverage = priced known tokens / priced+unpriced known tokens",
+		AnalyticsURL:   analyticsURL,
+		AnalyticsQuery: query,
+		Qualifiers:     qualifiers,
+	}
+	score := maxFloat(cachedShare, outputShare)
+	if costCoverage < 1 {
+		score = maxFloat(score, 1-costCoverage)
+	}
+	return card, score, true
+}
+
+func insightConfidenceCard(query AnalyticsQuery, aggregate insightAggregate, summary AnalyticsSummary, quality InsightDataQuality, analyticsURL string) (InsightCard, float64, bool) {
+	if summary.Events <= 0 {
+		return InsightCard{}, 0, false
+	}
+	accuracyLabel := "accuracy classification unavailable"
+	if len(quality.Accuracy) > 0 {
+		parts := make([]string, 0, len(quality.Accuracy))
+		for _, key := range []usage.Accuracy{usage.AccuracyReported, usage.AccuracyDerived, usage.AccuracyEstimated, usage.AccuracyUnknown} {
+			if count := quality.Accuracy[key]; count > 0 {
+				parts = append(parts, fmt.Sprintf("%d %s", count, key))
+			}
+		}
+		if len(parts) > 0 {
+			accuracyLabel = strings.Join(parts, ", ")
+		}
+	}
+	narrative := fmt.Sprintf("%d of %d events have known totals (%.1f%% coverage); data confidence is %s.", quality.KnownEvents, summary.Events, quality.EventCoverage*100, quality.Confidence)
+	if quality.UnknownEvents > 0 {
+		narrative += " Unknown totals are excluded from token-volume conclusions."
+	}
+	card := InsightCard{
+		ID:             "data-confidence",
+		Category:       insightCategoryConfidence,
+		Title:          "Data confidence",
+		Narrative:      narrative,
+		Observation:    fmt.Sprintf("%.1f%% of events have known totals", quality.EventCoverage*100),
+		Evidence:       fmt.Sprintf("Known events: %d; unknown events: %d; token accuracy classes: %s.", quality.KnownEvents, quality.UnknownEvents, accuracyLabel),
+		Basis:          "known-total events / all events; unknown totals remain unknown and do not become zero",
+		AnalyticsURL:   analyticsURL,
+		AnalyticsQuery: query,
+		Qualifiers:     []string{quality.Qualifier},
+	}
+	score := 1 - quality.EventCoverage
+	if aggregate.componentEvents < quality.KnownEvents {
+		score = maxFloat(score, float64(quality.KnownEvents-aggregate.componentEvents)/float64(maxInt64(1, quality.KnownEvents)))
+	}
+	return card, score, true
+}
+
+func analyticsInsightURL(query AnalyticsQuery) string {
+	values := url.Values{}
+	values.Set("period", query.Period)
+	values.Set("dimension", query.Dimension)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return "/analytics?" + values.Encode()
+}
+
+func analyticsDimensionName(dimension string) string {
+	switch dimension {
+	case "harnesses":
+		return "Harnesses"
+	case "providers":
+		return "Providers"
+	case "models":
+		return "Models"
+	case "machines":
+		return "Machines"
+	default:
+		return "Projects"
+	}
+}
+
+func absFloat(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func maxFloat(left, right float64) float64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func (s *Store) normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, time.Time, time.Time) {

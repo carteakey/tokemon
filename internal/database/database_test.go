@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -911,4 +912,166 @@ func pointForDate(points []AnalyticsSharePoint, date string) *AnalyticsSharePoin
 		}
 	}
 	return nil
+}
+
+func TestInsightsUsesConfiguredTimezoneFiltersAndStablePrivacySafeCards(t *testing.T) {
+	location := time.FixedZone("Toronto", -4*60*60)
+	store, err := OpenWithLocation(t.TempDir()+"/tokemon.db", catalog.Empty(), location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 2026-07-18 12:00 UTC is 08:00 in Toronto. The first two records fall
+	// into the current 7-day window under that local calendar, while the equal
+	// prior window contains the baseline event.
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-current-late", Timestamp: time.Date(2026, 7, 18, 2, 30, 0, 0, time.UTC), MachineID: "desk", Project: "alpha", Provider: "openai", Model: "gpt", Tool: "codex", SessionID: "private-session-current", InputTokens: usage.Int64(60), CacheReadTokens: usage.Int64(20), OutputTokens: usage.Int64(20), TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-current-early", Timestamp: time.Date(2026, 7, 18, 5, 0, 0, 0, time.UTC), MachineID: "desk", Project: "alpha", Provider: "openai", Model: "gpt", Tool: "codex", SessionID: "private-session-current-2", InputTokens: usage.Int64(30), CacheReadTokens: usage.Int64(10), OutputTokens: usage.Int64(10), TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-prior", Timestamp: time.Date(2026, 7, 11, 5, 0, 0, 0, time.UTC), MachineID: "desk", Project: "alpha", Provider: "openai", Model: "gpt", Tool: "codex", SessionID: "private-session-prior", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-filtered", Timestamp: time.Date(2026, 7, 18, 6, 0, 0, 0, time.UTC), MachineID: "other", Project: "beta", Provider: "openai", Model: "gpt", Tool: "codex", TotalTokens: usage.Int64(900), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+
+	query := AnalyticsQuery{Period: "7d", Dimension: "projects", Machine: "desk", Now: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)}
+	result, err := store.Insights(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Timezone != "Toronto" || result.Period != "7d" || result.Scope.Machine != "desk" {
+		t.Fatalf("insights did not preserve timezone/scope: %+v", result)
+	}
+	if result.DataQuality.KnownTokens != 150 || result.DataQuality.KnownEvents != 2 || result.DataQuality.UnknownEvents != 0 {
+		t.Fatalf("unexpected insight quality: %+v", result.DataQuality)
+	}
+	if result.PeakHour != "22:00" || result.PeakWeekday != "Friday" {
+		t.Fatalf("local peak buckets = %s / %s", result.PeakHour, result.PeakWeekday)
+	}
+	if len(result.Hourly) != 24 || len(result.Weekdays) != 7 {
+		t.Fatalf("unexpected distributions: hourly=%d weekdays=%d", len(result.Hourly), len(result.Weekdays))
+	}
+	if len(result.Cards) == 0 || len(result.Cards) > 5 {
+		t.Fatalf("unexpected card count: %d", len(result.Cards))
+	}
+	seen := make(map[string]bool)
+	for _, card := range result.Cards {
+		if card.ID == "" || card.Category == "" || card.Title == "" || card.Narrative == "" || card.Evidence == "" || card.Basis == "" {
+			t.Fatalf("card lacks evidence-backed fields: %+v", card)
+		}
+		if seen[card.ID] {
+			t.Fatalf("duplicate card id %q", card.ID)
+		}
+		seen[card.ID] = true
+		if card.AnalyticsURL == "" || card.AnalyticsQuery.Machine != "desk" || !card.AnalyticsQuery.Now.IsZero() {
+			t.Fatalf("card lacks canonical analytics deep link: %+v", card)
+		}
+		encoded, err := json.Marshal(card)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(encoded)
+		for _, forbidden := range []string{"private-session-current", "private-session-prior", "insight-current", "2026-07-18T"} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("privacy leak %q in card JSON: %s", forbidden, text)
+			}
+		}
+	}
+	repeat, err := store.Insights(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range result.Cards {
+		if result.Cards[index].ID != repeat.Cards[index].ID {
+			t.Fatalf("unstable card ranking: first=%v repeat=%v", result.Cards, repeat.Cards)
+		}
+	}
+}
+
+func TestInsightsHonorsWindowBoundariesAndSuppressesAllTimeGrowth(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	// For a 7-day query, local UTC boundaries are Jul 12 00:00 inclusive and
+	// Jul 19 00:00 exclusive. The exact boundary records make inclusion clear.
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-boundary-start", Timestamp: time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC), MachineID: "machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-boundary-end", Timestamp: time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC), MachineID: "machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-prior-window", Timestamp: time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), MachineID: "machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(5), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+	for _, period := range []string{"24h", "7d", "30d", "all"} {
+		result, err := store.Insights(context.Background(), AnalyticsQuery{Period: period, Dimension: "projects", Now: now})
+		if err != nil {
+			t.Fatalf("period %s: %v", period, err)
+		}
+		if result.Period != period {
+			t.Fatalf("period %s normalized unexpectedly: %+v", period, result.Scope)
+		}
+		for _, card := range result.Cards {
+			if card.Category == insightCategoryMomentum && period == "all" {
+				t.Fatalf("all-time insights reported growth without an equal prior window: %+v", card)
+			}
+		}
+		if period == "7d" && result.DataQuality.KnownTokens != 10 {
+			t.Fatalf("7d boundary tokens = %d, want only inclusive start record", result.DataQuality.KnownTokens)
+		}
+	}
+	short, err := store.Insights(context.Background(), AnalyticsQuery{Period: "24h", Dimension: "projects", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.DataQuality.KnownTokens != 0 {
+		t.Fatalf("24h boundary unexpectedly included old records: %+v", short.DataQuality)
+	}
+}
+
+func TestInsightsQualifiesUnknownTotalsAndSuppressesMissingBaseline(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-known-only", Timestamp: time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC), MachineID: "machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(120), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "insight-unknown-only", Timestamp: time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC), MachineID: "machine", Project: "project", Provider: "provider", Model: "model", Tool: "tool", TokenAccuracy: usage.AccuracyUnknown, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("unexpected ingest result: %+v, error: %v", result, err)
+	}
+	result, err := store.Insights(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "projects", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DataQuality.KnownTokens != 120 || result.DataQuality.KnownEvents != 1 || result.DataQuality.UnknownEvents != 1 || result.DataQuality.EventCoverage != 0.5 {
+		t.Fatalf("unknown totals were not preserved in quality: %+v", result.DataQuality)
+	}
+	if result.DataQuality.Confidence != "limited" || result.DataQuality.Qualifier == "" || len(result.Qualifiers) == 0 {
+		t.Fatalf("missing quality qualifiers: %+v / %v", result.DataQuality, result.Qualifiers)
+	}
+	for _, card := range result.Cards {
+		if card.Category == insightCategoryMomentum {
+			t.Fatalf("momentum card should be suppressed without a positive equal prior baseline: %+v", card)
+		}
+		if len(card.Qualifiers) == 0 {
+			t.Fatalf("card should carry a data-quality qualifier: %+v", card)
+		}
+	}
+
+	empty, err := store.Insights(context.Background(), AnalyticsQuery{Period: "24h", Dimension: "projects", Now: time.Date(2027, 1, 1, 12, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Cards) != 0 || empty.DataQuality.Confidence != "unknown" || empty.PeakHour != "" || empty.PeakWeekday != "" {
+		t.Fatalf("empty window should suppress conclusions: %+v", empty)
+	}
 }
