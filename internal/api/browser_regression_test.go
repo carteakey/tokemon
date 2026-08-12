@@ -122,7 +122,7 @@ func TestAnalyticsEmptyStateBrowserRegression(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("empty analytics status = %d: %s", response.Code, response.Body.String())
 	}
-	for _, want := range []string{"No token activity in this window.", "No known token totals to compare in this window.", "No sessions match these filters."} {
+	for _, want := range []string{"No token activity in this window.", "No token totals to compare in this window.", "No sessions match these filters."} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Fatalf("empty analytics missing %q", want)
 		}
