@@ -742,11 +742,17 @@ func parseResponse(body []byte, evidence []Evidence) (Output, Status, error) {
 
 func stripJSONFence(text string) string {
 	text = strings.TrimSpace(text)
-	if strings.HasPrefix(text, "```") && strings.HasSuffix(text, "```") {
-		text = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "```json"), "```"))
-		if strings.HasPrefix(text, "```") {
-			text = strings.TrimSpace(strings.TrimPrefix(text, "```"))
+	if !strings.HasPrefix(text, "```") || !strings.HasSuffix(text, "```") {
+		return text
+	}
+	text = strings.TrimSpace(strings.TrimSuffix(text, "```"))
+	if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+		language := strings.TrimSpace(text[:newline])
+		if strings.EqualFold(language, "```") || strings.EqualFold(language, "```json") {
+			text = strings.TrimSpace(text[newline+1:])
 		}
+	} else {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "```"))
 	}
 	return text
 }
