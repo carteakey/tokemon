@@ -889,6 +889,173 @@ func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	}
 }
 
+type insightsRecapStub struct {
+	text string
+	err  error
+}
+
+func (stub insightsRecapStub) Generate(context.Context, database.Insights) (string, error) {
+	return stub.text, stub.err
+}
+
+func TestInsightsPageAndAPIRespectAnalyticsFilters(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "insights-render",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "insights-machine",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		SessionID:     "private-session-id",
+		InputTokens:   usage.Int64(60),
+		OutputTokens:  usage.Int64(40),
+		TotalTokens:   usage.Int64(100),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	unknown := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "insights-unknown",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "insights-machine",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		TokenAccuracy: usage.AccuracyUnknown,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	if result, err := store.Ingest(context.Background(), []usage.Event{event, unknown}); err != nil || result.Accepted != 2 {
+		t.Fatalf("unexpected insights ingest result: %+v, error: %v", result, err)
+	}
+
+	pageResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/insights?period=7d&dimension=models&machine=insights-machine", nil))
+	if pageResponse.Code != http.StatusOK {
+		t.Fatalf("insights page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
+	}
+	body := pageResponse.Body.String()
+	for _, want := range []string{"<title>Tokemon · Insights</title>", "Overview", "Analytics", "Insights", "Privacy boundary", "prompts", "responses", "source paths", "24-hour rhythm", "Weekday distribution", "Why this?", "Evidence", "Basis", "Open this slice in Analytics", "AI recap", "Recap disabled / unconfigured", "unknown token totals", "@media (max-width: 700px)", "name=\"dimension\"", "name=\"machine\"", "name=\"provider\"", "name=\"model\"", "name=\"tool\""} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("insights page does not contain %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "private-session-id") || strings.Contains(body, "session_id") {
+		t.Fatal("insights page leaked session metadata")
+	}
+
+	apiResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(apiResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights?period=7d&dimension=models&machine=insights-machine", nil))
+	if apiResponse.Code != http.StatusOK {
+		t.Fatalf("insights API status = %d, want %d: %s", apiResponse.Code, http.StatusOK, apiResponse.Body.String())
+	}
+	var payload struct {
+		database.Insights
+		AIRecap InsightsRecap `json:"ai_recap"`
+	}
+	if err := json.Unmarshal(apiResponse.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode insights API: %v", err)
+	}
+	if payload.Filter.Period != "7d" || payload.Filter.Dimension != "models" || payload.Filter.Machine != "insights-machine" {
+		t.Fatalf("unexpected insights filter: %+v", payload.Filter)
+	}
+	if payload.AIRecap.Status != InsightsRecapDisabled {
+		t.Fatalf("default AI recap status = %q, want %q", payload.AIRecap.Status, InsightsRecapDisabled)
+	}
+	if strings.Contains(apiResponse.Body.String(), "session_id") || strings.Contains(apiResponse.Body.String(), "private-session-id") {
+		t.Fatal("insights API leaked session metadata")
+	}
+	defaultResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(defaultResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights", nil))
+	if defaultResponse.Code != http.StatusOK {
+		t.Fatalf("default insights API status = %d, want %d", defaultResponse.Code, http.StatusOK)
+	}
+	var defaultPayload struct {
+		database.Insights
+	}
+	if err := json.Unmarshal(defaultResponse.Body.Bytes(), &defaultPayload); err != nil {
+		t.Fatalf("decode default insights API: %v", err)
+	}
+	if defaultPayload.Filter.Period != "30d" {
+		t.Fatalf("default insights period = %q, want 30d", defaultPayload.Filter.Period)
+	}
+}
+
+func TestInsightsRecapStatusesAndEmptyState(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithInsights(store, "", insightsRecapStub{text: "A generated aggregate recap."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("empty insights status = %d, want %d", response.Code, http.StatusOK)
+	}
+	for _, want := range []string{"No strong signals in this window.", "No token metadata matches these filters yet.", "Generated recap", "A generated aggregate recap."} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Fatalf("empty insights does not contain %q: %s", want, response.Body.String())
+		}
+	}
+	allWindow := httptest.NewRecorder()
+	server.Handler().ServeHTTP(allWindow, httptest.NewRequest(http.MethodGet, "/insights?period=all", nil))
+	if allWindow.Code != http.StatusOK || !strings.Contains(allWindow.Body.String(), "No comparable baseline for the all-time window") {
+		t.Fatalf("all-time baseline state = %d %s", allWindow.Code, allWindow.Body.String())
+	}
+
+	store2, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	unavailable, err := NewWithInsights(store2, "", insightsRecapStub{err: fmt.Errorf("provider offline")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	unavailable.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Recap temporarily unavailable") {
+		t.Fatalf("unavailable recap page = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestInsightsRenderHidesDatabaseErrorDetails(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(store, "")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("closed-store insights status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "Insights are temporarily unavailable.") || strings.Contains(body, "sql:") || strings.Contains(body, "database is closed") {
+		t.Fatalf("insights error leaked database details: %s", body)
+	}
+}
+
 func TestSettingsRequireAuthenticationAndCSRF(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

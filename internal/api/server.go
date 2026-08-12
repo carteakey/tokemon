@@ -34,6 +34,7 @@ type Server struct {
 	ingestToken    string
 	template       *template.Template
 	static         http.Handler
+	recapProvider  InsightsRecapProvider
 	evolutionMu    sync.Mutex
 	evolutionCache *evolutionCacheEntry
 	evolutionReady chan struct{}
@@ -70,6 +71,40 @@ type analyticsPageData struct {
 type analyticsAxisTick struct {
 	Value    int64
 	Position int
+}
+
+// InsightsRecapStatus describes the optional AI recap slot on the Insights
+// page. The dashboard itself remains useful without a configured provider.
+type InsightsRecapStatus string
+
+const (
+	InsightsRecapGenerated   InsightsRecapStatus = "generated"
+	InsightsRecapDisabled    InsightsRecapStatus = "disabled"
+	InsightsRecapUnavailable InsightsRecapStatus = "unavailable"
+)
+
+// InsightsRecap is deliberately small so a future AI adapter can be injected
+// without changing the page contract. It contains a recap only, never source
+// records or prompts.
+type InsightsRecap struct {
+	Status InsightsRecapStatus `json:"status"`
+	Text   string              `json:"text,omitempty"`
+}
+
+// InsightsRecapProvider is an optional API-local seam for a future AI recap
+// integration. Implementations should summarize aggregate Insights data only.
+type InsightsRecapProvider interface {
+	Generate(context.Context, database.Insights) (string, error)
+}
+
+type insightsPageData struct {
+	database.Insights
+	Facets         database.AnalyticsFacets
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
+	HourlyMax      int64
+	WeekdayMax     int64
+	Recap          InsightsRecap
 }
 
 type aliasRow struct {
@@ -665,6 +700,25 @@ func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
 	}
 }
 
+func analyticsQueryValues(query database.AnalyticsQuery) url.Values {
+	values := url.Values{}
+	values.Set("period", query.Period)
+	values.Set("dimension", query.Dimension)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return values
+}
+
 func analyticsExportURL(query database.AnalyticsQuery) string {
 	values := url.Values{}
 	values.Set("period", query.Period)
@@ -707,6 +761,61 @@ func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
 func analyticsPeriodURL(query database.AnalyticsQuery, period string) string {
 	query.Period = period
 	return analyticsViewURL(query, query.Dimension)
+}
+
+func insightsViewURL(query database.AnalyticsQuery, dimension string) string {
+	query.Dimension = dimension
+	return "/insights?" + analyticsQueryValues(query).Encode()
+}
+
+func insightsPeriodURL(query database.AnalyticsQuery, period string) string {
+	query.Period = period
+	return insightsViewURL(query, query.Dimension)
+}
+
+func insightBarPercent(value, maximum int64) float64 {
+	if value <= 0 || maximum <= 0 {
+		return 0
+	}
+	percent := float64(value) * 100 / float64(maximum)
+	if percent < 2 {
+		return 2
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func insightDistributionMax(values []database.InsightDistribution) int64 {
+	var maximum int64
+	for _, value := range values {
+		if value.Tokens > maximum {
+			maximum = value.Tokens
+		}
+	}
+	return maximum
+}
+
+func insightCoverage(value float64) string {
+	if value <= 0 {
+		return "0%"
+	}
+	if value >= 1 {
+		return "100%"
+	}
+	return fmt.Sprintf("%.0f%%", value*100)
+}
+
+func insightRecapLabel(status InsightsRecapStatus) string {
+	switch status {
+	case InsightsRecapGenerated:
+		return "Generated recap"
+	case InsightsRecapUnavailable:
+		return "Recap temporarily unavailable"
+	default:
+		return "Recap disabled / unconfigured"
+	}
 }
 
 func aliasMaps(values []database.DisplayAlias) (map[string]string, map[string]string) {
@@ -763,6 +872,16 @@ func limitDashboardRows[T any](values []T) []T {
 }
 
 func New(store *database.Store, ingestToken string) (*Server, error) {
+	return NewWithInsights(store, ingestToken)
+}
+
+// NewWithInsights keeps the original New constructor source-compatible while
+// allowing a future aggregate-only recap provider to be injected.
+func NewWithInsights(store *database.Store, ingestToken string, providers ...InsightsRecapProvider) (*Server, error) {
+	var recap InsightsRecapProvider
+	if len(providers) > 0 {
+		recap = providers[0]
+	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
 		"commas":          commas,
 		"commasPtr":       commasPtr,
@@ -796,6 +915,11 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 		"analyticsPeriodURL":   analyticsPeriodURL,
 		"analyticsChange":      analyticsChangeLabel,
 		"analyticsChangeClass": analyticsChangeClass,
+		"insightsURL":          insightsViewURL,
+		"insightsPeriodURL":    insightsPeriodURL,
+		"insightBar":           insightBarPercent,
+		"insightCoverage":      insightCoverage,
+		"insightRecapLabel":    insightRecapLabel,
 		"glyphCell":            glyphCellClass,
 		"projectGlyph":         glyphForProject,
 		"harnessGlyph":         glyphForHarness,
@@ -815,11 +939,14 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 	if _, err := page.Parse(analyticsTemplate); err != nil {
 		return nil, err
 	}
+	if _, err := page.Parse(insightsTemplate); err != nil {
+		return nil, err
+	}
 	staticFiles, err := fs.Sub(web.StaticFS, "static")
 	if err != nil {
 		return nil, err
 	}
-	return &Server{store: store, ingestToken: ingestToken, template: page, static: http.FileServer(http.FS(staticFiles))}, nil
+	return &Server{store: store, ingestToken: ingestToken, template: page, static: http.FileServer(http.FS(staticFiles)), recapProvider: recap}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -829,6 +956,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /", s.dashboard)
 	mux.HandleFunc("GET /analytics", s.analyticsPage)
 	mux.HandleFunc("GET /data", s.analyticsPage)
+	mux.HandleFunc("GET /insights", s.insightsPage)
 	mux.HandleFunc("GET /settings", s.requireDashboardSession(s.settings))
 	mux.HandleFunc("GET /settings/login", s.settingsLogin)
 	mux.HandleFunc("POST /settings/login", s.saveSettingsLogin)
@@ -841,6 +969,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/analytics/overview", s.overview)
 	mux.HandleFunc("GET /api/v1/analytics", s.analyticsAPI)
 	mux.HandleFunc("GET /api/v1/analytics/export", s.analyticsExport)
+	mux.HandleFunc("GET /api/v1/insights", s.insightsAPI)
 	return securityHeaders(mux)
 }
 
@@ -1215,6 +1344,62 @@ func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) insightsRecap(ctx context.Context, result database.Insights) InsightsRecap {
+	if s.recapProvider == nil {
+		return InsightsRecap{Status: InsightsRecapDisabled}
+	}
+	text, err := s.recapProvider.Generate(ctx, result)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return InsightsRecap{Status: InsightsRecapUnavailable}
+	}
+	return InsightsRecap{Status: InsightsRecapGenerated, Text: strings.TrimSpace(text)}
+}
+
+func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
+	query := analyticsQueryFromRequest(r)
+	result, err := s.store.Insights(r.Context(), query)
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	analytics, err := s.store.Analytics(r.Context(), query)
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := insightsPageData{
+		Insights:       result,
+		Facets:         analytics.Facets,
+		ModelAliases:   modelAliases,
+		MachineAliases: machineAliases,
+		HourlyMax:      insightDistributionMax(result.Hourly),
+		WeekdayMax:     insightDistributionMax(result.Weekdays),
+		Recap:          s.insightsRecap(r.Context(), result),
+	}
+	if err := s.template.ExecuteTemplate(w, "insights", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Insights(r.Context(), analyticsQueryFromRequest(r))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload := struct {
+		database.Insights
+		AIRecap InsightsRecap `json:"ai_recap"`
+	}{Insights: result, AIRecap: s.insightsRecap(r.Context(), result)}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
@@ -1592,6 +1777,7 @@ const dashboardTemplate = `<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link active" href="/">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
+      <a class="nav-link" href="/insights">Insights</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
   </header>
@@ -2520,6 +2706,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
+      <a class="nav-link" href="/insights">Insights</a>
     </nav>
   </header>
 
@@ -2795,5 +2982,172 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     });
   })();
 </script>
+</body>
+</html>{{end}}`
+
+const insightsTemplate = `{{define "insights"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Insights</title>
+  <style>
+    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #6f766b; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    a { color: inherit; text-decoration: none; }
+    button, select { font: inherit; }
+    main { width: min(1200px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; }
+    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
+    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
+    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
+    .heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
+    .eyebrow, .label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 8px 0 0; font: 700 clamp(27px, 4vw, 42px)/1 var(--font-display); letter-spacing: .01em; }
+    h2, h3 { margin: 0; }
+    .heading-copy { max-width: 670px; margin: 9px 0 0; color: var(--muted); }
+    .privacy-boundary { display: grid; gap: 4px; max-width: 670px; margin-top: 13px; padding: 9px 11px; border: 1px solid rgba(155, 187, 160, .36); border-radius: 5px; background: rgba(155, 187, 160, .045); color: var(--muted); font-size: 12px; }
+    .privacy-boundary strong { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .heading-actions { display: flex; align-items: end; flex-direction: column; gap: 9px; }
+    .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
+    .window-link { padding: 7px 10px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .08em; }
+    .window-link:hover, .window-link:focus-visible, .window-link.active { background: var(--surface-raised); color: var(--accent); outline: none; }
+    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
+    .filter-panel { padding: 13px 14px; }
+    .filter-form { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: end; gap: 9px; }
+    .filter-form label { display: grid; gap: 5px; color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
+    select:focus-visible, a:focus-visible, button:focus-visible, summary:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .25); outline-offset: 2px; }
+    .filter-actions { display: flex; justify-content: end; gap: 7px; grid-column: span 5; }
+    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 31px; padding: 8px 11px; border: 1px solid var(--line-bright); border-radius: 4px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .action:hover, .action:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .action.apply { border-color: var(--warm); color: var(--warm); }
+    .quality { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; padding: 10px 13px; color: var(--muted); font: 11px var(--font-data); }
+    .quality strong { color: var(--text); }
+    .quality .confidence { color: var(--accent); text-transform: uppercase; }
+    .state { margin-top: 10px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-size: 12px; }
+    .state.unknown { border-color: rgba(210, 164, 119, .52); color: var(--warm); }
+    .state.baseline { border-color: rgba(155, 187, 160, .36); color: var(--accent); }
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 12px 14px 9px; border-bottom: 1px solid var(--line); }
+    .section-title { color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .section-meta { color: var(--faint); font: 10px var(--font-data); }
+    .insight-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .insight-card { min-width: 0; padding: 14px 15px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .insight-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+    .card-category { color: var(--warm); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .insight-card h2 { margin-top: 7px; color: var(--text); font: 700 18px/1.15 var(--font-display); }
+    .narrative { margin: 8px 0 0; color: var(--muted); }
+    .observation { margin: 11px 0 0; color: var(--text); font: 700 12px/1.35 var(--font-data); }
+    .insight-card details { margin-top: 13px; border-top: 1px solid var(--line); }
+    .insight-card summary { padding: 10px 0 3px; color: var(--accent); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .08em; list-style-position: inside; text-transform: uppercase; }
+    .evidence { display: grid; gap: 7px; padding: 6px 0 1px 17px; color: var(--muted); font-size: 12px; }
+    .evidence p { margin: 0; }
+    .evidence strong { color: var(--text); font: 700 10px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .qualifiers { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; padding: 0; list-style: none; }
+    .qualifiers li { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font: 10px var(--font-data); }
+    .analytics-deep-link { display: inline-block; margin-top: 3px; color: var(--accent); font: 700 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .analytics-deep-link:hover, .analytics-deep-link:focus-visible { color: var(--warm); outline: none; }
+    .empty-cards { margin-top: 10px; padding: 30px 15px; text-align: center; }
+    .empty-cards strong { display: block; color: var(--text); font: 700 17px/1.2 var(--font-display); }
+    .empty-cards span { display: block; margin-top: 7px; color: var(--faint); font-size: 12px; }
+    .distribution-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 10px; margin-top: 10px; }
+    .distribution { min-width: 0; }
+    .histogram { display: grid; grid-template-columns: repeat(24, minmax(8px, 1fr)); align-items: end; gap: 3px; min-height: 148px; padding: 18px 13px 8px; }
+    .hour { display: grid; min-width: 0; grid-template-rows: 112px 14px; align-items: end; gap: 5px; }
+    .hour-track { display: flex; height: 112px; align-items: end; justify-content: center; }
+    .hour-bar { display: block; width: min(100%, 18px); min-height: 2px; border: 1px solid var(--accent-dim); border-bottom-color: var(--accent); border-radius: 2px 2px 0 0; background: var(--accent-dim); }
+    .hour-label { overflow: hidden; color: var(--faint); font: 8px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .weekday-list { display: grid; gap: 7px; padding: 14px; }
+    .weekday-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 8px; color: var(--muted); font: 10px var(--font-data); }
+    .weekday-track { height: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; background: #11130f; }
+    .weekday-bar { display: block; height: 100%; min-width: 2px; background: var(--warm); }
+    .weekday-value { color: var(--text); white-space: nowrap; }
+    .peak-note { padding: 0 14px 13px; color: var(--faint); font: 10px var(--font-data); }
+    .peak-note strong { color: var(--warm); }
+    .ai-recap { margin-top: 10px; }
+    .ai-recap-body { padding: 13px 14px; color: var(--muted); font-size: 12px; }
+    .ai-recap-body p { margin: 0; }
+    .ai-status { color: var(--faint); font: 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .ai-status.generated { color: var(--accent); }
+    .ai-status.unavailable { color: var(--warm); }
+    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
+    @media (max-width: 900px) { .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); } .filter-actions { grid-column: span 3; } .distribution-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 700px) { main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; } .topbar { display: flex; align-items: start; flex-wrap: wrap; } .nav { order: 3; width: 100%; justify-content: center; } .heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; } .heading-actions { width: 100%; align-items: stretch; } .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); } .window-link { text-align: center; } .filter-panel { padding: 12px; } .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .filter-actions { grid-column: span 2; } .filter-actions .action { flex: 1; } .insight-cards { grid-template-columns: 1fr; } .insight-card:last-child:nth-child(odd) { grid-column: auto; } .quality { align-items: start; flex-direction: column; gap: 5px; } footer { flex-direction: column; gap: 4px; } }
+    @media (max-width: 430px) { .filter-form { grid-template-columns: 1fr; } .filter-actions { grid-column: auto; } .histogram { padding-inline: 7px; gap: 2px; } .hour-label { font-size: 7px; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-delay: 0ms !important; } }
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="nav-link" href="/">Overview</a>
+      <a class="nav-link" href="/analytics">Analytics</a>
+      <a class="nav-link active" href="/insights" aria-current="page">Insights</a>
+    </nav>
+  </header>
+
+  <section class="heading">
+    <div>
+      <div class="eyebrow">Aggregate signals</div>
+      <h1>Insights</h1>
+      <p class="heading-copy">A quiet readout of recurring token patterns for the selected window and filters.</p>
+      <aside class="privacy-boundary" aria-label="Privacy boundary"><strong>Privacy boundary</strong><span>Metadata only: prompts, responses, source code, source paths, repository contents, conversation titles, and session IDs never appear in Insights.</span></aside>
+    </div>
+    <div class="heading-actions">
+      <nav class="window-nav" aria-label="Time window">
+        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{insightsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
+        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{insightsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
+        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{insightsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
+        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{insightsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
+        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{insightsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
+      </nav>
+    </div>
+  </section>
+
+  <section class="panel filter-panel" aria-label="Insights filters">
+    <form class="filter-form" method="get" action="/insights">
+      <input type="hidden" name="period" value="{{.Filter.Period}}">
+      <label>Breakdown<select name="dimension"><option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option><option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option><option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option><option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option><option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option></select></label>
+      <label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label>
+      <label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label>
+      <label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label>
+      <label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label>
+      <div class="filter-actions"><button class="action apply" type="submit">Apply filters</button><a class="action" href="/insights">Reset</a></div>
+    </form>
+  </section>
+
+  <section class="panel quality" aria-label="Insight data quality"><span><strong>{{commas .DataQuality.KnownEvents}}</strong> known events</span><span><strong>{{commas .DataQuality.KnownTokens}}</strong> known tokens</span><span>Event-total coverage <strong>{{insightCoverage .DataQuality.EventCoverage}}</strong></span><span class="confidence">{{if .DataQuality.Confidence}}{{.DataQuality.Confidence}}{{else}}Unknown confidence{{end}}</span></section>
+  {{if .DataQuality.UnknownEvents}}<div class="state unknown" role="status">{{commas .DataQuality.UnknownEvents}} event{{if ne .DataQuality.UnknownEvents 1}}s{{end}} have unknown token totals. They remain unknown and are not treated as zero.</div>{{end}}
+  {{if eq .Filter.Period "all"}}<div class="state baseline" role="status">No comparable baseline for the all-time window; growth signals are intentionally omitted.</div>{{end}}
+
+  {{if .Cards}}
+  <section class="insight-cards" aria-label="Evidence-backed insights">
+    {{range .Cards}}
+    <article class="insight-card" role="listitem"><div class="card-category">{{.Category}}</div><h2>{{.Title}}</h2><p class="narrative">{{.Narrative}}</p>{{if .Observation}}<p class="observation">{{.Observation}}</p>{{end}}<details><summary>Why this?</summary><div class="evidence"><p><strong>Evidence</strong> {{.Evidence}}</p><p><strong>Basis</strong> {{.Basis}}</p>{{if .Qualifiers}}<ul class="qualifiers" aria-label="Qualifiers">{{range .Qualifiers}}<li>{{.}}</li>{{end}}</ul>{{end}}{{if .AnalyticsURL}}<a class="analytics-deep-link" href="{{.AnalyticsURL}}">Open this slice in Analytics →</a>{{end}}</div></details></article>
+    {{end}}
+  </section>
+  {{else}}
+  <section class="panel empty-cards" role="status"><strong>No strong signals in this window.</strong><span>{{if .DataQuality.KnownEvents}}There is not enough known metadata to form a deterministic card yet. Try a wider window or different filters.{{else}}No token metadata matches these filters yet. Insights will appear after usage is recorded.{{end}}</span></section>
+  {{end}}
+
+  <section class="distribution-grid" aria-label="Usage rhythm">
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Known tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} known tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Known tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
+  </section>
+
+  <section class="panel ai-recap" aria-labelledby="ai-recap-title" data-ai-status="{{.Recap.Status}}"><div class="section-head"><h2 class="section-title" id="ai-recap-title">AI recap</h2><span class="ai-status {{.Recap.Status}}">{{insightRecapLabel .Recap.Status}}</span></div><div class="ai-recap-body">{{if eq .Recap.Status "generated"}}<p class="ai-status generated">Optional AI interpretation of aggregate evidence</p><p>{{.Recap.Text}}</p>{{else if eq .Recap.Status "unavailable"}}<p>The recap service is temporarily unavailable. Deterministic Insights remain available.</p>{{else}}<p>AI recap is disabled or unconfigured. This page uses deterministic aggregate signals only.</p>{{end}}</div></section>
+
+  <footer><span>Local-first · metadata only</span><span>No prompts, responses, source paths, repository contents, or session IDs are used.</span></footer>
+</main>
 </body>
 </html>{{end}}`
