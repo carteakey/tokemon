@@ -20,6 +20,7 @@ import (
 
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/evolution"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/web"
 )
@@ -96,6 +97,50 @@ type InsightsRecap struct {
 // integration. Implementations should summarize aggregate Insights data only.
 type InsightsRecapProvider interface {
 	Generate(context.Context, database.Insights) (string, error)
+}
+
+type aggregateAIRecapProvider struct {
+	synthesizer insightai.Synthesizer
+}
+
+func (provider aggregateAIRecapProvider) Generate(ctx context.Context, result database.Insights) (string, error) {
+	output, err := provider.synthesizer.Synthesize(ctx, aggregateAIInput(result))
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(output.Title) == "" {
+		return strings.TrimSpace(output.Summary), nil
+	}
+	return strings.TrimSpace(output.Title) + " — " + strings.TrimSpace(output.Summary), nil
+}
+
+func aggregateAIInput(result database.Insights) insightai.Input {
+	scope := insightai.ScopeOverall
+	if result.Filter.Machine != "" || result.Filter.Provider != "" || result.Filter.Model != "" || result.Filter.Tool != "" {
+		scope = insightai.ScopeFilteredView
+	}
+	evidence := make([]insightai.Evidence, 0, len(result.Cards))
+	for _, card := range result.Cards {
+		observation := card.Observation
+		basis := card.Basis
+		if card.Category == "concentration" {
+			observation = "One selected-dimension category has the largest known-token share; its label stays local."
+			basis = "largest selected-dimension known-token share / window known-token total; category labels are withheld"
+		}
+		evidence = append(evidence, insightai.Evidence{
+			ID:          card.ID,
+			Category:    card.Category,
+			Observation: observation,
+			Basis:       basis,
+		})
+	}
+	return insightai.Input{
+		PeriodLabel: result.Period,
+		Timezone:    result.Timezone,
+		ScopeLabels: []insightai.ScopeLabel{{Label: scope, Count: len(result.Cards)}},
+		DataQuality: insightai.DataQuality{Level: result.DataQuality.Confidence, Note: result.DataQuality.Qualifier},
+		Evidence:    evidence,
+	}
 }
 
 type insightsPageData struct {
@@ -794,6 +839,25 @@ func limitDashboardRows[T any](values []T) []T {
 
 func New(store *database.Store, ingestToken string) (*Server, error) {
 	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: ingestToken})
+}
+
+// NewWithInsightsAI enables optional aggregate-only AI synthesis. The caller
+// should use New when synthesis is not explicitly configured so the page can
+// distinguish disabled from temporarily unavailable.
+func NewWithInsightsAI(store *database.Store, ingestToken string, synthesizer insightai.Synthesizer) (*Server, error) {
+	if synthesizer == nil {
+		return New(store, ingestToken)
+	}
+	return NewWithInsights(store, ingestToken, aggregateAIRecapProvider{synthesizer: synthesizer})
+}
+
+// NewWithConfigAndInsightsAI builds a server from an explicit security and
+// lifecycle configuration plus an optional aggregate-only AI synthesizer.
+func NewWithConfigAndInsightsAI(store *database.Store, config Config, synthesizer insightai.Synthesizer) (*Server, error) {
+	if synthesizer == nil {
+		return NewWithConfig(store, config)
+	}
+	return NewWithConfig(store, config, aggregateAIRecapProvider{synthesizer: synthesizer})
 }
 
 // NewWithInsights keeps the original New constructor source-compatible while

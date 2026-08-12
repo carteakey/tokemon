@@ -56,6 +56,8 @@ basenames (never full paths); set `TOKEMON_INCLUDE_PROJECTS=false` or pass
 Use `TOKEMON_ADAPTERS` as a provider allowlist and configure generic JSONL only
 through explicit paths.
 
+Open `/insights` for evidence-backed momentum, concentration, token-mix, weekday, and time-of-day patterns. Insights are deterministic and local by default; an optional AI recap can be enabled with `TOKEMON_INSIGHTS_OPENAI_API_KEY`. Tokemon then sends only a bounded aggregate card to the OpenAI Responses API, with `store: false`. Raw events, exact timestamps, session IDs, project and machine names, model and provider names, prompts, responses, code, titles, paths, and repository contents are excluded. The model defaults to `gpt-5.6-luna` and can be changed with `TOKEMON_INSIGHTS_OPENAI_MODEL`; compatible gateways can use `TOKEMON_INSIGHTS_OPENAI_BASE_URL`.
+
 ## Deploy with Docker Compose
 
 Compose runs Tokemon as a persistent dashboard hub with SQLite data stored under `./data`.

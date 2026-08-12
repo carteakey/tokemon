@@ -27,6 +27,7 @@ import (
 	"github.com/tokemon/tokemon/internal/art"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/internal/version"
 )
@@ -184,13 +185,22 @@ func runServe(args []string) error {
 		return err
 	}
 	defer store.Close()
-	server, err := api.NewWithConfig(store, api.Config{
+	insightsAPIKey := configuredSecret(configValues, "TOKEMON_INSIGHTS_OPENAI_API_KEY")
+	var insightsSynthesizer insightai.Synthesizer
+	if insightsAPIKey != "" {
+		insightsSynthesizer = insightai.New(insightai.Config{
+			APIKey:  insightsAPIKey,
+			Model:   configuredValue(configValues, "TOKEMON_INSIGHTS_OPENAI_MODEL"),
+			BaseURL: configuredValue(configValues, "TOKEMON_INSIGHTS_OPENAI_BASE_URL"),
+		})
+	}
+	server, err := api.NewWithConfigAndInsightsAI(store, api.Config{
 		IngestToken:       *ingestToken,
 		DashboardToken:    *dashboardToken,
 		AllowLoopbackDev:  *devLoopback,
 		TrustedProxyCIDRs: splitConfiguredPaths(*trustedProxyCIDRs),
 		Logger:            slog.New(slog.NewJSONHandler(os.Stderr, nil)),
-	})
+	}, insightsSynthesizer)
 	if err != nil {
 		return err
 	}
@@ -206,6 +216,20 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return serveHTTP(ctx, httpServer, *shutdownTimeout)
+}
+
+func configuredValue(values map[string]string, name string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(values[name])
+}
+
+func configuredSecret(values map[string]string, name string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return values[name]
 }
 
 func runImport(args []string) error {

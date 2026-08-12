@@ -35,6 +35,10 @@ readiness check and returns `503` when the store is unavailable; authenticated
 Use `TOKEMON_INGEST_TOKEN` or `--token-stdin` during installation; inline token
 arguments are rejected.
 
+Optional Insights synthesis reads `TOKEMON_INSIGHTS_OPENAI_API_KEY`,
+`TOKEMON_INSIGHTS_OPENAI_MODEL`, and `TOKEMON_INSIGHTS_OPENAI_BASE_URL` from the
+same mode-`0600` config file.
+
 The installer writes:
 
 - `~/.local/bin/tokemon`
