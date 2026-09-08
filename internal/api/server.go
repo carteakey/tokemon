@@ -1785,6 +1785,9 @@ const dashboardTemplate = `<!doctype html>
     .composition-segment.output { background: var(--warm); }
     .composition-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
     .composition-item { display: flex; min-width: 0; align-items: start; flex-direction: column; justify-content: start; gap: 4px; padding: 8px 10px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); color: var(--muted); cursor: help; font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .composition-label { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; }
+    .composition-share { color: var(--accent); font-weight: 700; letter-spacing: 0; }
+    .composition-item.output .composition-share { color: var(--warm); }
     .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .22); outline-offset: 2px; }
     .composition-item.output { border-color: rgba(210, 164, 119, .58); background: rgba(210, 164, 119, .06); }
     .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: rgba(210, 164, 119, .24); }
@@ -1871,8 +1874,8 @@ const dashboardTemplate = `<!doctype html>
     th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    th:first-child, td:first-child { width: 43%; }
-    th:nth-child(2), td:nth-child(2) { width: 41%; }
+    th:first-child, td:first-child { width: 60%; }
+    th:nth-child(2), td:nth-child(2) { width: 24%; }
     th:last-child, td:last-child { width: 16%; }
     td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
@@ -1932,7 +1935,7 @@ const dashboardTemplate = `<!doctype html>
       .command { width: 100%; overflow: auto; }
       footer { flex-direction: column; gap: 4px; }
     }
-    @media (max-width: 420px) { .composition-grid { gap: 10px; } }
+    @media (max-width: 420px) { .composition-primary { grid-template-columns: 1fr; gap: 10px; } }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
       .odometer-strip { transition: none; }
@@ -1979,12 +1982,12 @@ const dashboardTemplate = `<!doctype html>
           <span class="composition-segment output" id="live-output-segment"></span>
         </div>
         <div class="composition-primary">
-          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
-          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
+          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><span class="composition-share" id="live-input-share">—</span></span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
+          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><span class="composition-share" id="live-output-share">—</span></span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
         </div>
       </div>
       <div class="progress-block">
-        <div class="progress-row"><span>Next evolution</span></div>
+        <div class="progress-row"><span>Next evolution</span>{{if .Evolution.NextThreshold}}<strong>{{compactPtr .Evolution.NextThreshold}} lifetime target</strong>{{else}}<strong>Maximum stage</strong>{{end}}</div>
         <div class="progress-value"><strong id="live-remaining-copy">{{if .Evolution.TokensRemaining}}{{compactPtr .Evolution.TokensRemaining}} <small>to go</small>{{else}}Final form{{end}}</strong><strong id="live-progress-label">{{printf "%.0f" (mul .Evolution.Progress 100)}}%</strong></div>
         <div class="progress" id="live-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
       </div>
@@ -2031,19 +2034,19 @@ const dashboardTemplate = `<!doctype html>
     <h2 id="breakdowns-title" class="sr-only">Usage breakdowns</h2>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Projects</h2></div>
-      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Harnesses</h2></div>
-      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Models</h2></div>
-      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Machines</h2></div>
-      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
   </section>
 
@@ -2241,6 +2244,9 @@ const dashboardTemplate = `<!doctype html>
     };
     updateOdometer(document.getElementById('live-input-tokens'), number.format(input));
     updateOdometer(document.getElementById('live-output-tokens'), number.format(output));
+    const percent = (value) => total === 0 ? '—' : new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 }).format(value / total);
+    document.getElementById('live-input-share').textContent = percent(input);
+    document.getElementById('live-output-share').textContent = percent(output);
     setTooltip('live-input', 'Input', input, []);
     setTooltip('live-output', 'Output', output, []);
   };
