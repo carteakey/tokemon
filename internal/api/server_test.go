@@ -279,6 +279,9 @@ func TestDashboardDoesNotDuplicateStageWatermarkBesideFormChip(t *testing.T) {
 	if !strings.Contains(body, `<div class="stage-chip">FORM / 09</div>`) {
 		t.Fatalf("dashboard does not render the stage-nine form chip")
 	}
+	if !strings.Contains(body, `<strong>2B lifetime target</strong>`) {
+		t.Fatalf("dashboard does not identify the next lifetime target")
+	}
 	if strings.Contains(body, `.creature-panel::after`) || strings.Contains(body, `content: "STAGE " attr(data-stage)`) {
 		t.Fatalf("dashboard still renders the duplicate stage watermark")
 	}
@@ -308,6 +311,9 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`class="mini-odometer"`,
 		`id="live-input-tokens"`,
 		`id="live-output-tokens"`,
+		`id="live-input-share"`,
+		`id="live-output-share"`,
+		`const percent = (value)`,
 		`data-tooltip-kind="composition"`,
 		`aria-label="Token mix"`,
 		`>Input</span>`,
@@ -322,6 +328,9 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`updateOdometer(document.getElementById('live-output-tokens'), number.format(output))`,
 		`setTooltip('live-input', 'Input'`,
 		`setTooltip('live-output', 'Output'`,
+		`document.getElementById('live-input-share').textContent = percent(input)`,
+		`document.getElementById('live-output-share').textContent = percent(output)`,
+		`@media (max-width: 420px) { .composition-primary { grid-template-columns: 1fr; gap: 10px; } }`,
 		`cell.dataset.tooltipKind === 'composition'`,
 		`segment.style.width`,
 		`updateOdometer(counter, display)`,
@@ -628,6 +637,31 @@ func TestModelGlyphIsStableAndNameDerived(t *testing.T) {
 				t.Fatalf("model glyph row %d is not symmetrical", row)
 			}
 		}
+	}
+}
+
+func TestDashboardUsesCompactBreakdownTotalsWithExactTooltips(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "compact-breakdown", Timestamp: time.Now().UTC(), MachineID: "workstation", Project: "tokemon", Provider: "openai", Model: "gpt-5.6-luna", Tool: "codex", TotalTokens: usage.Int64(1_165_236_062), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if !strings.Contains(body, `title="1,165,236,062 tokens" aria-label="1,165,236,062 tokens">1.2B</td>`) {
+		t.Fatalf("dashboard does not pair a compact total with its exact tooltip: %s", body)
+	}
+	if !strings.Contains(body, `th:first-child, td:first-child { width: 60%; }`) {
+		t.Fatal("dashboard does not reserve additional width for breakdown names")
 	}
 }
 

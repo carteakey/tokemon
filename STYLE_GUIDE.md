@@ -19,7 +19,7 @@ Tokemon is a dense, quiet instrument panel with the charm of an original 16-bit 
 | Raised panel | `--surface-raised` | `#1d201b` |
 | Main text | `--text` | `#f0ede5` |
 | Secondary text | `--muted` | `#a2a69b` |
-| Quiet text | `--faint` | `#6f766b` |
+| Quiet text | `--faint` | `#858b80` |
 | Border | `--line` | `#30352d` |
 | Strong border | `--line-bright` | `#485044` |
 | Sage accent | `--accent` | `#9bbba0` |
@@ -78,7 +78,7 @@ Use a compact 2px / 4px / 6px / 8px / 10px / 12px / 16px / 20px rhythm.
 - Evolution progress appears once: remaining amount, percentage, and one progress bar.
 - Activity uses the compact daily pixel field. Details belong on hover or focus.
 - Exact Input and Output totals are visible in the mini counters and remain available on hover or focus; Unknown remains preserved in the data layer but is omitted from the overview hero.
-- Tables show at most the most useful rows and align numeric columns to the right.
+- Tables show at most the most useful rows, align numeric columns to the right, and use compact visible totals with exact values available on hover.
 - Unknown values stay unknown; never silently convert them to zero.
 
 ## Voice and copy
