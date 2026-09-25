@@ -81,8 +81,9 @@ jobs:
       - name: Build and scan release image
         run: |
           docker build --pull --tag "$IMAGE:${GITHUB_REF_NAME#v}" .
-          docker run --rm aquasec/trivy:0.56.2 \
-            image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$IMAGE:${GITHUB_REF_NAME#v}"
+          docker save "$IMAGE:${GITHUB_REF_NAME#v}" --output "$RUNNER_TEMP/tokemon-release.tar"
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" aquasec/trivy:0.56.2 \
+            image --input /scan/tokemon-release.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
