@@ -153,7 +153,7 @@ func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "api-session", Timestamp: now.Add(-time.Hour), MachineID: "machine", SessionID: "session", Project: "/private/project", Provider: "provider", Model: "raw-model", Tool: "codex", InputTokens: usage.Int64(4), OutputTokens: usage.Int64(6), TotalTokens: usage.Int64(10), DurationMS: usage.Int64(1200), Cost: usage.Float64(.12), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "api-session", Timestamp: now, MachineID: "machine", SessionID: "session", Project: "/private/project", Provider: "provider", Model: "raw-model", Tool: "codex", InputTokens: usage.Int64(4), OutputTokens: usage.Int64(6), TotalTokens: usage.Int64(10), DurationMS: usage.Int64(1200), Cost: usage.Float64(.12), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
 	}
