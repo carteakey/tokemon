@@ -121,6 +121,170 @@ func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestPeriodSummaryAndOverviewExposeTodayAndWeekContext(t *testing.T) {
+	location := time.FixedZone("Test", -4*60*60)
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 10, 13, 0, 0, 0, location)
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "today", Timestamp: now.Add(-time.Hour), MachineID: "desk", Provider: "openai", Model: "gpt", Tool: "codex", InputTokens: usage.Int64(3), OutputTokens: usage.Int64(7), TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "week-unknown", Timestamp: now.AddDate(0, 0, -2), MachineID: "desk", Provider: "openai", Model: "gpt", Tool: "codex", TokenAccuracy: usage.AccuracyUnknown, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	today, err := store.PeriodSummary(context.Background(), now, now.AddDate(0, 0, 1))
+	if err != nil || today.Tokens != 10 || today.Events != 1 || today.InputTokens != 3 || today.OutputTokens != 7 {
+		t.Fatalf("today = %+v, err = %v", today, err)
+	}
+	week, err := store.PeriodSummary(context.Background(), now.AddDate(0, 0, -6), now.AddDate(0, 0, 1))
+	if err != nil || week.Tokens != 10 || week.Events != 2 || week.UnknownTokens != 1 {
+		t.Fatalf("week = %+v, err = %v", week, err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil || overview.Today.StartDate == "" || overview.Week.StartDate == "" {
+		t.Fatalf("overview context = %+v, err = %v", overview, err)
+	}
+}
+
+func TestSessionsAggregateMetadataAndFilters(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC)
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-1", Timestamp: now.Add(-time.Hour), MachineID: "desk", SessionID: "session-a", Project: "/private/repo", Provider: "openai", Model: "gpt", Tool: "codex", InputTokens: usage.Int64(4), OutputTokens: usage.Int64(6), TotalTokens: usage.Int64(10), DurationMS: usage.Int64(1200), Cost: usage.Float64(.25), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-2", Timestamp: now.Add(-30 * time.Minute), MachineID: "desk", SessionID: "session-a", Project: "/private/repo", Provider: "openai", Model: "gpt", Tool: "codex", InputTokens: usage.Int64(2), OutputTokens: usage.Int64(3), TotalTokens: usage.Int64(5), DurationMS: usage.Int64(800), Cost: usage.Float64(.1), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-b", Timestamp: now.Add(-2 * time.Hour), MachineID: "laptop", SessionID: "session-b", Project: "other", Provider: "anthropic", Model: "claude", Tool: "claude-code", TotalTokens: usage.Int64(9), TokenAccuracy: usage.AccuracyDerived, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Sessions(context.Background(), AnalyticsQuery{Period: "24h", Machine: "desk", Provider: "openai", Model: "gpt", Tool: "codex", Now: now})
+	if err != nil || len(result) != 1 {
+		t.Fatalf("sessions = %+v, err = %v", result, err)
+	}
+	item := result[0]
+	if item.SessionID != "session-a" || item.Project != "repo" || item.InputTokens == nil || *item.InputTokens != 6 || item.OutputTokens == nil || *item.OutputTokens != 9 || item.TotalTokens == nil || *item.TotalTokens != 15 || item.Cost == nil || *item.Cost != .35 || item.DurationMS == nil || *item.DurationMS != 2000 || item.Accuracy != usage.AccuracyReported {
+		t.Fatalf("aggregated session = %+v", item)
+	}
+	if _, err := store.Sessions(context.Background(), AnalyticsQuery{Period: "24h", Machine: "missing", Now: now}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMachinesAtClassifiesHealthAndUsage(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.RecordHeartbeat(context.Background(), AgentHeartbeat{MachineID: "connected", OperatingSystem: "darwin", SourceCount: 2, Adapters: []string{"codex"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordHeartbeat(context.Background(), AgentHeartbeat{MachineID: "stale", SourceCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordHeartbeat(context.Background(), AgentHeartbeat{MachineID: "offline", SourceErrorCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE machines SET last_seen_at = CASE id WHEN 'connected' THEN '2026-08-10T12:58:00Z' WHEN 'stale' THEN '2026-08-10T12:40:00Z' ELSE '2026-08-10T10:00:00Z' END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{{SchemaVersion: usage.SchemaVersion, EventID: "machine-usage", Timestamp: time.Date(2026, 8, 10, 12, 30, 0, 0, time.UTC), MachineID: "connected", Provider: "openai", Model: "gpt", Tool: "codex", TotalTokens: usage.Int64(42), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}}); err != nil {
+		t.Fatal(err)
+	}
+	machines, err := store.MachinesAt(context.Background(), time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC))
+	if err != nil || len(machines) != 3 {
+		t.Fatalf("machines = %+v, err = %v", machines, err)
+	}
+	byID := make(map[string]MachineInfo, len(machines))
+	for _, machine := range machines {
+		byID[machine.ID] = machine
+	}
+	if byID["connected"].Status != MachineStatusConnected || byID["stale"].Status != MachineStatusStale || byID["offline"].Status != MachineStatusOffline {
+		t.Fatalf("statuses = %+v", byID)
+	}
+	if byID["connected"].TodayTokens != 42 || byID["connected"].WeekTokens != 42 || byID["connected"].LifetimeTokens != 42 || byID["offline"].SyncContext != "1 source error" {
+		t.Fatalf("usage/sync context = %+v", byID)
+	}
+}
+
+func TestMachineStatusThresholdBoundaries(t *testing.T) {
+	now := time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name string
+		age  time.Duration
+		want string
+	}{
+		{name: "connected edge", age: 5 * time.Minute, want: MachineStatusConnected},
+		{name: "stale start", age: 5*time.Minute + time.Nanosecond, want: MachineStatusStale},
+		{name: "stale edge", age: 30 * time.Minute, want: MachineStatusStale},
+		{name: "offline start", age: 30*time.Minute + time.Nanosecond, want: MachineStatusOffline},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			seen := now.Add(-test.age).Format(time.RFC3339Nano)
+			if got := machineStatus(seen, now); got != test.want {
+				t.Fatalf("machineStatus(%s) = %q, want %q", test.age, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCatalogSnapshotIncludesTierAliasesAndUsageContext(t *testing.T) {
+	price := 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"alpha": {Provider: "provider", DisplayName: "Alpha", Aliases: []string{"alpha", "provider/alpha"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"beta":  {Provider: "provider", DisplayName: "Beta", Aliases: []string{"beta"}, Tier: "Unranked", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Ingest(context.Background(), []usage.Event{{SchemaVersion: usage.SchemaVersion, EventID: "catalog-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "provider", Model: "provider/alpha", CanonicalModel: "alpha", Tool: "tool", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.CatalogSnapshot(context.Background())
+	if err != nil || len(snapshot.Models) != 2 || snapshot.SchemaVersion != catalog.SchemaVersion {
+		t.Fatalf("snapshot = %+v, err = %v", snapshot, err)
+	}
+	if snapshot.Models[0].ID != "alpha" || snapshot.Models[0].Tier != "S" || snapshot.Models[0].UsageTokens != 10 || snapshot.Models[0].Context != "Observed in usage" || len(snapshot.Models[0].Aliases) != 2 {
+		t.Fatalf("catalog model = %+v", snapshot.Models[0])
+	}
+}
+
+func TestReadyAndStaleAgentsUseSQLiteState(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(context.Background()); err != nil {
+		store.Close()
+		t.Fatalf("ready before close: %v", err)
+	}
+	if err := store.RecordHeartbeat(context.Background(), AgentHeartbeat{MachineID: "machine"}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	stale, err := store.StaleAgents(context.Background(), time.Now().UTC().Add(time.Minute))
+	if err != nil || stale != 1 {
+		store.Close()
+		t.Fatalf("stale agents = %d, err = %v, want 1", stale, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(context.Background()); err == nil {
+		t.Fatal("ready after close unexpectedly succeeded")
+	}
+}
+
 func TestDisplayAliasesRoundTrip(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

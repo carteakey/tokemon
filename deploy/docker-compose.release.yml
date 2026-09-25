@@ -1,0 +1,7 @@
+# Production release overlay. CI publishes both semver tags and a digest; the
+# digest is mandatory here so a mutable registry tag cannot silently change a
+# running deployment. Never set TOKEMON_IMAGE_DIGEST from untrusted input.
+services:
+  tokemon:
+    image: "ghcr.io/carteakey/tokemon:${TOKEMON_VERSION:?set TOKEMON_VERSION}@${TOKEMON_IMAGE_DIGEST:?set TOKEMON_IMAGE_DIGEST}"
+    build: null

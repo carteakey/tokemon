@@ -1,9 +1,17 @@
 /data/
+/backups/
+/incidents/
 .env
 .venv/
 *.db
+*.db.lock
 *.db-shm
 *.db-wal
+*.db.restore-*
+*.sqlite
+*.sqlite-*
+/testdata/private/
+/fixtures/private/
 /tokemon
 /site/
 *.DS_Store

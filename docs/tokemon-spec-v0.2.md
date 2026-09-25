@@ -343,6 +343,9 @@ tokemon inspect
 tokemon import usage.jsonl
 tokemon export usage.jsonl
 tokemon purge --before 2026-01-01
+tokemon backup create --destination /mnt/off-host/tokemon
+tokemon backup verify /mnt/off-host/tokemon/tokemon-backup-v4-<utc>.db
+tokemon backup restore --source /mnt/off-host/tokemon/tokemon-backup-v4-<utc>.db --force
 ```
 
 ### `tokemon serve`
@@ -388,7 +391,24 @@ Exports normalized JSONL events.
 
 ### `tokemon purge`
 
-Deletes usage events older than a specified date.
+Deletes usage events strictly before a specified UTC date boundary. Evolution
+is derived from the remaining total and may move to a lower stage after a
+purge.
+
+### `tokemon backup`
+
+`backup create` uses SQLite `VACUUM INTO` to produce a standalone, integrity-
+checked snapshot that includes committed rows in the source WAL without
+copying `-wal` or `-shm` sidecars. Versioned UTC files are retained according
+to the configured bound. `backup verify` checks integrity and event/token
+equivalence; `backup restore` requires an offline destination and `--force` to
+replace an existing database, retaining a pre-restore rollback snapshot.
+
+File-backed server and mutating CLI opens hold an inter-process lock for the
+database lifetime, so migrations, imports, exports, purge, and restore cannot
+run concurrently. Scheduled `backup create` remains a read-only online
+operation. The deployment runbook defines scheduling, off-host retention, and
+rollback procedure.
 
 CSV import and export are not required for v0.2.
 
@@ -437,9 +457,19 @@ JSONL path opts the generic adapter in.
 
 For v0.2:
 
-- Use one shared ingest token.
-- Do not implement dashboard accounts.
-- Recommend Tailscale, Cloudflare Access, or reverse-proxy authentication outside a trusted network.
+- Require a non-empty shared ingest token on every non-loopback listener.
+- Allow an empty token only with the explicit `--dev-loopback` mode and an
+  explicit loopback bind (`127.0.0.1`, `::1`, or `localhost`).
+- Protect dashboard, settings, analytics, export, machines, and evolution
+  routes with Basic auth (`tokemon:<token>`) or Bearer auth. The dashboard
+  token defaults to the ingest token and may be separated with
+  `TOKEMON_DASHBOARD_TOKEN`.
+- A reverse proxy may provide `X-Forwarded-User` only when its source is in
+  the configured `TOKEMON_TRUSTED_PROXY_CIDRS`; the proxy must strip incoming
+  copies of that header. Do not trust forwarded identity from arbitrary
+  clients.
+- Keep the service on Tailscale/WireGuard or behind an authenticated proxy;
+  direct public-internet exposure is unsupported.
 - Generate a stable machine ID for each agent.
 
 Per-agent credentials and revocation can come later.
@@ -602,6 +632,16 @@ state:
 ```
 
 The local state database stores cursors and machine state only.
+
+The native agent enforces this boundary again at the shared outbound client and
+the `inspect` command. Unknown fields and sensitive metadata are rejected
+before any upload. A working directory may be reduced to a lowercase basename
+for project analytics (for example, `/work/SecretClient` becomes
+`secretclient`); the basename can still be identifying. Users who do not want
+project labels can set `TOKEMON_INCLUDE_PROJECTS=false` or use
+`--include-projects=false`. `TOKEMON_ADAPTERS` is an explicit provider
+allowlist, and generic JSONL is opt-in through configured paths. Extension
+metadata is limited to keys in the `tokemon_` namespace.
 
 ---
 
@@ -883,7 +923,7 @@ Subscription products must not pretend to have exact per-token cost.
 Navigation:
 
 ```text
-Overview | Tokedex | Settings
+Overview | Analytics | Tokedex | Sessions | Settings
 ```
 
 `Settings` may initially be configuration documentation instead of a full interface.
@@ -915,6 +955,12 @@ Time ranges:
 Custom ranges can wait.
 
 The Tokemon form is always based on unfiltered lifetime usage. Filters must not make it temporarily devolve.
+
+The overview keeps the lifetime counter global and exposes explicit **Today** and
+**This week** context summaries beside it. Machine health uses heartbeat age to
+classify each machine as Connected (≤5 minutes), Stale (>5 and ≤30 minutes), or
+Offline (>30 minutes). Recent sessions remain metadata-only and show known versus
+unavailable token, cost, duration, and accuracy fields without conversation data.
 
 ---
 
@@ -1171,6 +1217,15 @@ The exact values may change. Accessibility and consistency matter more than spec
 - Use a restrained idle state, or none
 - Support `prefers-reduced-motion`
 
+The server-rendered overview, settings, and analytics pages must remain usable
+without a pointer: provide a skip link, semantic headings and table names,
+explicit form labels, visible `:focus-visible` states, keyboard-operable chart
+points/tooltips, and a screen-reader table alternative for visual charts.
+Color tokens used for text must meet a WCAG AA contrast policy against the
+dashboard background. Empty and form-error states expose status text through
+semantic live/alert regions. The public [incident-response runbook](incident-response.md)
+covers recovery and privacy handling without collecting conversation content.
+
 ---
 
 ## 26. Responsive Design
@@ -1307,6 +1362,7 @@ GET  /api/v1/models
 GET  /api/v1/machines
 GET  /api/v1/sessions
 GET  /api/v1/catalog
+GET  /api/v1/sessions/export
 ```
 
 ### Evolution Response
@@ -1333,8 +1389,14 @@ Support:
 - JSON
 - Optional gzip compression
 - Idempotency
-- Partial validation errors
+- Whole-batch validation before SQLite mutation (a rejected event rejects the
+  complete request)
 - Maximum batch size
+- 10 MiB compressed request, 8 MiB decompressed request, 4 MiB serialized
+  event batch, and 1,000 events
+- Bounded field/string/metadata sizes; finite non-negative costs; bounded
+  timestamps; uppercase three-letter currencies; and consistent known token
+  components. Unknown provider values remain valid unknowns.
 - Accepted, duplicate, and rejected counts
 - Previous and new lifetime totals
 - Whether an evolution threshold was crossed
@@ -1368,6 +1430,25 @@ deployment metadata only:
   "source_error_count": 0
 }
 ```
+
+### HTTP lifecycle and operational telemetry
+
+The hub uses a configured `http.Server` with read, read-header, write, idle,
+and bounded graceful-shutdown timeouts. `SIGTERM` and `SIGINT` stop accepting
+new requests, drain in-flight work until the shutdown deadline, and close the
+SQLite store before exit. Health, heartbeat, and ingest handlers derive
+request contexts from explicit per-route deadlines; the agent applies the same
+bounded request timeout to each health, heartbeat, and batch upload. A failed
+upload does not commit its local cursor or event fingerprint, so the next pass
+retries the batch.
+
+`GET /healthz` is intentionally unauthenticated for private-network probes but
+is readiness-backed: it executes a read-only SQLite query and returns `503`
+when the store is unavailable. Authenticated `GET /metrics` returns
+deterministic process counters for requests, server failures, ingest batches
+and accepted/duplicate/rejected events, source errors, SQLite operation count
+and latency, plus a SQLite-derived stale-agent count. JSON request and source
+error logs omit query strings, bodies, credentials, and local paths.
 
 ---
 

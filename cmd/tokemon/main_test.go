@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -8,11 +9,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunCatalogValidate(t *testing.T) {
 	path := filepath.Join("..", "..", "catalog", "models.yaml")
 	if err := run([]string{"catalog", "validate", "--catalog", path}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServeHTTPGracefulShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if err := serveHTTP(ctx, server, time.Second); err != nil {
+		t.Fatalf("serveHTTP shutdown: %v", err)
+	}
+}
+
+func TestRunArtValidate(t *testing.T) {
+	path := filepath.Join("..", "..", "web", "static", "tokemon")
+	if err := run([]string{"art", "validate", "--dir", path}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -25,6 +46,28 @@ func TestRunCatalogValidateRejectsInvalidCatalog(t *testing.T) {
 	err := run([]string{"catalog", "validate", "--catalog", path})
 	if err == nil || !strings.Contains(err.Error(), `schema_version must be "2"`) {
 		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+func TestReadEventsRejectsSensitiveFieldsBeforeInspectOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sensitive.jsonl")
+	line := `{"schema_version":"1","event_id":"inspect-sensitive","timestamp":"2026-07-12T12:00:00Z","machine_id":"machine","provider":"example","model":"model","tool":"generic-jsonl","token_accuracy":"reported","prompt":"private prompt","total_tokens":1}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEvents(path); err == nil || !strings.Contains(err.Error(), "disallowed sensitive content") {
+		t.Fatalf("readEvents error = %v, want privacy rejection", err)
+	}
+}
+
+func TestReadEventsRejectsSensitiveNestedSourceFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested-sensitive.jsonl")
+	line := `{"schema_version":"1","event_id":"inspect-source-sensitive","timestamp":"2026-07-12T12:00:00Z","machine_id":"machine","provider":"example","model":"model","tool":"generic-jsonl","token_accuracy":"reported","source":{"adapter":"generic-jsonl","path":"/private/repository"}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEvents(path); err == nil || !strings.Contains(err.Error(), "disallowed sensitive content") {
+		t.Fatalf("readEvents error = %v, want nested privacy rejection", err)
 	}
 }
 
@@ -61,6 +104,26 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 	applyServerConfig(flags, map[string]string{"TOKEMON_SERVER_ADDR": "0.0.0.0:18080"}, addr, databasePath, ingestToken, catalogPath, timezone)
 	if *addr != "127.0.0.1:9999" {
 		t.Fatalf("explicit flag was overwritten: %q", *addr)
+	}
+}
+
+func TestApplyAgentConfigProjectLabelOptOut(t *testing.T) {
+	t.Setenv("TOKEMON_INCLUDE_PROJECTS", "")
+	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
+	serverURL := flags.String("server", "http://localhost", "")
+	token := flags.String("token", "token", "")
+	machineID := flags.String("machine-id", "machine", "")
+	home := flags.String("home", "/tmp/home", "")
+	adapters := flags.String("adapters", "codex", "")
+	interval := flags.Duration("interval", time.Minute, "")
+	statePath := flags.String("state", "/tmp/state.db", "")
+	includeProjects := flags.Bool("include-projects", true, "")
+	if err := flags.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	applyAgentConfig(flags, map[string]string{"TOKEMON_INCLUDE_PROJECTS": "false"}, serverURL, token, machineID, home, adapters, interval, statePath, includeProjects)
+	if *includeProjects {
+		t.Fatal("config opt-out did not disable project labels")
 	}
 }
 

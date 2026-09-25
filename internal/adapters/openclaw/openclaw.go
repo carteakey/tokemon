@@ -123,7 +123,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return adapters.ParseResult{}, err
 	}
 
-	sessionID := firstNonEmpty(header.ID, header.SessionID, header.SessionIDAlt, sessionIDFromPath(source.Path))
+	sessionID := usage.NormalizeSessionID(firstNonEmpty(header.ID, header.SessionID, header.SessionIDAlt, sessionIDFromPath(source.Path)))
 	project := usage.NormalizeProject(header.CWD)
 	reader := bufio.NewReaderSize(file, 64*1024)
 	position := offset
@@ -194,7 +194,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			continue
 		}
 
-		currentSessionID := firstNonEmpty(record.SessionID, record.SessionIDAlt, sessionID)
+		currentSessionID := usage.NormalizeSessionID(firstNonEmpty(record.SessionID, record.SessionIDAlt, sessionID))
 		currentProject := firstNonEmpty(
 			usage.NormalizeProject(record.CWD),
 			usage.NormalizeProject(record.Message.CWD),
@@ -382,7 +382,7 @@ func makeCursorIdentity(sourceIdentity string, header []byte) string {
 }
 
 func sessionIDFromPath(path string) string {
-	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	return usage.HashSessionID(path)
 }
 
 func parseTimestamp(raw json.RawMessage) (time.Time, error) {

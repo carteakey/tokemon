@@ -13,10 +13,27 @@ bash deploy/macos/install-server.sh \
   --binary ./tokemon \
   --catalog ./catalog/models.yaml \
   --database ./data/tokemon.db \
-  --token 'replace-with-a-generated-secret'
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
-The default listen address is `0.0.0.0:18080`. The server config supports `TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`, `TOKEMON_INGEST_TOKEN`, and `TOKEMON_ANALYTICS_TIMEZONE` (an IANA name such as `America/Toronto`; default `UTC`). Its LaunchAgent is `com.tokemon.server`.
+The default listen address is `0.0.0.0:18080`; non-loopback listeners require
+`TOKEMON_INGEST_TOKEN`. The server config supports
+`TOKEMON_SERVER_ADDR`, `TOKEMON_DATABASE`, `TOKEMON_MODEL_CATALOG`,
+`TOKEMON_INGEST_TOKEN`, `TOKEMON_DASHBOARD_TOKEN`,
+`TOKEMON_TRUSTED_PROXY_CIDRS`, and `TOKEMON_ANALYTICS_TIMEZONE` (an IANA name
+such as `America/Toronto`; default `UTC`). Its LaunchAgent is
+`com.tokemon.server`.
+
+The server also accepts `TOKEMON_SERVER_READ_TIMEOUT`,
+`TOKEMON_SERVER_READ_HEADER_TIMEOUT`, `TOKEMON_SERVER_WRITE_TIMEOUT`,
+`TOKEMON_SERVER_IDLE_TIMEOUT`, and `TOKEMON_SERVER_SHUTDOWN_TIMEOUT`. These
+bound request processing and graceful shutdown. `/healthz` performs a SQLite
+readiness check and returns `503` when the store is unavailable; authenticated
+`/metrics` exposes redacted operational counters.
+Use `TOKEMON_INGEST_TOKEN` or `--token-stdin` during installation; inline token
+arguments are rejected.
 
 The installer writes:
 
@@ -40,8 +57,10 @@ Build or obtain the matching Tokemon binary, then run:
 bash deploy/macos/install-agent.sh \
   --binary ./tokemon \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret' \
-  --adapters claude-code,codex
+  --adapters claude-code,codex \
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
 The installer writes:
@@ -52,7 +71,11 @@ The installer writes:
 - `~/Library/LaunchAgents/com.tokemon.agent.plist`
 - `~/Library/Logs/Tokemon/agent.log`
 
-The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments.
+The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments. Use `TOKEMON_INGEST_TOKEN` or `--token-stdin`; inline token arguments are rejected.
+
+Set `TOKEMON_AGENT_REQUEST_TIMEOUT` (default `30s`) to bound each health,
+heartbeat, and ingest request. A timed-out upload leaves the local cursor
+unchanged for a safe retry.
 
 For the same install flow on macOS and Linux, use `deploy/install-agent.sh` with a release version. It downloads the architecture-matched archive, verifies `checksums.txt`, writes the adapter profile, and installs the native user supervisor. `deploy/macos/install-agent.sh` remains as a compatibility entry point and delegates to that shared installer.
 
