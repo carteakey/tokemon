@@ -22,14 +22,13 @@ func TestInstallAgentCleanInstallAndUpgradeProtectSecretsAndState(t *testing.T) 
 		cmd := exec.Command("bash", "install-agent.sh",
 			"--binary", fakeBinary,
 			"--server", "https://hub.example.test",
-			"--token", token,
 			"--machine-id", "clean-machine",
 			"--home", home,
 			"--state", statePath,
 			"--install-dir", installDir,
 			"--no-supervisor",
 		)
-		cmd.Env = append(os.Environ(), "HOME="+home, "TOKEMON_HOME=", "TOKEMON_INGEST_TOKEN=", "TOKEMON_SERVER_URL=")
+		cmd.Env = append(os.Environ(), "HOME="+home, "TOKEMON_HOME=", "TOKEMON_INGEST_TOKEN="+token, "TOKEMON_SERVER_URL=")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("installer failed: %v\n%s", err, output)
@@ -87,11 +86,10 @@ func TestInstallAgentRejectsTokenNewlinesBeforeWritingConfig(t *testing.T) {
 	cmd := exec.Command("bash", "install-agent.sh",
 		"--binary", fakeBinary,
 		"--server", "https://hub.example.test",
-		"--token", "bad\nsecret",
 		"--home", home,
 		"--no-supervisor",
 	)
-	cmd.Env = append(os.Environ(), "HOME="+home, "TOKEMON_HOME=", "TOKEMON_INGEST_TOKEN=")
+	cmd.Env = append(os.Environ(), "HOME="+home, "TOKEMON_HOME=", "TOKEMON_INGEST_TOKEN=bad\nsecret")
 	output, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(output), "token contains a newline") {
 		t.Fatalf("newline token result = %v, output = %q", err, output)
