@@ -44,9 +44,10 @@ type HeartbeatRequest struct {
 
 const (
 	maxIngestBatchBytes = 4 << 20
-	// maxIngestBatchEvents mirrors the hub's per-batch event cap so the agent
-	// never assembles a batch the server would reject on count alone.
-	maxIngestBatchEvents = 1000
+	// maxIngestBatchEvents stays comfortably below the hub's 1,000-event hard
+	// cap so representative SQLite backfills also finish within the shared
+	// request deadline.
+	maxIngestBatchEvents = 100
 	// requestTimeout bounds each hub request unless the caller already supplied
 	// a shorter deadline, so a stuck hub cannot hang the agent forever.
 	requestTimeout = 30 * time.Second

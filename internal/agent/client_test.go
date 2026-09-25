@@ -62,7 +62,8 @@ func TestClientIngestRedactsMetadataBeforeUpload(t *testing.T) {
 	}
 }
 
-func TestClientIngestSplitsBatchesBelowCountCap(t *testing.T) {
+func TestClientIngestSplitsBackfillsIntoDeadlineSizedBatches(t *testing.T) {
+	const operationalBatchLimit = 100
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
@@ -71,15 +72,15 @@ func TestClientIngestSplitsBatchesBelowCountCap(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 			return
 		}
-		if len(request.Events) > maxIngestBatchEvents {
-			t.Errorf("batch = %d events, want at most %d", len(request.Events), maxIngestBatchEvents)
+		if len(request.Events) > operationalBatchLimit {
+			t.Errorf("batch = %d events, want at most %d", len(request.Events), operationalBatchLimit)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(database.IngestResult{Accepted: len(request.Events), CurrentTotal: int64(requests)})
 	}))
 	defer server.Close()
 
-	events := make([]usage.Event, maxIngestBatchEvents*2+1)
+	events := make([]usage.Event, operationalBatchLimit*2+1)
 	for index := range events {
 		events[index] = usage.Event{
 			SchemaVersion: usage.SchemaVersion,
