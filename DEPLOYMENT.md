@@ -90,7 +90,7 @@ For an immutable GHCR deployment, use the release overlay with the digest
 recorded by CI (there is deliberately no `latest` tag):
 
 ```bash
-export TOKEMON_VERSION=0.3.3
+export TOKEMON_VERSION=VERSION_FROM_PUBLISHED_RELEASE
 export TOKEMON_IMAGE_DIGEST=sha256:<digest-from-release-image-digest.txt>
 docker compose --env-file .env \
   -f deploy/docker-compose.yml -f deploy/docker-compose.release.yml \
