@@ -161,20 +161,8 @@ func (e Event) validateAt(now time.Time) error {
 	if err := validateText("source.identity", e.Source.Identity, MaxIdentityLength, true); err != nil {
 		return err
 	}
-	if e.TotalTokens != nil {
-		var components int64
-		for _, value := range []*int64{e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens} {
-			if value == nil {
-				continue
-			}
-			if components > math.MaxInt64-*value {
-				return errors.New("token components overflow")
-			}
-			components += *value
-		}
-		if components > *e.TotalTokens {
-			return errors.New("total_tokens is smaller than known token components")
-		}
+	if err := validateTokenTotals(e); err != nil {
+		return err
 	}
 	if e.Metadata != nil {
 		payload, err := json.Marshal(e.Metadata)
@@ -186,6 +174,39 @@ func (e Event) validateAt(now time.Time) error {
 		}
 	}
 	return nil
+}
+
+func validateTokenTotals(e Event) error {
+	if e.TotalTokens == nil {
+		return nil
+	}
+	var components int64
+	for _, value := range []*int64{e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens} {
+		if value == nil {
+			continue
+		}
+		if components > math.MaxInt64-*value {
+			return errors.New("token components overflow")
+		}
+		components += *value
+	}
+	if components > *e.TotalTokens {
+		return errors.New("total_tokens is smaller than known token components")
+	}
+	return nil
+}
+
+// SanitizeOutbound returns a copy of the event that is safe to validate and
+// upload. A provider total that contradicts a reported token component becomes
+// unknown (components are preserved) rather than blocking every otherwise-valid
+// event in the same collection pass. It never touches metadata: the outbound
+// privacy guard still decides whether that is permitted.
+func SanitizeOutbound(event Event) Event {
+	if event.TotalTokens != nil && validateTokenTotals(event) != nil {
+		event.TotalTokens = nil
+		event.TokenAccuracy = AccuracyUnknown
+	}
+	return event
 }
 
 func validateText(name, value string, max int, allowWhitespace bool) error {

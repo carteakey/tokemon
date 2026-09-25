@@ -68,6 +68,7 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 	if len(events) == 0 {
 		return database.IngestResult{}, fmt.Errorf("events must not be empty")
 	}
+	events = sanitizeOutboundEvents(events)
 	// Validate the complete batch before encoding or opening the first HTTP
 	// request. A privacy rejection therefore cannot partially upload a batch.
 	if err := usage.ValidateOutboundBatch(events); err != nil {
@@ -96,6 +97,17 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 		combined.Evolved = combined.Evolved || result.Evolved
 	}
 	return combined, nil
+}
+
+// sanitizeOutboundEvents copies the batch with inconsistent provider totals
+// downgraded to unknown; the caller's events (and their delta fingerprints)
+// are left unchanged.
+func sanitizeOutboundEvents(events []usage.Event) []usage.Event {
+	sanitized := make([]usage.Event, len(events))
+	for index, event := range events {
+		sanitized[index] = usage.SanitizeOutbound(event)
+	}
+	return sanitized
 }
 
 func splitIngestBatches(events []usage.Event) ([][]usage.Event, error) {

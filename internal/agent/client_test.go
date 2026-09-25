@@ -208,3 +208,42 @@ func TestClientRequestTimeoutBoundsHealth(t *testing.T) {
 		t.Fatal("test server did not receive health request")
 	}
 }
+
+func TestClientDowngradesImpossibleProviderTotalInsteadOfBlockingBatch(t *testing.T) {
+	var sent []usage.Event
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		sent = append(sent, request.Events...)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accepted":2}`))
+	}))
+	defer server.Close()
+
+	bad := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "bad-total", Timestamp: time.Now().UTC(),
+		MachineID: "machine", Provider: "provider", Model: "model", Tool: "tool",
+		InputTokens: usage.Int64(3), CacheReadTokens: usage.Int64(10), TotalTokens: usage.Int64(5),
+		TokenAccuracy: usage.AccuracyReported,
+	}
+	good := bad
+	good.EventID = "good-total"
+	good.TotalTokens = usage.Int64(13)
+	if _, err := (Client{ServerURL: server.URL}).Ingest(t.Context(), []usage.Event{bad, good}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent %d events, want both in one pass", len(sent))
+	}
+	if sent[0].TotalTokens != nil || sent[0].TokenAccuracy != usage.AccuracyUnknown || sent[0].InputTokens == nil {
+		t.Fatalf("impossible total was not downgraded with components preserved: %+v", sent[0])
+	}
+	if sent[1].TotalTokens == nil || *sent[1].TotalTokens != 13 {
+		t.Fatalf("consistent event changed: %+v", sent[1])
+	}
+	if bad.TotalTokens == nil {
+		t.Fatal("caller's event was mutated")
+	}
+}
