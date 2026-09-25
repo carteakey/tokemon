@@ -100,6 +100,11 @@ off-host destination (or schedule `deploy/tokemon-backup.sh`). See the
 [backup and restore runbook](DEPLOYMENT.md#back-up-and-restore-sqlite) for
 retention, integrity verification, and offline restore steps.
 
+Versioned releases publish architecture-specific, checksum- and Cosign-signed
+archives plus an SPDX SBOM. Installers reject unsigned or tampered assets; the
+release deployment overlay requires a semver image digest and never uses a
+mutable `latest` tag. See [release integrity and safe upgrades](DEPLOYMENT.md#release-integrity-and-safe-upgrades).
+
 ## Roadmap
 
 - **Current:** reliable multi-machine collection, metadata-only privacy, analytics, and the evolving Tokemon dashboard.

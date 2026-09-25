@@ -7,9 +7,13 @@ set -euo pipefail
 
 repository="${TOKEMON_RELEASE_REPOSITORY:-carteakey/tokemon}"
 release_token="${TOKEMON_RELEASE_TOKEN:-${GITHUB_TOKEN:-}}"
+release_base_url="${TOKEMON_RELEASE_BASE_URL:-}"
+release_identity="${TOKEMON_RELEASE_CERTIFICATE_IDENTITY:-}"
+release_issuer="${TOKEMON_RELEASE_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 version="${TOKEMON_VERSION:-}"
 server_url="${TOKEMON_SERVER_URL:-}"
 ingest_token="${TOKEMON_INGEST_TOKEN:-}"
+token_stdin=0
 machine_id="${TOKEMON_MACHINE_ID:-}"
 interval="${TOKEMON_SCAN_INTERVAL:-1m}"
 adapters="${TOKEMON_ADAPTERS:-}"
@@ -25,17 +29,19 @@ install_dir_explicit=0
 
 usage() {
   cat <<'EOF'
-Usage: install-agent.sh --server URL --token TOKEN [options]
+Usage: install-agent.sh --server URL [options]
 
 Install a user-level Tokemon agent on macOS or Linux.
 
 Options:
   --server URL          Tokemon server base URL
-  --token TOKEN         ingest token (stored in a mode-0600 config file)
+  --token-stdin         read the ingest token from stdin (noninteractive)
   --binary PATH         existing Tokemon binary
   --version VERSION     download vVERSION from the GitHub release repository
   --repo OWNER/REPO     release repository (default: carteakey/tokemon)
-  --release-token TOKEN GitHub token for private release downloads
+  TOKEMON_RELEASE_TOKEN GitHub token for private release downloads (environment only)
+  TOKEMON_RELEASE_BASE_URL override release download root for mirrors/tests
+  TOKEMON_RELEASE_CERTIFICATE_IDENTITY trusted keyless signer identity
   --machine-id ID       stable machine ID (default: host name)
   --interval DUR        polling interval (default: 1m)
   --adapters IDS        comma-separated built-in adapter IDs
@@ -75,6 +81,29 @@ sha256_of() {
   die "sha256sum or shasum is required to verify release downloads"
 }
 
+verify_cosign_blob() {
+  local file="$1"
+  command -v cosign >/dev/null 2>&1 || die "cosign is required to verify signed release assets"
+  [[ -f "$file.sig" && -f "$file.pem" ]] || die "unsigned release asset: $(basename "$file")"
+  cosign verify-blob \
+    --certificate "$file.pem" \
+    --signature "$file.sig" \
+    --certificate-identity "$release_identity" \
+    --certificate-oidc-issuer "$release_issuer" \
+    "$file" >/dev/null || die "release signature verification failed for $(basename "$file")"
+}
+
+verify_checksum_set() {
+  local checksum_file="$1" expected file actual
+  while read -r expected file; do
+    [[ -n "$expected" && -n "$file" ]] || continue
+    file="${file#\*}"
+    [[ -f "$file" ]] || die "release checksum references missing asset: $file"
+    actual="$(sha256_of "$file")"
+    [[ "$actual" == "$expected" ]] || die "release checksum set verification failed for $file"
+  done < "$checksum_file"
+}
+
 while (($#)); do
   case "$1" in
     --server)
@@ -83,9 +112,11 @@ while (($#)); do
       shift 2
       ;;
     --token)
-      (($# >= 2)) || die "--token requires a value"
-      ingest_token="$2"
-      shift 2
+      die "inline --token is not accepted; use TOKEMON_INGEST_TOKEN or --token-stdin"
+      ;;
+    --token-stdin)
+      token_stdin=1
+      shift
       ;;
     --binary)
       (($# >= 2)) || die "--binary requires a path"
@@ -103,9 +134,7 @@ while (($#)); do
       shift 2
       ;;
     --release-token)
-      (($# >= 2)) || die "--release-token requires a value"
-      release_token="$2"
-      shift 2
+      die "inline --release-token is not accepted; use TOKEMON_RELEASE_TOKEN"
       ;;
     --machine-id)
       (($# >= 2)) || die "--machine-id requires an ID"
@@ -165,6 +194,12 @@ done
 if (( !state_explicit )) && [[ -z "${TOKEMON_STATE:-}" ]]; then
   state_path="$home/.local/share/tokemon/state.db"
 fi
+
+if ((token_stdin)); then
+  if ! IFS= read -r ingest_token; then
+    [[ -n "$ingest_token" ]] || die "--token-stdin received no token"
+  fi
+fi
 if (( !install_dir_explicit )) && [[ -z "${TOKEMON_INSTALL_DIR:-}" ]]; then
   install_dir="$home/.local/bin"
 fi
@@ -200,7 +235,7 @@ if ((uninstall)); then
 fi
 
 [[ -n "$server_url" ]] || die "--server or TOKEMON_SERVER_URL is required"
-[[ -n "$ingest_token" ]] || die "--token or TOKEMON_INGEST_TOKEN is required"
+[[ -n "$ingest_token" ]] || die "TOKEMON_INGEST_TOKEN or --token-stdin is required"
 [[ "$server_url" != *$'\n'* && "$server_url" != *$'\r'* ]] || die "server URL contains a newline"
 [[ "$ingest_token" != *$'\n'* && "$ingest_token" != *$'\r'* ]] || die "token contains a newline"
 [[ "$ingest_token" != *[[:space:]]* ]] || die "token contains whitespace"
@@ -236,28 +271,68 @@ if [[ -z "$binary" ]]; then
   command -v tar >/dev/null 2>&1 || die "tar is required to unpack releases"
   temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/tokemon-agent.XXXXXX")"
   archive_name="tokemon_${version}_${platform}_${architecture}.tar.gz"
-  release_base="https://github.com/${repository}/releases/download/v${version}"
+  sbom_name="sbom.spdx.json"
+  if [[ -z "$release_base_url" ]]; then
+    release_base_url="https://github.com/${repository}/releases/download"
+  fi
+  release_base="${release_base_url%/}/v${version}"
+  if [[ -z "$release_identity" ]]; then
+    release_identity="https://github.com/${repository}/.github/workflows/release.yml@refs/tags/v${version}"
+  fi
   if [[ -n "$release_token" ]]; then
+    [[ "$release_token" != *$'\n'* && "$release_token" != *$'\r'* ]] || die "release token contains a newline"
     command -v jq >/dev/null 2>&1 || die "jq is required for private release downloads"
+    auth_config="$temporary_dir/curl-auth.conf"
+    escaped_release_token="${release_token//\\/\\\\}"
+    escaped_release_token="${escaped_release_token//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped_release_token" > "$auth_config"
+    chmod 0600 "$auth_config"
     api_base="https://api.github.com/repos/${repository}"
-    auth_header="Authorization: Bearer $release_token"
     accept_header="Accept: application/vnd.github+json"
-    curl --fail --location --silent --show-error -H "$auth_header" -H "$accept_header" "$api_base/releases/tags/v${version}" -o "$temporary_dir/release.json"
+    curl --fail --location --silent --show-error --config "$auth_config" -H "$accept_header" "$api_base/releases/tags/v${version}" -o "$temporary_dir/release.json"
     archive_url="$(jq -r --arg name "$archive_name" '.assets[] | select(.name == $name) | .url' "$temporary_dir/release.json" | head -1)"
     checksum_url="$(jq -r '.assets[] | select(.name == "checksums.txt") | .url' "$temporary_dir/release.json" | head -1)"
-    [[ -n "$archive_url" && "$archive_url" != "null" ]] || die "release asset not found: $archive_name"
-    [[ -n "$checksum_url" && "$checksum_url" != "null" ]] || die "release asset not found: checksums.txt"
-    curl --fail --location --silent --show-error -H "$auth_header" -H 'Accept: application/octet-stream' "$archive_url" -o "$temporary_dir/$archive_name"
-    curl --fail --location --silent --show-error -H "$auth_header" -H 'Accept: application/octet-stream' "$checksum_url" -o "$temporary_dir/checksums.txt"
+    sbom_url="$(jq -r --arg name "$sbom_name" '.assets[] | select(.name == $name) | .url' "$temporary_dir/release.json" | head -1)"
+    archive_sig_url="$(jq -r --arg name "${archive_name}.sig" '.assets[] | select(.name == $name) | .url' "$temporary_dir/release.json" | head -1)"
+    archive_pem_url="$(jq -r --arg name "${archive_name}.pem" '.assets[] | select(.name == $name) | .url' "$temporary_dir/release.json" | head -1)"
+    checksum_sig_url="$(jq -r '.assets[] | select(.name == "checksums.txt.sig") | .url' "$temporary_dir/release.json" | head -1)"
+    checksum_pem_url="$(jq -r '.assets[] | select(.name == "checksums.txt.pem") | .url' "$temporary_dir/release.json" | head -1)"
+    sbom_sig_url="$(jq -r '.assets[] | select(.name == "sbom.spdx.json.sig") | .url' "$temporary_dir/release.json" | head -1)"
+    sbom_pem_url="$(jq -r '.assets[] | select(.name == "sbom.spdx.json.pem") | .url' "$temporary_dir/release.json" | head -1)"
+    for asset in archive_url checksum_url sbom_url archive_sig_url archive_pem_url checksum_sig_url checksum_pem_url sbom_sig_url sbom_pem_url; do
+      [[ -n "${!asset}" && "${!asset}" != "null" ]] || die "signed release asset is missing"
+    done
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$archive_url" -o "$temporary_dir/$archive_name"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$checksum_url" -o "$temporary_dir/checksums.txt"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$sbom_url" -o "$temporary_dir/$sbom_name"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$archive_sig_url" -o "$temporary_dir/$archive_name.sig"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$archive_pem_url" -o "$temporary_dir/$archive_name.pem"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$checksum_sig_url" -o "$temporary_dir/checksums.txt.sig"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$checksum_pem_url" -o "$temporary_dir/checksums.txt.pem"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$sbom_sig_url" -o "$temporary_dir/$sbom_name.sig"
+    curl --fail --location --silent --show-error --config "$auth_config" -H 'Accept: application/octet-stream' "$sbom_pem_url" -o "$temporary_dir/$sbom_name.pem"
   else
     curl --fail --location --silent --show-error "$release_base/$archive_name" -o "$temporary_dir/$archive_name" || die "release download failed; set TOKEMON_RELEASE_TOKEN for private GitHub releases"
     curl --fail --location --silent --show-error "$release_base/checksums.txt" -o "$temporary_dir/checksums.txt" || die "checksum download failed; set TOKEMON_RELEASE_TOKEN for private GitHub releases"
+    curl --fail --location --silent --show-error "$release_base/$sbom_name" -o "$temporary_dir/$sbom_name" || die "SBOM download failed; release is unsigned or incomplete"
+    curl --fail --location --silent --show-error "$release_base/$archive_name.sig" -o "$temporary_dir/$archive_name.sig" || die "release signature download failed"
+    curl --fail --location --silent --show-error "$release_base/$archive_name.pem" -o "$temporary_dir/$archive_name.pem" || die "release certificate download failed"
+    curl --fail --location --silent --show-error "$release_base/checksums.txt.sig" -o "$temporary_dir/checksums.txt.sig" || die "checksum signature download failed"
+    curl --fail --location --silent --show-error "$release_base/checksums.txt.pem" -o "$temporary_dir/checksums.txt.pem" || die "checksum certificate download failed"
+    curl --fail --location --silent --show-error "$release_base/$sbom_name.sig" -o "$temporary_dir/$sbom_name.sig" || die "SBOM signature download failed"
+    curl --fail --location --silent --show-error "$release_base/$sbom_name.pem" -o "$temporary_dir/$sbom_name.pem" || die "SBOM certificate download failed"
   fi
+  verify_cosign_blob "$temporary_dir/checksums.txt"
+  verify_cosign_blob "$temporary_dir/$archive_name"
+  verify_cosign_blob "$temporary_dir/$sbom_name"
   expected="$(awk -v file="$archive_name" '$2 == file || $2 == "*" file {print $1; exit}' "$temporary_dir/checksums.txt")"
   actual="$(sha256_of "$temporary_dir/$archive_name")"
   [[ -n "$expected" && "$expected" == "$actual" ]] || die "release checksum verification failed for $archive_name"
+  (cd "$temporary_dir" && verify_checksum_set checksums.txt)
   tar -xzf "$temporary_dir/$archive_name" -C "$temporary_dir"
   binary="$temporary_dir/tokemon"
+  reported_version="$("$binary" version 2>/dev/null | awk '$1 == "version:" {print $2; exit}')"
+  [[ "$reported_version" == "$version" ]] || die "release version mismatch: expected $version, got ${reported_version:-unknown}"
 fi
 [[ -x "$binary" ]] || die "tokemon binary is not executable: $binary"
 

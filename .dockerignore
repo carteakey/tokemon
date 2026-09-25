@@ -3,6 +3,13 @@
 .env
 .venv
 data
+backups
+incidents
 *.db
 *.db-*
+*.db.lock
+*.sqlite
+*.sqlite-*
+testdata/private
+fixtures/private
 site

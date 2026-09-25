@@ -13,7 +13,9 @@ bash deploy/macos/install-server.sh \
   --binary ./tokemon \
   --catalog ./catalog/models.yaml \
   --database ./data/tokemon.db \
-  --token 'replace-with-a-generated-secret'
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
 The default listen address is `0.0.0.0:18080`; non-loopback listeners require
@@ -30,6 +32,8 @@ The server also accepts `TOKEMON_SERVER_READ_TIMEOUT`,
 bound request processing and graceful shutdown. `/healthz` performs a SQLite
 readiness check and returns `503` when the store is unavailable; authenticated
 `/metrics` exposes redacted operational counters.
+Use `TOKEMON_INGEST_TOKEN` or `--token-stdin` during installation; inline token
+arguments are rejected.
 
 The installer writes:
 
@@ -53,8 +57,10 @@ Build or obtain the matching Tokemon binary, then run:
 bash deploy/macos/install-agent.sh \
   --binary ./tokemon \
   --server https://tokemon.example.ts.net \
-  --token 'replace-with-a-generated-secret' \
-  --adapters claude-code,codex
+  --adapters claude-code,codex \
+  --token-stdin <<'TOKEN'
+replace-with-a-generated-secret
+TOKEN
 ```
 
 The installer writes:
@@ -65,7 +71,7 @@ The installer writes:
 - `~/Library/LaunchAgents/com.tokemon.agent.plist`
 - `~/Library/Logs/Tokemon/agent.log`
 
-The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments.
+The endpoint is the server base URL. The agent appends `/api/v1/events/batch` and `/api/v1/agents/heartbeat` itself. The LaunchAgent runs as the logged-in user and keeps the token out of process arguments. Use `TOKEMON_INGEST_TOKEN` or `--token-stdin`; inline token arguments are rejected.
 
 Set `TOKEMON_AGENT_REQUEST_TIMEOUT` (default `30s`) to bound each health,
 heartbeat, and ingest request. A timed-out upload leaves the local cursor
