@@ -1,7 +1,6 @@
-# Keep the build reproducible across runners. These are the multi-platform
-# manifest digests resolved and checked with `docker buildx imagetools inspect`
-# on 2026-08-10; updates must be deliberate and reviewed.
-FROM golang:1.26@sha256:2005724102f45917a63e9d092fc0e4ea56ea575048ce147caad5f5f61502c365 AS build
+# Keep the build reproducible across runners. The Go manifest digest was
+# resolved with `docker buildx imagetools inspect` on 2026-09-24.
+FROM golang:1.26.8@sha256:6c2a5538f964f1c82f97ad14988bf05de100d922d159d0e398b54c7b0ca0c6c9 AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
