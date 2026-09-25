@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/database"
@@ -16,9 +17,10 @@ import (
 )
 
 type Client struct {
-	ServerURL  string
-	Token      string
-	HTTPClient *http.Client
+	ServerURL      string
+	Token          string
+	HTTPClient     *http.Client
+	RequestTimeout time.Duration
 }
 
 type batchRequest struct {
@@ -43,12 +45,27 @@ type HeartbeatRequest struct {
 
 const maxIngestBatchBytes = 4 << 20
 
+const DefaultRequestTimeout = 30 * time.Second
+
+func (c Client) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = DefaultRequestTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.IngestResult, error) {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return database.IngestResult{}, fmt.Errorf("server URL is required")
 	}
 	if len(events) == 0 {
 		return database.IngestResult{}, fmt.Errorf("events must not be empty")
+	}
+	// Validate the complete batch before encoding or opening the first HTTP
+	// request. A privacy rejection therefore cannot partially upload a batch.
+	if err := usage.ValidateOutboundBatch(events); err != nil {
+		return database.IngestResult{}, err
 	}
 	batches, err := splitIngestBatches(events)
 	if err != nil {
@@ -126,7 +143,9 @@ func (c Client) Health(ctx context.Context) error {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
 	if err != nil {
 		return err
 	}
@@ -157,7 +176,9 @@ func (c Client) postJSON(ctx context.Context, path string, payload any, result a
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.ServerURL, "/")+path, bytes.NewReader(encoded))
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, strings.TrimRight(c.ServerURL, "/")+path, bytes.NewReader(encoded))
 	if err != nil {
 		return err
 	}

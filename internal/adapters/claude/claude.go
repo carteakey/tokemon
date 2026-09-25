@@ -163,7 +163,9 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			sessionID = record.SessionIDAlt
 		}
 		if sessionID == "" {
-			sessionID = strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
+			sessionID = usage.HashSessionID(source.Path)
+		} else {
+			sessionID = usage.NormalizeSessionID(sessionID)
 		}
 		event := normalize(record, rawUsage, machineID, identity, lineNumber, sessionID, timestamp)
 		events = append(events, event)

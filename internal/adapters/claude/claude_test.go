@@ -119,6 +119,33 @@ func TestParseUnknownCacheFieldsDoesNotInventTotal(t *testing.T) {
 	}
 }
 
+func TestFallbackSessionIDHashesFilenameAndRemainsStable(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "private title.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	first, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, error: %v", first, err)
+	}
+	second, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(second.Events) != 1 {
+		t.Fatalf("second parse = %+v, error: %v", second, err)
+	}
+	if !strings.HasPrefix(first.Events[0].SessionID, "sha256:") || strings.Contains(first.Events[0].SessionID, "private title") {
+		t.Fatalf("filename leaked through session ID: %q", first.Events[0].SessionID)
+	}
+	if first.Events[0].EventID != second.Events[0].EventID {
+		t.Fatalf("fallback session ID changed event identity: first=%+v second=%+v", first.Events[0], second.Events[0])
+	}
+}
+
 func TestParseUsesCommittedCursorForAppendedRecords(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")

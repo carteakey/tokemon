@@ -111,7 +111,10 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 	}
 	defer file.Close()
 
-	sessionID := filepath.Base(filepath.Dir(source.Path))
+	// A source directory name is only a local filename fallback, never a
+	// trustworthy provider identifier. Keep it opaque until Copilot supplies a
+	// normalized session ID from the event stream.
+	sessionID := usage.HashSessionID(source.Path)
 	var project string
 	var sessionStart time.Time
 	var latest *shutdownRecord
@@ -152,8 +155,8 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 		case "session.start":
 			var data sessionStartData
 			if err := json.Unmarshal(event.Data, &data); err == nil {
-				if data.SessionID != "" {
-					sessionID = data.SessionID
+				if normalized := usage.NormalizeSessionID(data.SessionID); normalized != "" {
+					sessionID = normalized
 				}
 				project = firstNonEmpty(project, usage.NormalizeProject(data.Context.CWD))
 				if parsed, err := time.Parse(time.RFC3339Nano, data.StartTime); err == nil {

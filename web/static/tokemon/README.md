@@ -12,4 +12,14 @@ The stage filenames are stable and intentionally use the evolution stage number.
 
 The art pass contains one asset for every stage from `stage-00.png` through `stage-18.png`. Stages 13–18 extend the original silhouette family at the tail; existing assets were not renumbered or replaced. The manifest is the stable lookup contract used by the dashboard.
 
+`manifest.json` records the expected SHA-256 digest, dimensions, and RGBA/alpha
+requirements for every stage. Validate the contract before a release with:
+
+```bash
+go run ./cmd/tokemon art validate --dir web/static/tokemon
+```
+
+The public visual and release checklist is in
+[`docs/evolution-art-qa.md`](../../../docs/evolution-art-qa.md).
+
 The dashboard self-hosts the Latin subset of Pixelify Sans at `fonts/pixelify-sans-latin.woff2` for creature names, stage labels, and display headings. Body copy remains system sans-serif, while token values and code remain system monospace. The font is distributed under the SIL Open Font License 1.1; see `fonts/OFL.txt`.

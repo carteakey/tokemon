@@ -226,7 +226,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if err != nil {
 		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 	}
-	sessionID := strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
+	sessionID := usage.HashSessionID(source.Path)
 	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
 	if err != nil {
 		err = fmt.Errorf("read Antigravity generation metadata: %w", err)

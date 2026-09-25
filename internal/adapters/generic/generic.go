@@ -5,7 +5,6 @@ package generic
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -150,17 +149,24 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		line, readErr := reader.ReadBytes('\n')
 		position += int64(len(line))
 		if len(strings.TrimSpace(string(line))) > 0 {
-			var event usage.Event
-			if err := json.Unmarshal(line, &event); err != nil {
+			event, err := usage.DecodeOutboundEvent(line)
+			if err != nil {
 				return adapters.ParseResult{}, fmt.Errorf("%s byte %d: %w", filepath.Base(source.Path), lineOffset, err)
 			}
 			event.MachineID = machineID
+			event.Project = usage.NormalizeProject(event.Project)
 			event.Model = a.NormalizeModel(event.Model)
 			event.Source = usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: identity, Offset: lineOffset}
 			if strings.TrimSpace(event.EventID) == "" {
 				event.EventID = usage.DeterministicID(machineID, adapterID, identity, lineOffset, event.Timestamp.UTC().Format(timeFormat), event.SessionID)
 			}
+			if event.Metadata, err = usage.FilterApprovedMetadata(event.Metadata); err != nil {
+				return adapters.ParseResult{}, fmt.Errorf("%s byte %d: %w", filepath.Base(source.Path), lineOffset, err)
+			}
 			if err := event.Validate(); err != nil {
+				return adapters.ParseResult{}, fmt.Errorf("%s byte %d: %w", filepath.Base(source.Path), lineOffset, err)
+			}
+			if err := usage.ValidateOutbound(event); err != nil {
 				return adapters.ParseResult{}, fmt.Errorf("%s byte %d: %w", filepath.Base(source.Path), lineOffset, err)
 			}
 			events = append(events, event)

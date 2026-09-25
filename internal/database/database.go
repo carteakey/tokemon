@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/catalog"
@@ -18,9 +19,12 @@ import (
 )
 
 type Store struct {
-	db       *sql.DB
-	catalog  *catalog.Catalog
-	location *time.Location
+	db        *sql.DB
+	catalog   *catalog.Catalog
+	location  *time.Location
+	lock      *databaseLock
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type IngestResult struct {
@@ -70,6 +74,11 @@ type MachineInfo struct {
 	SourceErrorCount int      `json:"source_error_count"`
 	FirstSeenAt      string   `json:"first_seen_at"`
 	LastSeenAt       string   `json:"last_seen_at"`
+	Status           string   `json:"status"`
+	SyncContext      string   `json:"sync_context"`
+	TodayTokens      int64    `json:"today_tokens"`
+	WeekTokens       int64    `json:"week_tokens"`
+	LifetimeTokens   int64    `json:"lifetime_tokens"`
 }
 
 type ToolTotal struct {
@@ -155,6 +164,8 @@ type ActivityHeatmap struct {
 type Overview struct {
 	LifetimeTokens int64                    `json:"lifetime_tokens"`
 	Timezone       string                   `json:"timezone"`
+	Today          PeriodSummary            `json:"today"`
+	Week           PeriodSummary            `json:"week"`
 	Evolution      evolution.Snapshot       `json:"evolution"`
 	Activity       ActivityHeatmap          `json:"activity"`
 	ByModel        []ModelTotal             `json:"by_model"`
@@ -283,6 +294,13 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 		location = time.UTC
 	}
 	fileBacked := !strings.HasPrefix(path, ":") && !strings.HasPrefix(path, "file:")
+	if fileBacked {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database path: %w", err)
+		}
+		path = absolute
+	}
 	existing := false
 	if fileBacked {
 		if info, err := os.Stat(path); err == nil {
@@ -296,48 +314,93 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 			}
 		}
 	}
+	var lock *databaseLock
+	if fileBacked {
+		var err error
+		lock, err = acquireDatabaseLock(path)
+		if err != nil {
+			return nil, err
+		}
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
 		db.Close()
+		if lock != nil {
+			_ = lock.Close()
+		}
 		return nil, fmt.Errorf("configure database busy timeout: %w", err)
 	}
 	if fileBacked {
 		var journalMode string
 		if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
 			db.Close()
+			if lock != nil {
+				_ = lock.Close()
+			}
 			return nil, fmt.Errorf("enable database WAL mode: %w", err)
 		}
 		if !strings.EqualFold(journalMode, "wal") {
 			db.Close()
+			if lock != nil {
+				_ = lock.Close()
+			}
 			return nil, fmt.Errorf("enable database WAL mode: got %q", journalMode)
 		}
 	}
-	store := &Store{db: db, catalog: modelCatalog, location: location}
+	store := &Store{db: db, catalog: modelCatalog, location: location, lock: lock}
 	if existing {
 		version, err := schemaVersion(context.Background(), db)
 		if err != nil {
-			db.Close()
+			_ = store.Close()
 			return nil, err
 		}
 		if version < databaseSchemaVersion {
 			if err := backupBeforeMigration(context.Background(), db, path, version, databaseSchemaVersion, time.Now().UTC()); err != nil {
-				db.Close()
+				_ = store.Close()
 				return nil, err
 			}
 		}
 	}
 	if err := store.migrate(context.Background()); err != nil {
-		db.Close()
+		_ = store.Close()
 		return nil, err
 	}
 	return store, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.closeErr = s.db.Close()
+		if s.lock != nil {
+			s.closeErr = errors.Join(s.closeErr, s.lock.Close())
+		}
+	})
+	return s.closeErr
+}
+
+// Ready performs a small read-only query used by the HTTP readiness endpoint.
+// It deliberately checks the SQLite connection rather than reporting that
+// the process is alive while the database is unavailable.
+func (s *Store) Ready(ctx context.Context) error {
+	var result int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&result); err != nil {
+		return err
+	}
+	if result != 1 {
+		return errors.New("database readiness query returned an unexpected value")
+	}
+	return nil
+}
 
 func (s *Store) Timezone() string {
 	if s.location == nil {
@@ -561,6 +624,10 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 	defer tx.Rollback()
 
 	for index, event := range events {
+		// Normalize project labels before validation and persistence so local
+		// ingestion never stores a filesystem path. The API rejects paths before
+		// this point; this also protects direct import callers.
+		event.Project = usage.NormalizeProject(event.Project)
 		if err := event.Validate(); err != nil {
 			result.Rejected++
 			result.Errors = append(result.Errors, fmt.Sprintf("event %d: %v", index+1, err))
@@ -807,30 +874,16 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 func (s *Store) Machines(ctx context.Context) ([]MachineInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, operating_system, architecture, agent_version,
-       detected_adapters, source_count, source_error_count, first_seen_at, last_seen_at
-FROM machines
-ORDER BY last_seen_at DESC, id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []MachineInfo
-	for rows.Next() {
-		var machine MachineInfo
-		var adapterList string
-		if err := rows.Scan(
-			&machine.ID, &machine.Name, &machine.OperatingSystem, &machine.Architecture,
-			&machine.AgentVersion, &adapterList, &machine.SourceCount, &machine.SourceErrorCount,
-			&machine.FirstSeenAt, &machine.LastSeenAt,
-		); err != nil {
-			return nil, err
-		}
-		machine.DetectedAdapters = splitAdapterIDs(adapterList)
-		result = append(result, machine)
-	}
-	return result, rows.Err()
+	return s.MachinesAt(ctx, time.Now())
+}
+
+// StaleAgents counts enrolled machines whose latest heartbeat is older than
+// cutoff. The count is derived from SQLite so it remains deterministic across
+// process restarts and does not require a second state store.
+func (s *Store) StaleAgents(ctx context.Context, cutoff time.Time) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM machines WHERE last_seen_at < ?`, cutoff.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&count)
+	return count, err
 }
 
 func normalizeAdapterIDs(values []string) []string {
@@ -1094,6 +1147,16 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 		return Overview{}, err
 	}
 	result := Overview{LifetimeTokens: total, Timezone: s.Timezone(), Evolution: evolution.SnapshotFor(total), Accuracy: make(map[usage.Accuracy]int64)}
+	today := s.dateOnly(time.Now())
+	result.Today, err = s.PeriodSummary(ctx, today, today.AddDate(0, 0, 1))
+	if err != nil {
+		return Overview{}, err
+	}
+	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	result.Week, err = s.PeriodSummary(ctx, weekStart, today.AddDate(0, 0, 1))
+	if err != nil {
+		return Overview{}, err
+	}
 	if err := s.db.QueryRowContext(ctx, `SELECT
 COALESCE(SUM(cost), 0),
 COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),

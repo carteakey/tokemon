@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/usage"
@@ -43,7 +46,7 @@ func TestClientIngestSplitsLargeBatches(t *testing.T) {
 			Provider:      "provider",
 			Model:         "model",
 			Tool:          "codex",
-			Metadata:      map[string]any{"test_payload": strings.Repeat("x", 3<<20)},
+			Metadata:      map[string]any{"tokemon_test_payload": strings.Repeat("x", 3<<20)},
 		}
 	}
 
@@ -53,6 +56,36 @@ func TestClientIngestSplitsLargeBatches(t *testing.T) {
 	}
 	if requests != len(events) || result.Accepted != len(events) || result.CurrentTotal != int64(len(events)) {
 		t.Fatalf("requests = %d, result = %+v, want %d bounded requests and all events accepted", requests, result, len(events))
+	}
+}
+
+func TestClientRejectsSensitivePayloadBeforeAnyRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "sensitive-event",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "machine",
+		Provider:      "provider",
+		Model:         "model",
+		Tool:          "generic-jsonl",
+		TokenAccuracy: usage.AccuracyReported,
+		Project:       "/private/repository",
+		Metadata:      map[string]any{"tokemon_prompt": "never upload this"},
+	}
+	if _, err := (Client{ServerURL: server.URL}).Ingest(t.Context(), []usage.Event{event}); err == nil {
+		t.Fatal("sensitive event was accepted")
+	} else if !strings.Contains(err.Error(), "disallowed sensitive content") {
+		t.Fatalf("error = %v, want privacy rejection", err)
+	}
+	if requests != 0 {
+		t.Fatalf("server received %d requests after local privacy rejection", requests)
 	}
 }
 
@@ -111,5 +144,24 @@ func TestClientHealthRejectsUnavailableHub(t *testing.T) {
 	err := (Client{ServerURL: server.URL}).Health(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
 		t.Fatalf("health error = %v, want unavailable status", err)
+	}
+}
+
+func TestClientRequestTimeoutBoundsHealth(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := Client{ServerURL: server.URL, RequestTimeout: 20 * time.Millisecond}
+	if err := client.Health(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("health error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not receive health request")
 	}
 }
