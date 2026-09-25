@@ -68,6 +68,36 @@ func TestParseAssistantUsageWithoutConversationContent(t *testing.T) {
 	}
 }
 
+func TestParseLargeClaudeRecordWithinBound(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	privateContent := strings.Repeat("private conversation content", 100000)
+	line := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session","message":{"model":"claude-sonnet","content":"` + privateContent + `","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if len(line) <= adapters.MaxRecordBytes || len(line) >= maxRecordBytes {
+		t.Fatalf("fixture size = %d, want between default and Claude bounds", len(line))
+	}
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(home).Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Events[0].InputTokens == nil || *result.Events[0].InputTokens != 10 || result.Events[0].OutputTokens == nil || *result.Events[0].OutputTokens != 20 {
+		t.Fatalf("large record usage = %+v", result.Events)
+	}
+	payload, err := json.Marshal(result.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "private conversation content") {
+		t.Fatal("conversation content leaked into usage event")
+	}
+}
+
 func TestNormalizedPayloadIsExactAndMetadataOnly(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".claude", "projects", "private-project", "session.jsonl")

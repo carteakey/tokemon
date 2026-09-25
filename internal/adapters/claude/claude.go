@@ -21,6 +21,7 @@ import (
 const (
 	adapterID      = "claude-code"
 	adapterVersion = "0.2.0"
+	maxRecordBytes = 4 << 20
 )
 
 type Adapter struct {
@@ -115,7 +116,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := adapters.ReadRecord(reader)
+		line, readErr := adapters.ReadRecordLimit(reader, maxRecordBytes)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}

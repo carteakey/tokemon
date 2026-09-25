@@ -18,12 +18,18 @@ const MaxRecordBytes = 1 << 20
 // ReadRecord reads one newline-delimited provider record without allowing a
 // malformed line to grow without bound in memory.
 func ReadRecord(reader *bufio.Reader) ([]byte, error) {
+	return ReadRecordLimit(reader, MaxRecordBytes)
+}
+
+// ReadRecordLimit allows adapters with larger documented provider records to
+// use a separate, explicit memory bound.
+func ReadRecordLimit(reader *bufio.Reader, limit int) ([]byte, error) {
 	var record []byte
 	for {
 		chunk, err := reader.ReadSlice('\n')
 		record = append(record, chunk...)
-		if len(record) > MaxRecordBytes {
-			return nil, fmt.Errorf("provider record exceeds %d bytes", MaxRecordBytes)
+		if len(record) > limit {
+			return nil, fmt.Errorf("provider record exceeds %d bytes", limit)
 		}
 		if err == bufio.ErrBufferFull {
 			continue
