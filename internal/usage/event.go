@@ -155,9 +155,15 @@ func (e Event) Validate() error {
 // SanitizeOutbound removes the extensible metadata bag before an event is
 // serialized for a hub. The normalized schema is intentionally allowlisted so
 // a generic source cannot accidentally upload prompts, responses, paths, or
-// other provider payloads.
+// other provider payloads. Provider totals that contradict a reported token
+// component become unknown rather than blocking every otherwise-valid event in
+// the same collection pass.
 func SanitizeOutbound(event Event) Event {
 	event.Metadata = nil
+	if event.TotalTokens != nil && !validTokenTotals(event) {
+		event.TotalTokens = nil
+		event.TokenAccuracy = AccuracyUnknown
+	}
 	return event
 }
 

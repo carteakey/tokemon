@@ -137,6 +137,28 @@ func TestValidateRejectsMetadataPayloads(t *testing.T) {
 	}
 }
 
+func TestSanitizeOutboundPreservesComponentsAndDropsImpossibleTotal(t *testing.T) {
+	event := validEvent()
+	event.InputTokens = Int64(3)
+	event.CacheReadTokens = Int64(10)
+	event.TotalTokens = Int64(5)
+	event.TokenAccuracy = AccuracyReported
+
+	sanitized := SanitizeOutbound(event)
+	if sanitized.TotalTokens != nil {
+		t.Fatalf("total_tokens = %d, want unknown", *sanitized.TotalTokens)
+	}
+	if sanitized.InputTokens == nil || *sanitized.InputTokens != 3 || sanitized.CacheReadTokens == nil || *sanitized.CacheReadTokens != 10 {
+		t.Fatalf("reported components changed: %+v", sanitized)
+	}
+	if sanitized.TokenAccuracy != AccuracyUnknown {
+		t.Fatalf("token_accuracy = %q, want %q", sanitized.TokenAccuracy, AccuracyUnknown)
+	}
+	if err := sanitized.Validate(); err != nil {
+		t.Fatalf("sanitized event remains invalid: %v", err)
+	}
+}
+
 func validEvent() Event {
 	return Event{
 		SchemaVersion: SchemaVersion,
