@@ -1,14 +1,15 @@
 package api
 
 import (
-	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"io/fs"
+	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -19,18 +20,24 @@ import (
 
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/evolution"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/web"
 )
 
 type Server struct {
-	store          *database.Store
-	ingestToken    string
-	template       *template.Template
-	static         http.Handler
-	evolutionMu    sync.Mutex
-	evolutionCache *evolutionCacheEntry
-	evolutionReady chan struct{}
+	store                *database.Store
+	config               Config
+	logger               *slog.Logger
+	metrics              *Metrics
+	csrfSecret           []byte
+	trustedProxyNetworks []*net.IPNet
+	template             *template.Template
+	static               http.Handler
+	recapProvider        InsightsRecapProvider
+	evolutionMu          sync.Mutex
+	evolutionCache       *evolutionCacheEntry
+	evolutionReady       chan struct{}
 }
 
 type evolutionCacheEntry struct {
@@ -48,6 +55,8 @@ type dashboardPage struct {
 	database.Overview
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
+	Machines       []database.MachineInfo
+	Sessions       []database.SessionRecord
 }
 
 type analyticsPageData struct {
@@ -66,6 +75,84 @@ type analyticsAxisTick struct {
 	Position int
 }
 
+// InsightsRecapStatus describes the optional AI recap slot on the Insights
+// page. The dashboard itself remains useful without a configured provider.
+type InsightsRecapStatus string
+
+const (
+	InsightsRecapGenerated   InsightsRecapStatus = "generated"
+	InsightsRecapDisabled    InsightsRecapStatus = "disabled"
+	InsightsRecapUnavailable InsightsRecapStatus = "unavailable"
+)
+
+// InsightsRecap is deliberately small so a future AI adapter can be injected
+// without changing the page contract. It contains a recap only, never source
+// records or prompts.
+type InsightsRecap struct {
+	Status InsightsRecapStatus `json:"status"`
+	Text   string              `json:"text,omitempty"`
+}
+
+// InsightsRecapProvider is an optional API-local seam for a future AI recap
+// integration. Implementations should summarize aggregate Insights data only.
+type InsightsRecapProvider interface {
+	Generate(context.Context, database.Insights) (string, error)
+}
+
+type aggregateAIRecapProvider struct {
+	synthesizer insightai.Synthesizer
+}
+
+func (provider aggregateAIRecapProvider) Generate(ctx context.Context, result database.Insights) (string, error) {
+	output, err := provider.synthesizer.Synthesize(ctx, aggregateAIInput(result))
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(output.Title) == "" {
+		return strings.TrimSpace(output.Summary), nil
+	}
+	return strings.TrimSpace(output.Title) + " — " + strings.TrimSpace(output.Summary), nil
+}
+
+func aggregateAIInput(result database.Insights) insightai.Input {
+	scope := insightai.ScopeOverall
+	if result.Filter.Machine != "" || result.Filter.Provider != "" || result.Filter.Model != "" || result.Filter.Tool != "" {
+		scope = insightai.ScopeFilteredView
+	}
+	evidence := make([]insightai.Evidence, 0, len(result.Cards))
+	for _, card := range result.Cards {
+		observation := card.Observation
+		basis := card.Basis
+		if card.Category == "concentration" {
+			observation = "One selected-dimension category has the largest token share; its label stays local."
+			basis = "largest selected-dimension token share / window token total; category labels are withheld"
+		}
+		evidence = append(evidence, insightai.Evidence{
+			ID:          card.ID,
+			Category:    card.Category,
+			Observation: observation,
+			Basis:       basis,
+		})
+	}
+	return insightai.Input{
+		PeriodLabel: result.Period,
+		Timezone:    result.Timezone,
+		ScopeLabels: []insightai.ScopeLabel{{Label: scope, Count: len(result.Cards)}},
+		DataQuality: insightai.DataQuality{Level: result.DataQuality.Confidence, Note: result.DataQuality.Qualifier},
+		Evidence:    evidence,
+	}
+}
+
+type insightsPageData struct {
+	database.Insights
+	Facets         database.AnalyticsFacets
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
+	HourlyMax      int64
+	WeekdayMax     int64
+	Recap          InsightsRecap
+}
+
 type aliasRow struct {
 	Identity string
 	Alias    string
@@ -73,10 +160,28 @@ type aliasRow struct {
 }
 
 type settingsPage struct {
-	Models   []aliasRow
-	Machines []aliasRow
-	Saved    bool
-	Error    string
+	Models    []aliasRow
+	Machines  []aliasRow
+	CSRFToken string
+	Saved     bool
+	Error     string
+}
+
+type catalogTier struct {
+	Name   string
+	Models []database.CatalogEntry
+}
+
+type catalogPageData struct {
+	Tiers []catalogTier
+}
+
+type sessionsPageData struct {
+	Sessions       []database.SessionRecord
+	Filter         database.AnalyticsQuery
+	Facets         database.AnalyticsFacets
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
 }
 
 const dashboardUsageRowsLimit = 5
@@ -543,6 +648,25 @@ func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
 	}
 }
 
+func analyticsQueryValues(query database.AnalyticsQuery) url.Values {
+	values := url.Values{}
+	values.Set("period", query.Period)
+	values.Set("dimension", query.Dimension)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return values
+}
+
 func analyticsExportURL(query database.AnalyticsQuery) string {
 	values := url.Values{}
 	values.Set("period", query.Period)
@@ -560,6 +684,24 @@ func analyticsExportURL(query database.AnalyticsQuery) string {
 		values.Set("tool", query.Tool)
 	}
 	return "/api/v1/analytics/export?" + values.Encode()
+}
+
+func sessionsExportURL(query database.AnalyticsQuery) string {
+	values := url.Values{}
+	values.Set("period", query.Period)
+	if query.Machine != "" {
+		values.Set("machine", query.Machine)
+	}
+	if query.Provider != "" {
+		values.Set("provider", query.Provider)
+	}
+	if query.Model != "" {
+		values.Set("model", query.Model)
+	}
+	if query.Tool != "" {
+		values.Set("tool", query.Tool)
+	}
+	return "/api/v1/sessions/export?" + values.Encode()
 }
 
 func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
@@ -585,6 +727,61 @@ func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
 func analyticsPeriodURL(query database.AnalyticsQuery, period string) string {
 	query.Period = period
 	return analyticsViewURL(query, query.Dimension)
+}
+
+func insightsViewURL(query database.AnalyticsQuery, dimension string) string {
+	query.Dimension = dimension
+	return "/insights?" + analyticsQueryValues(query).Encode()
+}
+
+func insightsPeriodURL(query database.AnalyticsQuery, period string) string {
+	query.Period = period
+	return insightsViewURL(query, query.Dimension)
+}
+
+func insightBarPercent(value, maximum int64) float64 {
+	if value <= 0 || maximum <= 0 {
+		return 0
+	}
+	percent := float64(value) * 100 / float64(maximum)
+	if percent < 2 {
+		return 2
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func insightDistributionMax(values []database.InsightDistribution) int64 {
+	var maximum int64
+	for _, value := range values {
+		if value.Tokens > maximum {
+			maximum = value.Tokens
+		}
+	}
+	return maximum
+}
+
+func insightCoverage(value float64) string {
+	if value <= 0 {
+		return "0%"
+	}
+	if value >= 1 {
+		return "100%"
+	}
+	return fmt.Sprintf("%.0f%%", value*100)
+}
+
+func insightRecapLabel(status InsightsRecapStatus) string {
+	switch status {
+	case InsightsRecapGenerated:
+		return "Generated recap"
+	case InsightsRecapUnavailable:
+		return "Recap temporarily unavailable"
+	default:
+		return "Recap disabled / unconfigured"
+	}
 }
 
 func aliasMaps(values []database.DisplayAlias) (map[string]string, map[string]string) {
@@ -641,6 +838,48 @@ func limitDashboardRows[T any](values []T) []T {
 }
 
 func New(store *database.Store, ingestToken string) (*Server, error) {
+	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: ingestToken})
+}
+
+// NewWithInsightsAI enables optional aggregate-only AI synthesis. The caller
+// should use New when synthesis is not explicitly configured so the page can
+// distinguish disabled from temporarily unavailable.
+func NewWithInsightsAI(store *database.Store, ingestToken string, synthesizer insightai.Synthesizer) (*Server, error) {
+	if synthesizer == nil {
+		return New(store, ingestToken)
+	}
+	return NewWithInsights(store, ingestToken, aggregateAIRecapProvider{synthesizer: synthesizer})
+}
+
+// NewWithConfigAndInsightsAI builds a server from an explicit security and
+// lifecycle configuration plus an optional aggregate-only AI synthesizer.
+func NewWithConfigAndInsightsAI(store *database.Store, config Config, synthesizer insightai.Synthesizer) (*Server, error) {
+	if synthesizer == nil {
+		return NewWithConfig(store, config)
+	}
+	return NewWithConfig(store, config, aggregateAIRecapProvider{synthesizer: synthesizer})
+}
+
+// NewWithInsights keeps the original New constructor source-compatible while
+// allowing an aggregate-only recap provider to be injected.
+func NewWithInsights(store *database.Store, ingestToken string, providers ...InsightsRecapProvider) (*Server, error) {
+	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: ingestToken}, providers...)
+}
+
+func NewWithConfig(store *database.Store, config Config, providers ...InsightsRecapProvider) (*Server, error) {
+	var recap InsightsRecapProvider
+	if len(providers) > 0 {
+		recap = providers[0]
+	}
+	config = config.normalized()
+	trustedProxyNetworks, err := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	csrfSecret, err := newCSRFSecret(config.DashboardToken)
+	if err != nil {
+		return nil, err
+	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
 		"commas":          commas,
 		"commasPtr":       commasPtr,
@@ -672,14 +911,57 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 		"analyticsTime":        analyticsShortTime,
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
+		"sessionsExportURL":    sessionsExportURL,
 		"analyticsChange":      analyticsChangeLabel,
 		"analyticsChangeClass": analyticsChangeClass,
-		"glyphCell":            glyphCellClass,
-		"projectGlyph":         glyphForProject,
-		"harnessGlyph":         glyphForHarness,
-		"modelGlyph":           glyphForModel,
-		"machineGlyph":         glyphForMachine,
-		"assetPath":            func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
+		"insightsURL":          insightsViewURL,
+		"insightsPeriodURL":    insightsPeriodURL,
+		"insightBar":           insightBarPercent,
+		"insightCoverage":      insightCoverage,
+		"insightRecapLabel":    insightRecapLabel,
+		"tokenValue": func(value *int64) string {
+			if value == nil {
+				return "Unknown"
+			}
+			return commas(*value)
+		},
+		"costValue": func(value *float64, estimated bool) string {
+			if value == nil {
+				return "Unavailable"
+			}
+			label := fmt.Sprintf("$%.4f", *value)
+			if estimated {
+				return label + " estimated"
+			}
+			return label
+		},
+		"durationValue": func(value *int64) string {
+			if value == nil {
+				return "Unknown"
+			}
+			if *value < 1000 {
+				return fmt.Sprintf("%dms", *value)
+			}
+			return fmt.Sprintf("%.1fs", float64(*value)/1000)
+		},
+		"priceValue": func(value *float64) string {
+			if value == nil {
+				return "—"
+			}
+			return fmt.Sprintf("$%.3f/M", *value)
+		},
+		"statusClass": func(status string) string {
+			return strings.ToLower(status)
+		},
+		"joinAdapters": func(values []string) string {
+			return strings.Join(values, " · ")
+		},
+		"glyphCell":    glyphCellClass,
+		"projectGlyph": glyphForProject,
+		"harnessGlyph": glyphForHarness,
+		"modelGlyph":   glyphForModel,
+		"machineGlyph": glyphForMachine,
+		"assetPath":    func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
 	}).Parse(dashboardTemplate)
 	if err != nil {
 		return nil, err
@@ -690,30 +972,124 @@ func New(store *database.Store, ingestToken string) (*Server, error) {
 	if _, err := page.Parse(analyticsTemplate); err != nil {
 		return nil, err
 	}
+	if _, err := page.Parse(catalogTemplate); err != nil {
+		return nil, err
+	}
+	if _, err := page.Parse(sessionsTemplate); err != nil {
+		return nil, err
+	}
+	if _, err := page.Parse(insightsTemplate); err != nil {
+		return nil, err
+	}
 	staticFiles, err := fs.Sub(web.StaticFS, "static")
 	if err != nil {
 		return nil, err
 	}
-	return &Server{store: store, ingestToken: ingestToken, template: page, static: http.FileServer(http.FS(staticFiles))}, nil
+	return &Server{
+		store:                store,
+		config:               config,
+		logger:               config.Logger,
+		metrics:              config.Metrics,
+		csrfSecret:           csrfSecret,
+		trustedProxyNetworks: trustedProxyNetworks,
+		template:             page,
+		static:               http.FileServer(http.FS(staticFiles)),
+		recapProvider:        recap,
+	}, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.health)
+	mux.Handle("GET /healthz", s.withDeadline(s.config.HealthTimeout, http.HandlerFunc(s.health)))
 	mux.Handle("GET /static/", http.StripPrefix("/static/", s.static))
-	mux.HandleFunc("GET /", s.dashboard)
-	mux.HandleFunc("GET /analytics", s.analyticsPage)
-	mux.HandleFunc("GET /data", s.analyticsPage)
-	mux.HandleFunc("GET /settings", s.settings)
-	mux.HandleFunc("POST /settings/aliases", s.saveSettings)
-	mux.HandleFunc("POST /api/v1/events/batch", s.ingest)
-	mux.HandleFunc("POST /api/v1/agents/heartbeat", s.heartbeat)
-	mux.HandleFunc("GET /api/v1/machines", s.machines)
-	mux.HandleFunc("GET /api/v1/evolution", s.evolution)
-	mux.HandleFunc("GET /api/v1/analytics/overview", s.overview)
-	mux.HandleFunc("GET /api/v1/analytics", s.analyticsAPI)
-	mux.HandleFunc("GET /api/v1/analytics/export", s.analyticsExport)
-	return securityHeaders(mux)
+	dashboard := func(handler http.Handler) http.Handler {
+		return s.withDeadline(s.config.RequestTimeout, s.dashboardAuth(handler))
+	}
+	mux.Handle("GET /", dashboard(http.HandlerFunc(s.dashboard)))
+	mux.Handle("GET /analytics", dashboard(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /data", dashboard(http.HandlerFunc(s.analyticsPage)))
+	mux.Handle("GET /insights", dashboard(http.HandlerFunc(s.insightsPage)))
+	mux.Handle("GET /api/v1/insights", dashboard(http.HandlerFunc(s.insightsAPI)))
+	mux.Handle("GET /tokedex", dashboard(http.HandlerFunc(s.catalogPage)))
+	mux.Handle("GET /catalog", dashboard(http.HandlerFunc(s.catalogPage)))
+	mux.Handle("GET /sessions", dashboard(http.HandlerFunc(s.sessionsPage)))
+	mux.Handle("GET /settings", dashboard(http.HandlerFunc(s.settings)))
+	mux.Handle("GET /settings/aliases", dashboard(http.HandlerFunc(s.settings)))
+	mux.Handle("POST /settings/aliases", dashboard(http.HandlerFunc(s.saveSettings)))
+	mux.Handle("POST /api/v1/events/batch", s.withDeadline(s.config.IngestTimeout, http.HandlerFunc(s.ingest)))
+	mux.Handle("POST /api/v1/agents/heartbeat", s.withDeadline(s.config.HeartbeatTimeout, http.HandlerFunc(s.heartbeat)))
+	mux.Handle("GET /api/v1/machines", dashboard(http.HandlerFunc(s.machines)))
+	mux.Handle("GET /api/v1/catalog", dashboard(http.HandlerFunc(s.catalogAPI)))
+	mux.Handle("GET /api/v1/models", dashboard(http.HandlerFunc(s.modelsAPI)))
+	mux.Handle("GET /api/v1/sessions", dashboard(http.HandlerFunc(s.sessionsAPI)))
+	mux.Handle("GET /api/v1/sessions/export", dashboard(http.HandlerFunc(s.sessionsExport)))
+	mux.Handle("GET /api/v1/evolution", dashboard(http.HandlerFunc(s.evolution)))
+	mux.Handle("GET /api/v1/analytics/overview", dashboard(http.HandlerFunc(s.overview)))
+	mux.Handle("GET /api/v1/analytics", dashboard(http.HandlerFunc(s.analyticsAPI)))
+	mux.Handle("GET /api/v1/analytics/timeline", dashboard(http.HandlerFunc(s.timelineAPI)))
+	mux.Handle("GET /api/v1/analytics/export", dashboard(http.HandlerFunc(s.analyticsExport)))
+	mux.Handle("GET /metrics", dashboard(http.HandlerFunc(s.metricsHandler)))
+	return s.requestLogging(securityHeaders(mux))
+}
+
+func (s *Server) withDeadline(timeout time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if timeout <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+type responseStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseStatusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseStatusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+// Unwrap preserves access to optional ResponseWriter capabilities through
+// middleware (for example, http.NewResponseController). The server currently
+// renders bounded responses, but retaining the underlying writer avoids
+// surprising handlers when the API grows streaming endpoints.
+func (w *responseStatusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (s *Server) requestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		response := &responseStatusWriter{ResponseWriter: w}
+		s.metrics.requestsTotal.Add(1)
+		next.ServeHTTP(response, r)
+		status := response.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if status >= http.StatusInternalServerError {
+			s.metrics.requestFailures.Add(1)
+		}
+		s.logger.Info("http_request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -724,8 +1100,29 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	err := s.store.Ready(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		s.logger.Warn("readiness_failed", "status", http.StatusServiceUnavailable)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	stale, err := s.store.StaleAgents(r.Context(), time.Now().Add(-s.config.StaleAgentAfter))
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "metrics unavailable"})
+		return
+	}
+	snapshot := s.metrics.snapshot()
+	snapshot.StaleAgents = stale
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 type batchRequest struct {
@@ -748,50 +1145,73 @@ type heartbeatRequest struct {
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
-	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
+	s.metrics.ingestRequests.Add(1)
+	if !s.ingestAuthorized(r) {
+		s.rejectIngest(w, http.StatusUnauthorized, "invalid ingest token", 1)
 		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
-	var reader io.Reader = r.Body
-	var compressed *gzip.Reader
-	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		var err error
-		compressed, err = gzip.NewReader(r.Body)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid gzip body"})
-			return
-		}
-		defer compressed.Close()
-		reader = compressed
 	}
 	var request batchRequest
-	if err := json.NewDecoder(reader).Decode(&request); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+	if err := decodeJSONBody(w, r, maxDecompressedBodyBytes, &request); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		s.rejectIngest(w, status, "invalid or oversized event batch", 1)
 		return
 	}
-	if len(request.Events) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "events must contain at least one event"})
+	if len(request.Events) == 0 || len(request.Events) > maxBatchEvents {
+		s.rejectIngest(w, http.StatusBadRequest, "event batch count is outside the permitted range", len(request.Events))
 		return
 	}
+	encodedBatch, err := json.Marshal(request)
+	if err != nil || int64(len(encodedBatch)) > maxBatchBodyBytes {
+		s.rejectIngest(w, http.StatusRequestEntityTooLarge, "event batch is too large", len(request.Events))
+		return
+	}
+	for index, event := range request.Events {
+		if err := event.Validate(); err != nil {
+			// Do not echo validation details or payload fields to a remote caller.
+			s.rejectIngest(w, http.StatusBadRequest, fmt.Sprintf("event %d is invalid", index+1), len(request.Events))
+			return
+		}
+	}
+	started := time.Now()
 	result, err := s.store.Ingest(r.Context(), request.Events)
+	s.metrics.observeDB(started)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.logger.Error("ingest_failed", "events", len(request.Events))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist event batch"})
 		return
 	}
+	s.metrics.ingestAccepted.Add(uint64(result.Accepted))
+	s.metrics.ingestDuplicates.Add(uint64(result.Duplicates))
+	s.metrics.ingestRejected.Add(uint64(result.Rejected))
+	s.logger.Info("ingest_completed", "events", len(request.Events), "accepted", result.Accepted, "duplicates", result.Duplicates, "rejected", result.Rejected)
 	s.invalidateEvolutionCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) rejectIngest(w http.ResponseWriter, status int, message string, count int) {
+	if count < 1 {
+		count = 1
+	}
+	s.metrics.ingestRejected.Add(uint64(count))
+	s.logger.Warn("ingest_rejected", "rejected", count)
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
-	if s.ingestToken != "" && !validToken(r, s.ingestToken) {
+	if !s.ingestAuthorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid ingest token"})
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var request heartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+	if err := decodeJSONBody(w, r, 1<<20, &request); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, map[string]string{"error": "invalid or oversized heartbeat"})
 		return
 	}
 	if strings.TrimSpace(request.MachineID) == "" {
@@ -808,12 +1228,17 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	adapterIDs := make([]string, 0, len(request.Adapters))
 	for _, adapter := range request.Adapters {
-		if strings.TrimSpace(adapter.ID) == "" || len(adapter.ID) > 128 {
+		if strings.TrimSpace(adapter.ID) == "" || len([]rune(adapter.ID)) > 128 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter IDs must be non-empty and at most 128 characters"})
 			return
 		}
 		adapterIDs = append(adapterIDs, adapter.ID)
 	}
+	s.metrics.sourceErrors.Add(uint64(request.SourceErrorCount))
+	if request.SourceErrorCount > 0 {
+		s.logger.Warn("source_errors", "count", request.SourceErrorCount)
+	}
+	started := time.Now()
 	if err := s.store.RecordHeartbeat(r.Context(), database.AgentHeartbeat{
 		MachineID:        request.MachineID,
 		AgentVersion:     request.AgentVersion,
@@ -823,14 +1248,20 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		SourceCount:      request.SourceCount,
 		SourceErrorCount: request.SourceErrorCount,
 	}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.metrics.observeDB(started)
+		s.logger.Error("heartbeat_failed")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not persist heartbeat"})
 		return
 	}
+	s.metrics.observeDB(started)
+	s.logger.Info("heartbeat_recorded", "source_errors", request.SourceErrorCount)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Machines(r.Context())
+	started := time.Now()
+	result, err := s.store.MachinesAt(r.Context(), time.Now())
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -838,12 +1269,58 @@ func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func validToken(r *http.Request, expected string) bool {
-	provided := r.Header.Get("X-Tokemon-Ingest-Token")
-	if provided == "" {
-		provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+func (s *Server) catalogAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	result, err := s.store.CatalogSnapshot(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	return provided == expected
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) modelsAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	result, err := s.store.CatalogSnapshot(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result.Models)
+}
+
+func (s *Server) sessionsAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	result, err := s.store.Sessions(r.Context(), analyticsQueryFromRequest(r))
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
+	query := analyticsQueryFromRequest(r)
+	started := time.Now()
+	result, err := s.store.Sessions(r.Context(), query)
+	s.metrics.observeDB(started)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload = append(payload, '\n')
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-sessions-`+query.Period+`.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
 }
 
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
@@ -892,11 +1369,15 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 }
 
 func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error) {
+	started := time.Now()
 	snapshot, err := s.store.Evolution(ctx)
+	s.metrics.observeDB(started)
 	if err != nil {
 		return evolutionResponse{}, err
 	}
+	started = time.Now()
 	composition, err := s.store.TokenComposition(ctx)
+	s.metrics.observeDB(started)
 	if err != nil {
 		return evolutionResponse{}, err
 	}
@@ -910,7 +1391,9 @@ func (s *Server) invalidateEvolutionCache() {
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -919,7 +1402,71 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	started = time.Now()
+	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	machines, err := s.store.MachinesAt(r.Context(), time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sessions, err := s.store.Sessions(r.Context(), database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(sessions) > 8 {
+		sessions = sessions[:8]
+	}
+	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions}
+	if err := s.template.ExecuteTemplate(w, "dashboard", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := s.store.CatalogSnapshot(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	byTier := make(map[string][]database.CatalogEntry)
+	for _, model := range snapshot.Models {
+		byTier[model.Tier] = append(byTier[model.Tier], model)
+	}
+	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers))}
+	for _, tier := range snapshot.Tiers {
+		models := byTier[tier]
+		if len(models) == 0 {
+			continue
+		}
+		page.Tiers = append(page.Tiers, catalogTier{Name: tier, Models: models})
+	}
+	if err := s.template.ExecuteTemplate(w, "catalog", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
+	query := analyticsQueryFromRequest(r)
+	result, err := s.store.Sessions(r.Context(), query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	analytics, err := s.store.Analytics(r.Context(), query)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -930,20 +1477,24 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases}
-	if err := s.template.ExecuteTemplate(w, "dashboard", page); err != nil {
+	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics.Facets, ModelAliases: modelAliases, MachineAliases: machineAliases}
+	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
 }
 
 func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
+	started := time.Now()
 	result, err := s.store.Analytics(r.Context(), query)
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	started = time.Now()
 	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -966,7 +1517,9 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -974,8 +1527,81 @@ func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
+func (s *Server) insightsRecap(ctx context.Context, result database.Insights) InsightsRecap {
+	if s.recapProvider == nil {
+		return InsightsRecap{Status: InsightsRecapDisabled}
+	}
+	text, err := s.recapProvider.Generate(ctx, result)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return InsightsRecap{Status: InsightsRecapUnavailable}
+	}
+	return InsightsRecap{Status: InsightsRecapGenerated, Text: strings.TrimSpace(text)}
+}
+
+func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
+	query := analyticsQueryFromRequest(r)
+	result, err := s.store.Insights(r.Context(), query)
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	analytics, err := s.store.Analytics(r.Context(), query)
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := insightsPageData{
+		Insights:       result,
+		Facets:         analytics.Facets,
+		ModelAliases:   modelAliases,
+		MachineAliases: machineAliases,
+		HourlyMax:      insightDistributionMax(result.Hourly),
+		WeekdayMax:     insightDistributionMax(result.Weekdays),
+		Recap:          s.insightsRecap(r.Context(), result),
+	}
+	if err := s.template.ExecuteTemplate(w, "insights", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
+	result, err := s.store.Insights(r.Context(), analyticsQueryFromRequest(r))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	payload := struct {
+		database.Insights
+		AIRecap InsightsRecap `json:"ai_recap"`
+	}{Insights: result, AIRecap: s.insightsRecap(r.Context(), result)}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) timelineAPI(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"filter":     result.Filter,
+		"start_date": result.StartDate,
+		"end_date":   result.EndDate,
+		"bucket":     result.Bucket,
+		"points":     result.Points,
+	})
+}
+
+func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -993,21 +1619,26 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	result, err := s.store.Overview(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	started = time.Now()
 	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
 	page := settingsPage{
-		Models:   modelAliasRows(result.ByModel, modelAliases),
-		Machines: machineAliasRows(result.ByMachine, machineAliases),
-		Saved:    r.URL.Query().Get("saved") == "1",
+		Models:    modelAliasRows(result.ByModel, modelAliases),
+		Machines:  machineAliasRows(result.ByMachine, machineAliases),
+		CSRFToken: s.csrfToken(),
+		Saved:     r.URL.Query().Get("saved") == "1",
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -1017,17 +1648,27 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid settings form", http.StatusBadRequest)
+		writeAccessibleError(w, http.StatusBadRequest, "Invalid settings form.")
 		return
 	}
+	if !validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
+		writeAccessibleError(w, http.StatusForbidden, "The settings form could not be verified. Reload the page and try again.")
+		return
+	}
+	started := time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindModel, r.Form["model_identity"], r.Form["model_alias"]); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.metrics.observeDB(started)
+		writeAccessibleError(w, http.StatusBadRequest, "Could not save model aliases. Check each alias and try again.")
 		return
 	}
+	s.metrics.observeDB(started)
+	started = time.Now()
 	if err := saveAliasGroup(r.Context(), s.store, database.AliasKindMachine, r.Form["machine_identity"], r.Form["machine_alias"]); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.metrics.observeDB(started)
+		writeAccessibleError(w, http.StatusBadRequest, "Could not save machine aliases. Check each alias and try again.")
 		return
 	}
+	s.metrics.observeDB(started)
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
 
@@ -1047,6 +1688,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeAccessibleError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Tokemon error</title></head><body><main><h1>Settings error</h1><div role=\"alert\" tabindex=\"-1\">%s</div><p><a href=\"/settings\">Return to settings</a></p></main></body></html>", template.HTMLEscapeString(message))
 }
 
 const dashboardTemplate = `<!doctype html>
@@ -1075,7 +1722,7 @@ const dashboardTemplate = `<!doctype html>
       --surface-soft: #22261f;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -1086,6 +1733,10 @@ const dashboardTemplate = `<!doctype html>
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body {
       margin: 0;
       background: var(--bg);
@@ -1103,7 +1754,7 @@ const dashboardTemplate = `<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
@@ -1134,6 +1785,9 @@ const dashboardTemplate = `<!doctype html>
     .composition-segment.output { background: var(--warm); }
     .composition-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
     .composition-item { display: flex; min-width: 0; align-items: start; flex-direction: column; justify-content: start; gap: 4px; padding: 8px 10px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); color: var(--muted); cursor: help; font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .composition-label { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; }
+    .composition-share { color: var(--accent); font-weight: 700; letter-spacing: 0; }
+    .composition-item.output .composition-share { color: var(--warm); }
     .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .22); outline-offset: 2px; }
     .composition-item.output { border-color: rgba(210, 164, 119, .58); background: rgba(210, 164, 119, .06); }
     .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: rgba(210, 164, 119, .24); }
@@ -1194,15 +1848,34 @@ const dashboardTemplate = `<!doctype html>
     .activity-tooltip-row span:first-child { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
     .activity-tooltip-row span:last-child { flex: 0 0 auto; color: var(--accent); white-space: nowrap; }
     .content-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .context-grid, .health-panel, .sessions-panel { margin-top: 10px; }
+    .context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .context-card { padding: 13px 16px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .context-card h2 { margin: 0; color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .context-value { margin-top: 9px; color: var(--text); font: 700 24px/1 var(--font-data); }
+    .context-detail { margin-top: 6px; color: var(--muted); font: 10px/1.3 var(--font-data); }
+    .health-panel, .sessions-panel { padding: 12px 16px; }
+    .health-table, .sessions-table { min-width: 700px; overflow-wrap: anywhere; }
+    .health-scroll, .sessions-scroll { overflow-x: auto; }
+    .status-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--line-bright); border-radius: 999px; font: 700 9px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .status-pill::before { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); content: ""; }
+    .status-pill.connected { border-color: rgba(155, 187, 160, .55); color: var(--accent); }
+    .status-pill.connected::before { background: var(--accent); }
+    .status-pill.stale { border-color: rgba(210, 164, 119, .6); color: var(--warm); }
+    .status-pill.stale::before { background: var(--warm); }
+    .status-pill.offline { border-color: rgba(189, 113, 100, .55); color: #d88b7e; }
+    .status-pill.offline::before { background: #d88b7e; }
+    .table-muted { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; font-weight: 400; }
+    .unknown-value { color: var(--warm); }
     .data-panel { min-height: 0; padding: 12px 16px; }
     .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
-    .section-title { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .section-title { margin: 0; color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 2px; }
     th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    th:first-child, td:first-child { width: 43%; }
-    th:nth-child(2), td:nth-child(2) { width: 41%; }
+    th:first-child, td:first-child { width: 60%; }
+    th:nth-child(2), td:nth-child(2) { width: 24%; }
     th:last-child, td:last-child { width: 16%; }
     td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
@@ -1244,6 +1917,7 @@ const dashboardTemplate = `<!doctype html>
       .power-panel { min-height: 350px; }
       .stat-grid { grid-template-columns: repeat(2, 1fr); }
       .activity-panel { padding: 18px; }
+      .context-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 500px) {
       main { width: min(100% - 12px, 420px); margin: 6px auto; padding: 6px; border-radius: 8px; }
@@ -1261,7 +1935,7 @@ const dashboardTemplate = `<!doctype html>
       .command { width: 100%; overflow: auto; }
       footer { flex-direction: column; gap: 4px; }
     }
-    @media (max-width: 420px) { .composition-grid { gap: 10px; } }
+    @media (max-width: 420px) { .composition-primary { grid-template-columns: 1fr; gap: 10px; } }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
       .odometer-strip { transition: none; }
@@ -1269,20 +1943,24 @@ const dashboardTemplate = `<!doctype html>
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
       <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
       <span class="brand-name">TOKEMON</span>
     </a>
     <nav class="nav" aria-label="Primary navigation">
-      <a class="nav-link active" href="/">Overview</a>
+      <a class="nav-link active" href="/" aria-current="page">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
+      <a class="nav-link" href="/tokedex">Tokedex</a>
+      <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
   </header>
 
-  <section class="hero" aria-label="Current Tokemon and lifetime usage">
+  <section class="hero" aria-labelledby="hero-title">
+    <h1 id="hero-title" class="sr-only">Current Tokemon and lifetime usage</h1>
     <article class="panel creature-panel" data-stage="{{.Evolution.Stage}}">
       <div class="creature-art-wrap">
         <img class="creature-art" src="{{assetPath .Evolution.Stage}}" alt="{{.Evolution.FormName}}, stage {{.Evolution.Stage}}" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
@@ -1304,12 +1982,12 @@ const dashboardTemplate = `<!doctype html>
           <span class="composition-segment output" id="live-output-segment"></span>
         </div>
         <div class="composition-primary">
-          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
-          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
+          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><span class="composition-share" id="live-input-share">—</span></span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
+          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><span class="composition-share" id="live-output-share">—</span></span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
         </div>
       </div>
       <div class="progress-block">
-        <div class="progress-row"><span>Next evolution</span></div>
+        <div class="progress-row"><span>Next evolution</span>{{if .Evolution.NextThreshold}}<strong>{{compactPtr .Evolution.NextThreshold}} lifetime target</strong>{{else}}<strong>Maximum stage</strong>{{end}}</div>
         <div class="progress-value"><strong id="live-remaining-copy">{{if .Evolution.TokensRemaining}}{{compactPtr .Evolution.TokensRemaining}} <small>to go</small>{{else}}Final form{{end}}</strong><strong id="live-progress-label">{{printf "%.0f" (mul .Evolution.Progress 100)}}%</strong></div>
         <div class="progress" id="live-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
       </div>
@@ -1324,12 +2002,17 @@ const dashboardTemplate = `<!doctype html>
     <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/active-days.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Activity.ActiveDays}}</div></div></article>
   </section>
 
+  <section class="context-grid" aria-label="Today and week usage">
+    <article class="context-card"><h2>Today</h2><div class="context-value">{{commas .Today.Tokens}} tokens</div><div class="context-detail">{{commas .Today.Events}} events · {{commas .Today.InputTokens}} input · {{commas .Today.OutputTokens}} output{{if .Today.UnknownTokens}} · {{commas .Today.UnknownTokens}} unknown totals{{end}}</div></article>
+    <article class="context-card"><h2>This week</h2><div class="context-value">{{commas .Week.Tokens}} tokens</div><div class="context-detail">{{commas .Week.Events}} events · {{commas .Week.InputTokens}} input · {{commas .Week.OutputTokens}} output{{if .Week.UnknownTokens}} · {{commas .Week.UnknownTokens}} unknown totals{{end}}</div></article>
+  </section>
+
   <section class="panel activity-panel" aria-labelledby="activity-title">
     <div class="section-head">
-      <div class="section-title" id="activity-title">Token activity</div>
+      <h2 class="section-title" id="activity-title">Token activity</h2>
       {{if .Activity.ActiveDays}}<div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>{{end}}
     </div>
-    <div class="activity-shell" aria-label="Daily token activity for the last 53 weeks">
+    <div class="activity-shell" role="grid" aria-label="Daily token activity for the last 53 weeks">
       <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
       <div class="activity-scroll">
         <div class="activity-grid">
@@ -1347,23 +2030,34 @@ const dashboardTemplate = `<!doctype html>
     {{end}}
   </section>
 
-  <section class="content-grid" aria-label="Usage breakdowns">
+  <section class="content-grid" aria-labelledby="breakdowns-title">
+    <h2 id="breakdowns-title" class="sr-only">Usage breakdowns</h2>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Projects</div></div>
-      <table><thead><tr><th>Project</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Projects</h2></div>
+      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Harnesses</div></div>
-      <table><thead><tr><th>Harness</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Harnesses</h2></div>
+      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Models</div></div>
-      <table><thead><tr><th>Model</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Models</h2></div>
+      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
-      <div class="section-head"><div class="section-title">Machines</div></div>
-      <table><thead><tr><th>Machine</th><th>Tokens</th><th>Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td>{{commas .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <div class="section-head"><h2 class="section-title">Machines</h2></div>
+      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
+  </section>
+
+  <section class="panel health-panel" aria-labelledby="health-title">
+    <div class="section-head"><div class="section-title" id="health-title">Machine health</div><a class="table-muted" href="/api/v1/machines">Read API</a></div>
+    <div class="health-scroll"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td>{{analyticsTime .LastSeenAt}}</td><td>{{commas .TodayTokens}}</td><td>{{commas .WeekTokens}}</td><td>{{commas .LifetimeTokens}}</td><td>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">{{.SourceErrorCount}} source errors</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
+  </section>
+
+  <section class="panel sessions-panel" aria-labelledby="sessions-title">
+    <div class="section-head"><div class="section-title" id="sessions-title">Recent sessions</div><a class="table-muted" href="/sessions">Open session timeline</a></div>
+    <div class="sessions-scroll"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td>{{.SessionID}}<span class="table-muted">{{.Project}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td>{{analyticsTime .Timestamp}}</td><td>{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td>{{tokenValue .InputTokens}}</td><td>{{tokenValue .OutputTokens}}</td><td>{{tokenValue .TotalTokens}}</td><td>{{costValue .Cost .CostEstimated}}</td><td>{{durationValue .DurationMS}}</td><td>{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   {{if eq .LifetimeTokens 0}}
@@ -1550,6 +2244,9 @@ const dashboardTemplate = `<!doctype html>
     };
     updateOdometer(document.getElementById('live-input-tokens'), number.format(input));
     updateOdometer(document.getElementById('live-output-tokens'), number.format(output));
+    const percent = (value) => total === 0 ? '—' : new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 }).format(value / total);
+    document.getElementById('live-input-share').textContent = percent(input);
+    document.getElementById('live-output-share').textContent = percent(output);
     setTooltip('live-input', 'Input', input, []);
     setTooltip('live-output', 'Output', output, []);
   };
@@ -1726,9 +2423,6 @@ func activityTooltip(day database.ActivityDay) string {
 		fmt.Fprintf(&builder, "Token total unavailable · %s %s", commas(day.Events), eventWord)
 	} else {
 		tokenLabel := commas(day.Tokens)
-		if day.UnknownTokens > 0 {
-			tokenLabel += " known"
-		}
 		fmt.Fprintf(&builder, "%s tokens · %s %s", tokenLabel, commas(day.Events), eventWord)
 	}
 	if day.UnknownTokens > 0 {
@@ -1751,9 +2445,6 @@ func appendActivityBreakdown(builder *strings.Builder, heading string, values []
 			continue
 		}
 		tokenLabel := commas(value.Tokens)
-		if value.UnknownTokens > 0 {
-			tokenLabel += " known"
-		}
 		fmt.Fprintf(builder, "\n  %s · %s tokens", value.Name, tokenLabel)
 	}
 }
@@ -1844,7 +2535,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --surface: #171916;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -1852,6 +2543,10 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
     * { box-sizing: border-box; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     a { color: inherit; text-decoration: none; }
     button, input { font: inherit; }
@@ -1868,28 +2563,36 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
     .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
     .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
-    input:focus { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    input:focus { border-color: var(--accent); }
+    input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
     button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: none; }
+    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
     .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
     footer { margin-top: 20px; color: var(--faint); font-size: 10px; }
     @media (max-width: 620px) {
       main { margin: 8px auto; padding: 12px; }
       .alias-row { grid-template-columns: 1fr; gap: 8px; }
     }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+    }
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <h1>Settings</h1>
-    <a class="back-link" href="/">← Overview</a>
+    <nav aria-label="Primary navigation"><a class="back-link" href="/">Overview</a> · <a class="back-link" href="/tokedex">Tokedex</a> · <a class="back-link" href="/sessions">Sessions</a></nav>
   </header>
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
-  <form action="/settings/aliases" method="post">
-    <h2>Models</h2>
+  {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
+  <form action="/settings/aliases" method="post" aria-labelledby="settings-form-title">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <h2 id="settings-form-title">Models</h2>
     {{if .Models}}
     <div class="alias-list">
       {{range $index, $row := .Models}}
@@ -1901,7 +2604,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       {{end}}
     </div>
     {{else}}<p class="empty">No models recorded yet.</p>{{end}}
-    <h2>Machines</h2>
+    <h2 id="machines-title">Machines</h2>
     {{if .Machines}}
     <div class="alias-list">
       {{range $index, $row := .Machines}}
@@ -1919,6 +2622,63 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
 </main>
 </body>
 </html>{{end}}`
+
+const catalogTemplate = `{{define "catalog"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Tokedex</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10110f; --surface:#171916; --surface-raised:#1d201b; --text:#f0ede5; --muted:#a2a69b; --faint:#6f766b; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
+    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    * { box-sizing:border-box; } [hidden] { display:none !important; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
+    a { color:inherit; text-decoration:none; } main { width:min(1200px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; }
+    .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); }
+    .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; }
+    .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); }
+    .heading { padding:26px 10px 14px; } .eyebrow,.section-title,.model-meta,.label { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; color:var(--text); font:700 clamp(28px,4vw,44px)/1 var(--font-display); } .heading p { max-width:780px; margin:10px 0 0; color:var(--muted); }
+    .tier { margin-top:12px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-head { display:flex; align-items:center; justify-content:space-between; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .tier-head h2 { margin:0; color:var(--warm); font:700 13px/1 var(--font-data); letter-spacing:.12em; text-transform:uppercase; }
+    .tier-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; padding:12px 16px 16px; } .model-card { min-width:0; padding:13px; border:1px solid var(--line); border-radius:6px; background:var(--surface-raised); } .model-name { margin-top:7px; overflow:hidden; color:var(--text); font:700 18px/1.15 var(--font-display); text-overflow:ellipsis; white-space:nowrap; } .model-id { margin-top:4px; overflow:hidden; color:var(--faint); font:10px var(--font-data); text-overflow:ellipsis; white-space:nowrap; }
+    .model-context { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); color:var(--muted); font:11px/1.35 var(--font-data); } .model-context strong { color:var(--text); } .aliases { margin-top:10px; color:var(--faint); font:10px/1.35 var(--font-data); } .aliases code { color:var(--muted); }
+    .pricing { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px; margin-top:10px; color:var(--muted); font:10px var(--font-data); } .pricing span:last-child { color:var(--text); text-align:right; }
+    footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; }
+    @media (max-width:900px) { .tier-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width:620px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:start; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .nav-link { padding:6px 7px; font-size:10px; } .tier-grid { grid-template-columns:1fr; padding:10px; } footer { flex-direction:column; gap:4px; } }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
+  </style>
+</head>
+<body><main>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a><a class="nav-link" href="/sessions">Sessions</a></nav><a class="nav-link" href="/settings">Settings</a></header>
+  <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p></section>
+  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><div class="label">{{.Provider}}</div><div class="model-name" title="{{.ID}}">{{.DisplayName}}</div><div class="model-id">{{.ID}}</div><div class="model-context"><strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div><div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div></article>{{end}}</div></section>{{else}}<p>No catalog models are configured.</p>{{end}}
+  <footer><span>Static YAML-backed catalog · metadata only</span><span><a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
+</main></body></html>{{end}}`
+
+const sessionsTemplate = `{{define "sessions"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="/static/tokemon/token-dex.png"><title>Tokemon · Sessions</title>
+  <style>
+    :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); }
+    .heading { display:flex; align-items:end; justify-content:space-between; gap:20px; padding:25px 10px 15px; } .eyebrow,.section-title,label,th { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; font:700 clamp(28px,4vw,42px)/1 var(--font-display); } .heading-copy { margin:9px 0 0; color:var(--muted); } .action { display:inline-flex; align-items:center; min-height:38px; padding:10px 13px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; white-space:nowrap; }
+    .panel { border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-panel { padding:14px 16px; } .filter-form { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); align-items:end; gap:10px; } label { display:grid; gap:7px; color:var(--faint); } select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); } select:focus-visible { border-color:var(--accent); outline:2px solid rgba(155,187,160,.16); } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions button,.filter-actions a { min-height:36px; padding:9px 11px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions .apply { border-color:var(--accent); color:var(--accent); }
+    .session-panel { margin-top:10px; overflow:hidden; } .section-head { display:flex; align-items:start; justify-content:space-between; gap:14px; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .section-meta { color:var(--faint); font:10px var(--font-data); } .table-scroll { overflow-x:auto; padding:0 16px 12px; } table { width:100%; min-width:930px; border-collapse:collapse; table-layout:fixed; } th,td { padding:9px 0; border-bottom:1px solid var(--line); text-align:left; } th { color:var(--faint); } td { color:var(--muted); font:12px/1.25 var(--font-data); } th:not(:first-child),td:not(:first-child) { padding-left:10px; text-align:right; white-space:nowrap; } td:first-child { color:var(--text); font-weight:600; } td:nth-child(2),td:nth-child(3) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .subline { display:block; margin-top:4px; overflow:hidden; color:var(--faint); font-size:10px; font-weight:400; text-overflow:ellipsis; white-space:nowrap; } .unknown { color:var(--warm); } .empty-row td { padding:32px 0; color:var(--faint); text-align:left; }
+    footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; } @media (max-width:900px) { .filter-form { grid-template-columns:repeat(3,minmax(0,1fr)); } .filter-actions { grid-column:span 3; } } @media (max-width:640px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:start; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .nav-link { padding:6px 7px; font-size:10px; } .heading { align-items:start; flex-direction:column; padding:20px 8px 14px; } .action { width:100%; justify-content:center; } .filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-actions { grid-column:span 2; } footer { flex-direction:column; gap:4px; } } @media (max-width:420px) { .filter-form { grid-template-columns:1fr; } .filter-actions { grid-column:auto; } } @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
+  </style>
+</head>
+<body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="nav-link" href="/settings">Settings</a></header>
+  <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" href="{{sessionsExportURL .Filter}}">Export sessions JSON</a></section>
+  <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Tool<select name="tool"><option value="">All tools</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
+  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td>{{.SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td>{{analyticsTime .Timestamp}}</td><td>{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td>{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
+  <footer><span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span></footer>
+</main></body></html>{{end}}`
 
 const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 <html lang="en">
@@ -1943,7 +2703,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       --surface-raised: #1d201b;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #a5ad9c;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -1954,6 +2714,10 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
+    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     a { color: inherit; text-decoration: none; }
     button, select { font: inherit; }
@@ -1967,21 +2731,22 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .analytics-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
     .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    h2.section-title { margin: 0; }
     h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
     .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
     .heading-actions { display: flex; align-items: center; gap: 10px; }
     .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
     .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
-    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid rgba(155, 187, 160, .18); outline-offset: 1px; }
+    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
     .window-link.active { background: var(--accent); color: var(--bg); }
     .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid rgba(210, 164, 119, .22); outline-offset: 2px; }
+    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
     .filter-panel { padding: 14px 16px; }
     .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
     label { display: grid; gap: 7px; color: var(--faint); }
     select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
-    select:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
     .filter-actions { display: flex; align-items: end; gap: 8px; }
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
@@ -2126,6 +2891,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; }
       .topbar { display: flex; align-items: start; flex-wrap: wrap; }
       .nav { order: 3; width: 100%; justify-content: center; }
+      .nav-link { padding: 6px 7px; font-size: 10px; }
       .analytics-heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; }
       .heading-actions { width: 100%; align-items: stretch; flex-direction: column; }
       .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); }
@@ -2152,7 +2918,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   </style>
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
       <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
@@ -2161,6 +2928,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
+      <a class="nav-link" href="/tokedex">Tokedex</a>
+      <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
   </header>
 
@@ -2185,8 +2954,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   <section class="panel filter-panel" aria-label="Analytics filters">
     <form class="filter-form" method="get" action="/analytics">
       <input type="hidden" name="period" value="{{.Filter.Period}}">
-      <label>Breakdown
-        <select name="dimension">
+      <label for="dimension-filter">Breakdown
+        <select id="dimension-filter" name="dimension">
           <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
           <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
           <option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option>
@@ -2194,26 +2963,26 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
         </select>
       </label>
-      <label>Machine
-        <select name="machine">
+      <label for="machine-filter">Machine
+        <select id="machine-filter" name="machine">
           <option value="">All machines</option>
           {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
         </select>
       </label>
-      <label>Provider
-        <select name="provider">
+      <label for="provider-filter">Provider
+        <select id="provider-filter" name="provider">
           <option value="">All providers</option>
           {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
-      <label>Model
-        <select name="model">
+      <label for="model-filter">Model
+        <select id="model-filter" name="model">
           <option value="">All models</option>
           {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
         </select>
       </label>
-      <label>Harness
-        <select name="tool">
+      <label for="harness-filter">Harness
+        <select id="harness-filter" name="tool">
           <option value="">All harnesses</option>
           {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
         </select>
@@ -2236,7 +3005,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 
   <section class="analytics-grid">
     <article class="panel trend-panel" aria-labelledby="trend-title">
-      <div class="section-head"><div class="section-title" id="trend-title">Token trend</div><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
+      <div class="section-head"><h2 class="section-title" id="trend-title">Token trend</h2><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
       <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
       {{if .Points}}
       <div class="trend-readout" aria-live="polite">
@@ -2250,7 +3019,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           <div class="trend-grid" aria-hidden="true">{{range .AxisTicks}}<i style="bottom: {{.Position}}%"></i>{{end}}</div>
           <div class="trend-chart period-{{.Filter.Period}}" aria-label="Token volume over the selected window">
             {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
               <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
               <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
@@ -2263,7 +3032,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     </article>
 
     <article class="panel breakdown-panel" aria-labelledby="breakdown-title">
-      <div class="section-head"><div class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</div><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
+      <div class="section-head"><h2 class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</h2><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
       <nav class="dimension-nav" aria-label="Breakdown dimension">
         <a class="dimension-link{{if eq .Filter.Dimension "projects"}} active{{end}}" href="{{analyticsURL .Filter "projects"}}">Projects</a>
         <a class="dimension-link{{if eq .Filter.Dimension "harnesses"}} active{{end}}" href="{{analyticsURL .Filter "harnesses"}}">Harnesses</a>
@@ -2272,7 +3041,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}">Machines</a>
       </nav>
       <div class="table-scroll breakdown-scroll">
-        <table><thead><tr><th>Name</th><th>Tokens</th><th>Share</th><th>Threads</th></tr></thead><tbody>
+        <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
           <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
@@ -2282,7 +3051,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   </section>
 
   <section class="panel share-panel" aria-labelledby="share-title">
-    <div class="section-head"><div class="section-title" id="share-title">Usage share</div><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
+    <div class="section-head"><h2 class="section-title" id="share-title">Usage share</h2><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
     {{if .SharePoints}}
     <div class="share-legend" aria-label="Usage share legend">
       {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $series.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $series.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $series.Name}}{{else}}{{$series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
@@ -2307,7 +3076,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
           </div>
           <div class="share-hit-grid">
             {{range $index, $point := .SharePoints}}
-            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} known tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
               <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
             </button>
@@ -2316,13 +3085,18 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         </div>
       </div>
     </div>
-    {{else}}<div class="empty-chart">No known token totals to compare in this window.</div>{{end}}
+    <div class="sr-only" id="share-data-table">
+      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}<th scope="col">{{.Name}} share</th>{{end}}</tr></thead><tbody>
+        {{range .SharePoints}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td>{{range .Values}}<td>{{printf "%.1f%%" (mul .Share 100)}}</td>{{end}}</tr>{{end}}
+      </tbody></table>
+    </div>
+    {{else}}<div class="empty-chart">No token totals to compare in this window.</div>{{end}}
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
-    <div class="section-head"><div class="section-title" id="sessions-title">Recent sessions</div><div class="section-meta">Metadata only · latest 12</div></div>
+    <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><div class="section-meta">Metadata only · latest 12</div></div>
     <div class="table-scroll">
-      <table><thead><tr><th>When</th><th>Project / machine</th><th>Model</th><th>Harness</th><th>Tokens</th></tr></thead><tbody>
+      <table aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">When</th><th scope="col">Project / machine</th><th scope="col">Model</th><th scope="col">Harness</th><th scope="col">Tokens</th></tr></thead><tbody>
         {{range .Sessions}}
         <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}"><span class="session-project">{{modelDisplayName $.ModelAliases .Model}}</span><span class="session-machine">{{.Provider}}</span></td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
         {{else}}<tr class="empty-row"><td colspan="5">No sessions match these filters.</td></tr>{{end}}
@@ -2396,7 +3170,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
       point.classList.add('active');
       shareTooltipDate.textContent = point.dataset.label;
-      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' known tokens';
+      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' tokens';
       const unknownEvents = Number(point.dataset.unknown);
       if (shareTooltipWarning) {
         shareTooltipWarning.hidden = unknownEvents <= 0;
@@ -2436,5 +3210,171 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     });
   })();
 </script>
+</body>
+</html>{{end}}`
+
+const insightsTemplate = `{{define "insights"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <title>Tokemon · Insights</title>
+  <style>
+    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #6f766b; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    a { color: inherit; text-decoration: none; }
+    button, select { font: inherit; }
+    main { width: min(1200px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; }
+    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
+    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
+    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
+    .heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
+    .eyebrow, .label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 8px 0 0; font: 700 clamp(27px, 4vw, 42px)/1 var(--font-display); letter-spacing: .01em; }
+    h2, h3 { margin: 0; }
+    .heading-copy { max-width: 670px; margin: 9px 0 0; color: var(--muted); }
+    .privacy-boundary { display: grid; gap: 4px; max-width: 670px; margin-top: 13px; padding: 9px 11px; border: 1px solid rgba(155, 187, 160, .36); border-radius: 5px; background: rgba(155, 187, 160, .045); color: var(--muted); font-size: 12px; }
+    .privacy-boundary strong { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .heading-actions { display: flex; align-items: end; flex-direction: column; gap: 9px; }
+    .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
+    .window-link { padding: 7px 10px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .08em; }
+    .window-link:hover, .window-link:focus-visible, .window-link.active { background: var(--surface-raised); color: var(--accent); outline: none; }
+    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
+    .filter-panel { padding: 13px 14px; }
+    .filter-form { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: end; gap: 9px; }
+    .filter-form label { display: grid; gap: 5px; color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
+    select:focus-visible, a:focus-visible, button:focus-visible, summary:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .25); outline-offset: 2px; }
+    .filter-actions { display: flex; justify-content: end; gap: 7px; grid-column: span 5; }
+    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 31px; padding: 8px 11px; border: 1px solid var(--line-bright); border-radius: 4px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .action:hover, .action:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .action.apply { border-color: var(--warm); color: var(--warm); }
+    .quality { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; padding: 10px 13px; color: var(--muted); font: 11px var(--font-data); }
+    .quality strong { color: var(--text); }
+    .quality .confidence { color: var(--accent); text-transform: uppercase; }
+    .state { margin-top: 10px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-size: 12px; }
+    .state.unknown { border-color: rgba(210, 164, 119, .52); color: var(--warm); }
+    .state.baseline { border-color: rgba(155, 187, 160, .36); color: var(--accent); }
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 12px 14px 9px; border-bottom: 1px solid var(--line); }
+    .section-title { color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .section-meta { color: var(--faint); font: 10px var(--font-data); }
+    .insight-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .insight-card { min-width: 0; padding: 14px 15px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .insight-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+    .card-category { color: var(--warm); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .insight-card h2 { margin-top: 7px; color: var(--text); font: 700 18px/1.15 var(--font-display); }
+    .narrative { margin: 8px 0 0; color: var(--muted); }
+    .observation { margin: 11px 0 0; color: var(--text); font: 700 12px/1.35 var(--font-data); }
+    .insight-card details { margin-top: 13px; border-top: 1px solid var(--line); }
+    .insight-card summary { padding: 10px 0 3px; color: var(--accent); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .08em; list-style-position: inside; text-transform: uppercase; }
+    .evidence { display: grid; gap: 7px; padding: 6px 0 1px 17px; color: var(--muted); font-size: 12px; }
+    .evidence p { margin: 0; }
+    .evidence strong { color: var(--text); font: 700 10px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .qualifiers { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; padding: 0; list-style: none; }
+    .qualifiers li { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font: 10px var(--font-data); }
+    .analytics-deep-link { display: inline-block; margin-top: 3px; color: var(--accent); font: 700 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .analytics-deep-link:hover, .analytics-deep-link:focus-visible { color: var(--warm); outline: none; }
+    .empty-cards { margin-top: 10px; padding: 30px 15px; text-align: center; }
+    .empty-cards strong { display: block; color: var(--text); font: 700 17px/1.2 var(--font-display); }
+    .empty-cards span { display: block; margin-top: 7px; color: var(--faint); font-size: 12px; }
+    .distribution-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 10px; margin-top: 10px; }
+    .distribution { min-width: 0; }
+    .histogram { display: grid; grid-template-columns: repeat(24, minmax(8px, 1fr)); align-items: end; gap: 3px; min-height: 148px; padding: 18px 13px 8px; }
+    .hour { display: grid; min-width: 0; grid-template-rows: 112px 14px; align-items: end; gap: 5px; }
+    .hour-track { display: flex; height: 112px; align-items: end; justify-content: center; }
+    .hour-bar { display: block; width: min(100%, 18px); min-height: 2px; border: 1px solid var(--accent-dim); border-bottom-color: var(--accent); border-radius: 2px 2px 0 0; background: var(--accent-dim); }
+    .hour-label { overflow: hidden; color: var(--faint); font: 8px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .weekday-list { display: grid; gap: 7px; padding: 14px; }
+    .weekday-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 8px; color: var(--muted); font: 10px var(--font-data); }
+    .weekday-track { height: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; background: #11130f; }
+    .weekday-bar { display: block; height: 100%; min-width: 2px; background: var(--warm); }
+    .weekday-value { color: var(--text); white-space: nowrap; }
+    .peak-note { padding: 0 14px 13px; color: var(--faint); font: 10px var(--font-data); }
+    .peak-note strong { color: var(--warm); }
+    .ai-recap { margin-top: 10px; }
+    .ai-recap-body { padding: 13px 14px; color: var(--muted); font-size: 12px; }
+    .ai-recap-body p { margin: 0; }
+    .ai-status { color: var(--faint); font: 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .ai-status.generated { color: var(--accent); }
+    .ai-status.unavailable { color: var(--warm); }
+    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
+    @media (max-width: 900px) { .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); } .filter-actions { grid-column: span 3; } .distribution-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 700px) { main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; } .topbar { display: flex; align-items: start; flex-wrap: wrap; } .nav { order: 3; width: 100%; justify-content: center; } .heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; } .heading-actions { width: 100%; align-items: stretch; } .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); } .window-link { text-align: center; } .filter-panel { padding: 12px; } .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .filter-actions { grid-column: span 2; } .filter-actions .action { flex: 1; } .insight-cards { grid-template-columns: 1fr; } .insight-card:last-child:nth-child(odd) { grid-column: auto; } .quality { align-items: start; flex-direction: column; gap: 5px; } footer { flex-direction: column; gap: 4px; } }
+    @media (max-width: 430px) { .filter-form { grid-template-columns: 1fr; } .filter-actions { grid-column: auto; } .histogram { padding-inline: 7px; gap: 2px; } .hour-label { font-size: 7px; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-delay: 0ms !important; } }
+  </style>
+</head>
+<body>
+<main>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="nav-link" href="/">Overview</a>
+      <a class="nav-link" href="/analytics">Analytics</a>
+    </nav>
+  </header>
+
+  <section class="heading">
+    <div>
+      <div class="eyebrow">Aggregate signals</div>
+      <h1>Insights</h1>
+      <p class="heading-copy">A quiet readout of recurring token patterns for the selected window and filters.</p>
+      <aside class="privacy-boundary" aria-label="Privacy boundary"><strong>Privacy boundary</strong><span>Metadata only: prompts, responses, source code, source paths, repository contents, conversation titles, and session IDs never appear in Insights.</span></aside>
+    </div>
+    <div class="heading-actions">
+      <nav class="window-nav" aria-label="Time window">
+        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{insightsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
+        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{insightsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
+        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{insightsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
+        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{insightsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
+        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{insightsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
+      </nav>
+    </div>
+  </section>
+
+  <section class="panel filter-panel" aria-label="Insights filters">
+    <form class="filter-form" method="get" action="/insights">
+      <input type="hidden" name="period" value="{{.Filter.Period}}">
+      <label>Breakdown<select name="dimension"><option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option><option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option><option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option><option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option><option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option></select></label>
+      <label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label>
+      <label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label>
+      <label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label>
+      <label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label>
+      <div class="filter-actions"><button class="action apply" type="submit">Apply filters</button><a class="action" href="/insights">Reset</a></div>
+    </form>
+  </section>
+
+  <section class="panel quality" aria-label="Insight data quality"><span><strong>{{commas .DataQuality.KnownEvents}}</strong> events</span><span><strong>{{commas .DataQuality.KnownTokens}}</strong> tokens</span><span>Event-total coverage <strong>{{insightCoverage .DataQuality.EventCoverage}}</strong></span><span class="confidence">{{if .DataQuality.Confidence}}{{.DataQuality.Confidence}}{{else}}Unknown confidence{{end}}</span></section>
+  {{if .DataQuality.UnknownEvents}}<div class="state unknown" role="status">{{commas .DataQuality.UnknownEvents}} event{{if ne .DataQuality.UnknownEvents 1}}s{{end}} have unknown token totals. They remain unknown and are not treated as zero.</div>{{end}}
+  {{if eq .Filter.Period "all"}}<div class="state baseline" role="status">No comparable baseline for the all-time window; growth signals are intentionally omitted.</div>{{end}}
+
+  {{if .Cards}}
+  <section class="insight-cards" aria-label="Evidence-backed insights">
+    {{range .Cards}}
+    <article class="insight-card" role="listitem"><div class="card-category">{{.Category}}</div><h2>{{.Title}}</h2><p class="narrative">{{.Narrative}}</p>{{if .Observation}}<p class="observation">{{.Observation}}</p>{{end}}<details><summary>Why this?</summary><div class="evidence"><p><strong>Evidence</strong> {{.Evidence}}</p><p><strong>Basis</strong> {{.Basis}}</p>{{if .Qualifiers}}<ul class="qualifiers" aria-label="Qualifiers">{{range .Qualifiers}}<li>{{.}}</li>{{end}}</ul>{{end}}{{if .AnalyticsURL}}<a class="analytics-deep-link" href="{{.AnalyticsURL}}">Open this slice in Analytics →</a>{{end}}</div></details></article>
+    {{end}}
+  </section>
+  {{else}}
+  <section class="panel empty-cards" role="status"><strong>No strong signals in this window.</strong><span>{{if .DataQuality.KnownEvents}}There is not enough metadata to form a deterministic card yet. Try a wider window or different filters.{{else}}No token metadata matches these filters yet. Insights will appear after usage is recorded.{{end}}</span></section>
+  {{end}}
+
+  <section class="distribution-grid" aria-label="Usage rhythm">
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
+  </section>
+
+  <section class="panel ai-recap" aria-labelledby="ai-recap-title" data-ai-status="{{.Recap.Status}}"><div class="section-head"><h2 class="section-title" id="ai-recap-title">AI recap</h2><span class="ai-status {{.Recap.Status}}">{{insightRecapLabel .Recap.Status}}</span></div><div class="ai-recap-body">{{if eq .Recap.Status "generated"}}<p class="ai-status generated">Optional AI interpretation of aggregate evidence</p><p>{{.Recap.Text}}</p>{{else if eq .Recap.Status "unavailable"}}<p>The recap service is temporarily unavailable. Deterministic Insights remain available.</p>{{else}}<p>AI recap is disabled or unconfigured. This page uses deterministic aggregate signals only.</p>{{end}}</div></section>
+
+  <footer><span>Local-first · metadata only</span><span>No prompts, responses, source paths, repository contents, or session IDs are used.</span></footer>
+</main>
 </body>
 </html>{{end}}`

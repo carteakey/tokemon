@@ -160,6 +160,44 @@ func TestParseResetsAfterReplacement(t *testing.T) {
 	}
 }
 
+func TestParseRejectsSensitiveAndUnknownFieldsBeforeForwarding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	line := `{"schema_version":"1","event_id":"sensitive","timestamp":"2026-07-12T12:00:00Z","provider":"example","model":"example-model","tool":"example-tool","total_tokens":42,"token_accuracy":"reported","prompt":"private prompt","metadata":{"tokemon_usage_kind":"batch"}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(path).Parse(context.Background(), discoverOne(t, New(path)), adapters.ParseRequest{MachineID: "machine"})
+	if err == nil || !strings.Contains(err.Error(), "disallowed sensitive content") {
+		t.Fatalf("sensitive generic record error = %v", err)
+	}
+
+	approved := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "approved",
+		Timestamp:     mustTime("2026-07-12T12:00:00Z"),
+		Provider:      "example",
+		Model:         "example-model",
+		Tool:          "example-tool",
+		TotalTokens:   usage.Int64(42),
+		TokenAccuracy: usage.AccuracyReported,
+		Metadata:      map[string]any{"tokemon_usage_kind": "batch"},
+	}
+	encoded, err := json.Marshal(approved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(path).Parse(context.Background(), discoverOne(t, New(path)), adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(result.Events) != 1 {
+		t.Fatalf("approved generic record = %+v, error = %v", result.Events, err)
+	}
+	if result.Events[0].Metadata["tokemon_usage_kind"] != "batch" {
+		t.Fatalf("approved metadata was not preserved: %+v", result.Events[0].Metadata)
+	}
+}
+
 func discoverOne(t *testing.T, adapter *Adapter) adapters.Source {
 	t.Helper()
 	sources, err := adapter.Discover(context.Background())

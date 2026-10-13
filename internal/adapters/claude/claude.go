@@ -21,6 +21,7 @@ import (
 const (
 	adapterID      = "claude-code"
 	adapterVersion = "0.2.0"
+	maxRecordBytes = 4 << 20
 )
 
 type Adapter struct {
@@ -115,7 +116,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecordLimit(reader, maxRecordBytes)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -163,7 +164,9 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			sessionID = record.SessionIDAlt
 		}
 		if sessionID == "" {
-			sessionID = strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path))
+			sessionID = usage.HashSessionID(source.Path)
+		} else {
+			sessionID = usage.NormalizeSessionID(sessionID)
 		}
 		event := normalize(record, rawUsage, machineID, identity, lineNumber, sessionID, timestamp)
 		events = append(events, event)

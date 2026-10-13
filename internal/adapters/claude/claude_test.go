@@ -68,6 +68,36 @@ func TestParseAssistantUsageWithoutConversationContent(t *testing.T) {
 	}
 }
 
+func TestParseLargeClaudeRecordWithinBound(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	privateContent := strings.Repeat("private conversation content", 100000)
+	line := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session","message":{"model":"claude-sonnet","content":"` + privateContent + `","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if len(line) <= adapters.MaxRecordBytes || len(line) >= maxRecordBytes {
+		t.Fatalf("fixture size = %d, want between default and Claude bounds", len(line))
+	}
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(home).Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Events[0].InputTokens == nil || *result.Events[0].InputTokens != 10 || result.Events[0].OutputTokens == nil || *result.Events[0].OutputTokens != 20 {
+		t.Fatalf("large record usage = %+v", result.Events)
+	}
+	payload, err := json.Marshal(result.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "private conversation content") {
+		t.Fatal("conversation content leaked into usage event")
+	}
+}
+
 func TestNormalizedPayloadIsExactAndMetadataOnly(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".claude", "projects", "private-project", "session.jsonl")
@@ -116,6 +146,33 @@ func TestParseUnknownCacheFieldsDoesNotInventTotal(t *testing.T) {
 	}
 	if len(result.Events) != 1 || result.Events[0].TotalTokens != nil || result.Events[0].TokenAccuracy != usage.AccuracyUnknown {
 		t.Fatalf("unknown fields were silently converted: %+v", result.Events)
+	}
+}
+
+func TestFallbackSessionIDHashesFilenameAndRemainsStable(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "private title.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	first, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, error: %v", first, err)
+	}
+	second, err := adapter.Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(second.Events) != 1 {
+		t.Fatalf("second parse = %+v, error: %v", second, err)
+	}
+	if !strings.HasPrefix(first.Events[0].SessionID, "sha256:") || strings.Contains(first.Events[0].SessionID, "private title") {
+		t.Fatalf("filename leaked through session ID: %q", first.Events[0].SessionID)
+	}
+	if first.Events[0].EventID != second.Events[0].EventID {
+		t.Fatalf("fallback session ID changed event identity: first=%+v second=%+v", first.Events[0], second.Events[0])
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -15,8 +16,28 @@ import (
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
+	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 )
+
+const testDashboardToken = "test-dashboard-token"
+
+func newTestServer(store *database.Store, ingestToken string) (*Server, error) {
+	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: testDashboardToken, AllowLoopbackDev: true})
+}
+
+func testHandler(server *Server) http.Handler {
+	base := server.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if server.config.AllowLoopbackDev && server.config.IngestToken == "" {
+			r.RemoteAddr = "127.0.0.1:1234"
+		}
+		if r.Header.Get("Authorization") == "" && r.Header.Get("X-Tokemon-Ingest-Token") == "" {
+			r.SetBasicAuth("test", testDashboardToken)
+		}
+		base.ServeHTTP(w, r)
+	})
+}
 
 func TestBatchIngestRequiresTokenAndUpdatesEvolution(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
@@ -24,7 +45,7 @@ func TestBatchIngestRequiresTokenAndUpdatesEvolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "secret")
+	server, err := newTestServer(store, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +91,7 @@ func TestBatchIngestRequiresTokenAndUpdatesEvolution(t *testing.T) {
 
 	evolutionRequest := httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil).WithContext(context.Background())
 	evolutionResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(evolutionResponse, evolutionRequest)
+	testHandler(server).ServeHTTP(evolutionResponse, evolutionRequest)
 	if evolutionResponse.Code != http.StatusOK || !bytes.Contains(evolutionResponse.Body.Bytes(), []byte(`"stage":1`)) {
 		t.Fatalf("unexpected evolution response: %d %s", evolutionResponse.Code, evolutionResponse.Body.String())
 	}
@@ -82,7 +103,7 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "secret")
+	server, err := newTestServer(store, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +124,7 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("machines status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
 	}
@@ -119,13 +140,106 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
+	price := 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"test-model": {Provider: "provider", DisplayName: "Test Model", Aliases: []string{"raw-model", "provider/raw-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "api-session", Timestamp: now, MachineID: "machine", SessionID: "session", Project: "/private/project", Provider: "provider", Model: "raw-model", Tool: "codex", InputTokens: usage.Int64(4), OutputTokens: usage.Int64(6), TotalTokens: usage.Int64(10), DurationMS: usage.Int64(1200), Cost: usage.Float64(.12), CostEstimated: true, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(`{"machine_id":"machine","agent_version":"test","operating_system":"linux","architecture":"amd64","adapters":[{"id":"codex"}],"source_count":1,"source_error_count":0}`))
+	heartbeat.Header.Set("Authorization", "Bearer secret")
+	heartbeatResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(heartbeatResponse, heartbeat)
+	if heartbeatResponse.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d: %s", heartbeatResponse.Code, heartbeatResponse.Body.String())
+	}
+
+	checks := []struct {
+		path string
+		want []string
+	}{
+		{path: "/api/v1/catalog", want: []string{`"schema_version":"2"`, `"tier":"S"`, `"aliases":["raw-model","provider/raw-model"]`, `"usage_tokens":10`}},
+		{path: "/api/v1/models", want: []string{`"display_name":"Test Model"`, `"context":"Observed in usage"`}},
+		{path: "/api/v1/sessions?period=24h&machine=machine", want: []string{`"session_id":"session"`, `"input_tokens":4`, `"output_tokens":6`, `"total_tokens":10`, `"project":"project"`}},
+		{path: "/api/v1/analytics/timeline?period=24h&machine=machine", want: []string{`"bucket":"hour"`, `"points"`}},
+		{path: "/api/v1/machines", want: []string{`"status":"Connected"`, `"today_tokens":10`, `"sync_context":"1 source synced"`}},
+	}
+	for _, check := range checks {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, check.path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", check.path, response.Code, response.Body.String())
+		}
+		for _, want := range check.want {
+			if !strings.Contains(response.Body.String(), want) {
+				t.Fatalf("%s missing %q: %s", check.path, want, response.Body.String())
+			}
+		}
+		if strings.Contains(response.Body.String(), "private/project") || strings.Contains(response.Body.String(), "conversation") {
+			t.Fatalf("%s leaked private metadata: %s", check.path, response.Body.String())
+		}
+	}
+
+	for _, path := range []string{"/", "/tokedex", "/sessions?period=24h&machine=machine"} {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d", path, response.Code)
+		}
+		body := response.Body.String()
+		for _, want := range []string{"Today", "This week", "Machine health", "Recent sessions"} {
+			if path == "/" && !strings.Contains(body, want) {
+				t.Fatalf("overview missing %q", want)
+			}
+		}
+		if path == "/tokedex" && (!strings.Contains(body, "Tokedex") || !strings.Contains(body, "Aliases") || !strings.Contains(body, "Tier S")) {
+			t.Fatalf("tokedex missing catalog content: %s", body)
+		}
+		if strings.Contains(body, "private/project") {
+			t.Fatalf("%s leaked full project path", path)
+		}
+	}
+	filtered := httptest.NewRecorder()
+	filteredRequest := httptest.NewRequest(http.MethodGet, "/api/v1/analytics?period=24h&machine=other", nil)
+	filteredRequest.SetBasicAuth("tokemon", testDashboardToken)
+	server.Handler().ServeHTTP(filtered, filteredRequest)
+	if filtered.Code != http.StatusOK || !strings.Contains(filtered.Body.String(), `"lifetime_tokens":10`) || !strings.Contains(filtered.Body.String(), `"tokens":0`) {
+		t.Fatalf("filtered analytics changed global total: %d %s", filtered.Code, filtered.Body.String())
+	}
+
+	export := httptest.NewRecorder()
+	exportRequest := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?period=24h&machine=machine", nil)
+	exportRequest.SetBasicAuth("tokemon", testDashboardToken)
+	server.Handler().ServeHTTP(export, exportRequest)
+	if export.Code != http.StatusOK || !strings.Contains(export.Header().Get("Content-Disposition"), "tokemon-sessions-24h.json") || !strings.Contains(export.Body.String(), `"session_id": "session"`) {
+		t.Fatalf("session export = %d %s %s", export.Code, export.Header().Get("Content-Disposition"), export.Body.String())
+	}
+}
+
 func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +261,7 @@ func TestDashboardRendersDailyTokenActivityField(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("dashboard status = %d, want %d", response.Code, http.StatusOK)
 	}
@@ -165,7 +279,7 @@ func TestDashboardAliasSettingsUseCompactDefaultsAndSavedOverrides(t *testing.T)
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +300,7 @@ func TestDashboardAliasSettingsUseCompactDefaultsAndSavedOverrides(t *testing.T)
 	}
 
 	settings := httptest.NewRecorder()
-	server.Handler().ServeHTTP(settings, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	testHandler(server).ServeHTTP(settings, httptest.NewRequest(http.MethodGet, "/settings", nil))
 	if settings.Code != http.StatusOK {
 		t.Fatalf("settings status = %d, want %d", settings.Code, http.StatusOK)
 	}
@@ -201,17 +315,18 @@ func TestDashboardAliasSettingsUseCompactDefaultsAndSavedOverrides(t *testing.T)
 		"model_alias":      {"Sonnet 4"},
 		"machine_identity": {"Kartikeys-MacBook-Air"},
 		"machine_alias":    {"Work Mac"},
+		"csrf_token":       {server.csrfToken()},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	saved := httptest.NewRecorder()
-	server.Handler().ServeHTTP(saved, request)
+	testHandler(server).ServeHTTP(saved, request)
 	if saved.Code != http.StatusSeeOther || saved.Header().Get("Location") != "/settings?saved=1" {
 		t.Fatalf("save response = %d, location %q", saved.Code, saved.Header().Get("Location"))
 	}
 
 	dashboard := httptest.NewRecorder()
-	server.Handler().ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := dashboard.Body.String()
 	for _, want := range []string{">Sonnet 4</span>", ">Work Mac</span>", `title="claude-sonnet-4"`, `title="Kartikeys-MacBook-Air"`} {
 		if !strings.Contains(body, want) {
@@ -226,7 +341,7 @@ func TestDashboardDoesNotDuplicateStageWatermarkBesideFormChip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,13 +363,112 @@ func TestDashboardDoesNotDuplicateStageWatermarkBesideFormChip(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.String()
 	if !strings.Contains(body, `<div class="stage-chip">FORM / 09</div>`) {
 		t.Fatalf("dashboard does not render the stage-nine form chip")
 	}
+	if !strings.Contains(body, `<strong>2B lifetime target</strong>`) {
+		t.Fatalf("dashboard does not identify the next lifetime target")
+	}
 	if strings.Contains(body, `.creature-panel::after`) || strings.Contains(body, `content: "STAGE " attr(data-stage)`) {
 		t.Fatalf("dashboard still renders the duplicate stage watermark")
+	}
+}
+
+func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens int64
+		stage  int
+		form   string
+		label  string
+	}{
+		{name: "empty egg", tokens: 0, stage: 0, form: "egg", label: "Egg"},
+		{name: "populated context cub", tokens: 12_345, stage: 4, form: "context-cub", label: "Context Cub"},
+		{name: "before late threshold", tokens: 1_999_999_999, stage: 9, form: "token-titan", label: "Token Titan"},
+		{name: "late threshold", tokens: 2_000_000_000, stage: 10, form: "model-eater", label: "Model Eater"},
+		{name: "final singularity", tokens: 1_000_000_000_000, stage: 18, form: "the-singularity", label: "The Singularity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			server, err := newTestServer(store, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.tokens > 0 {
+				event := usage.Event{
+					SchemaVersion: usage.SchemaVersion,
+					EventID:       "art-stage-" + strings.ReplaceAll(test.name, " ", "-"),
+					Timestamp:     time.Now().UTC(),
+					MachineID:     "art-test-machine",
+					Provider:      "test",
+					Model:         "test-model",
+					Tool:          "test-tool",
+					TotalTokens:   usage.Int64(test.tokens),
+					TokenAccuracy: usage.AccuracyReported,
+					Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
+				}
+				if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			response := httptest.NewRecorder()
+			testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("dashboard status = %d, want 200: %s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			for _, want := range []string{
+				fmt.Sprintf(`data-stage="%d"`, test.stage),
+				fmt.Sprintf(`src="/static/tokemon/stage-%02d.png"`, test.stage),
+				fmt.Sprintf(`alt="%s, stage %d"`, test.label, test.stage),
+				fmt.Sprintf(`<div class="stage-chip">FORM / %02d</div>`, test.stage),
+			} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("dashboard missing %q: %s", want, body)
+				}
+			}
+		})
+	}
+}
+
+func TestDashboardMissingAssetFallbackRuntimeContract(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	missing := httptest.NewRecorder()
+	server.Handler().ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/static/tokemon/stage-99.png", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing stage status = %d, want 404", missing.Code)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		`onerror="this.hidden=true;this.nextElementSibling.hidden=false"`,
+		`<div class="creature-fallback" hidden>STAGE 0</div>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard missing fallback contract %q: %s", want, body)
+		}
 	}
 }
 
@@ -264,13 +478,13 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	for _, want := range []string{
 		`id="lifetime-counter"`,
 		`id="token-composition"`,
@@ -282,6 +496,9 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`class="mini-odometer"`,
 		`id="live-input-tokens"`,
 		`id="live-output-tokens"`,
+		`id="live-input-share"`,
+		`id="live-output-share"`,
+		`const percent = (value)`,
 		`data-tooltip-kind="composition"`,
 		`aria-label="Token mix"`,
 		`>Input</span>`,
@@ -296,6 +513,9 @@ func TestDashboardPollsAndUpdatesLifetimeCounter(t *testing.T) {
 		`updateOdometer(document.getElementById('live-output-tokens'), number.format(output))`,
 		`setTooltip('live-input', 'Input'`,
 		`setTooltip('live-output', 'Output'`,
+		`document.getElementById('live-input-share').textContent = percent(input)`,
+		`document.getElementById('live-output-share').textContent = percent(output)`,
+		`@media (max-width: 420px) { .composition-primary { grid-template-columns: 1fr; gap: 10px; } }`,
 		`cell.dataset.tooltipKind === 'composition'`,
 		`segment.style.width`,
 		`updateOdometer(counter, display)`,
@@ -321,12 +541,12 @@ func TestEvolutionEndpointIncludesTokenComposition(t *testing.T) {
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
 	for _, want := range []string{`"lifetime_tokens":15`, `"input_tokens":12`, `"uncached_input_tokens":5`, `"cached_input_tokens":7`, `"output_tokens":3`} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("evolution response does not contain %q: %s", want, response.Body.String())
@@ -340,7 +560,7 @@ func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "secret")
+	server, err := newTestServer(store, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +569,7 @@ func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := server.Handler()
+	handler := testHandler(server)
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
 	if first.Code != http.StatusOK || server.evolutionCache == nil {
@@ -388,7 +608,7 @@ func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +617,7 @@ func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := server.Handler()
+	handler := testHandler(server)
 	start := make(chan struct{})
 	var wait sync.WaitGroup
 	for worker := 0; worker < 16; worker++ {
@@ -448,7 +668,7 @@ func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +677,7 @@ func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := server.Handler()
+	handler := testHandler(server)
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
 	if first.Code != http.StatusOK || server.evolutionCache == nil {
@@ -497,7 +717,7 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +731,7 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
 	for _, want := range []string{"Est. API cost", "$10.00"} {
 		if !bytes.Contains(body, []byte(want)) {
@@ -535,12 +755,12 @@ func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
 	for _, want := range []string{"Cache hit", "80.0%", "Threads", "/static/tokemon/icons/cache-hit.png", "/static/tokemon/icons/threads.png"} {
 		if !bytes.Contains(body, []byte(want)) {
@@ -560,7 +780,7 @@ func TestDashboardRendersMergedProjectUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +792,7 @@ func TestDashboardRendersMergedProjectUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	for _, want := range []string{"Projects", "Harnesses", "Codex", "carteakey.dev", "150", `class="pixel-glyph project-glyph palette-`, `class="pixel-glyph harness-glyph preset-codex`, `class="pixel-glyph model-glyph palette-`, `class="pixel-glyph machine-glyph palette-`} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
@@ -602,6 +822,31 @@ func TestModelGlyphIsStableAndNameDerived(t *testing.T) {
 				t.Fatalf("model glyph row %d is not symmetrical", row)
 			}
 		}
+	}
+}
+
+func TestDashboardUsesCompactBreakdownTotalsWithExactTooltips(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "compact-breakdown", Timestamp: time.Now().UTC(), MachineID: "workstation", Project: "tokemon", Provider: "openai", Model: "gpt-5.6-luna", Tool: "codex", TotalTokens: usage.Int64(1_165_236_062), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := response.Body.String()
+	if !strings.Contains(body, `title="1,165,236,062 tokens" aria-label="1,165,236,062 tokens">1.2B</td>`) {
+		t.Fatalf("dashboard does not pair a compact total with its exact tooltip: %s", body)
+	}
+	if !strings.Contains(body, `th:first-child, td:first-child { width: 60%; }`) {
+		t.Fatal("dashboard does not reserve additional width for breakdown names")
 	}
 }
 
@@ -653,7 +898,7 @@ func TestDashboardRendersFriendlyHarnessNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +912,7 @@ func TestDashboardRendersFriendlyHarnessNames(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	for _, want := range []string{"Harnesses", "Claude Code", "Codex", "preset-claude", "preset-codex", "60.0%", "40.0%"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain harness breakdown %q: %s", want, response.Body.String())
@@ -681,13 +926,13 @@ func TestDashboardOmitsDuplicateAndTechnicalCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
 	for _, want := range []string{"Lifetime tokens", "Next evolution", "Top machine", "Local-first · no conversation content"} {
 		if !bytes.Contains(body, []byte(want)) {
@@ -709,6 +954,12 @@ func TestDashboardOmitsDuplicateAndTechnicalCopy(t *testing.T) {
 			t.Fatalf("dashboard still contains unnecessary copy %q", omitted)
 		}
 	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(body) {
+		t.Fatal("dashboard still exposes Insights in primary navigation")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(body) {
+		t.Fatalf("dashboard still renders known qualifier: %s", body)
+	}
 }
 
 func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
@@ -717,7 +968,7 @@ func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +994,7 @@ func TestDashboardTrimsProjectAndModelUsage(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
 	for _, want := range []string{">project-00</span>", ">project-04</span>", ">model-00</span>", ">model-04</span>"} {
 		if !bytes.Contains(body, []byte(want)) {
@@ -766,7 +1017,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, "")
+	server, err := newTestServer(store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,7 +1043,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	}
 
 	pageResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/analytics?period=7d&dimension=models&machine=machine-one", nil))
+	testHandler(server).ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/analytics?period=7d&dimension=models&machine=machine-one", nil))
 	if pageResponse.Code != http.StatusOK {
 		t.Fatalf("analytics page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
 	}
@@ -819,9 +1070,15 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`/api/v1/analytics/overview">Data</a>`)) {
 		t.Fatal("analytics navigation still points directly at the overview JSON")
 	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(pageResponse.Body.Bytes()) {
+		t.Fatal("analytics page still exposes Insights in primary navigation")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(pageResponse.Body.Bytes()) {
+		t.Fatalf("analytics page still renders known qualifier: %s", pageResponse.Body.String())
+	}
 
 	exportResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(exportResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=7d&dimension=models", nil))
+	testHandler(server).ServeHTTP(exportResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=7d&dimension=models", nil))
 	if exportResponse.Code != http.StatusOK {
 		t.Fatalf("analytics export status = %d, want %d: %s", exportResponse.Code, http.StatusOK, exportResponse.Body.String())
 	}
@@ -860,5 +1117,251 @@ func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	}
 	if got := analyticsDateTickClass(6, 30, "30d"); got != "" {
 		t.Fatalf("unexpected intermediate 30-day tick class: %q", got)
+	}
+}
+
+type insightsRecapStub struct {
+	text string
+	err  error
+}
+
+func (stub insightsRecapStub) Generate(context.Context, database.Insights) (string, error) {
+	return stub.text, stub.err
+}
+
+func TestInsightsPageAndAPIRespectAnalyticsFilters(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "insights-render",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "insights-machine",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		SessionID:     "private-session-id",
+		InputTokens:   usage.Int64(60),
+		OutputTokens:  usage.Int64(40),
+		TotalTokens:   usage.Int64(100),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	unknown := usage.Event{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "insights-unknown",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "insights-machine",
+		Provider:      "openai",
+		Model:         "gpt",
+		Tool:          "codex",
+		TokenAccuracy: usage.AccuracyUnknown,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	if result, err := store.Ingest(context.Background(), []usage.Event{event, unknown}); err != nil || result.Accepted != 2 {
+		t.Fatalf("unexpected insights ingest result: %+v, error: %v", result, err)
+	}
+
+	pageResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(pageResponse, httptest.NewRequest(http.MethodGet, "/insights?period=7d&dimension=models&machine=insights-machine", nil))
+	if pageResponse.Code != http.StatusOK {
+		t.Fatalf("insights page status = %d, want %d: %s", pageResponse.Code, http.StatusOK, pageResponse.Body.String())
+	}
+	body := pageResponse.Body.String()
+	for _, want := range []string{"<title>Tokemon · Insights</title>", "Overview", "Analytics", "Insights", "Privacy boundary", "prompts", "responses", "source paths", "24-hour rhythm", "Weekday distribution", "Why this?", "Evidence", "Basis", "Open this slice in Analytics", "AI recap", "Recap disabled / unconfigured", "unknown token totals", "@media (max-width: 700px)", "name=\"dimension\"", "name=\"machine\"", "name=\"provider\"", "name=\"model\"", "name=\"tool\""} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("insights page does not contain %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "private-session-id") || strings.Contains(body, "session_id") {
+		t.Fatal("insights page leaked session metadata")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).MatchString(body) {
+		t.Fatalf("insights page still renders known qualifier: %s", body)
+	}
+	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).MatchString(body) {
+		t.Fatal("insights page still exposes Insights in primary navigation")
+	}
+
+	apiResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(apiResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights?period=7d&dimension=models&machine=insights-machine", nil))
+	if apiResponse.Code != http.StatusOK {
+		t.Fatalf("insights API status = %d, want %d: %s", apiResponse.Code, http.StatusOK, apiResponse.Body.String())
+	}
+	var payload struct {
+		database.Insights
+		AIRecap InsightsRecap `json:"ai_recap"`
+	}
+	if err := json.Unmarshal(apiResponse.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode insights API: %v", err)
+	}
+	if payload.Filter.Period != "7d" || payload.Filter.Dimension != "models" || payload.Filter.Machine != "insights-machine" {
+		t.Fatalf("unexpected insights filter: %+v", payload.Filter)
+	}
+	if payload.AIRecap.Status != InsightsRecapDisabled {
+		t.Fatalf("default AI recap status = %q, want %q", payload.AIRecap.Status, InsightsRecapDisabled)
+	}
+	if strings.Contains(apiResponse.Body.String(), "session_id") || strings.Contains(apiResponse.Body.String(), "private-session-id") {
+		t.Fatal("insights API leaked session metadata")
+	}
+	if regexp.MustCompile(`(?i)\bknown\b`).Match(apiResponse.Body.Bytes()) {
+		t.Fatalf("insights API still emits known qualifier: %s", apiResponse.Body.String())
+	}
+	defaultResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(defaultResponse, httptest.NewRequest(http.MethodGet, "/api/v1/insights", nil))
+	if defaultResponse.Code != http.StatusOK {
+		t.Fatalf("default insights API status = %d, want %d", defaultResponse.Code, http.StatusOK)
+	}
+	var defaultPayload struct {
+		database.Insights
+	}
+	if err := json.Unmarshal(defaultResponse.Body.Bytes(), &defaultPayload); err != nil {
+		t.Fatalf("decode default insights API: %v", err)
+	}
+	if defaultPayload.Filter.Period != "30d" {
+		t.Fatalf("default insights period = %q, want 30d", defaultPayload.Filter.Period)
+	}
+}
+
+func TestInsightsRecapStatusesAndEmptyState(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithConfig(store, Config{DashboardToken: testDashboardToken, AllowLoopbackDev: true}, insightsRecapStub{text: "A generated aggregate recap."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("empty insights status = %d, want %d", response.Code, http.StatusOK)
+	}
+	for _, want := range []string{"No strong signals in this window.", "No token metadata matches these filters yet.", "Generated recap", "A generated aggregate recap."} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Fatalf("empty insights does not contain %q: %s", want, response.Body.String())
+		}
+	}
+	allWindow := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(allWindow, httptest.NewRequest(http.MethodGet, "/insights?period=all", nil))
+	if allWindow.Code != http.StatusOK || !strings.Contains(allWindow.Body.String(), "No comparable baseline for the all-time window") {
+		t.Fatalf("all-time baseline state = %d %s", allWindow.Code, allWindow.Body.String())
+	}
+
+	store2, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	unavailable, err := NewWithConfig(store2, Config{DashboardToken: testDashboardToken, AllowLoopbackDev: true}, insightsRecapStub{err: fmt.Errorf("provider offline")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	testHandler(unavailable).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Recap temporarily unavailable") {
+		t.Fatalf("unavailable recap page = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestInsightsRenderHidesDatabaseErrorDetails(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("closed-store insights status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "Insights are temporarily unavailable.") || strings.Contains(body, "sql:") || strings.Contains(body, "database is closed") {
+		t.Fatalf("insights error leaked database details: %s", body)
+	}
+}
+
+type insightsSynthesizerStub struct {
+	input insightai.Input
+}
+
+func (stub *insightsSynthesizerStub) Synthesize(_ context.Context, input insightai.Input) (insightai.Output, error) {
+	stub.input = input
+	return insightai.Output{Title: "Usage pulse", Summary: "Your aggregate rhythm shifted.", EvidenceIDs: []string{"rhythm-peak-time"}}, nil
+}
+
+func TestAggregateAIRecapRedactsSelectedDimensionLabels(t *testing.T) {
+	stub := &insightsSynthesizerStub{}
+	result := database.Insights{
+		Period: "30d", Timezone: "America/Toronto",
+		Filter:      database.AnalyticsQuery{Period: "30d", Dimension: "projects", Machine: "private-machine"},
+		DataQuality: database.InsightDataQuality{Confidence: "high", Qualifier: "all event totals are available"},
+		Cards: []database.InsightCard{
+			{ID: "dimension-concentration", Category: "concentration", Observation: "secret-project: 81% of tokens", Basis: "project share"},
+			{ID: "rhythm-peak-time", Category: "rhythm", Observation: "14:00 local hour is highest", Basis: "tokens grouped by configured timezone"},
+		},
+	}
+	recap, err := aggregateAIRecapProvider{synthesizer: stub}.Generate(context.Background(), result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recap != "Usage pulse — Your aggregate rhythm shifted." {
+		t.Fatalf("recap = %q", recap)
+	}
+	payload, err := json.Marshal(stub.input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret-project", "private-machine", "project share"} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("aggregate AI input leaked %q: %s", forbidden, payload)
+		}
+	}
+	if _, err := insightai.ValidateInput(stub.input); err != nil {
+		t.Fatalf("aggregate AI input rejected by transport policy: %v", err)
+	}
+	if len(stub.input.Evidence) != 2 || stub.input.ScopeLabels[0].Label != insightai.ScopeFilteredView {
+		t.Fatalf("unexpected aggregate AI input: %+v", stub.input)
+	}
+}
+
+func TestInsightsRoutesRequireDashboardAuth(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "ingest-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/insights", "/api/v1/insights"} {
+		anonymous := httptest.NewRecorder()
+		server.Handler().ServeHTTP(anonymous, httptest.NewRequest(http.MethodGet, path, nil))
+		if anonymous.Code != http.StatusUnauthorized {
+			t.Fatalf("anonymous %s status = %d, want %d", path, anonymous.Code, http.StatusUnauthorized)
+		}
+		authed := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.SetBasicAuth("tokemon", testDashboardToken)
+		server.Handler().ServeHTTP(authed, request)
+		if authed.Code != http.StatusOK {
+			t.Fatalf("authenticated %s status = %d, want %d: %s", path, authed.Code, http.StatusOK, authed.Body.String())
+		}
 	}
 }

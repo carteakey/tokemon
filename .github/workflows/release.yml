@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/carteakey/tokemon
+
+jobs:
+  native:
+    name: Native ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: darwin, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: amd64}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require a semantic-version tag
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Guard source and build context
+        run: |
+          bash deploy/release-guard.sh --tracked
+          bash deploy/release-guard.sh --context .
+      - name: Build release archive
+        env:
+          TOKEMON_VERSION: ${{ github.ref_name }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # The shared script builds all four targets once per matrix member;
+          # retain the selected archive for an unambiguous artifact name.
+          out="$RUNNER_TEMP/dist"
+          bash deploy/build-release.sh "${TOKEMON_VERSION#v}" "$out"
+          mkdir -p "$RUNNER_TEMP/selected"
+          cp "$out/tokemon_${TOKEMON_VERSION#v}_${GOOS}_${GOARCH}.tar.gz" "$RUNNER_TEMP/selected/"
+      - name: Upload native archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ runner.temp }}/selected/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Sign release and publish immutable image
+    needs: native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download native archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SBOM (required release artifact)
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD:/src:ro" anchore/syft:v1.33.0 \
+            dir:/src --exclude './data/**' --exclude '**/*.db*' --output spdx-json=/dev/stdout \
+            > dist/sbom.spdx.json
+          test -s dist/sbom.spdx.json
+      - name: Build and scan release image
+        run: |
+          docker build --pull --tag "$IMAGE:${GITHUB_REF_NAME#v}" .
+          docker save "$IMAGE:${GITHUB_REF_NAME#v}" --output "$RUNNER_TEMP/tokemon-release.tar"
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" aquasec/trivy:0.56.2 \
+            image --input /scan/tokemon-release.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable semver image (no latest tag)
+        id: image
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --provenance=true --sbom=true --push \
+            --tag "$IMAGE:$version" --tag "$IMAGE:v$version" .
+          digest="$(docker buildx imagetools inspect "$IMAGE:$version" | awk '/^Digest:/ {print $2; exit}')"
+          [[ "$digest" == sha256:* ]] || { echo 'image digest missing' >&2; exit 1; }
+          printf '%s@%s\n' "$IMAGE" "$digest" > dist/image-digest.txt
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign checksums, SBOM, and native archives keylessly
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          bash deploy/update-checksums.sh dist
+          for file in dist/checksums.txt dist/sbom.spdx.json dist/image-digest.txt dist/tokemon_*.tar.gz; do
+            cosign sign-blob --yes \
+              --output-signature "$file.sig" \
+              --output-certificate "$file.pem" "$file"
+          done
+          digest="$(awk -F@ '{print $2}' dist/image-digest.txt)"
+          cosign sign --yes "$IMAGE@$digest"
+      - name: Verify signed assets and tamper policy
+        env:
+          TOKEMON_RELEASE_CERTIFICATE_IDENTITY: https://github.com/carteakey/tokemon/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}
+        run: bash deploy/verify-release.sh dist "${GITHUB_REF_NAME#v}"
+      - name: Publish signed release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$GITHUB_REF_NAME"
+          gh release create "$version" dist/* \
+            --title "Tokemon ${version#v}" --generate-notes

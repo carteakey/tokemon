@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,7 +206,7 @@ INSERT INTO steps (idx, step_payload) VALUES (0, 'secret prompt and response');`
 	if event.Timestamp != time.Date(2026, 7, 12, 21, 30, 0, 123, time.UTC) || event.TokenAccuracy != usage.AccuracyReported {
 		t.Fatalf("unexpected timestamp or accuracy: %+v", event)
 	}
-	if event.Project != "carteakey.dev" || event.Metadata != nil || event.Source.Identity == sources[0].Path || event.SessionID != "session-private-title" {
+	if event.Project != "carteakey.dev" || event.Metadata != nil || event.Source.Identity == sources[0].Path || !strings.HasPrefix(event.SessionID, "sha256:") || strings.Contains(event.SessionID, "session-private-title") {
 		t.Fatalf("privacy boundary failed: %+v", event)
 	}
 	if err := event.Validate(); err != nil {

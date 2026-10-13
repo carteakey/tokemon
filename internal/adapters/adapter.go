@@ -3,12 +3,43 @@
 package adapters
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
 
 	"github.com/tokemon/tokemon/internal/usage"
 )
+
+const MaxRecordBytes = 1 << 20
+
+// ReadRecord reads one newline-delimited provider record without allowing a
+// malformed line to grow without bound in memory.
+func ReadRecord(reader *bufio.Reader) ([]byte, error) {
+	return ReadRecordLimit(reader, MaxRecordBytes)
+}
+
+// ReadRecordLimit allows adapters with larger documented provider records to
+// use a separate, explicit memory bound.
+func ReadRecordLimit(reader *bufio.Reader, limit int) ([]byte, error) {
+	var record []byte
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		record = append(record, chunk...)
+		if len(record) > limit {
+			return nil, fmt.Errorf("provider record exceeds %d bytes", limit)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err == nil || err == io.EOF {
+			return record, err
+		}
+		return record, err
+	}
+}
 
 // HashIdentity turns a local source identity into a safe value for an event.
 // In particular, encoded project paths must never be sent as source metadata.
