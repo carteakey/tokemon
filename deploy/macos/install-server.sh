@@ -4,6 +4,7 @@ set -euo pipefail
 label="com.tokemon.server"
 server_addr="${TOKEMON_SERVER_ADDR:-0.0.0.0:18080}"
 ingest_token="${TOKEMON_INGEST_TOKEN:-}"
+token_stdin=0
 database="${TOKEMON_DATABASE:-}"
 catalog="${TOKEMON_MODEL_CATALOG:-}"
 timezone="${TOKEMON_ANALYTICS_TIMEZONE:-UTC}"
@@ -13,10 +14,10 @@ uninstall=0
 
 usage() {
   cat <<'EOF'
-Usage: install-server.sh --token TOKEN [options]
+Usage: install-server.sh [options]
 
 Options:
-  --token TOKEN      ingest token (stored in a mode-0600 config file)
+  --token-stdin      read the ingest token from stdin (noninteractive)
   --binary PATH      existing tokemon binary (default: tokemon on PATH)
   --addr ADDRESS     listen address (default: 0.0.0.0:18080)
   --database PATH    SQLite database path (default: ~/Library/Application Support/Tokemon/tokemon.db)
@@ -44,9 +45,11 @@ xml_escape() {
 while (($#)); do
   case "$1" in
     --token)
-      (($# >= 2)) || die "--token requires a value"
-      ingest_token="$2"
-      shift 2
+      die "inline --token is not accepted; use TOKEMON_INGEST_TOKEN or --token-stdin"
+      ;;
+    --token-stdin)
+      token_stdin=1
+      shift
       ;;
     --binary)
       (($# >= 2)) || die "--binary requires a path"
@@ -87,6 +90,12 @@ while (($#)); do
   esac
 done
 
+if ((token_stdin)); then
+  if ! IFS= read -r ingest_token; then
+    [[ -n "$ingest_token" ]] || die "--token-stdin received no token"
+  fi
+fi
+
 config_path="$home/.config/tokemon/server.env"
 plist_path="$home/Library/LaunchAgents/$label.plist"
 log_dir="$home/Library/Logs/Tokemon"
@@ -103,7 +112,7 @@ if ((uninstall)); then
   exit 0
 fi
 
-[[ -n "$ingest_token" ]] || die "--token or TOKEMON_INGEST_TOKEN is required"
+[[ -n "$ingest_token" ]] || die "TOKEMON_INGEST_TOKEN or --token-stdin is required"
 [[ -n "$binary" && -x "$binary" ]] || die "tokemon binary not found; pass --binary PATH"
 [[ "$server_addr" != *$'\n'* && "$server_addr" != *$'\r'* ]] || die "listen address contains a newline"
 [[ "$ingest_token" != *$'\n'* && "$ingest_token" != *$'\r'* ]] || die "token contains a newline"

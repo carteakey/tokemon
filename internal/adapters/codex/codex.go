@@ -480,8 +480,8 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 			// Forked logs expose the child thread in id and the original thread
 			// in session_id. Count the child as its own chat, while retaining the
 			// old parent-based identity for event IDs during the migration.
-			sessionID = firstNonEmpty(sessionID, metadata.ID, metadata.SessionID)
-			sourceSessionID = firstNonEmpty(sourceSessionID, metadata.SessionID, metadata.ID)
+			sessionID = firstNonEmpty(sessionID, usage.NormalizeSessionID(metadata.ID), usage.NormalizeSessionID(metadata.SessionID))
+			sourceSessionID = firstNonEmpty(sourceSessionID, usage.NormalizeSessionID(metadata.SessionID), usage.NormalizeSessionID(metadata.ID))
 			provider = firstNonEmpty(metadata.ModelProvider, provider)
 			project = firstNonEmpty(usage.NormalizeProject(metadata.CWD), project)
 		case "turn_context":
@@ -547,7 +547,7 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 				continue
 			}
 			currentModel := firstNonEmpty(a.NormalizeModel(payload.Info.Model), a.NormalizeModel(payload.Info.ModelName), model, "unknown")
-			stableSessionID := firstNonEmpty(sessionID, strings.TrimSuffix(filepath.Base(source.Path), filepath.Ext(source.Path)))
+			stableSessionID := firstNonEmpty(sessionID, usage.HashSessionID(source.Path))
 			eventSessionID := firstNonEmpty(sourceSessionID, stableSessionID)
 			identity := adapters.HashIdentity(adapterID + ":session:" + eventSessionID)
 			if !usingCumulative {

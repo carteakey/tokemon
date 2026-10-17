@@ -134,6 +134,29 @@ func TestParseDerivesTotalsOnlyFromCompleteComponents(t *testing.T) {
 	}
 }
 
+func TestFallbackSessionIDHashesFilenameAndRemainsStable(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".openclaw", "agents", "main", "sessions", "private title.jsonl")
+	header := `{"type":"session","cwd":"/private/repo"}` + "\n"
+	writeFile(t, path, header+assistantLine("assistant", "2026-07-18T23:00:01Z", 10))
+	adapter := New(home)
+	source := discoverOne(t, adapter)
+	first, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, error: %v", first, err)
+	}
+	second, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(second.Events) != 1 {
+		t.Fatalf("second parse = %+v, error: %v", second, err)
+	}
+	if !strings.HasPrefix(first.Events[0].SessionID, "sha256:") || strings.Contains(first.Events[0].SessionID, "private title") {
+		t.Fatalf("filename leaked through session ID: %q", first.Events[0].SessionID)
+	}
+	if first.Events[0].EventID != second.Events[0].EventID {
+		t.Fatalf("fallback session ID changed event identity: first=%+v second=%+v", first.Events[0], second.Events[0])
+	}
+}
+
 func TestParseUsesCommittedCursorAndRetriesIncompleteRecord(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".openclaw", "agents", "main", "sessions", "session.jsonl")

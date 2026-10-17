@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/database"
@@ -16,9 +17,10 @@ import (
 )
 
 type Client struct {
-	ServerURL  string
-	Token      string
-	HTTPClient *http.Client
+	ServerURL      string
+	Token          string
+	HTTPClient     *http.Client
+	RequestTimeout time.Duration
 }
 
 type batchRequest struct {
@@ -41,7 +43,23 @@ type HeartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
-const maxIngestBatchBytes = 4 << 20
+const (
+	maxIngestBatchBytes = 4 << 20
+	// maxIngestBatchEvents stays comfortably below the hub's 1,000-event hard
+	// cap so representative SQLite backfills also finish within the shared
+	// request deadline.
+	maxIngestBatchEvents = 100
+)
+
+const DefaultRequestTimeout = 30 * time.Second
+
+func (c Client) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = DefaultRequestTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
 
 func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.IngestResult, error) {
 	if strings.TrimSpace(c.ServerURL) == "" {
@@ -49,6 +67,12 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 	}
 	if len(events) == 0 {
 		return database.IngestResult{}, fmt.Errorf("events must not be empty")
+	}
+	events = sanitizeOutboundEvents(events)
+	// Validate the complete batch before encoding or opening the first HTTP
+	// request. A privacy rejection therefore cannot partially upload a batch.
+	if err := usage.ValidateOutboundBatch(events); err != nil {
+		return database.IngestResult{}, err
 	}
 	batches, err := splitIngestBatches(events)
 	if err != nil {
@@ -75,6 +99,17 @@ func (c Client) Ingest(ctx context.Context, events []usage.Event) (database.Inge
 	return combined, nil
 }
 
+// sanitizeOutboundEvents copies the batch with inconsistent provider totals
+// downgraded to unknown; the caller's events (and their delta fingerprints)
+// are left unchanged.
+func sanitizeOutboundEvents(events []usage.Event) []usage.Event {
+	sanitized := make([]usage.Event, len(events))
+	for index, event := range events {
+		sanitized[index] = usage.SanitizeOutbound(event)
+	}
+	return sanitized
+}
+
 func splitIngestBatches(events []usage.Event) ([][]usage.Event, error) {
 	envelopeBytes := len(`{"events":[]}`) - 2
 	var batches [][]usage.Event
@@ -89,7 +124,7 @@ func splitIngestBatches(events []usage.Event) ([][]usage.Event, error) {
 		if len(batch) > 0 {
 			separatorBytes = 1
 		}
-		if len(batch) > 0 && batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes {
+		if len(batch) > 0 && (batchBytes+separatorBytes+len(encoded) > maxIngestBatchBytes || len(batch) >= maxIngestBatchEvents) {
 			batches = append(batches, batch)
 			batch = nil
 			batchBytes = envelopeBytes
@@ -126,7 +161,9 @@ func (c Client) Health(ctx context.Context) error {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
 	if err != nil {
 		return err
 	}
@@ -157,7 +194,9 @@ func (c Client) postJSON(ctx context.Context, path string, payload any, result a
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.ServerURL, "/")+path, bytes.NewReader(encoded))
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, strings.TrimRight(c.ServerURL, "/")+path, bytes.NewReader(encoded))
 	if err != nil {
 		return err
 	}

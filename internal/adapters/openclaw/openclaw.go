@@ -123,7 +123,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return adapters.ParseResult{}, err
 	}
 
-	sessionID := firstNonEmpty(header.ID, header.SessionID, header.SessionIDAlt, sessionIDFromPath(source.Path))
+	sessionID := usage.NormalizeSessionID(firstNonEmpty(header.ID, header.SessionID, header.SessionIDAlt, sessionIDFromPath(source.Path)))
 	project := usage.NormalizeProject(header.CWD)
 	reader := bufio.NewReaderSize(file, 64*1024)
 	position := offset
@@ -133,7 +133,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			return adapters.ParseResult{}, err
 		}
 		lineOffset := position
-		line, readErr := reader.ReadBytes('\n')
+		line, readErr := adapters.ReadRecord(reader)
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -194,7 +194,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			continue
 		}
 
-		currentSessionID := firstNonEmpty(record.SessionID, record.SessionIDAlt, sessionID)
+		currentSessionID := usage.NormalizeSessionID(firstNonEmpty(record.SessionID, record.SessionIDAlt, sessionID))
 		currentProject := firstNonEmpty(
 			usage.NormalizeProject(record.CWD),
 			usage.NormalizeProject(record.Message.CWD),
@@ -357,7 +357,7 @@ func readHeader(file *os.File) (transcriptHeader, []byte, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return transcriptHeader{}, nil, err
 	}
-	line, err := bufio.NewReaderSize(file, 64*1024).ReadBytes('\n')
+	line, err := adapters.ReadRecord(bufio.NewReaderSize(file, 64*1024))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return transcriptHeader{}, nil, err
 	}
@@ -382,7 +382,7 @@ func makeCursorIdentity(sourceIdentity string, header []byte) string {
 }
 
 func sessionIDFromPath(path string) string {
-	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	return usage.HashSessionID(path)
 }
 
 func parseTimestamp(raw json.RawMessage) (time.Time, error) {

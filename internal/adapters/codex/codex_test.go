@@ -138,6 +138,38 @@ func TestParseSessionLogPriceDefiningTokensWithoutConversationContent(t *testing
 	}
 }
 
+func TestParseSessionLogHashesFilenameFallbackAndRemainsStable(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "private title.jsonl")
+	log := `{"timestamp":"2026-07-12T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}` + "\n"
+	if err := os.WriteFile(path, []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %+v, error: %v", sources, err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, error: %v", first, err)
+	}
+	second, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(second.Events) != 1 {
+		t.Fatalf("second parse = %+v, error: %v", second, err)
+	}
+	if !strings.HasPrefix(first.Events[0].SessionID, "sha256:") || strings.Contains(first.Events[0].SessionID, "private title") {
+		t.Fatalf("filename leaked through session ID: %q", first.Events[0].SessionID)
+	}
+	if first.Events[0].EventID != second.Events[0].EventID {
+		t.Fatalf("fallback session ID changed event identity: first=%+v second=%+v", first.Events[0], second.Events[0])
+	}
+}
+
 func TestDiscoveringNewSessionDoesNotInvalidateUnchangedSession(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".codex", "sessions", "2026", "07", "12")

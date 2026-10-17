@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Build the four native agent artifacts consumed by deploy/install-agent.sh.
+# Release tags are immutable semantic versions; CI adds the SBOM and signs the
+# resulting checksums file with Cosign's keyless GitHub Actions identity.
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 version="${1:-${TOKEMON_VERSION:-}}"
@@ -9,7 +11,7 @@ output_dir="${2:-$root/dist}"
 version="${version#v}"
 
 [[ -n "$version" ]] || { printf 'usage: build-release.sh VERSION [OUTPUT_DIR]\n' >&2; exit 2; }
-[[ "$version" =~ ^[0-9A-Za-z._-]+$ ]] || { printf 'invalid version: %s\n' "$version" >&2; exit 2; }
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { printf 'invalid semantic version: %s\n' "$version" >&2; exit 2; }
 
 commit="${TOKEMON_COMMIT:-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')}"
 build_date="${TOKEMON_BUILD_DATE:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
