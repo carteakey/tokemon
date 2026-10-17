@@ -153,6 +153,7 @@ ORDER BY time_created, id`)
 		if err := rows.Scan(&sessionID, &createdAt, &updatedAt, &rawModel, &input, &output, &reasoning, &cacheRead, &cacheWrite, &cost, &workingDirectory); err != nil {
 			return adapters.ParseResult{}, err
 		}
+		normalizedSessionID := usage.NormalizeSessionID(sessionID)
 		model, provider := modelMetadata(rawModel)
 		if model == "" {
 			model = "unknown"
@@ -170,7 +171,7 @@ ORDER BY time_created, id`)
 			EventID:          usage.DeterministicID(machineID, adapterID, sourceIdentity, 0, "snapshot", sessionID),
 			Timestamp:        timestamp,
 			MachineID:        machineID,
-			SessionID:        sessionID,
+			SessionID:        normalizedSessionID,
 			Project:          usage.NormalizeProject(workingDirectory),
 			Provider:         provider,
 			Model:            model,
