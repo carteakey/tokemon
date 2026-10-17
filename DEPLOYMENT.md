@@ -30,7 +30,7 @@ dashboard.
 
 ## Requirements
 
-For the hub, install Docker Engine or Docker Desktop with Compose support. For native agents, use macOS or Linux on arm64 or amd64. A Go installation is only needed when building from source.
+For the hub, install Docker Engine or Docker Desktop with Compose support. For native agents, use macOS or Linux on arm64 or amd64. Building from source requires Go 1.26.9 or newer; CI and release builds use Go 1.26.9.
 
 ## Run the hub with Docker Compose
 

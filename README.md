@@ -20,7 +20,7 @@ Tools without a native provider can use Tokemon's generic event import path.
 
 ## Run locally
 
-Requires Go 1.26+.
+Requires Go 1.26.9 or newer.
 
 Start the dashboard:
 
