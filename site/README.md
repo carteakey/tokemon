@@ -28,7 +28,7 @@ npm run lint
 ## Release links
 
 - [Tokemon source repository](https://github.com/carteakey/tokemon)
-- [Latest Tokemon release](https://github.com/carteakey/tokemon/releases/tag/v0.3.3)
+- [Latest Tokemon release](https://github.com/carteakey/tokemon/releases/tag/v0.4.0)
 - [Public deployment guide](https://github.com/carteakey/tokemon/blob/main/DEPLOYMENT.md)
 - [MIT license](https://github.com/carteakey/tokemon/blob/main/LICENSE)
 

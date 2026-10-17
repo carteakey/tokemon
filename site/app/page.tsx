@@ -67,8 +67,8 @@ export default function Home() {
           <a href="#tokedex">Tokedex</a>
           <a href="#about">About</a>
         </div>
-        <a className="navCta" href="https://github.com/carteakey/tokemon/releases/tag/v0.3.3">
-          v0.3.3 <span>↗</span>
+        <a className="navCta" href="https://github.com/carteakey/tokemon/releases/tag/v0.4.0">
+          v0.4.0 <span>↗</span>
         </a>
       </nav>
 
@@ -111,7 +111,7 @@ export default function Home() {
         </div>
         <div className="installLinks">
           <a className="textLink" href="https://github.com/carteakey/tokemon/blob/main/DEPLOYMENT.md">Read deployment guide <span>↗</span></a>
-          <a className="textLink" href="https://github.com/carteakey/tokemon/releases/tag/v0.3.3">Download v0.3.3 <span>↗</span></a>
+          <a className="textLink" href="https://github.com/carteakey/tokemon/releases/tag/v0.4.0">Download v0.4.0 <span>↗</span></a>
         </div>
         <p className="commandNote">The same binary also includes <code>discover</code>, <code>inspect</code>, <code>import</code>, <code>export</code>, and <code>purge</code>. Run <code>inspect</code> to see exactly what leaves the machine.</p>
         <p className="requirement">Requires Go 1.26+ <span>·</span> macOS and Linux deployment paths included <span>·</span> Keep ingest private or set a token</p>
@@ -193,7 +193,7 @@ export default function Home() {
           <p>Tokemon is an independent, MIT-licensed experiment in making invisible coding-agent usage feel tangible—without turning private work into telemetry.</p>
           <div className="resourceLinks" aria-label="Tokemon resources">
             <a href="https://github.com/carteakey/tokemon">Source repository <span>↗</span></a>
-            <a href="https://github.com/carteakey/tokemon/releases/tag/v0.3.3">Latest release <span>↗</span></a>
+            <a href="https://github.com/carteakey/tokemon/releases/tag/v0.4.0">Latest release <span>↗</span></a>
             <a href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md">Product spec <span>↗</span></a>
           </div>
           <p className="aboutNote">Independent and just for fun. Not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.</p>

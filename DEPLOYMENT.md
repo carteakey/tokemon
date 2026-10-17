@@ -234,7 +234,7 @@ Use the shared installer to install a checksum-verified release binary and a use
 
 ```bash
 bash deploy/install-agent.sh \
-  --version 0.3.2 \
+  --version 0.4.0 \
   --server https://tokemon.example.ts.net \
   --machine-id laptop \
   --adapters claude-code,codex \
@@ -245,7 +245,7 @@ TOKEN
 
 The installer selects the matching macOS or Linux architecture, writes a mode-`0600` configuration, preserves the local state database across upgrades, and installs launchd or systemd without requiring root. Use a private server base URL; the installer adds the API paths itself.
 
-For a locally built binary, replace `--version 0.3.2` with `--binary ./tokemon`:
+For a locally built binary, replace `--version 0.4.0` with `--binary ./tokemon`:
 
 ```bash
 bash deploy/install-agent.sh \
