@@ -109,9 +109,9 @@ mutable `latest` tag. See [release integrity and safe upgrades](DEPLOYMENT.md#re
 
 ## Roadmap
 
-- **Current:** reliable multi-machine collection, metadata-only privacy, analytics, and the evolving Tokemon dashboard.
-- **Next:** broader provider fixtures, release verification, and a smoother install path.
-- **Later:** signed macOS and Linux distribution, more providers, and deeper evolution art.
+- **Current:** reliable multi-machine collection, metadata-only privacy, analytics, the evolving Tokemon dashboard, and signed macOS and Linux releases.
+- **Next:** broader provider fixtures and a smoother install path.
+- **Later:** more providers and deeper evolution art.
 
 ## Develop
 

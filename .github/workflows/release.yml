@@ -65,6 +65,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+      - name: Require release notes in CHANGELOG.md
+        # Fail before anything is published if the tagged version has no notes.
+        run: |
+          heading="## ${GITHUB_REF_NAME#v}"
+          awk -v heading="$heading" '$0 == heading {found = 1; next} found && /^## / {exit} found {print}' \
+            CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md" || {
+            printf 'CHANGELOG.md has no "%s" section\n' "$heading" >&2
+            exit 1
+          }
       - name: Download native archives
         uses: actions/download-artifact@v4
         with:
@@ -90,6 +100,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The default docker driver cannot build multi-platform images with
+      # attestations, and the arm64 build stage needs emulation. Set these up
+      # after the scan so the single-arch scan image still loads locally.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Publish immutable semver image (no latest tag)
         id: image
         run: |
@@ -124,4 +141,4 @@ jobs:
         run: |
           version="$GITHUB_REF_NAME"
           gh release create "$version" dist/* \
-            --title "Tokemon ${version#v}" --generate-notes
+            --title "Tokemon ${version#v}" --notes-file "$RUNNER_TEMP/release-notes.md"
