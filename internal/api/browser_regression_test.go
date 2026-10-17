@@ -105,6 +105,39 @@ func TestMobileNavigation390BrowserRegression(t *testing.T) {
 	}
 }
 
+// The breakdown cards' fixed 60/24/16 column split once leaked into the wide
+// health and session tables, collapsing their middle columns on top of each
+// other. Keep those tables content-sized with labelled cells for phones.
+func TestOverviewWideTablesKeepTheirOwnLayout(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/wide-tables.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.RecordHeartbeat(context.Background(), database.AgentHeartbeat{MachineID: "laptop", OperatingSystem: "darwin", Architecture: "arm64", SourceCount: 3, SourceErrorCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "wide-tables-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.SetBasicAuth("tokemon", testDashboardToken)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	body := response.Body.String()
+	for _, want := range []string{
+		`.health-table, .sessions-table { table-layout: auto; }`,
+		`.health-table :is(th, td):first-child, .sessions-table :is(th, td):first-child { width: 100%;`,
+		`<td data-label="Last seen">`, `<td data-label="Lifetime">`, `class="sync-error">1 source error<span class="table-muted">of 3 sources</span>`,
+		`<a class="settings-link" href="/settings"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("overview missing wide-table contract %q", want)
+		}
+	}
+}
+
 func TestAnalyticsEmptyStateBrowserRegression(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/empty.db", catalog.Empty())
 	if err != nil {

@@ -26,6 +26,7 @@ GitHub Release.
 - Added the `/tokedex` model catalog, a filterable metadata-only `/sessions` timeline with export, machine health, and today/week context, plus timeline, sessions, machines, catalog, and models read APIs.
 - Added an `/insights` page of deterministic aggregate cards. An optional AI recap runs only when `TOKEMON_INSIGHTS_OPENAI_API_KEY` is set and sends bounded aggregates with `store: false`. The page is not yet linked from the main navigation.
 - Improved dashboard accessibility, mobile navigation, and readability.
+- Fixed overlapping columns in the overview Machine health and Recent sessions tables, added labelled phone layouts for them and the Sessions timeline, unified navigation and headers across every page, and made model versions (`Opus 5.5`), costs (`$9,295.77`), and long durations (`21m 33s`) read naturally.
 - Bounded JSONL record reads in the Claude, Copilot, generic, and OpenClaw adapters so one unterminated line cannot grow without limit.
 - Kept agent backfills within the request deadline, split ingest batches by event count as well as size, and preserved token components when a provider total is inconsistent.
 - Added a tag-driven release workflow that builds the four native archives, generates an SPDX SBOM, scans and publishes a multi-arch GHCR image, and signs every asset and the image with keyless Cosign.

@@ -1365,3 +1365,32 @@ func TestInsightsRoutesRequireDashboardAuth(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayFormattersReadNaturally(t *testing.T) {
+	for raw, want := range map[string]string{
+		"claude-opus-5-5":            "Opus 5.5",
+		"claude-sonnet-4-5-20250929": "Sonnet 4.5",
+		"claude-3-5-sonnet":          "3.5 Sonnet",
+		"claude-opus-4":              "Opus 4",
+		"gpt-6.1-sol":                "GPT-6.1 Sol",
+	} {
+		if got := compactModelName(raw); got != want {
+			t.Errorf("compactModelName(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	for raw, want := range map[string]string{"macbook-air-2": "MacBook Air 2", "Kartikeys-MacBook-Air": "MacBook Air", "fx505": "fx505"} {
+		if got := compactMachineName(raw); got != want {
+			t.Errorf("compactMachineName(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	for value, want := range map[float64]string{0: "$0.00", 10: "$10.00", 9295.774: "$9,295.77", 1234567.891: "$1,234,567.89", -12.5: "-$12.50"} {
+		if got := money(value); got != want {
+			t.Errorf("money(%v) = %q, want %q", value, got, want)
+		}
+	}
+	for ms, want := range map[int64]string{850: "850ms", 42_000: "42.0s", 1_292_500: "21m 33s", 3_600_000: "1h 00m", 5_025_000: "1h 23m"} {
+		if got := durationLabel(ms); got != want {
+			t.Errorf("durationLabel(%d) = %q, want %q", ms, got, want)
+		}
+	}
+}
