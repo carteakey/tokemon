@@ -783,13 +783,16 @@ Built-in and extension adapters:
 5. Antigravity
 6. OpenClaw
 7. Hermes Agent
-8. Generic JSONL
+8. ZCode
+9. Generic JSONL
 
 GitHub Copilot CLI usage is read from `~/.copilot/session-state/*/events.jsonl`. The adapter consumes only durable `session.shutdown.modelMetrics.usage` aggregates and the final directory name from session context. Prompts, responses, tool arguments, titles, repository paths, and modified-file lists are never included in normalized events. One stable snapshot is emitted per model and session; active sessions become visible after Copilot writes their shutdown aggregate.
 
 OpenClaw usage is read from `~/.openclaw/agents/*/sessions/*.jsonl`. The adapter consumes only assistant message usage metadata, provider, model, timestamps, and the session header's normalized project basename. Transcript content, tool calls, tool arguments, trajectory mirrors, and full working-directory paths are never included in normalized events. Zero-token delivery and error records are ignored, and incomplete final records remain eligible for the next poll.
 
 Hermes Agent usage is read from the `sessions` and `session_model_usage` metadata tables in `~/.hermes/state.db` and `~/.hermes/profiles/*/state.db`. The adapter reconciles per-model and auxiliary usage against session aggregates, preserving provider, model, token components, timestamps, costs, and only the normalized working-directory basename. It never queries Hermes' `messages` table, so prompts, responses, reasoning text, tool arguments, conversation titles, credentials, billing endpoints, and full filesystem paths remain local. Stable snapshot IDs and WAL-aware source signatures make repeated polling idempotent while active sessions continue to update.
+
+ZCode usage is read from the `model_usage` metadata table in `~/.zcode/cli/db/db.sqlite`, joined to the `session` table's working directory. Terminal CLI sessions, desktop-app sessions, and subagents all write into that one store, so a single source covers every ZCode mode. The adapter aggregates usage per session and model with provider, token components, timestamps, and only the normalized project basename. It never queries the `message`, `part`, or `session_input` tables and never reads rollout transcripts, so prompts, responses, reasoning text, tool arguments, conversation titles, and full paths remain local. ZCode reports no cost, so no cost fields are emitted; requests without tokens are ignored, and WAL-aware source signatures make repeated polling idempotent while active sessions continue to update.
 
 ### Generic JSONL
 

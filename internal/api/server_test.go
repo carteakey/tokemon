@@ -878,6 +878,7 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 		"antigravity":  "gemini",
 		"openclaw":     "openclaw",
 		"hermes-agent": "hermes",
+		"zcode":        "zcode",
 	} {
 		glyph := glyphForHarness(tool)
 		if glyph.Kind != "harness" || glyph.Preset != preset {
@@ -889,6 +890,9 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 	}
 	if got := harnessName("hermes-agent"); got != "Hermes Agent" {
 		t.Fatalf("Hermes harness label = %q", got)
+	}
+	if got := harnessName("zcode"); got != "ZCode" {
+		t.Fatalf("ZCode harness label = %q", got)
 	}
 }
 

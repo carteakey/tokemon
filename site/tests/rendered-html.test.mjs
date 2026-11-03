@@ -57,7 +57,7 @@ test("keeps the evolution archive a teaser", async () => {
 
 test("guards product facts", async () => {
   const page = await html();
-  for (const adapter of ["Claude Code", "Codex", "GitHub Copilot CLI", "OpenCode", "Antigravity", "OpenClaw", "Hermes Agent", "Generic JSONL"]) {
+  for (const adapter of ["Claude Code", "Codex", "GitHub Copilot CLI", "OpenCode", "Antigravity", "OpenClaw", "Hermes Agent", "ZCode", "Generic JSONL"]) {
     assert.match(page, new RegExp(adapter, "i"), `missing adapter ${adapter}`);
   }
   assert.match(page, /MIT licensed/);

@@ -37,6 +37,7 @@ services:
       - ${TOKEMON_ANTIGRAVITY_DIR:-${HOME}/.gemini/antigravity-cli}:/home/tokemon/.gemini/antigravity-cli:ro
       - ${TOKEMON_OPENCLAW_DIR:-${HOME}/.openclaw}:/home/tokemon/.openclaw:ro
       - ${TOKEMON_HERMES_DIR:-${HOME}/.hermes}:/home/tokemon/.hermes:ro
+      - ${TOKEMON_ZCODE_DIR:-${HOME}/.zcode/cli/db}:/home/tokemon/.zcode/cli/db:ro
       - ${TOKEMON_GENERIC_JSONL_DIR:-./generic-jsonl}:/home/tokemon/generic:ro
 
   # Optional smoke service. It must fail every provider write attempt; the
@@ -60,6 +61,7 @@ services:
       - ${TOKEMON_ANTIGRAVITY_DIR:-${HOME}/.gemini/antigravity-cli}:/home/tokemon/.gemini/antigravity-cli:ro
       - ${TOKEMON_OPENCLAW_DIR:-${HOME}/.openclaw}:/home/tokemon/.openclaw:ro
       - ${TOKEMON_HERMES_DIR:-${HOME}/.hermes}:/home/tokemon/.hermes:ro
+      - ${TOKEMON_ZCODE_DIR:-${HOME}/.zcode/cli/db}:/home/tokemon/.zcode/cli/db:ro
       - ${TOKEMON_GENERIC_JSONL_DIR:-./generic-jsonl}:/home/tokemon/generic:ro
     entrypoint: ["/bin/sh", "-ec"]
     command:
@@ -78,7 +80,7 @@ services:
           exit 1
         fi
         rm -f /state/state.db
-        for path in /home/tokemon/.claude /home/tokemon/.codex /home/tokemon/.copilot /home/tokemon/.local/share/opencode /home/tokemon/.gemini/antigravity-cli /home/tokemon/.openclaw /home/tokemon/.hermes /home/tokemon/generic; do
+        for path in /home/tokemon/.claude /home/tokemon/.codex /home/tokemon/.copilot /home/tokemon/.local/share/opencode /home/tokemon/.gemini/antigravity-cli /home/tokemon/.openclaw /home/tokemon/.hermes /home/tokemon/.zcode/cli/db /home/tokemon/generic; do
           if touch "$$path/.tokemon-write-check" 2>/dev/null; then
             echo "provider mount is writable: $$path" >&2
             exit 1

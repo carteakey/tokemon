@@ -89,7 +89,8 @@ export const adapters: Adapter[] = [
   { no: "05", name: "Antigravity", id: "antigravity", habitat: "~/.gemini/antigravity*", format: "SQLite", enabled: "Default on" },
   { no: "06", name: "OpenClaw", id: "openclaw", habitat: "~/.openclaw/agents", format: "JSONL", enabled: "Default on" },
   { no: "07", name: "Hermes Agent", id: "hermes-agent", habitat: "~/.hermes/state.db", format: "SQLite", enabled: "Default on" },
-  { no: "08", name: "Generic JSONL", id: "generic-jsonl", habitat: "Paths you configure", format: "Normalized JSONL", enabled: "Opt-in" },
+  { no: "08", name: "ZCode", id: "zcode", habitat: "~/.zcode/cli/db/db.sqlite", format: "SQLite", enabled: "Default on" },
+  { no: "09", name: "Generic JSONL", id: "generic-jsonl", habitat: "Paths you configure", format: "Normalized JSONL", enabled: "Opt-in" },
 ];
 
 export const releaseNotes = [

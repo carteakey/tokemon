@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Added a metadata-only ZCode adapter reading `model_usage` from `~/.zcode/cli/db/db.sqlite`. Terminal CLI, desktop-app, and subagent sessions share that store, so one source covers every ZCode mode; usage aggregates per session and model with cache-aware input decomposition.
+- Environments that pin `TOKEMON_ADAPTERS` must add `zcode` to the list to pick the adapter up; unset selections enable it by default.
+
 ## 0.4.0
 
 The first signed Tokemon release and the first published release since 0.3.2.

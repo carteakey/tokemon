@@ -14,7 +14,7 @@ Tokemon is an independent project made just for fun and is not affiliated with, 
 
 ## Supported providers
 
-Claude Code · Codex · GitHub Copilot CLI · OpenCode · Antigravity · OpenClaw · Hermes Agent
+Claude Code · Codex · GitHub Copilot CLI · OpenCode · Antigravity · OpenClaw · Hermes Agent · ZCode
 
 Tools without a native provider can use Tokemon's generic event import path.
 

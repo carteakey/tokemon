@@ -12,7 +12,7 @@ checking it in):
 TOKEMON_SERVER_URL=https://tokemon.example.ts.net
 TOKEMON_INGEST_TOKEN=replace-with-a-generated-secret
 TOKEMON_MACHINE_ID=container-agent
-TOKEMON_ADAPTERS=claude-code,codex,copilot-cli,opencode,antigravity,openclaw,hermes-agent
+TOKEMON_ADAPTERS=claude-code,codex,copilot-cli,opencode,antigravity,openclaw,hermes-agent,zcode
 TOKEMON_HOME=/home/tokemon
 TOKEMON_STATE=/state/state.db
 TOKEMON_JSONL_PATHS=/home/tokemon/generic/*.jsonl
