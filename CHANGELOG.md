@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fixed dashboard WCAG AA contrast: the analytics Apply-filters button no longer renders accent text on the browser's default gray button background (2.54:1 → 8.43:1), and dimmed labels, footers, table headers, and axis text use a faint-gray token that passes on both card and page backgrounds (3.77–4.04:1 → 5.04–5.39:1).
+- Stopped the overview breakdown tables from truncating share percentages such as 100.0% by widening the share column (16% → 25%) in the fixed table layout.
+- Made dashboard keyboard focus visible: the settings gear keeps a solid accent outline instead of dropping it, and window links, selects, and action buttons show solid outlines on focus instead of ~16–22% alpha ones.
+- Reduced overview keyboard tab stops from 374 to 20 by making token-activity heatmap cells focusable only on days with usage or unknown tokens; the tooltip continues to open on focus for the remaining cells.
+- Exposed odometer values to screen readers via role=img and aria-label so assistive tech hears the formatted total instead of every digit-reel value.
+
 ## 0.3.3
 
 - Added a metadata-only Hermes Agent adapter for default and named-profile SQLite usage stores.
