@@ -8,6 +8,9 @@
 - Added a hub health preflight so offline hubs back off without repeatedly scanning local provider histories.
 - Cached the dashboard evolution summary between ingests with a bounded freshness window, while keeping writes visible immediately and collapsing concurrent polling into one recompute.
 - Hardened evolution and analytics accounting with schema drift warnings, missing-token attribution tests, and regression coverage for share timeline invariants.
+- Added a covering index over lifetime token totals so ingest batches, evolution recomputes, and dashboard renders stop scanning the full usage history.
+- Cached dashboard overview renders between ingests with the same bounded freshness window as the evolution summary, collapsing concurrent dashboard, analytics overview, and settings loads into one recompute; a compute that raced an ingest can no longer reinstall stale results.
+- Stopped the agent from re-writing unchanged source cursors on every poll cycle.
 
 ## 0.3.2
 

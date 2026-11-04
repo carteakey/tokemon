@@ -462,7 +462,7 @@ func runAgent(args []string) error {
 			}
 			fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
 		}
-		if err := stateStore.Commit(ctx, *machineID, reports, pending, time.Now().UTC()); err != nil {
+		if err := stateStore.Commit(ctx, *machineID, snapshot, reports, pending, time.Now().UTC()); err != nil {
 			return err
 		}
 		if len(pending) == 0 {

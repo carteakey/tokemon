@@ -30,17 +30,28 @@ import (
 )
 
 type Server struct {
-	store          *database.Store
-	ingestToken    string
-	template       *template.Template
-	static         http.Handler
-	evolutionMu    sync.Mutex
-	evolutionCache *evolutionCacheEntry
-	evolutionReady chan struct{}
+	store               *database.Store
+	ingestToken         string
+	template            *template.Template
+	static              http.Handler
+	evolutionMu         sync.Mutex
+	evolutionCache      *evolutionCacheEntry
+	evolutionReady      chan struct{}
+	evolutionGeneration uint64
+	overviewMu          sync.Mutex
+	overviewCache       *overviewCacheEntry
+	overviewReady       chan struct{}
+	overviewGeneration  uint64
 }
 
 type evolutionCacheEntry struct {
 	result  evolutionResponse
+	err     error
+	fetched time.Time
+}
+
+type overviewCacheEntry struct {
+	result  database.Overview
 	err     error
 	fetched time.Time
 }
@@ -1007,6 +1018,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateEvolutionCache()
+	s.invalidateOverviewCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -1119,6 +1131,9 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 				return evolutionResponse{}, ctx.Err()
 			}
 		}
+		// Remember the invalidation generation so a compute that started before
+		// an ingest cannot install its stale result after the ingest completed.
+		generation := s.evolutionGeneration
 		s.evolutionReady = make(chan struct{})
 		s.evolutionMu.Unlock()
 
@@ -1127,7 +1142,9 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 		s.evolutionMu.Lock()
 		ready := s.evolutionReady
 		s.evolutionReady = nil
-		s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		if s.evolutionGeneration == generation {
+			s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
 		s.evolutionMu.Unlock()
 		close(ready)
 		return result, err
@@ -1148,12 +1165,64 @@ func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error
 
 func (s *Server) invalidateEvolutionCache() {
 	s.evolutionMu.Lock()
+	s.evolutionGeneration++
 	s.evolutionCache = nil
 	s.evolutionMu.Unlock()
 }
 
+// overviewCacheTTL bounds how long cached dashboard overview data may be
+// served without any ingest writing to the store; the ingest path still
+// invalidates immediately. The dashboard auto-refreshes and each Overview
+// render costs several full-table aggregation scans, so repeat renders within
+// the TTL reuse one compute.
+const overviewCacheTTL = time.Minute
+
+func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) {
+	for {
+		s.overviewMu.Lock()
+		if cached := s.overviewCache; cached != nil && time.Since(cached.fetched) < overviewCacheTTL {
+			result, err := cached.result, cached.err
+			s.overviewMu.Unlock()
+			return result, err
+		}
+		if ready := s.overviewReady; ready != nil {
+			s.overviewMu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return database.Overview{}, ctx.Err()
+			}
+		}
+		// Remember the invalidation generation so a compute that started before
+		// an ingest cannot install its stale result after the ingest completed.
+		generation := s.overviewGeneration
+		s.overviewReady = make(chan struct{})
+		s.overviewMu.Unlock()
+
+		result, err := s.store.Overview(ctx)
+
+		s.overviewMu.Lock()
+		ready := s.overviewReady
+		s.overviewReady = nil
+		if s.overviewGeneration == generation {
+			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.overviewMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) invalidateOverviewCache() {
+	s.overviewMu.Lock()
+	s.overviewGeneration++
+	s.overviewCache = nil
+	s.overviewMu.Unlock()
+}
+
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1162,7 +1231,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1301,7 +1370,7 @@ func (s *Server) saveSettingsLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

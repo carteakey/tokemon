@@ -404,6 +404,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(canonical_model, raw_model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_machine ON usage_events(machine_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_total_tokens ON usage_events(total_tokens)
+WHERE total_tokens IS NOT NULL;
 CREATE TABLE IF NOT EXISTS display_aliases (
   kind TEXT NOT NULL CHECK (kind IN ('model', 'machine')),
   identity TEXT NOT NULL,
@@ -889,9 +891,13 @@ func currency(value string) string {
 	return value
 }
 
+// lifetimeTokensQuery must stay covered by idx_usage_events_total_tokens; both
+// ingest calls and every evolution recompute scan the whole history otherwise.
+const lifetimeTokensQuery = `SELECT COALESCE(SUM(total_tokens), 0) FROM usage_events WHERE total_tokens IS NOT NULL`
+
 func (s *Store) LifetimeTokens(ctx context.Context) (int64, error) {
 	var total sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0) FROM usage_events WHERE total_tokens IS NOT NULL`).Scan(&total)
+	err := s.db.QueryRowContext(ctx, lifetimeTokensQuery).Scan(&total)
 	return total.Int64, err
 }
 

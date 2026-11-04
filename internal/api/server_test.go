@@ -512,6 +512,119 @@ func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
 	}
 }
 
+func TestOverviewEndpointCachesUntilSuccessfulIngest(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-cache-initial", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{initial}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := server.Handler()
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+	if first.Code != http.StatusOK || server.overviewCache == nil {
+		t.Fatalf("initial overview response = %d %s, cache = %#v", first.Code, first.Body.String(), server.overviewCache)
+	}
+	cached := server.overviewCache
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+	if second.Code != http.StatusOK || server.overviewCache != cached || second.Body.String() != first.Body.String() {
+		t.Fatalf("repeated overview response missed cache: first=%s second=%s", first.Body.String(), second.Body.String())
+	}
+	dashboard := httptest.NewRecorder()
+	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
+	if dashboard.Code != http.StatusOK || server.overviewCache != cached {
+		t.Fatalf("dashboard response = %d, cache was not reused", dashboard.Code)
+	}
+
+	update := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-cache-update", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(15), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	payload, err := json.Marshal(batchRequest{Events: []usage.Event{update}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer secret")
+	accepted := httptest.NewRecorder()
+	handler.ServeHTTP(accepted, request)
+	if accepted.Code != http.StatusOK || server.overviewCache != nil {
+		t.Fatalf("ingest response = %d %s, overview cache was not invalidated", accepted.Code, accepted.Body.String())
+	}
+
+	refreshed := httptest.NewRecorder()
+	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) || server.overviewCache == nil || server.overviewCache == cached {
+		t.Fatalf("refreshed overview response = %d %s, cache = %#v", refreshed.Code, refreshed.Body.String(), server.overviewCache)
+	}
+}
+
+func TestOverviewEndpointCacheHandlesConcurrentPolling(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-concurrent-cache", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(42), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := server.Handler()
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for requestIndex := 0; requestIndex < 5; requestIndex++ {
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+				body := response.Body.String()
+				if response.Code != http.StatusOK || (!strings.Contains(body, `"lifetime_tokens":42`) && !strings.Contains(body, `"lifetime_tokens":43`)) {
+					t.Errorf("concurrent overview response = %d %s", response.Code, response.Body.String())
+					return
+				}
+			}
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		update := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-concurrent-update", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(1), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
+		payload, err := json.Marshal(batchRequest{Events: []usage.Event{update}})
+		if err != nil {
+			t.Errorf("marshal concurrent overview update: %v", err)
+			return
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload)))
+		if response.Code != http.StatusOK {
+			t.Errorf("concurrent overview ingest response = %d %s", response.Code, response.Body.String())
+		}
+	}()
+	close(start)
+	wait.Wait()
+
+	final := httptest.NewRecorder()
+	handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+	if final.Code != http.StatusOK || !strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
+		t.Fatalf("final overview response = %d %s", final.Code, final.Body.String())
+	}
+}
+
 func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) {
 	inputPrice := 10.0
 	outputPrice := 0.0

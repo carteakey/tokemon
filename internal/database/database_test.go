@@ -73,6 +73,40 @@ func TestOpenUsesWALForFileDatabase(t *testing.T) {
 	}
 }
 
+// LifetimeTokens runs twice per ingest batch and once per evolution recompute;
+// without the covering partial index both become full-table scans that grow
+// with the usage history.
+func TestLifetimeTokensUsesCoveringIndex(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var indexName string
+	if err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_events_total_tokens'`).Scan(&indexName); err != nil {
+		t.Fatalf("covering index missing after migration: %v", err)
+	}
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN ` + lifetimeTokensQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(detail, "USING COVERING INDEX idx_usage_events_total_tokens") {
+			t.Fatalf("lifetime tokens query plan = %q, want covering index scan", detail)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
 	if err != nil {
