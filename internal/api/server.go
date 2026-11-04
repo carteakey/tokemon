@@ -1458,7 +1458,7 @@ const dashboardTemplate = `<!doctype html>
       --surface-soft: #22261f;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #848b7f;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -1486,7 +1486,8 @@ const dashboardTemplate = `<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .settings-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
@@ -1584,9 +1585,9 @@ const dashboardTemplate = `<!doctype html>
     th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    th:first-child, td:first-child { width: 43%; }
-    th:nth-child(2), td:nth-child(2) { width: 41%; }
-    th:last-child, td:last-child { width: 16%; }
+    th:first-child, td:first-child { width: 40%; }
+    th:nth-child(2), td:nth-child(2) { width: 35%; }
+    th:last-child, td:last-child { width: 25%; }
     td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
     .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1719,7 +1720,7 @@ const dashboardTemplate = `<!doctype html>
           {{range .Activity.Weeks}}
           <div class="activity-week">
             <span class="activity-month">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="0"{{end}}></span>{{end}}
+            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}"{{if or .Level .UnknownTokens}} tabindex="0"{{end}}{{end}}></span>{{end}}
           </div>
           {{end}}
         </div>
@@ -1762,6 +1763,7 @@ const dashboardTemplate = `<!doctype html>
 (() => {
   const renderOdometer = (odometer, display, animate = true) => {
     odometer.dataset.display = display;
+    odometer.setAttribute('role', 'img');
     odometer.setAttribute('aria-label', display);
     odometer.replaceChildren();
     const fallback = document.createElement('span');
@@ -2227,7 +2229,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --surface: #171916;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #848b7f;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -2319,7 +2321,7 @@ const settingsLoginTemplate = `{{define "settings-login"}}<!doctype html>
   <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
   <title>Tokemon · Settings Sign In</title>
   <style>
-    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --text: #f0ede5; --muted: #a2a69b; --faint: #6f766b; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --warm: #d2a477; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --text: #f0ede5; --muted: #a2a69b; --faint: #848b7f; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --warm: #d2a477; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
     main { width: min(420px, calc(100% - 24px)); margin: 12vh auto; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
@@ -2371,7 +2373,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       --surface-raised: #1d201b;
       --text: #f0ede5;
       --muted: #a2a69b;
-      --faint: #6f766b;
+      --faint: #848b7f;
       --line: #30352d;
       --line-bright: #485044;
       --accent: #9bbba0;
@@ -2400,16 +2402,18 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .heading-actions { display: flex; align-items: center; gap: 10px; }
     .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
     .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
-    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid rgba(155, 187, 160, .18); outline-offset: 1px; }
+    .window-link:hover { color: var(--text); }
+    .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
     .window-link.active { background: var(--accent); color: var(--bg); }
-    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid rgba(210, 164, 119, .22); outline-offset: 2px; }
+    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; background: transparent; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+    .action:hover { background: rgba(210, 164, 119, .1); }
+    .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
     .filter-panel { padding: 14px 16px; }
     .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
     label { display: grid; gap: 7px; color: var(--faint); }
     select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); }
-    select:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .16); }
+    select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
     .filter-actions { display: flex; align-items: end; gap: 8px; }
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
