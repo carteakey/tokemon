@@ -187,8 +187,11 @@ func (s *StateStore) Pending(ctx context.Context, machineID string, events []usa
 
 // Commit advances successful source cursors and records uploaded event
 // fingerprints atomically. Call it only after the server accepts the batch,
-// or when a poll produced no pending events.
-func (s *StateStore) Commit(ctx context.Context, machineID string, reports []adapters.SourceReport, events []usage.Event, syncedAt time.Time) error {
+// or when a poll produced no pending events. Cursors that already match the
+// committed snapshot are skipped: re-writing an unchanged cursor row would
+// otherwise churn the state database once per poll cycle for every healthy
+// source.
+func (s *StateStore) Commit(ctx context.Context, machineID string, committed StateSnapshot, reports []adapters.SourceReport, events []usage.Event, syncedAt time.Time) error {
 	if strings.TrimSpace(machineID) == "" {
 		return errors.New("machine ID is required")
 	}
@@ -214,6 +217,9 @@ func (s *StateStore) Commit(ctx context.Context, machineID string, reports []ada
 		}
 		cursor := report.Cursor
 		cursor.Identity = identity
+		if existing, ok := committed.Cursors[sourceKey(report.Adapter, report.Path)]; ok && existing == cursor {
+			continue
+		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO source_state (
     machine_id, adapter, source_path, source_identity,

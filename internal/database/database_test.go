@@ -74,6 +74,40 @@ func TestOpenUsesWALForFileDatabase(t *testing.T) {
 	}
 }
 
+// LifetimeTokens runs twice per ingest batch and once per evolution recompute;
+// without the covering partial index both become full-table scans that grow
+// with the usage history.
+func TestLifetimeTokensUsesCoveringIndex(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var indexName string
+	if err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_events_total_tokens'`).Scan(&indexName); err != nil {
+		t.Fatalf("covering index missing after migration: %v", err)
+	}
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN ` + lifetimeTokensQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(detail, "USING COVERING INDEX idx_usage_events_total_tokens") {
+			t.Fatalf("lifetime tokens query plan = %q, want covering index scan", detail)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
 	if err != nil {
@@ -590,6 +624,34 @@ func TestOverviewGroupsUsageByTool(t *testing.T) {
 	}
 	if len(overview.ByTool) != 2 || overview.ByTool[0].Tool != "codex" || overview.ByTool[0].Tokens != 150 || overview.ByTool[1].Tool != "claude-code" || overview.ByTool[1].Tokens != 75 {
 		t.Fatalf("unexpected tool summary: %+v", overview.ByTool)
+	}
+}
+
+func TestOverviewUsesDistinctSessionIdentityCounts(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-1", Timestamp: now, MachineID: "laptop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-a-2", Timestamp: now.Add(time.Second), MachineID: "laptop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "session-b", Timestamp: now.Add(2 * time.Second), MachineID: "desktop", SessionID: "same", Project: "/repos/demo", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(30), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByModel) != 1 || overview.ByModel[0].Sessions != 2 {
+		t.Fatalf("model sessions = %+v, want two machine-scoped sessions", overview.ByModel)
+	}
+	if len(overview.ByProject) != 1 || overview.ByProject[0].Sessions != 2 {
+		t.Fatalf("project sessions = %+v, want two machine-scoped sessions", overview.ByProject)
 	}
 }
 

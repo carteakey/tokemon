@@ -38,10 +38,21 @@ type Server struct {
 	evolutionMu          sync.Mutex
 	evolutionCache       *evolutionCacheEntry
 	evolutionReady       chan struct{}
+	evolutionGeneration  uint64
+	overviewMu           sync.Mutex
+	overviewCache        *overviewCacheEntry
+	overviewReady        chan struct{}
+	overviewGeneration   uint64
 }
 
 type evolutionCacheEntry struct {
 	result  evolutionResponse
+	err     error
+	fetched time.Time
+}
+
+type overviewCacheEntry struct {
+	result  database.Overview
 	err     error
 	fetched time.Time
 }
@@ -185,6 +196,13 @@ type sessionsPageData struct {
 }
 
 const dashboardUsageRowsLimit = 5
+
+const (
+	maxIngestBodyBytes         = 10 << 20
+	maxIngestDecompressedBytes = 32 << 20
+	maxEventsPerBatch          = 5000
+	maxHeartbeatBodyBytes      = 1 << 20
+)
 
 const (
 	glyphOff uint8 = iota
@@ -1157,6 +1175,8 @@ type heartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
+var errRequestBodyTooLarge = errors.New("request body exceeds the size limit")
+
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ingestRequests.Add(1)
 	if !s.ingestAuthorized(r) {
@@ -1201,6 +1221,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ingestRejected.Add(uint64(result.Rejected))
 	s.logger.Info("ingest_completed", "events", len(request.Events), "accepted", result.Accepted, "duplicates", result.Duplicates, "rejected", result.Rejected)
 	s.invalidateEvolutionCache()
+	s.invalidateOverviewCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -1231,6 +1252,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine_id is required"})
 		return
 	}
+	if len(request.MachineID) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "machine_id is too long"})
+		return
+	}
+	if len(request.AgentVersion) > 64 || len(request.OperatingSystem) > 32 || len(request.Architecture) > 16 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "heartbeat metadata field is too long"})
+		return
+	}
 	if request.SourceCount < 0 || request.SourceErrorCount < 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source counts cannot be negative"})
 		return
@@ -1243,6 +1272,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	for _, adapter := range request.Adapters {
 		if strings.TrimSpace(adapter.ID) == "" || len([]rune(adapter.ID)) > 128 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter IDs must be non-empty and at most 128 characters"})
+			return
+		}
+		if len(adapter.Version) > 64 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter version is too long"})
 			return
 		}
 		adapterIDs = append(adapterIDs, adapter.ID)
@@ -1366,6 +1399,9 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 				return evolutionResponse{}, ctx.Err()
 			}
 		}
+		// Remember the invalidation generation so a compute that started before
+		// an ingest cannot install its stale result after the ingest completed.
+		generation := s.evolutionGeneration
 		s.evolutionReady = make(chan struct{})
 		s.evolutionMu.Unlock()
 
@@ -1374,7 +1410,9 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 		s.evolutionMu.Lock()
 		ready := s.evolutionReady
 		s.evolutionReady = nil
-		s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		if s.evolutionGeneration == generation {
+			s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
 		s.evolutionMu.Unlock()
 		close(ready)
 		return result, err
@@ -1399,13 +1437,65 @@ func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error
 
 func (s *Server) invalidateEvolutionCache() {
 	s.evolutionMu.Lock()
+	s.evolutionGeneration++
 	s.evolutionCache = nil
 	s.evolutionMu.Unlock()
 }
 
+// overviewCacheTTL bounds how long cached dashboard overview data may be
+// served without any ingest writing to the store; the ingest path still
+// invalidates immediately. The dashboard auto-refreshes and each Overview
+// render costs several full-table aggregation scans, so repeat renders within
+// the TTL reuse one compute.
+const overviewCacheTTL = time.Minute
+
+func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) {
+	for {
+		s.overviewMu.Lock()
+		if cached := s.overviewCache; cached != nil && time.Since(cached.fetched) < overviewCacheTTL {
+			result, err := cached.result, cached.err
+			s.overviewMu.Unlock()
+			return result, err
+		}
+		if ready := s.overviewReady; ready != nil {
+			s.overviewMu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return database.Overview{}, ctx.Err()
+			}
+		}
+		// Remember the invalidation generation so a compute that started before
+		// an ingest cannot install its stale result after the ingest completed.
+		generation := s.overviewGeneration
+		s.overviewReady = make(chan struct{})
+		s.overviewMu.Unlock()
+
+		result, err := s.store.Overview(ctx)
+
+		s.overviewMu.Lock()
+		ready := s.overviewReady
+		s.overviewReady = nil
+		if s.overviewGeneration == generation {
+			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.overviewMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) invalidateOverviewCache() {
+	s.overviewMu.Lock()
+	s.overviewGeneration++
+	s.overviewCache = nil
+	s.overviewMu.Unlock()
+}
+
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1416,7 +1506,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1633,7 +1723,7 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Overview(r.Context())
+	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1801,9 +1891,9 @@ const dashboardTemplate = `<!doctype html>
     .composition-label { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; }
     .composition-share { color: var(--accent); font-weight: 700; letter-spacing: 0; }
     .composition-item.output .composition-share { color: var(--warm); }
-    .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .22); outline-offset: 2px; }
+    .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
     .composition-item.output { border-color: rgba(210, 164, 119, .58); background: rgba(210, 164, 119, .06); }
-    .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: rgba(210, 164, 119, .24); }
+    .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: var(--warm); }
     .composition-item strong { color: var(--text); font-size: 20px; font-weight: 700; letter-spacing: 0; line-height: 1; }
     .composition-item.output strong { color: var(--warm); font-size: 22px; }
     .mini-odometer { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin-top: 2px; overflow: hidden; column-gap: 1px; color: var(--text); font: 700 20px/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
@@ -1888,8 +1978,8 @@ const dashboardTemplate = `<!doctype html>
     th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     td { color: var(--muted); font: 12px/1.25 var(--font-data); }
     th:first-child, td:first-child { width: 60%; }
-    th:nth-child(2), td:nth-child(2) { width: 24%; }
-    th:last-child, td:last-child { width: 16%; }
+    th:nth-child(2), td:nth-child(2) { width: 18%; }
+    th:last-child, td:last-child { width: 22%; }
     td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
     .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2058,7 +2148,7 @@ const dashboardTemplate = `<!doctype html>
           {{range .Activity.Weeks}}
           <div class="activity-week">
             <span class="activity-month">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="0"{{end}}></span>{{end}}
+            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}"{{if or .Level .UnknownTokens}} tabindex="0"{{end}}{{end}}></span>{{end}}
           </div>
           {{end}}
         </div>
@@ -2112,6 +2202,7 @@ const dashboardTemplate = `<!doctype html>
 (() => {
   const renderOdometer = (odometer, display, animate = true) => {
     odometer.dataset.display = display;
+    odometer.setAttribute('role', 'img');
     odometer.setAttribute('aria-label', display);
     odometer.replaceChildren();
     const fallback = document.createElement('span');
@@ -2716,7 +2807,7 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
   <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
   <title>Tokemon · Tokedex</title>
   <style>
-    :root { color-scheme: dark; --bg:#10110f; --surface:#171916; --surface-raised:#1d201b; --text:#f0ede5; --muted:#a2a69b; --faint:#6f766b; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
+    :root { color-scheme: dark; --bg:#10110f; --surface:#171916; --surface-raised:#1d201b; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
     @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
     * { box-sizing:border-box; } [hidden] { display:none !important; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
@@ -2752,7 +2843,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--line-bright); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); }
     .heading { display:flex; align-items:end; justify-content:space-between; gap:20px; padding:25px 10px 15px; } .eyebrow,.section-title,label,th { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; font:700 clamp(28px,4vw,42px)/1 var(--font-display); } .heading-copy { margin:9px 0 0; color:var(--muted); } .action { display:inline-flex; align-items:center; min-height:38px; padding:10px 13px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; white-space:nowrap; }
-    .panel { border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-panel { padding:14px 16px; } .filter-form { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); align-items:end; gap:10px; } label { display:grid; gap:7px; color:var(--faint); } select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } select:focus-visible { border-color:var(--accent); outline:2px solid rgba(155,187,160,.16); } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions button,.filter-actions a { min-height:36px; padding:9px 11px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions .apply { border-color:var(--accent); color:var(--accent); }
+    .panel { border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-panel { padding:14px 16px; } .filter-form { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); align-items:end; gap:10px; } label { display:grid; gap:7px; color:var(--faint); } select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } select:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions button,.filter-actions a { min-height:36px; padding:9px 11px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions .apply { border-color:var(--accent); color:var(--accent); }
     .session-panel { margin-top:10px; overflow:hidden; } .section-head { display:flex; align-items:start; justify-content:space-between; gap:14px; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .section-meta { color:var(--faint); font:10px var(--font-data); } .table-scroll { overflow-x:auto; padding:0 16px 12px; } table { width:100%; min-width:1060px; border-collapse:collapse; table-layout:auto; } th,td { padding:10px 0; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th:first-child,td:first-child { width:100%; overflow-wrap:anywhere; } th { color:var(--faint); } td { color:var(--muted); font:12px/1.25 var(--font-data); } th:not(:first-child),td:not(:first-child) { padding-left:18px; text-align:right; white-space:nowrap; } td:nth-child(3) { color:var(--text); } td:first-child { color:var(--text); font-weight:600; } td:nth-child(2),td:nth-child(3) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .subline { display:block; margin-top:4px; overflow:hidden; color:var(--faint); font-size:10px; font-weight:400; text-overflow:ellipsis; white-space:nowrap; } .unknown { color:var(--warm); } .empty-row td { padding:32px 0; color:var(--faint); text-align:left; }
     footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; } @media (max-width:900px) { .filter-form { grid-template-columns:repeat(3,minmax(0,1fr)); } .filter-actions { grid-column:span 3; } } @media (max-width:640px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:center; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } .nav-link { padding:6px 7px; font-size:10px; } .heading { align-items:start; flex-direction:column; padding:20px 8px 14px; } .action { width:100%; justify-content:center; } .filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-actions { grid-column:span 2; } footer { flex-direction:column; gap:4px; } table { min-width:0; } thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); } tbody tr { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px 14px; padding:12px 0; border-bottom:1px solid var(--line); } tbody td,tbody td:not(:first-child) { display:block; width:auto; padding:0; border:0; text-align:left; white-space:normal; } tbody td:first-child,.empty-row td { grid-column:1 / -1; } td[data-label]::before { content:attr(data-label); display:block; margin-bottom:4px; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } } @media (max-width:420px) { .filter-form { grid-template-columns:1fr; } .filter-actions { grid-column:auto; } } @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
   </style>
@@ -2824,10 +2915,12 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .heading-actions { display: flex; align-items: center; gap: 10px; }
     .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
     .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
-    .window-link:hover, .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
+    .window-link:hover { color: var(--text); }
+    .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
     .window-link.active { background: var(--accent); color: var(--bg); }
-    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .action:hover, .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; background: transparent; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+    .action:hover { background: rgba(210, 164, 119, .1); }
+    .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
     .filter-panel { padding: 14px 16px; }
     .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
@@ -3311,7 +3404,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
   <title>Tokemon · Insights</title>
   <style>
     @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
-    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #6f766b; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #a5ad9c; --line: #30352d; --line-bright: #485044; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -3337,16 +3430,18 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     .heading-actions { display: flex; align-items: end; flex-direction: column; gap: 9px; }
     .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
     .window-link { padding: 7px 10px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .08em; }
-    .window-link:hover, .window-link:focus-visible, .window-link.active { background: var(--surface-raised); color: var(--accent); outline: none; }
+    .window-link:hover, .window-link.active { background: var(--surface-raised); color: var(--accent); }
+    .window-link:focus-visible { background: var(--surface-raised); color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
     .filter-panel { padding: 13px 14px; }
     .filter-form { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: end; gap: 9px; }
     .filter-form label { display: grid; gap: 5px; color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
-    select:focus-visible, a:focus-visible, button:focus-visible, summary:focus-visible { border-color: var(--accent); outline: 2px solid rgba(155, 187, 160, .25); outline-offset: 2px; }
+    select:focus-visible, a:focus-visible, button:focus-visible, summary:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
     .filter-actions { display: flex; justify-content: end; gap: 7px; grid-column: span 5; }
     .action { display: inline-flex; align-items: center; justify-content: center; min-height: 31px; padding: 8px 11px; border: 1px solid var(--line-bright); border-radius: 4px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .action:hover, .action:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+    .action:hover { border-color: var(--accent); color: var(--accent); }
+    .action:focus-visible { border-color: var(--accent); color: var(--accent); outline: 2px solid var(--warm); outline-offset: 2px; }
     .action.apply { border-color: var(--warm); color: var(--warm); }
     .quality { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; padding: 10px 13px; color: var(--muted); font: 11px var(--font-data); }
     .quality strong { color: var(--text); }
@@ -3372,7 +3467,8 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     .qualifiers { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; padding: 0; list-style: none; }
     .qualifiers li { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font: 10px var(--font-data); }
     .analytics-deep-link { display: inline-block; margin-top: 3px; color: var(--accent); font: 700 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .analytics-deep-link:hover, .analytics-deep-link:focus-visible { color: var(--warm); outline: none; }
+    .analytics-deep-link:hover { color: var(--warm); }
+    .analytics-deep-link:focus-visible { color: var(--warm); outline: 2px solid var(--accent); outline-offset: 2px; }
     .empty-cards { margin-top: 10px; padding: 30px 15px; text-align: center; }
     .empty-cards strong { display: block; color: var(--text); font: 700 17px/1.2 var(--font-display); }
     .empty-cards span { display: block; margin-top: 7px; color: var(--faint); font-size: 12px; }

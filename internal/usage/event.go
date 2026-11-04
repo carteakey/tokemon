@@ -14,6 +14,9 @@ import (
 
 const SchemaVersion = "1"
 
+// eventIDPrefix identifies deterministic IDs produced by DeterministicID.
+const eventIDPrefix = "sha256:"
+
 const (
 	MaxEventIDLength      = 256
 	MaxMachineIDLength    = 256
@@ -92,6 +95,9 @@ func (e Event) validateAt(now time.Time) error {
 		return fmt.Errorf("schema_version must be %q", SchemaVersion)
 	}
 	if err := validateIdentifier("event_id", e.EventID, MaxEventIDLength); err != nil {
+		return err
+	}
+	if err := validateEventIDDigest(e.EventID); err != nil {
 		return err
 	}
 	if e.Timestamp.IsZero() {
@@ -246,6 +252,30 @@ func isASCIIAlpha(value string) bool {
 	return true
 }
 
+// validateEventIDDigest keeps deterministic event IDs well-formed: a
+// "sha256:"-prefixed ID must carry a full hex digest so the stored
+// deduplication key cannot drift into a corrupted form.
+func validateEventIDDigest(value string) error {
+	if !strings.HasPrefix(value, eventIDPrefix) {
+		return nil
+	}
+	digest := strings.TrimPrefix(value, eventIDPrefix)
+	if len(digest) != sha256.Size*2 || !isHex(digest) {
+		return errors.New("event_id must be a sha256: prefix followed by a full hex digest")
+	}
+	return nil
+}
+
+func isHex(value string) bool {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') && !(character >= 'A' && character <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateMetadata(value any, depth int) error {
 	if depth > MaxMetadataDepth {
 		return errors.New("metadata nesting is too deep")
@@ -312,6 +342,9 @@ func validateMetadataKey(key string) error {
 	return nil
 }
 
+// DeterministicID produces a stable, content-addressed event identifier. Do
+// not change its input construction: stored events depend on it for idempotent
+// re-ingestion.
 func DeterministicID(machineID, adapter, sourceIdentity string, offset int64, timestamp, sessionID string) string {
 	input := fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s\x00%s", machineID, adapter, sourceIdentity, offset, timestamp, sessionID)
 	hash := sha256.Sum256([]byte(input))

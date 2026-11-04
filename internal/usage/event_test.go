@@ -45,6 +45,7 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 		mutate func(*Event)
 	}{
 		{"future timestamp", func(event *Event) { event.Timestamp = time.Now().Add(48 * time.Hour) }},
+		{"pre-epoch timestamp", func(event *Event) { event.Timestamp = time.Unix(0, 0).Add(-time.Second) }},
 		{"path project", func(event *Event) { event.Project = "/Users/alice/project" }},
 		{"currency", func(event *Event) { event.Currency = "usd" }},
 		{"infinite cost", func(event *Event) { event.Cost = Float64(math.Inf(1)) }},
@@ -131,5 +132,40 @@ func TestSanitizeOutboundPreservesComponentsAndDropsImpossibleTotal(t *testing.T
 	}
 	if event.TotalTokens == nil || *event.TotalTokens != 5 {
 		t.Fatal("SanitizeOutbound mutated its input")
+	}
+}
+
+// Ported from the production-hardening line: deterministic event IDs must
+// carry a full hex digest, and every length-bounded field must be enforced.
+func TestValidateRejectsBadEventIDFormats(t *testing.T) {
+	for _, eventID := range []string{"", "with space", "sha256:short", "sha256:" + strings.Repeat("x", 64), strings.Repeat("a", MaxEventIDLength+1)} {
+		event := validEventForTest()
+		event.EventID = eventID
+		if err := event.Validate(); err == nil {
+			t.Errorf("Validate accepted event_id %q", eventID)
+		}
+	}
+}
+
+func TestValidateRejectsOversizedFields(t *testing.T) {
+	event := validEventForTest()
+	event.MachineID = strings.Repeat("m", MaxMachineIDLength+1)
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate accepted an oversized machine_id")
+	}
+	event = validEventForTest()
+	event.Provider = strings.Repeat("p", MaxProviderLength+1)
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate accepted an oversized provider")
+	}
+	event = validEventForTest()
+	event.Model = strings.Repeat("m", MaxModelLength+1)
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate accepted an oversized model")
+	}
+	event = validEventForTest()
+	event.SessionID = strings.Repeat("s", MaxSessionIDLength+1)
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate accepted an oversized session_id")
 	}
 }

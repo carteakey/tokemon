@@ -27,7 +27,7 @@ func TestStatePersistsCursorsAndEventFingerprints(t *testing.T) {
 		Cursor:  adapters.Cursor{Identity: "file-identity", Offset: 42, Line: 3},
 	}
 	event := stateEvent("event-1", 10)
-	if err := store.Commit(context.Background(), machineID, []adapters.SourceReport{report}, []usage.Event{event}, time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)); err != nil {
+	if err := store.Commit(context.Background(), machineID, StateSnapshot{}, []adapters.SourceReport{report}, []usage.Event{event}, time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestStateLeavesCursorAndFingerprintUncommittedUntilUploadSucceeds(t *testin
 		store.Close()
 		t.Fatalf("failed upload lost pending event: %d", len(pending))
 	}
-	if err := store.Commit(context.Background(), machineID, []adapters.SourceReport{report}, []usage.Event{event}, time.Now()); err != nil {
+	if err := store.Commit(context.Background(), machineID, StateSnapshot{}, []adapters.SourceReport{report}, []usage.Event{event}, time.Now()); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestStateSkipsFailedSourceReports(t *testing.T) {
 	}
 	defer store.Close()
 	report := adapters.SourceReport{Adapter: "claude-code", Path: "/private/session.jsonl", Err: errors.New("source unavailable")}
-	if err := store.Commit(context.Background(), "machine-a", []adapters.SourceReport{report}, nil, time.Now()); err != nil {
+	if err := store.Commit(context.Background(), "machine-a", StateSnapshot{}, []adapters.SourceReport{report}, nil, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := store.Snapshot(context.Background(), "machine-a")
@@ -132,6 +132,59 @@ func TestStateSkipsFailedSourceReports(t *testing.T) {
 	}
 	if len(snapshot.Cursors) != 0 {
 		t.Fatalf("failed source advanced state: %+v", snapshot.Cursors)
+	}
+}
+
+// Re-writing unchanged cursor rows once per poll cycle for every healthy
+// source would churn the state database without changing any meaningful
+// state, so Commit must skip them while still advancing changed cursors.
+func TestStateCommitSkipsUnchangedCursorRows(t *testing.T) {
+	store, err := OpenState(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const machineID = "machine-a"
+	report := adapters.SourceReport{
+		Adapter: "generic-jsonl",
+		Path:    "/private/local/usage.jsonl",
+		Source:  adapters.Source{Path: "/private/local/usage.jsonl", Identity: "file-identity"},
+		Cursor:  adapters.Cursor{Identity: "file-identity", Offset: 42, Line: 3},
+	}
+	firstSync := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	if err := store.Commit(context.Background(), machineID, StateSnapshot{}, []adapters.SourceReport{report}, nil, firstSync); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(context.Background(), machineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unchangedSync := firstSync.Add(time.Hour)
+	if err := store.Commit(context.Background(), machineID, snapshot, []adapters.SourceReport{report}, nil, unchangedSync); err != nil {
+		t.Fatal(err)
+	}
+	var syncedAt string
+	if err := store.db.QueryRow(`SELECT last_successful_sync FROM source_state WHERE machine_id = ? AND adapter = ? AND source_path = ?`, machineID, report.Adapter, report.Path).Scan(&syncedAt); err != nil {
+		t.Fatal(err)
+	}
+	if syncedAt != firstSync.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("unchanged cursor row was re-written: last_successful_sync = %q", syncedAt)
+	}
+
+	advanced := report
+	advanced.Cursor = adapters.Cursor{Identity: "file-identity", Offset: 100, Line: 8}
+	advancedSync := firstSync.Add(2 * time.Hour)
+	if err := store.Commit(context.Background(), machineID, snapshot, []adapters.SourceReport{advanced}, nil, advancedSync); err != nil {
+		t.Fatal(err)
+	}
+	var offset, line int64
+	if err := store.db.QueryRow(`SELECT last_successful_sync, cursor_offset, cursor_line FROM source_state WHERE machine_id = ? AND adapter = ? AND source_path = ?`, machineID, report.Adapter, report.Path).Scan(&syncedAt, &offset, &line); err != nil {
+		t.Fatal(err)
+	}
+	if syncedAt != advancedSync.UTC().Format(time.RFC3339Nano) || offset != 100 || line != 8 {
+		t.Fatalf("changed cursor was not updated: sync = %q, offset = %d, line = %d", syncedAt, offset, line)
 	}
 }
 

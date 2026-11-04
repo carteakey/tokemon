@@ -266,7 +266,11 @@ func syncAgent(t *testing.T, ctx context.Context, state *agent.StateStore, clien
 			t.Fatal(err)
 		}
 	}
-	if err := state.Commit(ctx, machineID, reports, events, time.Now().UTC()); err != nil {
+	snapshot, err := state.Snapshot(ctx, machineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Commit(ctx, machineID, snapshot, reports, events, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	return result, events, reports

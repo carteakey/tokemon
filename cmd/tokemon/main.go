@@ -308,7 +308,7 @@ func runInspect(args []string) error {
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	for _, event := range events {
-		if err := encoder.Encode(event); err != nil {
+		if err := encoder.Encode(usage.SanitizeOutbound(event)); err != nil {
 			return err
 		}
 	}
@@ -597,9 +597,16 @@ func runAgent(args []string) error {
 			if err != nil {
 				return err
 			}
+			if result.Rejected > 0 {
+				message := fmt.Sprintf("hub rejected %d of %d events", result.Rejected, len(pending))
+				if len(result.Errors) > 0 {
+					message += ": " + strings.Join(result.Errors, "; ")
+				}
+				return errors.New(message)
+			}
 			fmt.Printf("synced %d changed events (%d accepted, %d refreshed) · %d lifetime tokens\n", len(pending), result.Accepted, result.Duplicates, result.CurrentTotal)
 		}
-		if err := stateStore.Commit(ctx, *machineID, reports, pending, time.Now().UTC()); err != nil {
+		if err := stateStore.Commit(ctx, *machineID, snapshot, reports, pending, time.Now().UTC()); err != nil {
 			return err
 		}
 		if len(pending) == 0 {

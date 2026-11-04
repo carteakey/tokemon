@@ -63,6 +63,15 @@ probe backed by `SELECT 1`: it returns `200` only when SQLite is available and
 process-local request/ingest/source-error counters plus SQLite-derived stale
 agents and DB latency; logs are JSON and omit credentials, query strings,
 request bodies, and local paths.
+Compose binds the dashboard to `127.0.0.1` by default. For remote agents, set
+`TOKEMON_BIND_ADDRESS` to the host's private-network bind address (for example
+`0.0.0.0`) and keep the port behind Tailscale, WireGuard, or an authenticated
+reverse proxy:
+
+```bash
+export TOKEMON_BIND_ADDRESS=0.0.0.0
+docker compose -f deploy/docker-compose.yml up -d --build
+```
 
 The SQLite database persists at `./data/tokemon.db`. The Compose service mounts the model catalog read-only, runs without root privileges by default, and keeps its root filesystem read-only. If the host data directory is owned by a different user, set `TOKEMON_UID` and `TOKEMON_GID` as shown above so SQLite can write its database and WAL files.
 

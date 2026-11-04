@@ -53,6 +53,10 @@ const (
 
 const DefaultRequestTimeout = 30 * time.Second
 
+// healthTimeout keeps an offline hub from delaying collection passes; a health
+// check never needs the full request deadline.
+const healthTimeout = 10 * time.Second
+
 func (c Client) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
 	timeout := c.RequestTimeout
 	if timeout <= 0 {
@@ -161,9 +165,13 @@ func (c Client) Health(ctx context.Context) error {
 	if strings.TrimSpace(c.ServerURL) == "" {
 		return fmt.Errorf("server URL is required")
 	}
-	requestContext, cancel := c.requestContext(ctx)
+	timeout := c.RequestTimeout
+	if timeout <= 0 || timeout > healthTimeout {
+		timeout = healthTimeout
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
+	request, err := http.NewRequestWithContext(healthCtx, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+"/healthz", nil)
 	if err != nil {
 		return err
 	}
