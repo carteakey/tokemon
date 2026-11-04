@@ -603,6 +603,43 @@ func TestOverviewMergesProjectsAcrossMachines(t *testing.T) {
 	}
 }
 
+
+func TestOverviewBucketsUnknownProjects(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "named-project", Timestamp: time.Now().UTC(), MachineID: "laptop", SessionID: "session-a", Project: "/Users/alice/repos/tokemon", Provider: "anthropic", Model: "model", Tool: "codex", TotalTokens: usage.Int64(500), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// Claude Code style records: the adapter never reports a project.
+		{SchemaVersion: usage.SchemaVersion, EventID: "unknown-1", Timestamp: time.Now().UTC(), MachineID: "laptop", SessionID: "session-b", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(200), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "unknown-2", Timestamp: time.Now().UTC(), MachineID: "desktop", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByProject) != 2 {
+		t.Fatalf("expected named + unknown project rows, got %+v", overview.ByProject)
+	}
+	named := overview.ByProject[0]
+	if named.Project != "tokemon" || named.Tokens != 500 || named.Sessions != 1 {
+		t.Fatalf("unexpected named project row: %+v", named)
+	}
+	unknown := overview.ByProject[1]
+	if unknown.Project != "" || unknown.Tokens != 300 || unknown.Machines != 2 || unknown.Sessions != 1 {
+		t.Fatalf("unexpected unknown-project bucket: %+v", unknown)
+	}
+	if overview.LifetimeTokens != 800 {
+		t.Fatalf("lifetime tokens = %d, want 800 (unknown projects must still count toward totals)", overview.LifetimeTokens)
+	}
+}
+
 func TestOverviewGroupsUsageByTool(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

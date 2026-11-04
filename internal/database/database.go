@@ -1306,7 +1306,7 @@ FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	rows, err = s.db.QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
 COUNT(DISTINCT machine_id)
-FROM usage_events WHERE project <> '' GROUP BY project ORDER BY 2 DESC`)
+FROM usage_events GROUP BY project ORDER BY 2 DESC`)
 	if err != nil {
 		return result, err
 	}
