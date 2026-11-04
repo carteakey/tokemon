@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestRunCatalogValidate(t *testing.T) {
@@ -290,5 +293,116 @@ func TestRunAgentSkipsCollectionWhenHubIsUnavailable(t *testing.T) {
 	}
 	if healthCalls != 1 {
 		t.Fatalf("health calls = %d, want 1", healthCalls)
+	}
+}
+
+// The passwd subcommand (ported from the pre-merge auth design) must emit a
+// hash that bcrypt accepts and that verifies against the source password.
+func TestRunPasswdGeneratesVerifiableHash(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteString("hunter2\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = reader
+	originalStdout := os.Stdout
+	readBack, readBackWriter, err := os.Pipe()
+	if err != nil {
+		os.Stdin = originalStdin
+		t.Fatal(err)
+	}
+	os.Stdout = readBackWriter
+	err = run([]string{"passwd", "--stdin"})
+	os.Stdin = originalStdin
+	if err := readBackWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = originalStdout
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(readBack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.TrimSpace(string(output))
+	if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") {
+		t.Fatalf("passwd output = %q, want a bcrypt hash", hash)
+	}
+	if _, err := bcrypt.Cost([]byte(hash)); err != nil {
+		t.Fatalf("passwd produced an unusable hash: %v", err)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte("hunter2")) != nil {
+		t.Fatal("passwd hash does not verify against the entered password")
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte("other")) == nil {
+		t.Fatal("passwd hash verifies against the wrong password")
+	}
+}
+
+func TestRunPasswdRejectsNonTerminalWithoutStdinFlag(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteString("hunter2\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = reader
+	err = run([]string{"passwd"})
+	os.Stdin = originalStdin
+	if err == nil || !strings.Contains(err.Error(), "--stdin") {
+		t.Fatalf("pipe without --stdin = %v, want a --stdin hint", err)
+	}
+}
+
+func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
+	t.Setenv("TOKEMON_DASHBOARD_USERNAME", "")
+	t.Setenv("TOKEMON_DASHBOARD_PASSWORD_HASH", "")
+	t.Setenv("TOKEMON_DASHBOARD_TOKEN", "")
+	t.Setenv("TOKEMON_DEV_LOOPBACK", "")
+	t.Setenv("TOKEMON_TRUSTED_PROXY_CIDRS", "")
+
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	dashboardToken := flags.String("dashboard-token", "", "")
+	devLoopback := flags.Bool("dev-loopback", false, "")
+	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", "", "")
+	dashboardUsername := flags.String("dashboard-username", "", "")
+	dashboardPasswordHash := flags.String("dashboard-password-hash", "", "")
+
+	values := map[string]string{
+		"TOKEMON_DASHBOARD_USERNAME":      "kim",
+		"TOKEMON_DASHBOARD_PASSWORD_HASH": "$2a$10$examplehashfromconfigfile",
+	}
+	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	if *dashboardUsername != "kim" || *dashboardPasswordHash != "$2a$10$examplehashfromconfigfile" {
+		t.Fatalf("config-file values lost: username=%q hash=%q", *dashboardUsername, *dashboardPasswordHash)
+	}
+
+	flags = flag.NewFlagSet("serve", flag.ContinueOnError)
+	dashboardToken = flags.String("dashboard-token", "", "")
+	devLoopback = flags.Bool("dev-loopback", false, "")
+	trustedProxyCIDRs = flags.String("trusted-proxy-cidrs", "", "")
+	dashboardUsername = flags.String("dashboard-username", "", "")
+	dashboardPasswordHash = flags.String("dashboard-password-hash", "", "")
+	if err := flags.Set("dashboard-username", "flag-user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := flags.Set("dashboard-password-hash", "$2a$flaghash"); err != nil {
+		t.Fatal(err)
+	}
+	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	if *dashboardUsername != "flag-user" || *dashboardPasswordHash != "$2a$flaghash" {
+		t.Fatalf("explicit flags were overwritten: username=%q hash=%q", *dashboardUsername, *dashboardPasswordHash)
 	}
 }

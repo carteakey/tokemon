@@ -30,6 +30,8 @@ import (
 	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/internal/version"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 )
 
 const (
@@ -75,6 +77,8 @@ func run(args []string) error {
 		return runCatalog(args[1:])
 	case "art":
 		return runArt(args[1:])
+	case "passwd":
+		return runPasswd(args[1:])
 	case "version":
 		return runVersion(args[1:])
 	case "help", "-h", "--help":
@@ -139,6 +143,8 @@ func runServe(args []string) error {
 	databasePath := flags.String("database", envOr("TOKEMON_DATABASE", defaultDatabase), "SQLite database path")
 	ingestToken := flags.String("ingest-token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared token for event ingestion")
 	dashboardToken := flags.String("dashboard-token", os.Getenv("TOKEMON_DASHBOARD_TOKEN"), "token for dashboard and read API access (defaults to ingest token)")
+	dashboardUsername := flags.String("dashboard-username", os.Getenv("TOKEMON_DASHBOARD_USERNAME"), "dashboard login username for password authentication")
+	dashboardPasswordHash := flags.String("dashboard-password-hash", os.Getenv("TOKEMON_DASHBOARD_PASSWORD_HASH"), "bcrypt hash of the dashboard login password (generate with: tokemon passwd)")
 	devLoopback := flags.Bool("dev-loopback", envBool("TOKEMON_DEV_LOOPBACK"), "allow empty ingest token only on an explicit loopback listener")
 	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", os.Getenv("TOKEMON_TRUSTED_PROXY_CIDRS"), "comma-separated proxy CIDRs allowed to assert X-Forwarded-User")
 	readTimeout := flags.Duration("read-timeout", configDurationEnv("TOKEMON_SERVER_READ_TIMEOUT", defaultReadTimeout), "maximum duration for reading a request")
@@ -164,7 +170,7 @@ func runServe(args []string) error {
 		return err
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
-	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs)
+	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	applyServerTimeoutConfig(flags, configValues, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout)
 	if *readTimeout <= 0 || *readHeaderTimeout <= 0 || *writeTimeout <= 0 || *idleTimeout <= 0 || *shutdownTimeout <= 0 {
 		return errors.New("server timeouts must be positive")
@@ -195,11 +201,13 @@ func runServe(args []string) error {
 		})
 	}
 	server, err := api.NewWithConfigAndInsightsAI(store, api.Config{
-		IngestToken:       *ingestToken,
-		DashboardToken:    *dashboardToken,
-		AllowLoopbackDev:  *devLoopback,
-		TrustedProxyCIDRs: splitConfiguredPaths(*trustedProxyCIDRs),
-		Logger:            slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		IngestToken:           *ingestToken,
+		DashboardToken:        *dashboardToken,
+		DashboardUsername:     *dashboardUsername,
+		DashboardPasswordHash: []byte(*dashboardPasswordHash),
+		AllowLoopbackDev:      *devLoopback,
+		TrustedProxyCIDRs:     splitConfiguredPaths(*trustedProxyCIDRs),
+		Logger:                slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	}, insightsSynthesizer)
 	if err != nil {
 		return err
@@ -230,6 +238,52 @@ func configuredSecret(values map[string]string, name string) string {
 		return value
 	}
 	return values[name]
+}
+
+// runPasswd prints a bcrypt hash of a dashboard login password read from the
+// terminal or, with --stdin, from standard input. Configure the hash together
+// with TOKEMON_DASHBOARD_USERNAME to enable dashboard password authentication.
+func runPasswd(args []string) error {
+	flags := flag.NewFlagSet("passwd", flag.ContinueOnError)
+	stdin := flags.Bool("stdin", false, "read the password from standard input")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: tokemon passwd [--stdin]")
+	}
+	var input io.Reader
+	if *stdin {
+		input = os.Stdin
+	} else if file, err := os.Stdin.Stat(); err != nil || file.Mode()&os.ModeCharDevice == 0 {
+		return errors.New("standard input is not a terminal; pass --stdin to read the password from a pipe")
+	}
+	password, err := readPassword(input)
+	if err != nil {
+		return err
+	}
+	hash, err := bcrypt.GenerateFromPassword(password, bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(hash))
+	return nil
+}
+
+func readPassword(input io.Reader) ([]byte, error) {
+	if input == nil {
+		password, err := term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintln(os.Stderr)
+		return password, nil
+	}
+	line, err := bufio.NewReader(input).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return []byte(strings.TrimRight(line, "\r\n")), nil
 }
 
 func runImport(args []string) error {
@@ -772,10 +826,20 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 	}
 }
 
-func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, dashboardToken *string, devLoopback *bool, trustedProxyCIDRs *string) {
+func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, dashboardToken *string, devLoopback *bool, trustedProxyCIDRs *string, dashboardUsername *string, dashboardPasswordHash *string) {
 	if !flagWasSet(flags, "dashboard-token") && os.Getenv("TOKEMON_DASHBOARD_TOKEN") == "" {
 		if value := values["TOKEMON_DASHBOARD_TOKEN"]; value != "" {
 			*dashboardToken = value
+		}
+	}
+	if !flagWasSet(flags, "dashboard-username") && os.Getenv("TOKEMON_DASHBOARD_USERNAME") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_DASHBOARD_USERNAME"]); value != "" {
+			*dashboardUsername = value
+		}
+	}
+	if !flagWasSet(flags, "dashboard-password-hash") && os.Getenv("TOKEMON_DASHBOARD_PASSWORD_HASH") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_DASHBOARD_PASSWORD_HASH"]); value != "" {
+			*dashboardPasswordHash = value
 		}
 	}
 	if !flagWasSet(flags, "dev-loopback") && os.Getenv("TOKEMON_DEV_LOOPBACK") == "" {
@@ -996,6 +1060,7 @@ func printUsage() {
 Commands:
   serve       start the HTTP API and dashboard
   agent       scan local provider usage and upload metadata
+  passwd      generate a bcrypt hash for the dashboard login password
   version     print build and platform identity
   import      ingest normalized JSONL into SQLite
   export      export normalized JSONL from SQLite

@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"golang.org/x/crypto/bcrypt"
 	"io"
 	"log/slog"
 	"net"
@@ -39,15 +40,20 @@ const (
 type Config struct {
 	IngestToken       string
 	DashboardToken    string
-	AllowLoopbackDev  bool
-	TrustedProxyCIDRs []string
-	Logger            *slog.Logger
-	Metrics           *Metrics
-	RequestTimeout    time.Duration
-	HealthTimeout     time.Duration
-	HeartbeatTimeout  time.Duration
-	IngestTimeout     time.Duration
-	StaleAgentAfter   time.Duration
+	DashboardUsername string
+	// DashboardPasswordHash holds a bcrypt hash (see `tokemon passwd`). When
+	// it and DashboardUsername are both set, the dashboard accepts that
+	// username and password as an alternative to the raw dashboard token.
+	DashboardPasswordHash []byte
+	AllowLoopbackDev      bool
+	TrustedProxyCIDRs     []string
+	Logger                *slog.Logger
+	Metrics               *Metrics
+	RequestTimeout        time.Duration
+	HealthTimeout         time.Duration
+	HeartbeatTimeout      time.Duration
+	IngestTimeout         time.Duration
+	StaleAgentAfter       time.Duration
 }
 
 const (
@@ -120,6 +126,38 @@ func loopbackListenAddress(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// validateDashboardPasswordAuth enforces the pairing and format rules for
+// optional dashboard password authentication: username and bcrypt hash are
+// configured together or not at all, and the hash must be a usable bcrypt
+// digest so a typo fails at startup instead of at every login.
+func (c Config) validateDashboardPasswordAuth() error {
+	if (c.DashboardUsername == "") != (len(c.DashboardPasswordHash) == 0) {
+		return errors.New("TOKEMON_DASHBOARD_USERNAME and TOKEMON_DASHBOARD_PASSWORD_HASH must be set together; generate the hash with: tokemon passwd")
+	}
+	if len(c.DashboardPasswordHash) == 0 {
+		return nil
+	}
+	if _, err := bcrypt.Cost(c.DashboardPasswordHash); err != nil {
+		return errors.New("TOKEMON_DASHBOARD_PASSWORD_HASH is not a bcrypt hash; generate one with: tokemon passwd")
+	}
+	return nil
+}
+
+// dashboardPasswordAuthorized reports whether the request's Basic Auth
+// credentials match the configured dashboard username and password hash. The
+// username must match exactly; the password is verified against the bcrypt
+// digest.
+func dashboardPasswordAuthorized(r *http.Request, username string, hash []byte) bool {
+	if username == "" || len(hash) == 0 {
+		return false
+	}
+	basicUsername, basicPassword, ok := r.BasicAuth()
+	if !ok || basicUsername != username {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword(hash, []byte(basicPassword)) == nil
 }
 
 // ValidateServeConfig prevents an empty ingest token from silently exposing
@@ -251,6 +289,12 @@ func (s *Server) dashboardAuthorized(r *http.Request) bool {
 		return true
 	}
 	if provided, ok := bearerToken(r); ok && constantTimeEqual(provided, token) {
+		return true
+	}
+	// Optional password account: configured via `tokemon passwd` plus
+	// TOKEMON_DASHBOARD_USERNAME, letting a human sign in without sharing the
+	// raw dashboard token. Token credentials keep working.
+	if dashboardPasswordAuthorized(r, s.config.DashboardUsername, s.config.DashboardPasswordHash) {
 		return true
 	}
 	return false

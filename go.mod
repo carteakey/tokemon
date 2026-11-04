@@ -3,6 +3,8 @@ module github.com/tokemon/tokemon
 go 1.26.9
 
 require (
+	golang.org/x/crypto v0.41.0
+	golang.org/x/term v0.34.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.53.0
 )

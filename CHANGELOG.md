@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Added optional dashboard password authentication: `tokemon passwd` writes a bcrypt hash; configure it with `TOKEMON_DASHBOARD_USERNAME` and `TOKEMON_DASHBOARD_PASSWORD_HASH` to sign in with a username and password instead of the raw dashboard token. Token logins, CSRF, and the ingest token requirement are unchanged.
 - Fixed dashboard WCAG AA contrast: the analytics Apply-filters button no longer renders accent text on the browser's default gray button background (2.54:1 → 8.43:1), and dimmed labels, footers, table headers, and axis text use a faint-gray token that passes on both card and page backgrounds (3.77–4.04:1 → 5.04–5.39:1).
 - Stopped the overview breakdown tables from truncating share percentages such as 100.0% by widening the share column (16% → 25%) in the fixed table layout.
 - Made dashboard keyboard focus visible: the settings gear keeps a solid accent outline instead of dropping it, and window links, selects, and action buttons show solid outlines on focus instead of ~16–22% alpha ones.

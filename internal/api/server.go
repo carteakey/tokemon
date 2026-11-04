@@ -902,6 +902,9 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		recap = providers[0]
 	}
 	config = config.normalized()
+	if err := config.validateDashboardPasswordAuth(); err != nil {
+		return nil, err
+	}
 	trustedProxyNetworks, err := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
 	if err != nil {
 		return nil, err
