@@ -35,6 +35,15 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
       - name: Exercise migration compatibility gate
         run: go test ./internal/database -run 'TestOpenBacksUpExistingDatabaseBeforeMigration|TestOpenUsesWALForFileDatabase'
 
