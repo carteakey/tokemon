@@ -1514,6 +1514,22 @@ func TestDisplayFormattersReadNaturally(t *testing.T) {
 // Ported from the production-hardening line: the ingest endpoint must accept
 // exactly one JSON value so a trailing suffix cannot bypass request limits.
 
+func TestModelDisplayNameLabelsUnknownModel(t *testing.T) {
+	if got := modelDisplayName(nil, "unknown"); got != "Unknown model" {
+		t.Errorf("modelDisplayName(nil, %q) = %q, want %q", "unknown", got, "Unknown model")
+	}
+	if got := modelDisplayName(nil, "UNKNOWN"); got != "Unknown model" {
+		t.Errorf("modelDisplayName(nil, %q) = %q, want %q", "UNKNOWN", got, "Unknown model")
+	}
+	aliases := map[string]string{"unknown": "Mystery"}
+	if got := modelDisplayName(aliases, "unknown"); got != "Mystery" {
+		t.Errorf("explicit alias must win: got %q", got)
+	}
+	if got := modelDisplayName(nil, "claude-sonnet-4-5"); got != "Sonnet 4.5" {
+		t.Errorf("regular models unchanged: got %q", got)
+	}
+}
+
 func TestSessionDisplayNameCoversProviderIDShapes(t *testing.T) {
 	cases := []struct{ raw, want string }{
 		{"sess_2692e21a-a705-4739-9736-9944066c00c1", "session 2692e21a"},
