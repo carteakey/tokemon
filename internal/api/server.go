@@ -100,6 +100,7 @@ type analyticsPageData struct {
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
 	ExportURL      string
+	CSVURL         string
 	PeakPoint      database.AnalyticsPoint
 	AverageThread  int64
 	AxisMax        int64
@@ -821,7 +822,7 @@ func analyticsQueryValues(query database.AnalyticsQuery) url.Values {
 	return values
 }
 
-func analyticsExportURL(query database.AnalyticsQuery) string {
+func analyticsExportURL(query database.AnalyticsQuery, format string) string {
 	values := url.Values{}
 	values.Set("period", query.Period)
 	values.Set("dimension", query.Dimension)
@@ -836,6 +837,9 @@ func analyticsExportURL(query database.AnalyticsQuery) string {
 	}
 	if query.Tool != "" {
 		values.Set("tool", query.Tool)
+	}
+	if format != "" {
+		values.Set("format", format)
 	}
 	return "/api/v1/analytics/export?" + values.Encode()
 }
@@ -1821,7 +1825,8 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		Analytics:      result,
 		ModelAliases:   modelAliases,
 		MachineAliases: machineAliases,
-		ExportURL:      analyticsExportURL(result.Filter),
+		ExportURL:      analyticsExportURL(result.Filter, "json"),
+		CSVURL:         analyticsExportURL(result.Filter, "csv"),
 		PeakPoint:      analyticsPeakPoint(result.Points),
 		AverageThread:  analyticsAverageThread(result.Summary),
 		AxisMax:        axisMax,
@@ -1922,6 +1927,10 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	if r.URL.Query().Get("format") == "csv" {
+		writeAnalyticsCSV(w, result)
+		return
+	}
 	payload, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1932,6 +1941,33 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-analytics-`+result.Filter.Period+`.json"`)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(payload)
+}
+
+// writeAnalyticsCSV streams the current breakdown as RFC 4180 CSV, honoring
+// the active dimension and filters. Names are raw identifiers; share is the
+// rendered percentage. No invented pricing or derived fields.
+func writeAnalyticsCSV(w http.ResponseWriter, result database.Analytics) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-analytics-`+result.Filter.Dimension+`-`+result.Filter.Period+`.csv"`)
+	w.WriteHeader(http.StatusOK)
+	writer := csv.NewWriter(w)
+	defer writer.Flush()
+	if err := writer.Write([]string{"dimension", "period", "name", "tokens", "events", "sessions", "share_percent"}); err != nil {
+		return
+	}
+	for _, row := range result.Breakdown {
+		if err := writer.Write([]string{
+			result.Filter.Dimension,
+			result.Filter.Period,
+			row.Name,
+			strconv.FormatInt(row.Tokens, 10),
+			strconv.FormatInt(row.Events, 10),
+			strconv.FormatInt(row.Sessions, 10),
+			strconv.FormatFloat(row.Share*100, 'f', 1, 64),
+		}); err != nil {
+			return
+		}
+	}
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
@@ -3342,7 +3378,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
         <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
       </nav>
-      <a class="action" href="{{.ExportURL}}">Export analytics JSON</a>
+      <a class="action" href="{{.ExportURL}}">Export analytics JSON</a><a class="action" href="{{.CSVURL}}">Export analytics CSV</a>
     </div>
   </section>
 

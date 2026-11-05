@@ -857,6 +857,56 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 	}
 }
 
+func TestAnalyticsExportSupportsCSV(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "an-csv-1", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "sess-a", Project: "alpha", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(700), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "an-csv-2", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "sess-b", Project: "beta", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(300), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?dimension=projects&period=30d&format=csv", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("csv export status = %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/csv; charset=utf-8" {
+		t.Fatalf("csv content type = %q", got)
+	}
+	if got := response.Header().Get("Content-Disposition"); !strings.Contains(got, "tokemon-analytics-projects-30d.csv") {
+		t.Fatalf("csv disposition = %q", got)
+	}
+	rows := strings.Split(strings.TrimRight(response.Body.String(), "\n"), "\n")
+	if len(rows) != 3 {
+		t.Fatalf("csv rows = %d, want header + 2 breakdown rows", len(rows))
+	}
+	if !strings.HasPrefix(rows[0], "dimension,period,name,tokens,events,sessions,share_percent") {
+		t.Fatalf("csv header = %q", rows[0])
+	}
+	if !strings.Contains(rows[1], "projects,30d,alpha,700,1,1,70.0") {
+		t.Fatalf("alpha row = %q", rows[1])
+	}
+	if !strings.Contains(rows[2], "projects,30d,beta,300,1,1,30.0") {
+		t.Fatalf("beta row = %q", rows[2])
+	}
+
+	// default stays JSON
+	jsonResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(jsonResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?dimension=projects&period=30d", nil))
+	if got := jsonResponse.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("default export content type = %q", got)
+	}
+}
 func TestSessionsExportSupportsCSV(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
