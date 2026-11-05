@@ -1219,13 +1219,39 @@ func activityLevel(tokens, maxTokens int64) int {
 	}
 }
 
+// overviewTotalsQuery collapses what used to be three separate full-table
+// scans (lifetime tokens, cost split, cache/threads) into one pass. Each
+// aggregate keeps its exact previous semantics; the queries were independent
+// only in shape, not in the rows they read.
+const overviewTotalsQuery = `SELECT
+COALESCE(SUM(total_tokens), 0),
+COALESCE(SUM(cost), 0),
+COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
+FROM usage_events`
+
 func (s *Store) Overview(ctx context.Context) (Overview, error) {
-	total, err := s.LifetimeTokens(ctx)
-	if err != nil {
+	var total, eligibleTokens int64
+	result := Overview{Timezone: s.Timezone(), Accuracy: make(map[usage.Accuracy]int64)}
+	if err := s.db.QueryRowContext(ctx, overviewTotalsQuery).Scan(
+		&total,
+		&result.EstimatedCost.Amount,
+		&result.EstimatedCost.PricedTokens,
+		&result.EstimatedCost.UnpricedTokens,
+		&result.Cache.CachedTokens,
+		&eligibleTokens,
+		&result.Threads,
+	); err != nil {
 		return Overview{}, err
 	}
-	result := Overview{LifetimeTokens: total, Timezone: s.Timezone(), Evolution: evolution.SnapshotFor(total), Accuracy: make(map[usage.Accuracy]int64)}
+	result.LifetimeTokens = total
+	result.Evolution = evolution.SnapshotFor(total)
+	result.Cache.EligibleTokens = eligibleTokens
 	today := s.dateOnly(time.Now())
+	var err error
 	result.Today, err = s.PeriodSummary(ctx, today, today.AddDate(0, 0, 1))
 	if err != nil {
 		return Overview{}, err
@@ -1233,24 +1259,6 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
 	result.Week, err = s.PeriodSummary(ctx, weekStart, today.AddDate(0, 0, 1))
 	if err != nil {
-		return Overview{}, err
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT
-COALESCE(SUM(cost), 0),
-COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
-COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0)
-FROM usage_events`).Scan(
-		&result.EstimatedCost.Amount,
-		&result.EstimatedCost.PricedTokens,
-		&result.EstimatedCost.UnpricedTokens,
-	); err != nil {
-		return Overview{}, err
-	}
-	if err := s.db.QueryRowContext(ctx, `SELECT
-COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
-COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
-COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
-FROM usage_events`).Scan(&result.Cache.CachedTokens, &result.Cache.EligibleTokens, &result.Threads); err != nil {
 		return Overview{}, err
 	}
 	if result.Cache.EligibleTokens > 0 {
