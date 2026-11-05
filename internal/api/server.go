@@ -421,7 +421,7 @@ func sessionDisplayName(raw string) string {
 	if display, ok := sessionTimestampName(trimmed); ok {
 		return display
 	}
-	for _, prefix := range []string{"sha256:", "local-", "sess_subagent_agent_", "sess_", "session_"} {
+	for _, prefix := range []string{"sha256:", "local-", "sess_subagent_agent_", "sess_", "ses_", "session_"} {
 		if rest, ok := strings.CutPrefix(trimmed, prefix); ok && rest != "" {
 			label := "session"
 			if strings.HasPrefix(prefix, "sess_subagent") {
@@ -437,7 +437,9 @@ func sessionDisplayName(raw string) string {
 }
 
 func shortID(value string) string {
-	value = strings.TrimFunc(value, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) })
+	value = strings.TrimFunc(value, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'))
+	})
 	if len(value) > 8 {
 		return value[:8]
 	}
@@ -1010,7 +1012,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"insightBar":           insightBarPercent,
 		"insightCoverage":      insightCoverage,
 		"insightRecapLabel":    insightRecapLabel,
-		"sessionDisplayName": sessionDisplayName,
+		"sessionDisplayName":   sessionDisplayName,
 		"tokenValue": func(value *int64) string {
 			if value == nil {
 				return "Unknown"
