@@ -378,12 +378,12 @@ func TestApplyDashboardTokenFallback(t *testing.T) {
 		return flags
 	}
 	cases := []struct {
-		name          string
-		dashboard     string
-		ingest        string
-		setDash       bool
-		dashValue     string
-		want          string
+		name      string
+		dashboard string
+		ingest    string
+		setDash   bool
+		dashValue string
+		want      string
 	}{
 		{"documented default applies", "", "secret", false, "", "secret"},
 		{"explicit dashboard token wins", "own-token", "secret", true, "own-token", "own-token"},

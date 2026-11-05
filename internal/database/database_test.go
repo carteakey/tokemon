@@ -603,7 +603,6 @@ func TestOverviewMergesProjectsAcrossMachines(t *testing.T) {
 	}
 }
 
-
 func TestOverviewBucketsUnknownProjects(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {
