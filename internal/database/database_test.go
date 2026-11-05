@@ -1576,6 +1576,35 @@ func TestDailyUsageUTCPathBucketsAndFallsBack(t *testing.T) {
 	if _, err := store.DailyUsage(context.Background(), time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)); err == nil {
 		t.Fatal("malformed timestamp did not error")
 	}
+
+	// The calendar guard routes impossible dates to the parser (which errors)
+	// and accepts only real dates, including leap days.
+	cases := []struct {
+		timestamp string
+		want      string
+		wantErr   bool
+	}{
+		{"2026-11-05T10:00:00Z", "2026-11-05", false},
+		{"2026-13-01T10:00:00Z", "", true},
+		{"2026-00-10T10:00:00Z", "", true},
+		{"2026-02-30T10:00:00Z", "", true},
+		{"2025-02-29T10:00:00Z", "", true},
+		{"2024-02-29T10:00:00Z", "2024-02-29", false},
+		{"2000-02-29T10:00:00Z", "2000-02-29", false},
+		{"1900-02-29T10:00:00Z", "", true},
+	}
+	for _, tc := range cases {
+		got, err := store.localDayBucket(tc.timestamp)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("localDayBucket(%q) = %q, want an error", tc.timestamp, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("localDayBucket(%q) = %q, err %v, want %q", tc.timestamp, got, err, tc.want)
+		}
+	}
 }
 
 func BenchmarkDailyUsage(b *testing.B) {

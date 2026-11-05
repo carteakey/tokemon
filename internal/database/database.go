@@ -2488,13 +2488,16 @@ func timeParse(value string) (time.Time, error) {
 // behavior and error reporting for malformed values.
 func (s *Store) localDayBucket(timestamp string) (string, error) {
 	loc := s.reportingLocation()
-	// The guard validates the full canonical shape, including a plausible
-	// time of day: an in-range value like 2026-11-05T99:99:99Z must fall
-	// through to the parse so the previous error behavior is preserved.
+	// The guard validates the full canonical shape, including a real calendar
+	// date and a plausible time of day: in-range values like 2026-13-01,
+	// 2026-02-30, or 2026-11-05T99:99:99Z must fall through to the parse so
+	// the previous error behavior is preserved instead of silently bucketing
+	// an impossible date.
 	if loc == time.UTC && len(timestamp) >= 20 && timestamp[10] == 'T' && timestamp[13] == ':' && timestamp[16] == ':' && timestamp[len(timestamp)-1] == 'Z' &&
 		isASCIIDigits(timestamp[0:4]) && timestamp[4] == '-' && isASCIIDigits(timestamp[5:7]) && timestamp[7] == '-' && isASCIIDigits(timestamp[8:10]) &&
 		isASCIIDigits(timestamp[11:13]) && isASCIIDigits(timestamp[14:16]) && isASCIIDigits(timestamp[17:19]) &&
-		timestamp[11:13] <= "23" && timestamp[14:16] <= "59" && timestamp[17:19] <= "59" {
+		timestamp[11:13] <= "23" && timestamp[14:16] <= "59" && timestamp[17:19] <= "59" &&
+		isCalendarDate(timestamp[0:4], timestamp[5:7], timestamp[8:10]) {
 		return timestamp[:10], nil
 	}
 	parsed, err := timeParse(timestamp)
@@ -2502,6 +2505,32 @@ func (s *Store) localDayBucket(timestamp string) (string, error) {
 		return "", err
 	}
 	return parsed.In(loc).Format("2006-01-02"), nil
+}
+
+// isCalendarDate reports whether the year/month/day strings form a real
+// calendar date, so the fast path never accepts a value the parser would
+// reject (month 13, February 30, non-leap February 29).
+func isCalendarDate(year, month, day string) bool {
+	if month <= "00" || month > "12" || day <= "00" || day > "31" {
+		return false
+	}
+	var y int
+	for index := 0; index < 4; index++ {
+		y = y*10 + int(year[index]-'0')
+	}
+	var m int
+	for index := 0; index < 2; index++ {
+		m = m*10 + int(month[index]-'0')
+	}
+	var d int
+	for index := 0; index < 2; index++ {
+		d = d*10 + int(day[index]-'0')
+	}
+	daysInMonth := [12]int{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+	if m == 2 && (y%4 == 0 && (y%100 != 0 || y%400 == 0)) {
+		return d <= 29
+	}
+	return d <= daysInMonth[m-1]
 }
 
 func isASCIIDigits(value string) bool {
