@@ -5,7 +5,7 @@
 
 export const links = {
   repo: "https://github.com/carteakey/tokemon",
-  release: "https://github.com/carteakey/tokemon/releases/tag/v0.4.0",
+  release: "https://github.com/carteakey/tokemon/releases/tag/v0.4.2",
   deployment: "https://github.com/carteakey/tokemon/blob/main/DEPLOYMENT.md",
   license: "https://github.com/carteakey/tokemon/blob/main/LICENSE",
   spec: "https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md",
@@ -137,7 +137,7 @@ export const agentCommand = `bash deploy/install-agent.sh \\
 replace-with-a-generated-secret
 TOKEN`;
 
-export const cloneCommand = `git clone --branch v0.4.0 https://github.com/carteakey/tokemon.git
+export const cloneCommand = `git clone --branch v0.4.2 https://github.com/carteakey/tokemon.git
 cd tokemon`;
 
 export const localCommand = `go run ./cmd/tokemon serve --addr 127.0.0.1:8080 \\

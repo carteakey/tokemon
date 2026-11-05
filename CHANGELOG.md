@@ -1,4 +1,29 @@
-## Unreleased
+## 0.4.2
+
+The dashboard quality release: authentication options, accessibility,
+honest totals, and export tooling, on top of significant ingest and
+rendering performance work.
+
+### Upgrade notes
+
+- `tokemon serve` now implements the documented `--dashboard-token`
+  default: with no dashboard token configured, the ingest token
+  authenticates the dashboard too. Environments that previously relied
+  on the dashboard returning 401 without an explicit
+  `TOKEMON_DASHBOARD_TOKEN` should set one (or an explicit empty value)
+  to keep the web UI closed.
+- Optional password accounts: generate a hash with `tokemon passwd` and
+  set `TOKEMON_DASHBOARD_USERNAME` together with
+  `TOKEMON_DASHBOARD_PASSWORD_HASH` (both or neither; the server refuses
+  to start on a mismatch). Humans can then sign in without holding the
+  raw ingest token.
+- The first start after upgrading builds the new covering index over
+  lifetime token totals; expect a one-time pause on large databases
+  before ingest and rendering pick up the speedups.
+- CSV exports (sessions and analytics breakdown) are additive; existing
+  JSON export URLs are unchanged.
+
+### Changes
 
 - Added optional dashboard password authentication: `tokemon passwd` writes a bcrypt hash; configure it with `TOKEMON_DASHBOARD_USERNAME` and `TOKEMON_DASHBOARD_PASSWORD_HASH` to sign in with a username and password instead of the raw dashboard token. Token logins, CSRF, and the ingest token requirement are unchanged.
 - Fixed dashboard WCAG AA contrast: the analytics Apply-filters button no longer renders accent text on the browser's default gray button background (2.54:1 → 8.43:1), and dimmed labels, footers, table headers, and axis text use a faint-gray token that passes on both card and page backgrounds (3.77–4.04:1 → 5.04–5.39:1).
