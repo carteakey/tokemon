@@ -366,6 +366,40 @@ func TestRunPasswdRejectsNonTerminalWithoutStdinFlag(t *testing.T) {
 	}
 }
 
+func TestApplyDashboardTokenFallback(t *testing.T) {
+	newFlags := func(setDashboardToken bool, value string) *flag.FlagSet {
+		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+		flags.String("dashboard-token", "", "")
+		if setDashboardToken {
+			if err := flags.Set("dashboard-token", value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return flags
+	}
+	cases := []struct {
+		name          string
+		dashboard     string
+		ingest        string
+		setDash       bool
+		dashValue     string
+		want          string
+	}{
+		{"documented default applies", "", "secret", false, "", "secret"},
+		{"explicit dashboard token wins", "own-token", "secret", true, "own-token", "own-token"},
+		{"explicit empty stays closed", "", "secret", true, "", ""},
+		{"no ingest token stays closed", "", "", false, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := applyDashboardTokenFallback(tc.dashboard, tc.ingest, newFlags(tc.setDash, tc.dashValue))
+			if got != tc.want {
+				t.Fatalf("dashboard token = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
 	t.Setenv("TOKEMON_DASHBOARD_USERNAME", "")
 	t.Setenv("TOKEMON_DASHBOARD_PASSWORD_HASH", "")

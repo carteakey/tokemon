@@ -171,6 +171,7 @@ func runServe(args []string) error {
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
 	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	*dashboardToken = applyDashboardTokenFallback(*dashboardToken, *ingestToken, flags)
 	applyServerTimeoutConfig(flags, configValues, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout)
 	if *readTimeout <= 0 || *readHeaderTimeout <= 0 || *writeTimeout <= 0 || *idleTimeout <= 0 || *shutdownTimeout <= 0 {
 		return errors.New("server timeouts must be positive")
@@ -854,6 +855,18 @@ func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, da
 			*trustedProxyCIDRs = value
 		}
 	}
+}
+
+// applyDashboardTokenFallback implements the --dashboard-token flag's
+// documented default: with no dashboard token configured (flag, env, or config
+// file) the ingest token governs the dashboard too, so one secret works for
+// both ingestion and the web UI. An explicitly empty --dashboard-token keeps
+// the dashboard closed.
+func applyDashboardTokenFallback(dashboardToken, ingestToken string, flags *flag.FlagSet) string {
+	if dashboardToken != "" || ingestToken == "" || flagWasSet(flags, "dashboard-token") {
+		return dashboardToken
+	}
+	return ingestToken
 }
 
 func applyServerTimeoutConfig(flags *flag.FlagSet, values map[string]string, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout *time.Duration) {
