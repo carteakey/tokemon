@@ -1069,11 +1069,10 @@ ORDER BY timestamp`, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC
 		if err := rows.Scan(&timestamp, &model, &provider, &total); err != nil {
 			return nil, err
 		}
-		parsed, err := timeParse(timestamp)
+		date, err := s.localDayBucket(timestamp)
 		if err != nil {
 			return nil, err
 		}
-		date := parsed.In(s.reportingLocation()).Format("2006-01-02")
 		var tokens, unknownTokens int64
 		if total.Valid {
 			tokens = total.Int64
@@ -2465,6 +2464,40 @@ FROM usage_events ORDER BY timestamp, event_id`)
 
 func timeParse(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, value)
+}
+
+// localDayBucket returns the calendar-day key for one stored timestamp.
+// Timestamps are always written by this store as UTC RFC3339 (trailing Z), so
+// when the reporting location is UTC the day is simply the string's date
+// prefix — no per-row parse, location lookup, or format allocation. Any other
+// reporting location and any non-canonical value (including legacy rows with
+// explicit offsets) take the full-parse path, preserving the previous
+// behavior and error reporting for malformed values.
+func (s *Store) localDayBucket(timestamp string) (string, error) {
+	loc := s.reportingLocation()
+	// The guard validates the full canonical shape, including a plausible
+	// time of day: an in-range value like 2026-11-05T99:99:99Z must fall
+	// through to the parse so the previous error behavior is preserved.
+	if loc == time.UTC && len(timestamp) >= 20 && timestamp[10] == 'T' && timestamp[13] == ':' && timestamp[16] == ':' && timestamp[len(timestamp)-1] == 'Z' &&
+		isASCIIDigits(timestamp[0:4]) && timestamp[4] == '-' && isASCIIDigits(timestamp[5:7]) && timestamp[7] == '-' && isASCIIDigits(timestamp[8:10]) &&
+		isASCIIDigits(timestamp[11:13]) && isASCIIDigits(timestamp[14:16]) && isASCIIDigits(timestamp[17:19]) &&
+		timestamp[11:13] <= "23" && timestamp[14:16] <= "59" && timestamp[17:19] <= "59" {
+		return timestamp[:10], nil
+	}
+	parsed, err := timeParse(timestamp)
+	if err != nil {
+		return "", err
+	}
+	return parsed.In(loc).Format("2006-01-02"), nil
+}
+
+func isASCIIDigits(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if character := value[index]; character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func nullInt64(value sql.NullInt64) *int64 {

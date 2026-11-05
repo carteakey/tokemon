@@ -1502,3 +1502,76 @@ func TestDetailedCodexEventWithoutTotalKeepsAggregate(t *testing.T) {
 		t.Fatalf("expected exactly one counted row for the session, got %d", nonNullTotals)
 	}
 }
+
+// The UTC fast path must bucket by the stored string's date prefix with no
+// semantic drift: events on either side of a UTC-day boundary land on their
+// own days, legacy timestamps with explicit offsets still parse correctly,
+// and malformed values keep the previous error behavior.
+func TestDailyUsageUTCPathBucketsAndFallsBack(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "utc-before", Timestamp: time.Date(2026, 11, 4, 23, 59, 59, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "utc-after", Timestamp: time.Date(2026, 11, 5, 0, 0, 1, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != 2 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+	daily, err := store.DailyUsage(context.Background(), time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(daily) != 2 || daily[0].Date != "2026-11-04" || daily[0].Tokens != 10 || daily[1].Date != "2026-11-05" || daily[1].Tokens != 20 {
+		t.Fatalf("utc daily buckets = %+v", daily)
+	}
+
+	// A legacy row written with an explicit offset must not take the string
+	// prefix fast path: its UTC date differs from the prefix.
+	if _, err := store.db.Exec(`UPDATE usage_events SET timestamp = '2026-11-05T01:30:00+02:00' WHERE event_id = 'utc-after'`); err != nil {
+		t.Fatal(err)
+	}
+	daily, err = store.DailyUsage(context.Background(), time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(daily) != 1 || daily[0].Date != "2026-11-04" || daily[0].Tokens != 30 {
+		t.Fatalf("legacy offset row bucketed wrong: %+v", daily)
+	}
+
+	// Malformed in-range timestamps keep the previous error behavior (the
+	// fast-path guard must not silently bucket an invalid time of day).
+	if _, err := store.db.Exec(`UPDATE usage_events SET timestamp = '2026-11-05T99:99:99Z' WHERE event_id = 'utc-after'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DailyUsage(context.Background(), time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatal("malformed timestamp did not error")
+	}
+}
+
+func BenchmarkDailyUsage(b *testing.B) {
+	store, err := Open(b.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	base := time.Date(2025, 11, 5, 0, 0, 0, 0, time.UTC)
+	var batch []usage.Event
+	for day := 0; day < 365; day++ {
+		for hour := 0; hour < 24; hour++ {
+			batch = append(batch, usage.Event{SchemaVersion: usage.SchemaVersion, EventID: fmt.Sprintf("bench-%d-%d", day, hour), Timestamp: base.AddDate(0, 0, day).Add(time.Duration(hour) * time.Hour), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}})
+		}
+	}
+	if _, err := store.Ingest(context.Background(), batch); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if _, err := store.DailyUsage(context.Background(), base.AddDate(0, 0, 1), base.AddDate(1, 0, 1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
