@@ -605,6 +605,16 @@ WHERE adapter = 'codex'
 	if err != nil {
 		return err
 	}
+	// The covering aggregate indexes reference columns added by the
+	// migrations above (notably project), so they are created last, after the
+	// schema is final. On legacy databases that upgrade in place, the first
+	// startup pays a one-time index build.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_model_sessions ON usage_events(COALESCE(NULLIF(canonical_model, ''), raw_model), canonical_model, raw_model, machine_id, provider, tool, session_id, total_tokens, cost)`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_project_sessions ON usage_events(project, machine_id, provider, tool, session_id, total_tokens)`); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, databaseSchemaVersion))
 	return err
 }

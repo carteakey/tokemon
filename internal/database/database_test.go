@@ -108,6 +108,52 @@ func TestLifetimeTokensUsesCoveringIndex(t *testing.T) {
 	}
 }
 
+// Overview's by-model and by-project GROUP BYs carry the dashboard's most
+// expensive aggregates (distinct-thread concats + sums); both must run as
+// covering index scans instead of full table scans with temp b-trees.
+func TestOverviewGroupQueriesUseCoveringIndexes(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cases := []struct{ name, query, index string }{
+		{"by-model", `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
+COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0)
+FROM usage_events GROUP BY 1 ORDER BY 3 DESC`, "idx_usage_events_model_sessions"},
+		{"by-project", `SELECT project, COALESCE(SUM(total_tokens), 0),
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
+COUNT(DISTINCT machine_id)
+FROM usage_events GROUP BY project ORDER BY 2 DESC`, "idx_usage_events_project_sessions"},
+	}
+	for _, tc := range cases {
+		rows, err := store.db.Query(`EXPLAIN QUERY PLAN ` + tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		covered := false
+		for rows.Next() {
+			var id, parent, notUsed int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			if strings.Contains(detail, "USING COVERING INDEX "+tc.index) {
+				covered = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if !covered {
+			t.Errorf("%s query plan lost its covering index %s", tc.name, tc.index)
+		}
+	}
+}
+
 func TestRecordHeartbeatRoundTripsMachineMetadata(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
 	if err != nil {
