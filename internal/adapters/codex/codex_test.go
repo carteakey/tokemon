@@ -1,9 +1,11 @@
 package codex
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -644,4 +646,95 @@ func TestCodexTailParseSurvivesStateStoreRoundTrip(t *testing.T) {
 
 func sourceKey(adapter, path string) string {
 	return adapter + "\x00" + path
+}
+
+// The benchmarks quantify the phase-2 win: with a committed cursor the parse
+// touches only the appended tail, while a from-scratch parse of the same file
+// walks every line. Run with:
+//
+//	go test ./internal/adapters/codex/ -bench BenchmarkCodex -run '^$'
+func benchmarkCodexLog(b *testing.B, lines int) (*Adapter, []adapters.Source, adapters.Cursor) {
+	b.Helper()
+	home := b.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	path := filepath.Join(root, "benchmark.jsonl")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		b.Fatal(err)
+	}
+	writer := bufio.NewWriterSize(file, 1<<20)
+	fmt.Fprintf(writer, "%s\n", `{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-benchmark","model_provider":"openai"}}`)
+	fmt.Fprintf(writer, "%s\n", `{"timestamp":"2026-11-05T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6","cwd":"/home/user/project"}}`)
+	var cumulative int64
+	for index := 0; index < lines; index++ {
+		cumulative += 40
+		fmt.Fprintf(writer, `{"timestamp":"2026-11-05T12:00:%02dZ","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d}}}}`+"\n",
+			index%60, cumulative, cumulative*3/4, cumulative/4, cumulative/8, cumulative)
+	}
+	if err := writer.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	return adapter, sources, first.Cursor
+}
+
+func BenchmarkCodexParseFull(b *testing.B) {
+	adapter, sources, _ := benchmarkCodexLog(b, 20000)
+	b.SetBytes(int64(20000))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		result, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(result.Events) != 20000 {
+			b.Fatalf("events = %d", len(result.Events))
+		}
+	}
+}
+
+func BenchmarkCodexParseTail(b *testing.B) {
+	adapter, sources, cursor := benchmarkCodexLog(b, 20000)
+	path := sources[0].Path
+	// Append the tail a real active session would produce between polls.
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var tail int64 = 800000
+	tailLines := 100
+	for index := 0; index < tailLines; index++ {
+		tail += 40
+		fmt.Fprintf(file, `{"timestamp":"2026-11-05T13:00:%02dZ","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d}}}}`+"\n",
+			index%60, tail, tail*3/4, tail/4, tail/8, tail)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(tailLines))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		result, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: cursor})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(result.Events) != tailLines {
+			b.Fatalf("events = %d, want only the tail", len(result.Events))
+		}
+	}
 }
