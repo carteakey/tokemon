@@ -960,7 +960,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		},
 		"costValue": func(value *float64, estimated bool) string {
 			if value == nil {
-				return "Unavailable"
+				return "Unknown"
 			}
 			// Sub-dollar session costs keep enough precision to stay nonzero.
 			label := fmt.Sprintf("$%.4f", *value)

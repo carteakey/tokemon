@@ -729,6 +729,16 @@ Unknown values remain unknown rather than becoming zero.
 
 Only reported, derived, or clearly estimated tokens contribute to evolution. Records with unknown total tokens do not.
 
+Display vocabulary follows the same taxonomy:
+
+- **Unknown** — the field was not reported or is not safely inferable
+  (token totals, cost, duration, project, model).
+- **—** (em dash) — there is nothing to show yet (no usage recorded at
+  all), distinct from a reported unknown.
+- Cost estimates always disclose their coverage: priced and unpriced
+  token counts appear wherever an estimated cost is shown. Never blend
+  priced and unpriced tokens silently.
+
 ---
 
 ## 15. Provider Adapters
@@ -964,6 +974,24 @@ The overview keeps the lifetime counter global and exposes explicit **Today** an
 classify each machine as Connected (≤5 minutes), Stale (>5 and ≤30 minutes), or
 Offline (>30 minutes). Recent sessions remain metadata-only and show known versus
 unavailable token, cost, duration, and accuracy fields without conversation data.
+
+### Unknown Values
+
+Fields the adapter could not report are rendered as **Unknown**, never as zero,
+in every table and chart. The dashboard marks them consistently:
+
+- Warm amber styling on the affected cells: session-table totals, cost,
+  duration, and accuracy columns, plus the token-activity heatmap cells and
+  trend/share chart columns whose bucket contains events with unknown totals.
+- A dismissible-free note under the analytics period summary states how many
+  events in the current view have unavailable token totals.
+- Row labels use the same vocabulary: sessions without a reported project show
+  **Unknown project**, events with an unparsable model aggregate under
+  **Unknown model**.
+
+A session's aggregate snapshot keeps counting for its day until a detailed
+event carrying a usable total replaces it; an unknown-total detailed event
+never reduces a recorded total to zero.
 
 ---
 
