@@ -26,14 +26,16 @@ const (
 )
 
 type Adapter struct {
-	root  string
-	cache *adapters.SnapshotCache
+	root    string
+	cache   *adapters.SnapshotCache
+	handles *adapters.SQLiteHandles
 }
 
 func New(home string) *Adapter {
 	return &Adapter{
-		root:  filepath.Join(home, ".hermes"),
-		cache: adapters.NewSnapshotCache(),
+		root:    filepath.Join(home, ".hermes"),
+		cache:   adapters.NewSnapshotCache(),
+		handles: adapters.NewSQLiteHandles(8),
 	}
 }
 
@@ -144,11 +146,12 @@ type sessionAggregate struct {
 
 func (a *Adapter) parseUncached(ctx context.Context, path, machineID, identity, cursorIdentity string) (adapters.ParseResult, error) {
 	result := adapters.ParseResult{Cursor: adapters.Cursor{Identity: cursorIdentity}}
-	db, err := adapters.OpenReadOnly(ctx, path)
+	db, err := a.handles.Get(ctx, path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	defer db.Close()
+	// The handle is owned by the adapter's SQLiteHandles cache and stays open
+	// across polls; do not close it here.
 
 	hasSessions, err := adapters.HasTable(ctx, db, "sessions")
 	if err != nil {

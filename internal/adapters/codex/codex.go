@@ -32,6 +32,7 @@ type Adapter struct {
 	root           string
 	cache          *adapters.SnapshotCache
 	directories    *adapters.DirectoryCache
+	handles        *adapters.SQLiteHandles
 	sessionFiles   map[string]string
 	metadataByPath map[string]sessionMetadata
 	// metadataSigs remembers the file signature each indexed session log had
@@ -43,7 +44,7 @@ type Adapter struct {
 }
 
 func New(home string) *Adapter {
-	return &Adapter{root: filepath.Join(home, ".codex"), cache: adapters.NewSnapshotCache(), directories: adapters.NewDirectoryCache()}
+	return &Adapter{root: filepath.Join(home, ".codex"), cache: adapters.NewSnapshotCache(), directories: adapters.NewDirectoryCache(), handles: adapters.NewSQLiteHandles(8)}
 }
 
 func (a *Adapter) metadataReader() func(ctx context.Context, path string) (sessionMetadata, bool, error) {
@@ -781,11 +782,12 @@ func (a *Adapter) parseThreadSnapshots(ctx context.Context, source adapters.Sour
 }
 
 func (a *Adapter) parseThreadSnapshotsUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, sourceIdentity string) (adapters.ParseResult, error) {
-	db, err := adapters.OpenReadOnly(ctx, source.Path)
+	db, err := a.handles.Get(ctx, source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	defer db.Close()
+	// The handle is owned by the adapter's SQLiteHandles cache and stays open
+	// across polls; do not close it here.
 	hasThreads, err := adapters.HasTable(ctx, db, "threads")
 	if err != nil {
 		return adapters.ParseResult{}, err

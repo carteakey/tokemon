@@ -30,14 +30,16 @@ const (
 )
 
 type Adapter struct {
-	root  string
-	cache *adapters.SnapshotCache
+	root    string
+	cache   *adapters.SnapshotCache
+	handles *adapters.SQLiteHandles
 }
 
 func New(home string) *Adapter {
 	return &Adapter{
-		root:  filepath.Join(home, ".zcode", "cli", "db"),
-		cache: adapters.NewSnapshotCache(),
+		root:    filepath.Join(home, ".zcode", "cli", "db"),
+		cache:   adapters.NewSnapshotCache(),
+		handles: adapters.NewSQLiteHandles(8),
 	}
 }
 
@@ -293,10 +295,16 @@ func rowKey(aggregate *sessionAggregate) string {
 // are copied to a temporary directory and the copy is opened instead. The
 // originals are never written to.
 func (a *Adapter) openSource(ctx context.Context, path string) (*sql.DB, func(), error) {
-	db, err := adapters.OpenReadOnly(ctx, path)
+	db, err := a.handles.Get(ctx, path)
 	if err == nil {
-		return db, func() { _ = db.Close() }, nil
+		// The handle is owned by the adapter's SQLiteHandles cache and stays
+		// open across polls; the close callback is a no-op.
+		return db, func() {}, nil
 	}
+	// A hot WAL can make the direct read-only open fail (for example when the
+	// shared-memory sidecar needs recovery). Fall back to a per-parse copy of
+	// the database in a temporary directory, opened cold and closed after the
+	// parse — temp snapshots are not cached because each copy is new.
 	snapshot, cleanup, snapErr := snapshotCopy(path)
 	if snapErr != nil {
 		return nil, func() {}, fmt.Errorf("open %s read-only: %w", path, err)
