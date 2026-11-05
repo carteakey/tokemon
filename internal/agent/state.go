@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS source_state (
     cursor_identity TEXT NOT NULL,
     cursor_offset INTEGER NOT NULL,
     cursor_line INTEGER NOT NULL DEFAULT 0,
+    cursor_state TEXT NOT NULL DEFAULT '',
     last_successful_sync TEXT NOT NULL,
     PRIMARY KEY (machine_id, adapter, source_path)
 );
@@ -72,6 +73,10 @@ func OpenState(path string) (*StateStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize agent state: %w", err)
 	}
+	if err := migrateStateSchema(context.Background(), db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if !strings.HasPrefix(path, ":") && !strings.HasPrefix(path, "file:") {
 		if err := os.Chmod(path, 0o600); err != nil {
 			db.Close()
@@ -79,6 +84,44 @@ func OpenState(path string) (*StateStore, error) {
 		}
 	}
 	return &StateStore{db: db}, nil
+}
+
+// migrateStateSchema adds columns that post-date the initial release. The
+// cursor_state column carries the adapter-private resume blob; older state
+// databases simply start with an empty value, which makes the next parse a
+// full re-parse before incremental tail-parsing resumes.
+func migrateStateSchema(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(source_state)`)
+	if err != nil {
+		return fmt.Errorf("inspect agent state schema: %w", err)
+	}
+	hasCursorState := false
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan agent state schema: %w", err)
+		}
+		if name == "cursor_state" {
+			hasCursorState = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("scan agent state schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close agent state schema scan: %w", err)
+	}
+	if !hasCursorState {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE source_state ADD COLUMN cursor_state TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add source_state.cursor_state: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *StateStore) Close() error {
@@ -95,7 +138,7 @@ func (s *StateStore) Snapshot(ctx context.Context, machineID string) (StateSnaps
 		Cursors: make(map[string]adapters.Cursor),
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT adapter, source_path, cursor_identity, cursor_offset, cursor_line
+SELECT adapter, source_path, cursor_identity, cursor_offset, cursor_line, cursor_state
 FROM source_state
 WHERE machine_id = ?`, machineID)
 	if err != nil {
@@ -103,12 +146,12 @@ WHERE machine_id = ?`, machineID)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var adapter, sourcePath, identity string
+		var adapter, sourcePath, identity, cursorState string
 		var offset, line int64
-		if err := rows.Scan(&adapter, &sourcePath, &identity, &offset, &line); err != nil {
+		if err := rows.Scan(&adapter, &sourcePath, &identity, &offset, &line, &cursorState); err != nil {
 			return StateSnapshot{}, fmt.Errorf("scan agent cursor: %w", err)
 		}
-		snapshot.Cursors[sourceKey(adapter, sourcePath)] = adapters.Cursor{Identity: identity, Offset: offset, Line: line}
+		snapshot.Cursors[sourceKey(adapter, sourcePath)] = adapters.Cursor{Identity: identity, Offset: offset, Line: line, State: cursorState}
 	}
 	if err := rows.Err(); err != nil {
 		return StateSnapshot{}, fmt.Errorf("read agent cursors: %w", err)
@@ -223,16 +266,17 @@ func (s *StateStore) Commit(ctx context.Context, machineID string, committed Sta
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO source_state (
     machine_id, adapter, source_path, source_identity,
-    cursor_identity, cursor_offset, cursor_line, last_successful_sync
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    cursor_identity, cursor_offset, cursor_line, cursor_state, last_successful_sync
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(machine_id, adapter, source_path) DO UPDATE SET
     source_identity = excluded.source_identity,
     cursor_identity = excluded.cursor_identity,
     cursor_offset = excluded.cursor_offset,
     cursor_line = excluded.cursor_line,
+    cursor_state = excluded.cursor_state,
     last_successful_sync = excluded.last_successful_sync`,
 			machineID, report.Adapter, report.Path, identity,
-			cursor.Identity, cursor.Offset, cursor.Line, synced)
+			cursor.Identity, cursor.Offset, cursor.Line, cursor.State, synced)
 		if err != nil {
 			return rollback(fmt.Errorf("save cursor for %s: %w", report.Path, err))
 		}

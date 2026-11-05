@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tokemon/tokemon/internal/adapters"
+	"github.com/tokemon/tokemon/internal/agent"
 	"github.com/tokemon/tokemon/internal/usage"
 	_ "modernc.org/sqlite"
 )
@@ -408,4 +410,238 @@ func TestParseForkedSessionSubtractsParentPrefixAtForkBoundary(t *testing.T) {
 	if result.Events[0].SessionID != "child-session" || result.Events[1].SessionID != "child-session" {
 		t.Fatalf("child session attribution changed: %+v", result.Events)
 	}
+}
+
+// Incremental tail-parsing must produce exactly the events a full re-parse of
+// the same file produces: identical event IDs (they encode the absolute line
+// number), identical token deltas, and identical cursor positions.
+func TestCodexTailParseMatchesFullParse(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "incremental.jsonl")
+	baseLines := []string{
+		`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-incremental","model_provider":"openai"}}`,
+		`{"timestamp":"2026-11-05T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6","cwd":"/home/user/project"}}`,
+		`{"timestamp":"2026-11-05T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}`,
+		`{"timestamp":"2026-11-05T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":120,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":180}}}}`,
+	}
+	appendedLines := []string{
+		`{"timestamp":"2026-11-05T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"cached_input_tokens":140,"output_tokens":40,"reasoning_output_tokens":12,"total_tokens":220}}}}`,
+		// A cumulative reset (total drops) starts a new sequence.
+		`{"timestamp":"2026-11-05T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":60,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":20,"total_tokens":110}}}}`,
+	}
+	writeLog := func(lines []string) {
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLog(baseLines)
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := sources[0]
+	first, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 2 || first.Cursor.Offset == 0 || first.Cursor.Line != 4 || first.Cursor.State == "" {
+		t.Fatalf("first parse = %d events, cursor %+v", len(first.Events), first.Cursor)
+	}
+
+	// Append: the classic active-session shape (size and mtime change).
+	writeLog(append(baseLines, appendedLines...))
+	resumed, err := adapter.Parse(context.Background(), source, adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed.Events) != 2 {
+		t.Fatalf("resumed parse = %d events, want only the 2 appended: %+v", len(resumed.Events), resumed.Events)
+	}
+
+	// Ground truth: a from-scratch full parse of the same final content.
+	fullAdapter := New(home)
+	fullSources, err := fullAdapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := fullAdapter.Parse(context.Background(), fullSources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := append(append([]usage.Event{}, first.Events...), resumed.Events...)
+	if len(combined) != len(full.Events) {
+		t.Fatalf("incremental produced %d events, full parse produced %d", len(combined), len(full.Events))
+	}
+	for index := range combined {
+		got, want := combined[index], full.Events[index]
+		if got.EventID != want.EventID || got.TotalTokens == nil || want.TotalTokens == nil || *got.TotalTokens != *want.TotalTokens ||
+			got.Project != want.Project || got.Provider != want.Provider || got.Model != want.Model || got.SessionID != want.SessionID ||
+			got.InputTokens == nil || want.InputTokens == nil || *got.InputTokens != *want.InputTokens {
+			t.Fatalf("event %d diverged:\n incremental %+v\n full       %+v", index, got, want)
+		}
+	}
+	if resumed.Cursor.Offset != full.Cursor.Offset || resumed.Cursor.Line != full.Cursor.Line {
+		t.Fatalf("incremental cursor %+v != full cursor %+v", resumed.Cursor, full.Cursor)
+	}
+}
+
+func TestCodexTailParseFallsBackAfterTruncation(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "truncated.jsonl")
+	log := strings.Join([]string{
+		`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-truncated","model_provider":"openai"}}`,
+		`{"timestamp":"2026-11-05T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, err %v", first, err)
+	}
+
+	// Simulate replacement with a smaller file: the cursor offset now points
+	// past the end, which must reset to a full re-parse.
+	if err := os.WriteFile(path, []byte(log[:len(log)/2]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stored offset points past the smaller file, so the parse must reset:
+	// the cursor describes a full parse of the truncated content, not a resume.
+	if second.Cursor.Offset != 149 || second.Cursor.Line != 2 || len(second.Events) != 0 {
+		t.Fatalf("truncated file parse = %d events, cursor %+v, want a full re-parse of the truncated content", len(second.Events), second.Cursor)
+	}
+}
+
+func TestCodexTailParseRewindsPartialFinalRecord(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "partial.jsonl")
+	complete := []string{
+		`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-partial","model_provider":"openai"}}`,
+		`{"timestamp":"2026-11-05T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+	}
+	partial := `{"timestamp":"2026-11-05T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_us`
+	if err := os.WriteFile(path, []byte(strings.Join(complete, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 1 {
+		t.Fatalf("first parse = %+v, err %v", first, err)
+	}
+
+	// An active session mid-write: only a fragment of the next record exists.
+	if err := os.WriteFile(path, []byte(strings.Join(complete, "\n")+"\n"+partial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed.Events) != 0 || resumed.Cursor.Offset != first.Cursor.Offset || resumed.Cursor.Line != first.Cursor.Line {
+		t.Fatalf("partial-tail parse = %d events, cursor %+v, want an unchanged cursor", len(resumed.Events), resumed.Cursor)
+	}
+
+	// The record completes; the next parse emits it exactly once with the line
+	// number a full parse would have assigned.
+	completed := partial + `age":{"input_tokens":130,"output_tokens":30,"total_tokens":160}}}}`
+	if err := os.WriteFile(path, []byte(strings.Join(complete, "\n")+"\n"+completed+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	final, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: resumed.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Events) != 1 || final.Events[0].TotalTokens == nil || *final.Events[0].TotalTokens != 40 || final.Events[0].Source.Offset != 3 {
+		t.Fatalf("completed-tail parse = %+v", final.Events)
+	}
+}
+
+func TestCodexTailParseSurvivesStateStoreRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "roundtrip.jsonl")
+	log := strings.Join([]string{
+		`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-roundtrip","model_provider":"openai"}}`,
+		`{"timestamp":"2026-11-05T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || first.Cursor.State == "" {
+		t.Fatalf("first parse cursor %+v, err %v", first.Cursor, err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	store, err := agent.OpenState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const machineID = "machine"
+	report := adapters.SourceReport{Adapter: "codex", Path: path, Source: adapters.Source{Path: path}, Cursor: first.Cursor}
+	if err := store.Commit(context.Background(), machineID, agent.StateSnapshot{}, []adapters.SourceReport{report}, nil, time.Now()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(context.Background(), machineID)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.Close()
+	restored := snapshot.Cursors[sourceKey(report.Adapter, report.Path)]
+	if restored != first.Cursor {
+		t.Fatalf("state store round trip lost cursor state: %+v != %+v", restored, first.Cursor)
+	}
+
+	// A resumed parse driven by the restored cursor parses only new lines.
+	if err := os.WriteFile(path, []byte(log+`{"timestamp":"2026-11-05T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":25,"total_tokens":145}}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: restored})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed.Events) != 1 || resumed.Events[0].TotalTokens == nil || *resumed.Events[0].TotalTokens != 25 {
+		t.Fatalf("post-roundtrip resume = %+v", resumed.Events)
+	}
+}
+
+func sourceKey(adapter, path string) string {
+	return adapter + "\x00" + path
 }

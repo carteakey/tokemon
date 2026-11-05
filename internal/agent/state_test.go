@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -216,5 +217,66 @@ func stateEvent(id string, total int64) usage.Event {
 		Currency:      "USD",
 		TokenAccuracy: usage.AccuracyReported,
 		Source:        usage.Source{Adapter: "generic-jsonl", AdapterVersion: "test"},
+	}
+}
+
+// Agents upgraded from an older release carry a source_state table without
+// the cursor_state column; OpenState must migrate it in place so incremental
+// resume state can be stored.
+func TestOpenStateMigratesLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`
+CREATE TABLE IF NOT EXISTS source_state (
+    machine_id TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    source_identity TEXT NOT NULL,
+    cursor_identity TEXT NOT NULL,
+    cursor_offset INTEGER NOT NULL,
+    cursor_line INTEGER NOT NULL DEFAULT 0,
+    last_successful_sync TEXT NOT NULL,
+    PRIMARY KEY (machine_id, adapter, source_path)
+);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO source_state (machine_id, adapter, source_path, source_identity, cursor_identity, cursor_offset, cursor_line, last_successful_sync) VALUES ('machine-a', 'codex', '/private/session.jsonl', 'identity', 'cursor-identity', 42, 3, '2026-11-05T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// The legacy row survives with an empty resume state.
+	snapshot, err := store.Snapshot(context.Background(), "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, ok := snapshot.Cursors[sourceKey("codex", "/private/session.jsonl")]
+	if !ok || cursor.Offset != 42 || cursor.Line != 3 || cursor.State != "" {
+		t.Fatalf("legacy cursor = %+v, present=%t", cursor, ok)
+	}
+
+	// A state-bearing cursor round-trips through the migrated schema.
+	committed := adapters.Cursor{Identity: "cursor-identity", Offset: 100, Line: 8, State: `{"version":1}`}
+	report := adapters.SourceReport{Adapter: "codex", Path: "/private/session.jsonl", Source: adapters.Source{Path: "/private/session.jsonl", Identity: "identity"}, Cursor: committed}
+	if err := store.Commit(context.Background(), "machine-a", snapshot, []adapters.SourceReport{report}, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = store.Snapshot(context.Background(), "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.Cursors[sourceKey("codex", "/private/session.jsonl")]; got != committed {
+		t.Fatalf("migrated schema lost cursor state: %+v != %+v", got, committed)
 	}
 }

@@ -58,10 +58,16 @@ type Source struct {
 // Cursor is the last position successfully uploaded for one source identity.
 // An identity change or an offset beyond the current file size resets parsing
 // to the beginning, which handles replacement and truncation safely.
+//
+// State optionally carries an adapter-private, opaque resume blob (JSON) so
+// adapters whose events depend on earlier lines can parse only the appended
+// tail instead of the whole file. Adapters that do not need it leave it empty;
+// a state value that cannot be decoded must always fall back to a full parse.
 type Cursor struct {
 	Identity string `json:"identity"`
 	Offset   int64  `json:"offset"`
 	Line     int64  `json:"line,omitempty"`
+	State    string `json:"state,omitempty"`
 }
 
 type ParseRequest struct {

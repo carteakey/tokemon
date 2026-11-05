@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,10 @@ import (
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/usage"
 )
+
+// maxCodexRecordBytes bounds one JSONL record, matching the previous scanner
+// limit so a pathological line cannot grow without bound.
+const maxCodexRecordBytes = 64 << 20
 
 const (
 	adapterID      = "codex"
@@ -424,35 +430,158 @@ func (a *Adapter) parseLog(ctx context.Context, source adapters.Source, request 
 	if cached, err, ok := a.cache.Lookup(source.Path, signature, cacheIdentity, request.Cursor); ok {
 		return cached, err
 	}
-	result, err := a.parseLogUncached(ctx, source, request)
+	result, err := a.parseLogUncached(ctx, source, request, cacheIdentity)
 	a.cache.Store(source.Path, signature, cacheIdentity, request.Cursor, result, err)
 	return result, err
 }
 
-func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest) (adapters.ParseResult, error) {
+// codexParseStateVersion guards the resume blob: a state written by a
+// different version is discarded in favor of a full re-parse.
+const codexParseStateVersion = 1
+
+// codexParseState is the adapter-private state a resumed parse needs to
+// produce events identical to a full re-parse: the session context gathered
+// from earlier lines (session_meta / turn_context), the cumulative-delta
+// baseline, and the fork-prefix suppression state.
+type codexParseState struct {
+	Version int `json:"version"`
+	// CacheIdentity pins the fork-relevant environment (own identity, fork
+	// parent, parent signature). A changed value means already-parsed lines
+	// may now interpret differently, so the state must not be reused.
+	CacheIdentity         string                `json:"cache_identity,omitempty"`
+	SessionID             string                `json:"session_id,omitempty"`
+	SourceSessionID       string                `json:"source_session_id,omitempty"`
+	Provider              string                `json:"provider,omitempty"`
+	Model                 string                `json:"model,omitempty"`
+	Project               string                `json:"project,omitempty"`
+	PreviousCumulative    *normalizedTokenUsage `json:"previous_cumulative,omitempty"`
+	HasPreviousCumulative bool                  `json:"has_previous_cumulative,omitempty"`
+	ForkBaseline          *normalizedTokenUsage `json:"fork_baseline,omitempty"`
+	ForkResolved          bool                  `json:"fork_resolved,omitempty"`
+	ForkPrefixPending     bool                  `json:"fork_prefix_pending,omitempty"`
+	RemainingForkPrefix   *normalizedTokenUsage `json:"remaining_fork_prefix,omitempty"`
+}
+
+func encodeCodexParseState(state codexParseState) string {
+	state.Version = codexParseStateVersion
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		// A state that cannot be encoded simply forces a full parse next time.
+		return ""
+	}
+	return string(encoded)
+}
+
+func decodeCodexParseState(raw string) (codexParseState, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return codexParseState{}, false
+	}
+	var state codexParseState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil || state.Version != codexParseStateVersion {
+		return codexParseState{}, false
+	}
+	return state, true
+}
+
+func derefTokenUsage(value *normalizedTokenUsage) normalizedTokenUsage {
+	if value == nil {
+		return normalizedTokenUsage{}
+	}
+	return *value
+}
+
+func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, cacheIdentity string) (adapters.ParseResult, error) {
+	info, err := os.Stat(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
 	file, err := os.Open(source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	expectedIdentity := adapters.HashIdentity(source.Path)
+	// Resume from the parse state stored in the cursor so an append-only
+	// session log is read incrementally. The full parse stays the correctness
+	// baseline: missing or undecodable state, truncation, or an identity
+	// change all reset to it.
+	state, resume := decodeCodexParseState(request.Cursor.State)
+	if resume && (request.Cursor.Offset <= 0 || request.Cursor.Line <= 0 || request.Cursor.Offset > info.Size()) {
+		resume = false
+	}
+	if resume && state.CacheIdentity != cacheIdentity {
+		// The fork-relevant environment changed since the state was written
+		// (for example a fork parent appearing late); already-parsed lines may
+		// now interpret differently, so re-parse from the beginning.
+		resume = false
+	}
+	if resume && request.Cursor.Identity != "" && request.Cursor.Identity != expectedIdentity {
+		resume = false
+	}
+	if !resume {
+		state = codexParseState{}
+	}
+
+	offset, lineNumber := request.Cursor.Offset, request.Cursor.Line
+	if !resume {
+		offset, lineNumber = 0, 0
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return adapters.ParseResult{}, err
+	}
+	reader := bufio.NewReaderSize(file, 64*1024)
+	position := offset
+
 	provider, model, project := "openai", "unknown", ""
 	var sessionID, sourceSessionID string
 	var events []usage.Event
+	// seenUsage deduplicates repeated non-cumulative snapshots within a single
+	// parse pass. Duplicates that straddle an incremental boundary keep their
+	// deterministic per-line event ID and are absorbed by the server's Codex
+	// deduplication index, so account totals are unaffected.
 	seenUsage := make(map[string]struct{})
 	metadata, _ := a.sourceMetadata(ctx, source.Path)
-	forkBaseline, forkResolved := a.resolveForkBaseline(ctx, source.Path, metadata)
-	remainingForkPrefix := forkBaseline
-	previousCumulative := normalizedTokenUsage{}
-	hasPreviousCumulative := false
-	forkPrefixPending := forkResolved
-	for lineNumber := int64(1); scanner.Scan(); lineNumber++ {
+	var forkBaseline, remainingForkPrefix, previousCumulative normalizedTokenUsage
+	var hasPreviousCumulative, forkResolved, forkPrefixPending bool
+	if resume {
+		sessionID, sourceSessionID = state.SessionID, state.SourceSessionID
+		provider, model, project = state.Provider, state.Model, state.Project
+		previousCumulative = derefTokenUsage(state.PreviousCumulative)
+		hasPreviousCumulative = state.HasPreviousCumulative
+		forkBaseline = derefTokenUsage(state.ForkBaseline)
+		forkResolved = state.ForkResolved
+		forkPrefixPending = state.ForkPrefixPending
+		remainingForkPrefix = derefTokenUsage(state.RemainingForkPrefix)
+	} else {
+		forkBaseline, forkResolved = a.resolveForkBaseline(ctx, source.Path, metadata)
+		remainingForkPrefix = forkBaseline
+		forkPrefixPending = forkResolved
+	}
+	for {
 		if err := ctx.Err(); err != nil {
 			return adapters.ParseResult{}, err
 		}
-		line := scanner.Bytes()
+		line, readErr := adapters.ReadRecordLimit(reader, maxCodexRecordBytes)
+		if len(line) == 0 && errors.Is(readErr, io.EOF) {
+			break
+		}
+		lineStart := position
+		position += int64(len(line))
+		lineNumber++
+		if errors.Is(readErr, io.EOF) && !bytes.HasSuffix(line, []byte{'\n'}) {
+			if resume {
+				// The tail ends in a record that is still being written. Rewind
+				// so the next poll re-reads it whole; it has no stable line
+				// number yet.
+				position = lineStart
+				lineNumber--
+			}
+			break
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return adapters.ParseResult{}, readErr
+		}
 		if !bytes.Contains(line, []byte(`"session_meta"`)) && !bytes.Contains(line, []byte(`"turn_context"`)) && !bytes.Contains(line, []byte(`"token_count"`)) {
 			continue
 		}
@@ -580,10 +709,25 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 			})
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return adapters.ParseResult{}, err
-	}
-	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: adapters.HashIdentity(source.Path)}}, nil
+	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{
+		Identity: expectedIdentity,
+		Offset:   position,
+		Line:     lineNumber,
+		State: encodeCodexParseState(codexParseState{
+			CacheIdentity:         cacheIdentity,
+			SessionID:             sessionID,
+			SourceSessionID:       sourceSessionID,
+			Provider:              provider,
+			Model:                 model,
+			Project:               project,
+			PreviousCumulative:    &previousCumulative,
+			HasPreviousCumulative: hasPreviousCumulative,
+			ForkBaseline:          &forkBaseline,
+			ForkResolved:          forkResolved,
+			ForkPrefixPending:     forkPrefixPending,
+			RemainingForkPrefix:   &remainingForkPrefix,
+		}),
+	}}, nil
 }
 
 func codexUsageKey(sessionID, timestamp, provider, model string, input, cached, output, reasoning, total int64) string {
