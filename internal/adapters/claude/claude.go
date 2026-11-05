@@ -50,6 +50,21 @@ func (a *Adapter) Capabilities() adapters.Capabilities {
 	}
 }
 
+// claudeProjectLabel derives the project label from the session log's
+// enclosing folder. Claude Code stores transcripts under
+// ~/.claude/projects/<encoded-cwd>/, where the encoded folder is the working
+// directory with path separators replaced by dashes and a leading dash for
+// the root (e.g. /Users/alice/repos/tokemon -> -Users-alice-repos-tokemon).
+// The label is the folder name normalized as a project label; decoding the
+// dashes back into separators is ambiguous for project names that contain
+// dashes, so the encoded form is kept intact — it stays stable, unambiguous,
+// and never reads transcript content. A folder that normalizes to nothing
+// leaves the event without a project (rendered as Unknown project).
+func claudeProjectLabel(sourcePath string) string {
+	folder := filepath.Base(filepath.Dir(sourcePath))
+	return usage.NormalizeProject(strings.TrimLeft(folder, "-"))
+}
+
 func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 	paths, err := a.directories.Paths(ctx, a.root, ".jsonl")
 	if err != nil && !os.IsNotExist(err) {
@@ -77,6 +92,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	defer file.Close()
 
 	identity := a.sourceIdentity(source.Path)
+	project := claudeProjectLabel(source.Path)
 	info, err := file.Stat()
 	if err != nil {
 		return adapters.ParseResult{}, err
@@ -169,6 +185,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			sessionID = usage.NormalizeSessionID(sessionID)
 		}
 		event := normalize(record, rawUsage, machineID, identity, lineNumber, sessionID, timestamp)
+		event.Project = project
 		events = append(events, event)
 		if errors.Is(readErr, io.EOF) {
 			break

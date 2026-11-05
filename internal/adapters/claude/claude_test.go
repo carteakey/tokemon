@@ -123,7 +123,7 @@ func TestNormalizedPayloadIsExactAndMetadataOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"schema_version":"1","event_id":"sha256:18ff56ed97210f57f21a30ce17b70bd266d25b66b52f13bf6f9c6ed26ef90ecf","timestamp":"2026-07-12T12:00:01Z","machine_id":"machine","session_id":"session-123","provider":"anthropic","model":"claude-sonnet-4","tool":"claude-code","input_tokens":10,"output_tokens":20,"cache_read_tokens":30,"cache_write_tokens":40,"reasoning_tokens":null,"total_tokens":100,"duration_ms":1234,"cost":null,"currency":"USD","token_accuracy":"derived","source":{"adapter":"claude-code","adapter_version":"0.2.0","identity":"sha256:51e816557d9eccffd61d80ae073d8208c3a0b2b46332013f8cbb292ad8f9d7c1","offset":1}}`
+	const want = `{"schema_version":"1","event_id":"sha256:18ff56ed97210f57f21a30ce17b70bd266d25b66b52f13bf6f9c6ed26ef90ecf","timestamp":"2026-07-12T12:00:01Z","machine_id":"machine","session_id":"session-123","project":"private-project","provider":"anthropic","model":"claude-sonnet-4","tool":"claude-code","input_tokens":10,"output_tokens":20,"cache_read_tokens":30,"cache_write_tokens":40,"reasoning_tokens":null,"total_tokens":100,"duration_ms":1234,"cost":null,"currency":"USD","token_accuracy":"derived","source":{"adapter":"claude-code","adapter_version":"0.2.0","identity":"sha256:51e816557d9eccffd61d80ae073d8208c3a0b2b46332013f8cbb292ad8f9d7c1","offset":1}}`
 	if string(payload) != want {
 		t.Fatalf("payload mismatch\n got: %s\nwant: %s", payload, want)
 	}
@@ -298,5 +298,45 @@ func TestParseReplaysPreviousLineForLateDurationMetadata(t *testing.T) {
 	}
 	if updated.Events[0].EventID != initial.Events[0].EventID {
 		t.Fatalf("late duration changed event ID: initial=%q updated=%q", initial.Events[0].EventID, updated.Events[0].EventID)
+	}
+}
+
+// Project labels come from the encoded .claude/projects folder name only —
+// never from transcript content. The leading dash is the encoded root
+// separator; interior dashes stay intact so project names containing dashes
+// keep one stable, unambiguous label.
+func TestClaudeProjectLabelDerivesFromFolder(t *testing.T) {
+	cases := []struct{ folder, want string }{
+		{"-Users-alice-repos-tokemon", "users-alice-repos-tokemon"},
+		{"-Users-alice-repos-18-dawns", "users-alice-repos-18-dawns"},
+		{"encoded-project", "encoded-project"},
+		{"MyProject", "myproject"},
+		{"-", ""},
+	}
+	for _, tc := range cases {
+		if got := claudeProjectLabel("/home/user/.claude/projects/" + tc.folder + "/session.jsonl"); got != tc.want {
+			t.Errorf("claudeProjectLabel(%q) = %q, want %q", tc.folder, got, tc.want)
+		}
+	}
+}
+
+// End to end: a session log under an encoded project folder reports that
+// project label on every event, replacing the previous always-Unknown project.
+func TestParseReportsProjectFromProjectsFolder(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "-Users-alice-repos-18-dawns", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"session-123","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := New(home).Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Events[0].Project != "users-alice-repos-18-dawns" {
+		t.Fatalf("events = %+v, want project users-alice-repos-18-dawns", result.Events)
 	}
 }
