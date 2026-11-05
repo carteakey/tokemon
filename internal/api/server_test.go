@@ -897,6 +897,44 @@ func TestSessionsPageRendersSortableHeadersAndOrder(t *testing.T) {
 	}
 }
 
+func TestDashboardShowsDataFreshness(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh: an event just ingested.
+	recent := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "freshness-recent", Timestamp: time.Now().UTC().Add(-2 * time.Minute), MachineID: "machine", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{recent}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(fresh, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !bytes.Contains(fresh.Body.Bytes(), []byte("status-pill connected")) || !bytes.Contains(fresh.Body.Bytes(), []byte("Fresh")) {
+		t.Fatalf("fresh dashboard lacks the fresh pill: %s", fresh.Body.String())
+	}
+
+	// Stale: only an old event remains (new store replaces nothing; use the same store with an old-dated event).
+	stale := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "freshness-stale", Timestamp: time.Now().UTC().Add(-3 * time.Hour), MachineID: "machine", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(70), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{stale}); err != nil {
+		t.Fatal(err)
+	}
+	// Newest event is still the recent one, so force staleness by checking the stale path through the helper.
+	state := dataFreshnessFor(&stale.Timestamp, time.Now().UTC())
+	if state.Class != "stale" || state.State != "Stale" {
+		t.Fatalf("stale state = %+v", state)
+	}
+	none := dataFreshnessFor(nil, time.Now().UTC())
+	if none.Class != "" || none.State != "Unknown" {
+		t.Fatalf("unknown state = %+v", none)
+	}
+}
+
 func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

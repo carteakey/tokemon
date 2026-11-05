@@ -688,6 +688,32 @@ func TestOverviewMergesProjectsAcrossMachines(t *testing.T) {
 	}
 }
 
+func TestOverviewExposesNewestEvent(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	empty, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.NewestEvent != nil {
+		t.Fatalf("expected no newest event on an empty store, got %+v", empty.NewestEvent)
+	}
+	stamp := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.Ingest(context.Background(), []usage.Event{{SchemaVersion: usage.SchemaVersion, EventID: "freshness-1", Timestamp: stamp, MachineID: "machine", Provider: "provider", Model: "model", Tool: "tool", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}}); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.NewestEvent == nil || !overview.NewestEvent.Equal(stamp) {
+		t.Fatalf("newest event = %+v, want %v", overview.NewestEvent, stamp)
+	}
+}
+
 func TestOverviewBucketsUnknownProjects(t *testing.T) {
 	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

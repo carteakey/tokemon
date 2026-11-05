@@ -177,6 +177,7 @@ type Overview struct {
 	Cache          CacheSummary             `json:"cache"`
 	Threads        int64                    `json:"threads"`
 	Accuracy       map[usage.Accuracy]int64 `json:"accuracy"`
+	NewestEvent    *time.Time               `json:"newest_event,omitempty"`
 }
 
 // AnalyticsQuery describes the bounded, metadata-only slice shown by the
@@ -1229,11 +1230,13 @@ COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
-COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
+COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
+MAX(timestamp)
 FROM usage_events`
 
 func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	var total, eligibleTokens int64
+	var newestEvent sql.NullString
 	result := Overview{Timezone: s.Timezone(), Accuracy: make(map[usage.Accuracy]int64)}
 	if err := s.db.QueryRowContext(ctx, overviewTotalsQuery).Scan(
 		&total,
@@ -1243,8 +1246,18 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 		&result.Cache.CachedTokens,
 		&eligibleTokens,
 		&result.Threads,
+		&newestEvent,
 	); err != nil {
 		return Overview{}, err
+	}
+	// The timestamp column is stored as RFC3339Nano text; MAX(timestamp)
+	// surfaces it as a string, so parse rather than rely on driver conversion.
+	if newestEvent.Valid && newestEvent.String != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, newestEvent.String)
+		if err != nil {
+			return Overview{}, fmt.Errorf("parse newest event timestamp: %w", err)
+		}
+		result.NewestEvent = &parsed
 	}
 	result.LifetimeTokens = total
 	result.Evolution = evolution.SnapshotFor(total)

@@ -68,6 +68,30 @@ type dashboardPage struct {
 	MachineAliases map[string]string
 	Machines       []database.MachineInfo
 	Sessions       []database.SessionRecord
+	Freshness      dataFreshness
+}
+
+// dataFreshness describes how recent the newest persisted event is, using the
+// same pill vocabulary as machine health. It answers the "is my day total low
+// because a connector is down?" question from persisted data alone.
+type dataFreshness struct {
+	Class string
+	State string
+	Age   string
+}
+
+func dataFreshnessFor(newest *time.Time, now time.Time) dataFreshness {
+	if newest == nil {
+		return dataFreshness{Class: "", State: "Unknown", Age: "no events yet"}
+	}
+	age := now.Sub(*newest)
+	if age < 0 {
+		age = 0
+	}
+	if age <= 30*time.Minute {
+		return dataFreshness{Class: "connected", State: "Fresh", Age: durationLabel(age.Milliseconds()) + " ago"}
+	}
+	return dataFreshness{Class: "stale", State: "Stale", Age: durationLabel(age.Milliseconds()) + " ago"}
 }
 
 type analyticsPageData struct {
@@ -1637,7 +1661,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if len(sessions) > 8 {
 		sessions = sessions[:8]
 	}
-	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions}
+	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now())}
 	if err := s.template.ExecuteTemplate(w, "dashboard", page); err != nil {
 		return
 	}
@@ -2264,7 +2288,7 @@ const dashboardTemplate = `<!doctype html>
   </section>
 
   <section class="context-grid" aria-label="Today and week usage">
-    <article class="context-card"><h2>Today</h2><div class="context-value">{{commas .Today.Tokens}} tokens</div><div class="context-detail">{{commas .Today.Events}} events · {{commas .Today.InputTokens}} input · {{commas .Today.OutputTokens}} output{{if .Today.UnknownTokens}} · {{commas .Today.UnknownTokens}} unknown totals{{end}}</div></article>
+    <article class="context-card"><h2>Today <span class="status-pill {{.Freshness.Class}}" title="Newest stored event: {{.Freshness.Age}}">{{.Freshness.State}} · {{.Freshness.Age}}</span></h2><div class="context-value">{{commas .Today.Tokens}} tokens</div><div class="context-detail">{{commas .Today.Events}} events · {{commas .Today.InputTokens}} input · {{commas .Today.OutputTokens}} output{{if .Today.UnknownTokens}} · {{commas .Today.UnknownTokens}} unknown totals{{end}}</div></article>
     <article class="context-card"><h2>This week</h2><div class="context-value">{{commas .Week.Tokens}} tokens</div><div class="context-detail">{{commas .Week.Events}} events · {{commas .Week.InputTokens}} input · {{commas .Week.OutputTokens}} output{{if .Week.UnknownTokens}} · {{commas .Week.UnknownTokens}} unknown totals{{end}}</div></article>
   </section>
 
