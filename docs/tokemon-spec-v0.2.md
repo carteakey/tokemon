@@ -412,6 +412,10 @@ rollback procedure.
 
 CSV import and export are not required for v0.2.
 
+Post-v0.2: CSV **export** shipped for the current analytics breakdown and for
+sessions alongside the JSON exports (see the dashboard amendments appendix);
+CSV import remains unnecessary — JSONL stays the data-portability path.
+
 ---
 
 ## 9. Deployment
@@ -473,6 +477,15 @@ For v0.2:
 - Generate a stable machine ID for each agent.
 
 Per-agent credentials and revocation can come later.
+
+Post-v0.2 addition — optional username/password dashboard login: `tokemon
+passwd [--stdin]` writes a bcrypt hash; configuring both
+`TOKEMON_DASHBOARD_USERNAME` and `TOKEMON_DASHBOARD_PASSWORD_HASH` (flags, env,
+or dotenv, with the same precedence as the rest of the security config) lets a
+human sign in with that username and password via Basic auth as an alternative
+to the raw dashboard token. The server refuses to start on unpaired settings or
+a malformed hash. Token and Bearer logins, CSRF, and the ingest-token
+requirement for agent uploads are unchanged.
 
 ---
 
@@ -834,6 +847,14 @@ The **Tokedex** is the model catalog and tier-list view.
 
 The source of truth is a static YAML file bundled with Tokemon. Users may mount an override.
 
+Post-v0.2 disclosure: the Tokedex states pricing coverage up front ("Priced X
+of Y observed tokens") and renders models observed in usage but missing from
+the catalog in an explicit **Uncataloged models** section, each stating that
+usage counts toward totals but contributes no cost estimate. The literal
+`unknown` model aggregate is labeled **Unknown model** rather than surfacing
+the raw sentinel. Silent gaps between observed usage and catalog coverage are a
+spec violation ("never blend silently").
+
 Do not build:
 
 - A catalog editor
@@ -975,6 +996,14 @@ classify each machine as Connected (≤5 minutes), Stale (>5 and ≤30 minutes),
 Offline (>30 minutes). Recent sessions remain metadata-only and show known versus
 unavailable token, cost, duration, and accuracy fields without conversation data.
 
+Post-v0.2: the Today summary carries a **data-freshness pill** reflecting the
+age of the newest persisted event, so a stalled connector is visible on the
+card itself. Session identifiers render as readable display names (the `ses_…`
+shape collapses into a friendly label). The session timeline supports
+server-side sorting on When, Total, Cost, and Duration — headers are links
+exposing `aria-sort`, with sort state carried in the URL so filtered, sorted
+views are shareable.
+
 ### Unknown Values
 
 Fields the adapter could not report are rendered as **Unknown**, never as zero,
@@ -988,6 +1017,11 @@ in every table and chart. The dashboard marks them consistently:
 - Row labels use the same vocabulary: sessions without a reported project show
   **Unknown project**, events with an unparsable model aggregate under
   **Unknown model**.
+- Post-v0.2 aggregation rule: project-less usage (adapters such as Claude Code
+  that never report a project) is **bucketed** under Unknown project in the
+  overview breakdown, not filtered out — its tokens count in the row and the
+  displayed shares reconcile with lifetime totals. Unknown projects must never
+  be silently absent from a breakdown that sums to less than 100%.
 
 A session's aggregate snapshot keeps counting for its day until a detailed
 event carrying a usable total replaces it; an unknown-total detailed event
@@ -1678,7 +1712,7 @@ Only after v0.2 is stable:
 
 - Additional adapters
 - Better model-catalog coverage
-- CSV export
+- CSV export (shipped post-v0.2 for analytics breakdowns and sessions)
 - Per-agent tokens
 - Configurable terminology
 - Basic usage budgets
@@ -1769,3 +1803,41 @@ Its first proper release remains intentionally boring underneath:
 No React application. No Postgres. No Redis. No plugin runtime. No user-account system. No live sockets. No game engine.
 
 The product should be trustworthy first, useful immediately, and increasingly unhinged only in the appearance of the creature you have fed.
+
+---
+
+## Appendix — Shipped Dashboard Amendments (Post-v0.2)
+
+The v0.2 sections above remain the design baseline. These amendments record
+what shipped beyond it, so the spec and the dashboard do not drift apart.
+
+- **Export formats.** Analytics breakdowns and sessions export as CSV in
+  addition to JSON, honoring the current filters. JSONL remains the
+  import/export path for full data portability (§8).
+- **Sortable sessions.** The session timeline sorts server-side on When,
+  Total, Cost, and Duration. Sort headers are links carrying `aria-sort`, and
+  sort state rides in the URL next to the filter state (§18).
+- **Freshness.** The overview Today card shows a data-freshness pill derived
+  from the newest persisted event (§18).
+- **Readable identity.** Session IDs collapse into friendly display names;
+  the `unknown` model aggregate is labeled Unknown model (§18, §16).
+- **Disclosure over silence.** Cost cards show unpriced-token totals beside
+  estimates; the Tokedex shows pricing coverage and lists uncataloged models
+  (§16, §17 — "never blend silently" is enforced in the UI, not just prose).
+- **Project attribution.** Claude Code's project label derives from the
+  transcript cwd and the `.claude` projects folder; project-less usage
+  aggregates under Unknown project instead of vanishing (§18).
+- **Authentication.** Optional bcrypt-backed username/password dashboard login
+  via `tokemon passwd` and `TOKEMON_DASHBOARD_USERNAME` /
+  `TOKEMON_DASHBOARD_PASSWORD_HASH`, alongside token/Bearer auth (§9).
+- **Query posture.** Covering indexes over `usage_events` make lifetime-token
+  sums and by-model/by-project aggregates index-only scans; the first start
+  after upgrading builds them (see DEPLOYMENT.md). Overview scalar scans
+  collapsed into one pass; per-source SQLite handles and Codex cursor/index
+  state persist across polling cycles (§11).
+- **Accessibility contract.** Skip-to-content on every page, solid
+  `:focus-visible` outlines everywhere (no `outline:none`), heatmap cells
+  focusable only on days with usage, odometer values exposed via `role=img`
+  with an aria-label, keyboard-reachable scrollable regions, Tokedex cards
+  headed for screen-reader navigation, and WCAG AA contrast on all text
+  including status pills (§19 and the charts/tables sections).
