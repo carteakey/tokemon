@@ -387,6 +387,25 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 To upgrade a native agent, rerun `deploy/install-agent.sh` with the new release version. The installer keeps the existing state database and configuration path.
 
+### First start after upgrading builds covering indexes
+
+Recent releases add covering indexes over `usage_events` so the dashboard's
+lifetime-token sum and its by-model and by-project aggregates become
+index-only scans instead of full-table scans. The indexes are created
+automatically by the migration step (`CREATE INDEX IF NOT EXISTS` under the
+database lock, before `serve` starts accepting requests); no operator action
+is required.
+
+Expect a one-time build on the first start after upgrading. The cost scales
+with history size: on a 118k-event production-shaped copy the
+`idx_usage_events_total_tokens` partial index built in ~0.2s and added ~1.3MB;
+the two wider aggregate indexes (`idx_usage_events_model_sessions`,
+`idx_usage_events_project_sessions`) take longer to build and add proportionally
+more disk. Large databases may need a few extra seconds of startup time, and
+the database file grows accordingly. Later restarts skip the build, and the
+indexes are ordinary SQLite objects covered by `tokemon backup create` and
+`restore` like the rest of the schema.
+
 To stop the Compose hub:
 
 ```bash
