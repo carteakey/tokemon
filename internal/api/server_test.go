@@ -1513,6 +1513,26 @@ func TestDisplayFormattersReadNaturally(t *testing.T) {
 
 // Ported from the production-hardening line: the ingest endpoint must accept
 // exactly one JSON value so a trailing suffix cannot bypass request limits.
+
+func TestSessionDisplayNameCoversProviderIDShapes(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"sess_2692e21a-a705-4739-9736-9944066c00c1", "session 2692e21a"},
+		{"sess_subagent_agent_fd6451fa-45b6-4a23-8ecd-4c0933fdc1d3", "subagent fd6451fa"},
+		{"session_9b0ae0790f7b4e81a7bc6b5e74ba0bf6", "session 9b0ae079"},
+		{"local-17b847a5f18631cb112a0d7251603401ff0e70466ea0d6d5e441d88992fd2a3f", "session 17b847a5"},
+		{"sha256:5f1c3b9a88f700112233445566778899aabbccddeeff00112233445566778899", "session 5f1c3b9a"},
+		{"20261027_192814_9fa9fb3d", "2026-10-27 19:28"},
+		{"plain-name", "plain-name"},
+		{"a-very-long-unstructured-session-identifier-value", "a-very-long-unstru…"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := sessionDisplayName(tc.raw); got != tc.want {
+			t.Errorf("sessionDisplayName(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestIngestRejectsTrailingJSON(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

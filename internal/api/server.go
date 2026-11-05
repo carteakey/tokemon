@@ -405,6 +405,64 @@ func harnessName(tool string) string {
 	}
 }
 
+// sessionDisplayName renders a raw session ID for the dashboard tables.
+// Provider IDs arrive in a handful of noisy shapes (sess_<uuid>,
+// sess_subagent_agent_<uuid>, session_<hex>, local-<hex>, sha256:<hex>,
+// YYYYMMDD_HHMMSS_<hex>); the display name strips the known noise prefixes and
+// keeps a short stable identifier, expanding only the timestamp shape that
+// carries real meaning. The full ID stays available in the cell's title
+// attribute. Empty IDs render as empty and unknown shapes pass through
+// truncated.
+func sessionDisplayName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if display, ok := sessionTimestampName(trimmed); ok {
+		return display
+	}
+	for _, prefix := range []string{"sha256:", "local-", "sess_subagent_agent_", "sess_", "session_"} {
+		if rest, ok := strings.CutPrefix(trimmed, prefix); ok && rest != "" {
+			label := "session"
+			if strings.HasPrefix(prefix, "sess_subagent") {
+				label = "subagent"
+			}
+			return label + " " + shortID(rest)
+		}
+	}
+	if len(trimmed) > 18 {
+		return trimmed[:18] + "…"
+	}
+	return trimmed
+}
+
+func shortID(value string) string {
+	value = strings.TrimFunc(value, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) })
+	if len(value) > 8 {
+		return value[:8]
+	}
+	return value
+}
+
+// sessionTimestampName expands the hermes YYYYMMDD_HHMMSS_<hex> shape, the only
+// raw session ID that carries human-readable time information.
+func sessionTimestampName(raw string) (string, bool) {
+	if len(raw) < 16 || raw[8] != '_' || raw[15] != '_' {
+		return "", false
+	}
+	for _, r := range raw[:8] {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	for _, r := range raw[9:15] {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return raw[0:4] + "-" + raw[4:6] + "-" + raw[6:8] + " " + raw[9:11] + ":" + raw[11:13], true
+}
+
 func compactModelName(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -952,6 +1010,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"insightBar":           insightBarPercent,
 		"insightCoverage":      insightCoverage,
 		"insightRecapLabel":    insightRecapLabel,
+		"sessionDisplayName": sessionDisplayName,
 		"tokenValue": func(value *int64) string {
 			if value == nil {
 				return "Unknown"
@@ -2189,7 +2248,7 @@ const dashboardTemplate = `<!doctype html>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
     <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><a class="section-link" href="/sessions">Open session timeline</a></div>
-    <div class="sessions-scroll"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td>{{.SessionID}}<span class="table-muted">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td data-label="Input">{{tokenValue .InputTokens}}</td><td data-label="Output">{{tokenValue .OutputTokens}}</td><td data-label="Total">{{tokenValue .TotalTokens}}</td><td data-label="Cost">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
+    <div class="sessions-scroll"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}">{{sessionDisplayName .SessionID}}<span class="table-muted">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td data-label="Input">{{tokenValue .InputTokens}}</td><td data-label="Output">{{tokenValue .OutputTokens}}</td><td data-label="Total">{{tokenValue .TotalTokens}}</td><td data-label="Cost">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   {{if eq .LifetimeTokens 0}}
@@ -2855,7 +2914,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
   <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" href="{{sessionsExportURL .Filter}}">Export sessions JSON</a></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
-  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td>{{.SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
+  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}">{{sessionDisplayName .SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
   <footer><span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span></footer>
 </main></body></html>{{end}}`
 
