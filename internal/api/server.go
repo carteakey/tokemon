@@ -549,6 +549,12 @@ func modelDisplayName(aliases map[string]string, raw string) string {
 	if alias := strings.TrimSpace(aliases[raw]); alias != "" {
 		return alias
 	}
+	// The Claude adapter emits the literal "unknown" when a record's model
+	// cannot be parsed. It is not a real model: label the aggregate row as
+	// unknown instead of presenting it alongside catalog models.
+	if strings.EqualFold(raw, "unknown") {
+		return "Unknown model"
+	}
 	return compactModelName(raw)
 }
 
@@ -2235,7 +2241,7 @@ const dashboardTemplate = `<!doctype html>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Models</h2></div>
-      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if eq .Model "unknown"}}<span class="unknown-value" title="{{.Model}}">Unknown model</span>{{else}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span>{{end}}</span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Machines</h2></div>
@@ -3288,7 +3294,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       <div class="table-scroll breakdown-scroll">
         <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
-          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
+          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{if eq .Name "unknown"}}<span class="unknown-value">Unknown model</span>{{else}}{{modelDisplayName $.ModelAliases .Name}}{{end}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
