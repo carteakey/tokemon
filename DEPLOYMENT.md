@@ -49,7 +49,7 @@ curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/
 curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/metrics
 ```
 
-Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to 
+Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port.
 
 ## Dashboard authentication
 
@@ -72,7 +72,7 @@ Precedence for every setting: command-line flag first, then the environment
 variable, then the `--config` server.env file. `TOKEMON_DASHBOARD_TOKEN`
 defaults to `TOKEMON_INGEST_TOKEN` when unset, so a single token secures both
 agent upload and the dashboard; setting `TOKEMON_DASHBOARD_TOKEN` explicitly
-empty closes the dashboard entirely (agent upload keeps working).use another port. The container listens on port `8080` internally.
+empty closes the dashboard entirely (agent upload keeps working).
 
 The server uses bounded HTTP read, header, write, idle, and graceful-shutdown
 timeouts. Set `TOKEMON_SERVER_READ_TIMEOUT`,
