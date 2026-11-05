@@ -857,6 +857,57 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 	}
 }
 
+func TestSessionsExportSupportsCSV(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "csv-1", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "sess_csv", Project: "project,with-commas", Provider: "provider", Model: "model", Tool: "tool", InputTokens: usage.Int64(10), OutputTokens: usage.Int64(5), TotalTokens: usage.Int64(15), Cost: usage.Float64(0.25), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "csv-2", Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: "sess_csv", Provider: "provider", Model: "model", Tool: "tool", TokenAccuracy: usage.AccuracyUnknown, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?format=csv", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("csv export status = %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/csv; charset=utf-8" {
+		t.Fatalf("csv content type = %q", got)
+	}
+	if got := response.Header().Get("Content-Disposition"); !strings.Contains(got, "tokemon-sessions-30d.csv") {
+		t.Fatalf("csv disposition = %q", got)
+	}
+	rows := strings.Split(strings.TrimRight(response.Body.String(), "\n"), "\n")
+	if len(rows) != 2 {
+		t.Fatalf("csv rows = %d, want header + 1 session", len(rows))
+	}
+	if !strings.HasPrefix(rows[0], "session_id,timestamp,machine,provider,model,tool,project,") {
+		t.Fatalf("csv header = %q", rows[0])
+	}
+	// unknown token fields render as empty cells, never zero; the comma
+	// project is quoted per RFC 4180.
+	// The session aggregates both events: unknown totals collapse to empty
+	// cells (never zero), mixed accuracies become unknown, cost sums.
+	if !strings.Contains(rows[1], `"project,with-commas"`) || !strings.Contains(rows[1], ",,0.25,false,,unknown,2") {
+		t.Fatalf("csv data row = %q", rows[1])
+	}
+
+	// default stays JSON
+	jsonResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(jsonResponse, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export", nil))
+	if got := jsonResponse.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("default export content type = %q", got)
+	}
+}
 func TestSessionsPageRendersSortableHeadersAndOrder(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

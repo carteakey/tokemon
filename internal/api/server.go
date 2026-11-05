@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -839,7 +840,7 @@ func analyticsExportURL(query database.AnalyticsQuery) string {
 	return "/api/v1/analytics/export?" + values.Encode()
 }
 
-func sessionsExportURL(query database.AnalyticsQuery) string {
+func sessionsExportURL(query database.AnalyticsQuery, format string) string {
 	values := url.Values{}
 	values.Set("period", query.Period)
 	if query.Machine != "" {
@@ -853,6 +854,9 @@ func sessionsExportURL(query database.AnalyticsQuery) string {
 	}
 	if query.Tool != "" {
 		values.Set("tool", query.Tool)
+	}
+	if format != "" {
+		values.Set("format", format)
 	}
 	return "/api/v1/sessions/export?" + values.Encode()
 }
@@ -1485,6 +1489,10 @@ func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	if r.URL.Query().Get("format") == "csv" {
+		writeSessionsCSV(w, query, result)
+		return
+	}
 	payload, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1495,6 +1503,55 @@ func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-sessions-`+query.Period+`.json"`)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(payload)
+}
+
+// writeSessionsCSV streams the session table as RFC 4180 CSV. Unknown values
+// render as empty cells — never as zero — matching the dashboard vocabulary.
+func writeSessionsCSV(w http.ResponseWriter, query database.AnalyticsQuery, records []database.SessionRecord) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tokemon-sessions-`+query.Period+`.csv"`)
+	w.WriteHeader(http.StatusOK)
+	writer := csv.NewWriter(w)
+	defer writer.Flush()
+	if err := writer.Write([]string{"session_id", "timestamp", "machine", "provider", "model", "tool", "project", "input_tokens", "output_tokens", "total_tokens", "cost", "cost_estimated", "duration_ms", "accuracy", "events"}); err != nil {
+		return
+	}
+	for _, record := range records {
+		row := []string{
+			record.SessionID,
+			record.Timestamp,
+			record.Machine,
+			record.Provider,
+			record.Model,
+			record.Tool,
+			record.Project,
+			nullInt64Cell(record.InputTokens),
+			nullInt64Cell(record.OutputTokens),
+			nullInt64Cell(record.TotalTokens),
+			nullCostCell(record.Cost),
+			strconv.FormatBool(record.CostEstimated),
+			nullInt64Cell(record.DurationMS),
+			string(record.Accuracy),
+			strconv.FormatInt(record.Events, 10),
+		}
+		if err := writer.Write(row); err != nil {
+			return
+		}
+	}
+}
+
+func nullInt64Cell(value *int64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+func nullCostCell(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*value, 'f', -1, 64)
 }
 
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
@@ -3007,7 +3064,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
-  <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" href="{{sessionsExportURL .Filter}}">Export sessions JSON</a></section>
+  <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" href="{{sessionsExportURL .Filter "json"}}">Export sessions JSON</a><a class="action" href="{{sessionsExportURL .Filter "csv"}}">Export sessions CSV</a></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
   <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}">{{sessionDisplayName .SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
   <footer><span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span></footer>
