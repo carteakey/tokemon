@@ -119,7 +119,42 @@ FROM usage_events WHERE timestamp >= ? AND timestamp < ?`,
 	return result, nil
 }
 
+// NormalizeSessionSort validates the session-table sort request. Unknown or
+// missing values fall back to the timestamp default.
+func NormalizeSessionSort(sort, dir string) (string, string) {
+	switch sort {
+	case "when", "tokens", "cost", "duration":
+	default:
+		sort = "when"
+	}
+	if dir != "asc" && dir != "desc" {
+		dir = "desc"
+	}
+	return sort, dir
+}
+
+// sessionOrderBy builds the session-table ORDER BY from a validated sort key.
+// Only whitelisted literals reach the query; rows with an unknown sort value
+// (NULL aggregate) sort last regardless of direction, and timestamp breaks ties.
+func sessionOrderBy(sort, dir string) string {
+	expressions := map[string]string{
+		"when":     "MAX(timestamp)",
+		"tokens":   "CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END",
+		"cost":     "CASE WHEN COUNT(cost) = 0 THEN NULL ELSE SUM(cost) END",
+		"duration": "CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END",
+	}
+	column := expressions[sort]
+	return "ORDER BY " + column + " IS NULL ASC, " + column + " " + strings.ToUpper(dir) + ", MAX(timestamp) DESC LIMIT 100"
+}
+
 func (s *Store) Sessions(ctx context.Context, query AnalyticsQuery) ([]SessionRecord, error) {
+	return s.SessionsWithSort(ctx, query, "when", "desc")
+}
+
+// SessionsWithSort returns the session table ordered by the validated sort key
+// (when, tokens, cost, or duration) in the requested direction.
+func (s *Store) SessionsWithSort(ctx context.Context, query AnalyticsQuery, sort, dir string) ([]SessionRecord, error) {
+	sort, dir = NormalizeSessionSort(sort, dir)
 	query, start, end := s.normalizeAnalyticsQuery(query)
 	where, args := analyticsWhere(query, start, end)
 	rows, err := s.db.QueryContext(ctx, `SELECT
@@ -140,7 +175,7 @@ CASE WHEN COUNT(DISTINCT token_accuracy) = 1 THEN MAX(token_accuracy) ELSE 'unkn
 COUNT(*)
 FROM usage_events WHERE `+where+` AND NULLIF(session_id, '') IS NOT NULL
 GROUP BY session_id, machine_id, provider, tool
-ORDER BY 1 DESC LIMIT 100`, args...)
+`+sessionOrderBy(sort, dir), args...)
 	if err != nil {
 		return nil, err
 	}

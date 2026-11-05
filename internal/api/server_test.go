@@ -857,6 +857,46 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 	}
 }
 
+func TestSessionsPageRendersSortableHeadersAndOrder(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := func(id string, tokens int64) usage.Event {
+		return usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "ev-" + id, Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: id, Provider: "provider", Model: "model", Tool: "tool", InputTokens: usage.Int64(tokens), OutputTokens: usage.Int64(0), TotalTokens: usage.Int64(tokens), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{session("small", 100), session("large", 900)}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/sessions?sort=tokens&dir=asc", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("sessions status = %d", response.Code)
+	}
+	body := response.Body.Bytes()
+	for _, want := range []string{`aria-sort="ascending"`, "dir=desc&amp;sort=tokens", "small", "large"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("sessions page does not contain %q", want)
+		}
+	}
+	if bytes.Contains(body, []byte("DROP")) {
+		t.Fatal("sessions page leaked a raw sort expression")
+	}
+
+	// invalid sort key falls back to the timestamp default without error
+	fallback := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(fallback, httptest.NewRequest(http.MethodGet, "/sessions?sort=bogus%3B--&dir=asc", nil))
+	if fallback.Code != http.StatusOK || !bytes.Contains(fallback.Body.Bytes(), []byte("aria-sort=")) {
+		t.Fatalf("fallback sort status = %d", fallback.Code)
+	}
+}
+
 func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
 	if err != nil {

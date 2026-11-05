@@ -196,6 +196,16 @@ type sessionsPageData struct {
 	Facets         database.AnalyticsFacets
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
+	Sorts          map[string]sessionSortState
+}
+
+// sessionSortState carries the per-column sortable header state: the toggle
+// URL, whether this column is the active sort, and its aria-sort direction.
+type sessionSortState struct {
+	URL       string
+	Active    bool
+	AriaSort  string
+	Indicator string
 }
 
 const dashboardUsageRowsLimit = 5
@@ -406,6 +416,26 @@ func harnessName(tool string) string {
 	default:
 		return tool
 	}
+}
+
+// sortableHeader renders one sortable session-table header cell. The cell
+// links to the toggled sort, exposes aria-sort when active, and marks the
+// direction with a text arrow hidden from assistive tech.
+func sortableHeader(states map[string]sessionSortState, key string) template.HTML {
+	state, ok := states[key]
+	if !ok {
+		return ""
+	}
+	labels := map[string]string{"when": "When", "tokens": "Total", "cost": "Cost", "duration": "Duration"}
+	attr := ""
+	if state.Active {
+		attr = ` aria-sort="` + state.AriaSort + `"`
+	}
+	arrow := ""
+	if state.Indicator != "" {
+		arrow = ` <span aria-hidden="true">` + state.Indicator + `</span>`
+	}
+	return template.HTML(`<th scope="col"` + attr + `><a class="session-sort" href="` + template.HTMLEscapeString(state.URL) + `">` + labels[key] + arrow + `</a></th>`)
 }
 
 // sessionDisplayName renders a raw session ID for the dashboard tables.
@@ -1022,6 +1052,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"insightCoverage":      insightCoverage,
 		"insightRecapLabel":    insightRecapLabel,
 		"sessionDisplayName":   sessionDisplayName,
+		"sortableHeader":       sortableHeader,
 		"tokenValue": func(value *int64) string {
 			if value == nil {
 				return "Unknown"
@@ -1637,7 +1668,8 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
-	result, err := s.store.Sessions(r.Context(), query)
+	sort, dir := database.NormalizeSessionSort(r.URL.Query().Get("sort"), r.URL.Query().Get("dir"))
+	result, err := s.store.SessionsWithSort(r.Context(), query, sort, dir)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1653,12 +1685,39 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics.Facets, ModelAliases: modelAliases, MachineAliases: machineAliases}
+	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics.Facets, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
 }
 
+// sessionSortStates builds the sortable-header state for the four server-side
+// sorted columns. The active column toggles direction; the others default to
+// descending. Filter parameters are preserved in each toggle URL.
+func sessionSortStates(r *http.Request, activeSort, activeDir string) map[string]sessionSortState {
+	states := map[string]sessionSortState{}
+	for _, key := range []string{"when", "tokens", "cost", "duration"} {
+		active := key == activeSort
+		dir := activeDir
+		indicator := ""
+		ariaSort := ""
+		if active {
+			if dir == "desc" {
+				indicator, ariaSort = "\u25bc", "descending"
+			} else {
+				indicator, ariaSort = "\u25b2", "ascending"
+			}
+			dir = map[string]string{"desc": "asc", "asc": "desc"}[dir]
+		} else {
+			dir = "desc"
+		}
+		values := r.URL.Query()
+		values.Set("sort", key)
+		values.Set("dir", dir)
+		states[key] = sessionSortState{URL: "?" + values.Encode(), Active: active, AriaSort: ariaSort, Indicator: indicator}
+	}
+	return states
+}
 func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	started := time.Now()
@@ -2926,7 +2985,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
   <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" href="{{sessionsExportURL .Filter}}">Export sessions JSON</a></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
-  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}">{{sessionDisplayName .SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
+  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}">{{sessionDisplayName .SessionID}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
   <footer><span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span></footer>
 </main></body></html>{{end}}`
 

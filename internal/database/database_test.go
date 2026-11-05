@@ -271,6 +271,50 @@ func TestMachineStatusThresholdBoundaries(t *testing.T) {
 	}
 }
 
+func TestSessionsWithSortOrdersWhitelistedColumns(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := func(id string, tokens *int64, cost *float64, duration *int64) usage.Event {
+		return usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "ev-" + id, Timestamp: time.Now().UTC(), MachineID: "machine", SessionID: id, Provider: "provider", Model: "model", Tool: "tool", InputTokens: tokens, OutputTokens: usage.Int64(0), TotalTokens: tokens, Cost: cost, DurationMS: duration, TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	}
+	events := []usage.Event{
+		session("alpha", usage.Int64(100), usage.Float64(1.0), usage.Int64(1000)),
+		session("bravo", usage.Int64(300), nil, usage.Int64(3000)),
+		session("charlie", usage.Int64(200), usage.Float64(2.0), nil),
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	byTokens, err := store.SessionsWithSort(context.Background(), AnalyticsQuery{}, "tokens", "asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byTokens) != 3 || byTokens[0].TotalTokens == nil || *byTokens[0].TotalTokens != 100 || *byTokens[2].TotalTokens != 300 {
+		t.Fatalf("tokens asc order = %+v", byTokens)
+	}
+	byCost, err := store.SessionsWithSort(context.Background(), AnalyticsQuery{}, "cost", "desc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byCost) != 3 || byCost[2].Cost != nil || byCost[0].Cost == nil || *byCost[0].Cost != 2.0 {
+		t.Fatalf("cost desc order (unknown last) = %+v", byCost)
+	}
+	byDuration, err := store.SessionsWithSort(context.Background(), AnalyticsQuery{}, "duration", "asc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byDuration) != 3 || byDuration[2].DurationMS != nil || byDuration[0].DurationMS == nil || *byDuration[0].DurationMS != 1000 {
+		t.Fatalf("duration asc order (unknown last) = %+v", byDuration)
+	}
+	fallback, err := store.SessionsWithSort(context.Background(), AnalyticsQuery{}, "tokens; DROP TABLE usage_events", "asc")
+	if err != nil || len(fallback) != 3 {
+		t.Fatalf("injection-safe fallback failed: err=%v len=%d", err, len(fallback))
+	}
+}
+
 func TestCatalogSnapshotDisclosesUncatalogedModels(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{
