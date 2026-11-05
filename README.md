@@ -70,7 +70,7 @@ Precedence for each setting is command-line flag, then environment variable,
 then the `--config` server.env file. See DEPLOYMENT.md for the deployment
 keys.
 
-The overview shows lifetime tokens, today/week context, token mix, a 53-week activity field, machine health, recent metadata-only sessions, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export. `/tokedex` renders the bundled YAML model tiers, aliases, pricing provenance, and observed usage context; `/sessions` provides a filterable metadata-only session timeline.
+The overview shows lifetime tokens, today/week context with a data-freshness pill, token mix, a 53-week activity field, machine health, recent metadata-only sessions, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and JSON or CSV export. `/tokedex` renders the bundled YAML model tiers, aliases, pricing provenance, and observed usage context (including uncataloged models); `/sessions` provides a filterable, sortable metadata-only session timeline with JSON and CSV export.
 
 Read APIs include `/api/v1/analytics/timeline`, `/api/v1/sessions` (plus `/api/v1/sessions/export`), `/api/v1/machines`, `/api/v1/catalog`, and `/api/v1/models`. Filters affect only the requested analytics/session view; lifetime evolution and the primary token counter remain global.
 

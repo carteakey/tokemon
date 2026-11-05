@@ -9,6 +9,16 @@
 - Added a covering index over lifetime token totals so ingest batches, evolution recomputes, and dashboard renders stop scanning the full usage history.
 - Cached dashboard overview renders between ingests with the same bounded freshness window as the evolution summary, collapsing concurrent dashboard, analytics overview, and settings loads into one recompute; a compute that raced an ingest can no longer reinstall stale results.
 - Stopped the agent from re-writing unchanged source cursors on every poll cycle.
+- Added CSV export for the current analytics breakdown and for sessions alongside the existing JSON exports, so spreadsheets get the same filtered view the dashboard renders.
+- Added server-side sortable columns (When, Total, Cost, Duration) to the session timeline; headers are links that expose aria-sort, and sort state rides in the URL so filtered, sorted views can be shared.
+- Added a data-freshness pill to the overview Today card that reflects the age of the newest persisted event.
+- Made session tables readable: `ses_…` identifiers collapse into a friendly display name, and the literal `unknown` model aggregate is labeled "Unknown model" in breakdowns and the Tokedex instead of surfacing the raw sentinel.
+- Disclosed what was previously silent: unpriced tokens now appear on both cost cards instead of blending into estimates, and the Tokedex states pricing coverage plus a dedicated "Uncataloged models" section for models seen in usage but missing from the bundled catalog.
+- Derived Claude project labels from the transcript cwd and the `.claude` projects folder so project breakdowns no longer depend on adapters reporting an explicit project; usage from providers that never report a project now buckets as "Unknown project" in the overview instead of being silently dropped, and displayed shares reconcile with lifetime totals.
+- Sped up polling and rendering: per-source SQLite handles are reused across cycles instead of reopened, the Codex session metadata index survives polls, Codex session logs tail-parse incrementally instead of re-reading from byte 0 (benchmarks included), Overview's scalar queries collapsed into one pass, and the DailyUsage UTC fast path skips per-row timestamp parsing while validating calendar dates.
+- Implemented the documented `--dashboard-token` fallback: serving with only `TOKEMON_INGEST_TOKEN` now authenticates the dashboard with it instead of returning 401, matching the README and 0.4.0 upgrade notes.
+- Fixed Codex ingestion dropping a source's aggregate when a detailed event carried no total, and rewinding the Codex cursor over an unterminated final record so a partially written line cannot wedge the source.
+- Documented dashboard authentication (token, password, precedence), standardized the unknown-value vocabulary across docs and UI, disclosed unknown markers in the dashboard README section, and recorded the known-gaps audit in `docs/project-unknowns-audit.md`.
 
 ## 0.4.1
 
