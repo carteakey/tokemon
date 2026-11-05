@@ -1511,6 +1511,24 @@ func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
+// csvFormulaSafe prefixes spreadsheet-dangerous cells with a single quote so
+// a value that starts with a formula character is stored as text instead of
+// being executed by Excel, LibreOffice, or Google Sheets when the export is
+// opened. Text columns carry provider- and user-influenced values (session
+// IDs, machine names, project labels, model names), so every text cell goes
+// through this; numeric and boolean cells cannot start with these characters
+// and are written raw.
+func csvFormulaSafe(value string) string {
+	if value == "" {
+		return ""
+	}
+	switch value[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + value
+	}
+	return value
+}
+
 // writeSessionsCSV streams the session table as RFC 4180 CSV. Unknown values
 // render as empty cells — never as zero — matching the dashboard vocabulary.
 func writeSessionsCSV(w http.ResponseWriter, query database.AnalyticsQuery, records []database.SessionRecord) {
@@ -1524,13 +1542,13 @@ func writeSessionsCSV(w http.ResponseWriter, query database.AnalyticsQuery, reco
 	}
 	for _, record := range records {
 		row := []string{
-			record.SessionID,
+			csvFormulaSafe(record.SessionID),
 			record.Timestamp,
-			record.Machine,
-			record.Provider,
-			record.Model,
-			record.Tool,
-			record.Project,
+			csvFormulaSafe(record.Machine),
+			csvFormulaSafe(record.Provider),
+			csvFormulaSafe(record.Model),
+			csvFormulaSafe(record.Tool),
+			csvFormulaSafe(record.Project),
 			nullInt64Cell(record.InputTokens),
 			nullInt64Cell(record.OutputTokens),
 			nullInt64Cell(record.TotalTokens),
@@ -1959,9 +1977,9 @@ func writeAnalyticsCSV(w http.ResponseWriter, result database.Analytics) {
 	}
 	for _, row := range result.Breakdown {
 		if err := writer.Write([]string{
-			result.Filter.Dimension,
-			result.Filter.Period,
-			row.Name,
+			csvFormulaSafe(result.Filter.Dimension),
+			csvFormulaSafe(result.Filter.Period),
+			csvFormulaSafe(row.Name),
 			strconv.FormatInt(row.Tokens, 10),
 			strconv.FormatInt(row.Events, 10),
 			strconv.FormatInt(row.Sessions, 10),

@@ -1828,3 +1828,56 @@ func TestIngestRejectsTrailingJSON(t *testing.T) {
 		t.Fatalf("trailing JSON status = %d, want %d: %s", response.Code, http.StatusBadRequest, response.Body.String())
 	}
 }
+
+// Spreadsheet applications execute cells that begin with a formula character;
+// every text column of the CSV exports must be neutralized while numeric and
+// boolean cells stay raw.
+func TestCSVExportNeutralizesFormulaInjection(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "csv-injection", Timestamp: time.Now().UTC(),
+		MachineID: "=cmd|'/c-calc'", SessionID: "+1313544", Project: "-etc-passwd", Provider: "@provider",
+		Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	if result, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil || result.Accepted != 1 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	sessions := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(sessions, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/export?period=30d&format=csv", nil))
+	if sessions.Code != http.StatusOK {
+		t.Fatalf("sessions csv status = %d", sessions.Code)
+	}
+	body := sessions.Body.String()
+	for _, want := range []string{
+		`'+1313544`,
+		`'=cmd|'/c-calc'`,
+		`'-etc-passwd`,
+		`'@provider`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sessions csv missing neutralized cell %q", want)
+		}
+	}
+	if strings.Contains(body, "\n=cmd") || strings.Contains(body, "\n+1313544") {
+		t.Errorf("sessions csv contains an unneutralized formula cell:\n%s", body)
+	}
+
+	analytics := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(analytics, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?dimension=projects&period=30d&format=csv", nil))
+	if analytics.Code != http.StatusOK {
+		t.Fatalf("analytics csv status = %d", analytics.Code)
+	}
+	if body := analytics.Body.String(); !strings.Contains(body, "'-etc-passwd") {
+		t.Errorf("analytics csv missing neutralized project cell:\n%s", body)
+	}
+}
