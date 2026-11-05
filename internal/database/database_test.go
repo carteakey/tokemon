@@ -1338,3 +1338,83 @@ func TestInsightsQualifiesUnknownTotalsAndSuppressesMissingBaseline(t *testing.T
 		t.Fatalf("empty window should suppress conclusions: %+v", empty)
 	}
 }
+
+func TestDetailedCodexEventWithoutTotalKeepsAggregate(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	aggregate := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "agg-1", Timestamp: time.Now().UTC(),
+		MachineID: "m1", SessionID: "s1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+		TotalTokens: usage.Int64(1000), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{aggregate}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Today.Tokens != 1000 || before.LifetimeTokens != 1000 {
+		t.Fatalf("aggregate not counted: today=%d lifetime=%d", before.Today.Tokens, before.LifetimeTokens)
+	}
+
+	// What the agent uploads after SanitizeOutbound dropped a contradictory
+	// provider total: components preserved, TotalTokens nil, accuracy unknown.
+	sanitized := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "det-1", Timestamp: time.Now().UTC(),
+		MachineID: "m1", SessionID: "s1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+		InputTokens: usage.Int64(600), OutputTokens: usage.Int64(500),
+		CacheReadTokens: usage.Int64(0), CacheWriteTokens: usage.Int64(0), ReasoningTokens: usage.Int64(0),
+		TotalTokens: nil, TokenAccuracy: usage.AccuracyUnknown,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{sanitized}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Today.Tokens != 1000 || after.LifetimeTokens != 1000 {
+		t.Fatalf("aggregate was dropped for a nil-total detailed event: today=%d lifetime=%d", after.Today.Tokens, after.LifetimeTokens)
+	}
+
+	// A later corrected event carrying a consistent total replaces the aggregate
+	// without double-counting.
+	corrected := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "det-2", Timestamp: time.Now().UTC(),
+		MachineID: "m1", SessionID: "s1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+		InputTokens: usage.Int64(600), OutputTokens: usage.Int64(500),
+		CacheReadTokens: usage.Int64(0), CacheWriteTokens: usage.Int64(0), ReasoningTokens: usage.Int64(0),
+		TotalTokens: usage.Int64(1100), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{corrected}); err != nil {
+		t.Fatal(err)
+	}
+	final, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Today.Tokens != 1100 || final.LifetimeTokens != 1100 {
+		t.Fatalf("corrected event did not cleanly replace the aggregate: today=%d lifetime=%d", final.Today.Tokens, final.LifetimeTokens)
+	}
+	stored, err := store.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonNullTotals := 0
+	for _, event := range stored {
+		if event.SessionID == "s1" && event.TotalTokens != nil {
+			nonNullTotals++
+		}
+	}
+	if nonNullTotals != 1 {
+		t.Fatalf("expected exactly one counted row for the session, got %d", nonNullTotals)
+	}
+}

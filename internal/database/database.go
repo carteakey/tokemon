@@ -719,10 +719,15 @@ AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens 
 				continue
 			}
 		}
-		if event.Source.Adapter == "codex" && event.SessionID != "" && event.InputTokens != nil {
+		if event.Source.Adapter == "codex" && event.SessionID != "" && event.InputTokens != nil && event.TotalTokens != nil {
 			// Detailed Codex JSONL events supersede the older aggregate thread
 			// snapshot for the same session. Remove it before inserting component
 			// events so upgrading an agent cannot double-count lifetime usage.
+			// The removal requires the replacement event to carry a total: a
+			// sanitized event whose contradictory provider total was dropped
+			// (TotalTokens nil, components preserved) must keep the aggregate
+			// counting until a corrected event with a real total arrives,
+			// otherwise the session's contribution collapses to zero.
 			if _, err := tx.ExecContext(ctx, `DELETE FROM usage_events
 WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
 AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, event.MachineID, event.SessionID); err != nil {
