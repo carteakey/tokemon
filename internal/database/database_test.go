@@ -1676,3 +1676,39 @@ func BenchmarkDailyUsage(b *testing.B) {
 		}
 	}
 }
+
+// DST transitions move local midnight across UTC time, so a constant-offset
+// bucketing mislabels events near the transition. Segments from ZoneBounds
+// must keep both events on their true local date: with America/New_York
+// falling back at 2026-11-01T06:00Z, the events below are 00:30 EDT on Nov 1
+// and 23:30 EST on Nov 1 — the same local day, reachable only with each
+// segment's own offset.
+func TestDailyUsageDSTTransitionSegments(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	store, err := OpenWithLocation(t.TempDir()+"/tokemon.db", catalog.Empty(), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "dst-edt", Timestamp: time.Date(2026, 11, 1, 4, 30, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(3), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "dst-est", Timestamp: time.Date(2026, 11, 2, 4, 30, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(7), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "dst-next-day", Timestamp: time.Date(2026, 11, 2, 5, 0, 0, 0, time.UTC), MachineID: "machine", Provider: "provider", Model: "model", Tool: "codex", TotalTokens: usage.Int64(1), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != 3 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+	daily, err := store.DailyUsage(context.Background(), time.Date(2026, 10, 31, 0, 0, 0, 0, loc), time.Date(2026, 11, 3, 0, 0, 0, 0, loc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(daily) != 2 {
+		t.Fatalf("daily = %+v, want 2 local days", daily)
+	}
+	if daily[0].Date != "2026-11-01" || daily[0].Tokens != 10 || daily[1].Date != "2026-11-02" || daily[1].Tokens != 1 {
+		t.Fatalf("dst daily buckets = %+v, want 10 tokens on 11-01 and 1 on 11-02", daily)
+	}
+}
