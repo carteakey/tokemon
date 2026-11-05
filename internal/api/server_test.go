@@ -845,7 +845,7 @@ func TestDashboardRendersEstimatedAPICostWithoutPricingDisclaimer(t *testing.T) 
 	response := httptest.NewRecorder()
 	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
-	for _, want := range []string{"Est. API cost", "$10.00"} {
+	for _, want := range []string{"Est. API cost", "$10.00", "1M priced", "500K unpriced"} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
 		}
