@@ -45,6 +45,31 @@ Basic auth (`tokemon:<token>`) or Bearer auth. Keep the hub on Tailscale,
 WireGuard, or an authenticated reverse proxy. Direct public-internet exposure
 is unsupported.
 
+### Dashboard sign-in
+
+The dashboard accepts either credential:
+
+- **Dashboard token** — any Basic auth username with the dashboard token as
+  the password (`tokemon:<dashboard-token>`), or `Authorization: Bearer
+  <dashboard-token>`. With no dashboard token configured it defaults to the
+  ingest token; `--dashboard-token` / `TOKEMON_DASHBOARD_TOKEN` overrides
+  it, and setting it explicitly empty closes the dashboard entirely.
+- **Password account** — for humans who should not hold the raw token.
+  Generate a bcrypt hash and set the pair:
+
+  ```bash
+  tokemon passwd            # prompts on the terminal
+  tokemon passwd --stdin < secret.txt
+  ```
+
+  then set `TOKEMON_DASHBOARD_USERNAME` and
+  `TOKEMON_DASHBOARD_PASSWORD_HASH` (both together; the server refuses to
+  start with only one). Sign in as that username with the plaintext password.
+
+Precedence for each setting is command-line flag, then environment variable,
+then the `--config` server.env file. See DEPLOYMENT.md for the deployment
+keys.
+
 The overview shows lifetime tokens, today/week context, token mix, a 53-week activity field, machine health, recent metadata-only sessions, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and export. `/tokedex` renders the bundled YAML model tiers, aliases, pricing provenance, and observed usage context; `/sessions` provides a filterable metadata-only session timeline.
 
 Read APIs include `/api/v1/analytics/timeline`, `/api/v1/sessions` (plus `/api/v1/sessions/export`), `/api/v1/machines`, `/api/v1/catalog`, and `/api/v1/models`. Filters affect only the requested analytics/session view; lifetime evolution and the primary token counter remain global.

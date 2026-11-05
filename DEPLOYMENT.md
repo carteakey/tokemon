@@ -49,7 +49,30 @@ curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/
 curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/metrics
 ```
 
-Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port. The container listens on port `8080` internally.
+Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to 
+
+## Dashboard authentication
+
+The dashboard (and the read API) accept two credential kinds; configure either
+or both:
+
+| Setting | Flag | Purpose |
+| --- | --- | --- |
+| `TOKEMON_INGEST_TOKEN` | `--ingest-token` | Agent upload credential; also the dashboard token when no dashboard token is set |
+| `TOKEMON_DASHBOARD_TOKEN` | `--dashboard-token` | Dashboard + read-API token (Basic auth `tokemon:<token>` or `Bearer <token>`) |
+| `TOKEMON_DASHBOARD_USERNAME` | `--dashboard-username` | Human sign-in username; must be set together with the hash |
+| `TOKEMON_DASHBOARD_PASSWORD_HASH` | `--dashboard-password-hash` | bcrypt hash of the human password |
+
+Generate the password hash with `tokemon passwd` (prompts on the terminal) or
+`tokemon passwd --stdin`; the username and hash must be set together or the
+server refuses to start. Sign in with Basic auth as that username and the
+plaintext password.
+
+Precedence for every setting: command-line flag first, then the environment
+variable, then the `--config` server.env file. `TOKEMON_DASHBOARD_TOKEN`
+defaults to `TOKEMON_INGEST_TOKEN` when unset, so a single token secures both
+agent upload and the dashboard; setting `TOKEMON_DASHBOARD_TOKEN` explicitly
+empty closes the dashboard entirely (agent upload keeps working).use another port. The container listens on port `8080` internally.
 
 The server uses bounded HTTP read, header, write, idle, and graceful-shutdown
 timeouts. Set `TOKEMON_SERVER_READ_TIMEOUT`,
