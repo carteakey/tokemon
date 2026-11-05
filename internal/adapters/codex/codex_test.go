@@ -527,9 +527,10 @@ func TestCodexTailParseFallsBackAfterTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The stored offset points past the smaller file, so the parse must reset:
-	// the cursor describes a full parse of the truncated content, not a resume.
-	if second.Cursor.Offset != 149 || second.Cursor.Line != 2 || len(second.Events) != 0 {
-		t.Fatalf("truncated file parse = %d events, cursor %+v, want a full re-parse of the truncated content", len(second.Events), second.Cursor)
+	// the cursor describes a full parse of the truncated content, stopping
+	// before the incomplete final record so it is re-read when it completes.
+	if second.Cursor.Offset != 122 || second.Cursor.Line != 1 || len(second.Events) != 0 {
+		t.Fatalf("truncated file parse = %d events, cursor %+v, want a full re-parse rewound before the partial record", len(second.Events), second.Cursor)
 	}
 }
 
@@ -736,5 +737,67 @@ func BenchmarkCodexParseTail(b *testing.B) {
 		if len(result.Events) != tailLines {
 			b.Fatalf("events = %d, want only the tail", len(result.Events))
 		}
+	}
+}
+
+// Regression for the partial-final-record data-loss bug: a full parse must
+// NOT advance the cursor past an unterminated final record. The old behavior
+// stored a cursor after the partial bytes, so when the record completed the
+// resume seeked past its start and the event was lost (offset=404, then zero
+// events after completion).
+func TestCodexFullParseRewindsPartialTailAndCompletesIt(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "late-completion.jsonl")
+	complete := []string{
+		`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-late","model_provider":"openai"}}`,
+		`{"timestamp":"2026-11-05T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+	}
+	partial := `{"timestamp":"2026-11-05T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_us`
+	writeLog := func(body string) {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLog(strings.Join(complete, "\n") + "\n" + partial)
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Full parse (no cursor): line 3 is still being written, so the cursor
+	// must stop before it — never past its first bytes.
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 1 || first.Cursor.Line != 2 || first.Cursor.Offset == 0 {
+		t.Fatalf("full parse with partial tail = %d events, cursor %+v", len(first.Events), first.Cursor)
+	}
+
+	completed := partial + `age":{"input_tokens":130,"output_tokens":30,"total_tokens":160}}}}`
+	writeLog(strings.Join(complete, "\n") + "\n" + completed + "\n")
+	second, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Events) != 1 {
+		t.Fatalf("completed record produced %d events, want exactly 1: %+v", len(second.Events), second.Events)
+	}
+	if second.Events[0].TotalTokens == nil || *second.Events[0].TotalTokens != 40 || second.Events[0].Source.Offset != 3 {
+		t.Fatalf("completed record = %+v, want total 40 at line 3", second.Events[0])
+	}
+
+	// The event must be byte-identical to what a from-scratch parse yields.
+	fresh, err := New(home).Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Events) != 2 || fresh.Events[1].EventID != second.Events[0].EventID {
+		t.Fatalf("resumed event diverged from full parse: %+v vs %+v", fresh.Events, second.Events)
 	}
 }

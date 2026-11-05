@@ -570,13 +570,13 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 		position += int64(len(line))
 		lineNumber++
 		if errors.Is(readErr, io.EOF) && !bytes.HasSuffix(line, []byte{'\n'}) {
-			if resume {
-				// The tail ends in a record that is still being written. Rewind
-				// so the next poll re-reads it whole; it has no stable line
-				// number yet.
-				position = lineStart
-				lineNumber--
-			}
+			// The file ends mid-record. Rewind in both full and resume modes so
+			// the cursor never advances past a partially written record: once
+			// the record is complete, the next poll re-reads it whole with its
+			// stable line number. Advancing here would strand the first bytes
+			// of the record behind the cursor and lose the event forever.
+			position = lineStart
+			lineNumber--
 			break
 		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
