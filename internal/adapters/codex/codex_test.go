@@ -801,3 +801,118 @@ func TestCodexFullParseRewindsPartialTailAndCompletesIt(t *testing.T) {
 		t.Fatalf("resumed event diverged from full parse: %+v vs %+v", fresh.Events, second.Events)
 	}
 }
+
+// The session metadata index must persist across polls keyed by file
+// signature: unchanged logs are never re-read, new or changed logs are read
+// exactly once, and removed logs drop out of the index.
+func TestSessionIndexReadsOnlyNewOrChangedLogs(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSession := func(name, id string) {
+		log := `{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"` + id + `","model_provider":"openai"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(root, name), []byte(log), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSession("first.jsonl", "session-first")
+	writeSession("second.jsonl", "session-second")
+
+	reads := map[string]int{}
+	adapter := New(home)
+	adapter.readMetadata = func(ctx context.Context, path string) (sessionMetadata, bool, error) {
+		reads[path]++
+		return readSessionMetadata(ctx, path)
+	}
+
+	if _, err := adapter.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reads[filepath.Join(root, "first.jsonl")] != 1 || reads[filepath.Join(root, "second.jsonl")] != 1 {
+		t.Fatalf("initial index reads = %v, want one per log", reads)
+	}
+
+	// A poll with nothing changed: no reads at all.
+	if _, err := adapter.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 2 || reads[filepath.Join(root, "first.jsonl")] != 1 || reads[filepath.Join(root, "second.jsonl")] != 1 {
+		t.Fatalf("unchanged poll re-read logs: %v", reads)
+	}
+
+	// An active session appends: only that log is re-read (the session_meta
+	// line never moves, so the re-read stops at the first line).
+	if err := os.WriteFile(filepath.Join(root, "first.jsonl"), []byte(`{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-first","model_provider":"openai"}}`+"\n"+`{"timestamp":"2026-11-05T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSession("third.jsonl", "session-third")
+	if _, err := adapter.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reads[filepath.Join(root, "first.jsonl")] != 2 || reads[filepath.Join(root, "second.jsonl")] != 1 || reads[filepath.Join(root, "third.jsonl")] != 1 {
+		t.Fatalf("changed-poll reads = %v, want only first re-read and third read once", reads)
+	}
+	if len(adapter.metadataByPath) != 3 || len(adapter.sessionFiles) != 3 {
+		t.Fatalf("index = %d metadata / %d sessions, want 3 each", len(adapter.metadataByPath), len(adapter.sessionFiles))
+	}
+
+	// A removed log leaves the index.
+	if err := os.Remove(filepath.Join(root, "second.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.metadataByPath) != 2 || len(adapter.sessionFiles) != 2 {
+		t.Fatalf("index after removal = %d metadata / %d sessions, want 2 each", len(adapter.metadataByPath), len(adapter.sessionFiles))
+	}
+	if _, ok := adapter.metadataByPath[filepath.Join(root, "second.jsonl")]; ok {
+		t.Fatal("removed log stayed in the metadata index")
+	}
+}
+
+func BenchmarkDiscoverSessionIndex(b *testing.B) {
+	home := b.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	for index := 0; index < 200; index++ {
+		log := `{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-` + fmt.Sprintf("%03d", index) + `","model_provider":"openai"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("session-%03d.jsonl", index)), []byte(log), 0o600); err != nil {
+			b.Fatal(err)
+		}
+	}
+	adapter := New(home)
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if _, err := adapter.Discover(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDiscoverSessionIndexCold is the pre-optimization shape: a fresh
+// index every cycle re-reads every log. Compare with BenchmarkDiscoverSessionIndex.
+func BenchmarkDiscoverSessionIndexCold(b *testing.B) {
+	home := b.TempDir()
+	root := filepath.Join(home, ".codex", "sessions", "2026", "11", "05")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	for index := 0; index < 200; index++ {
+		log := `{"timestamp":"2026-11-05T12:00:00Z","type":"session_meta","payload":{"id":"session-` + fmt.Sprintf("%03d", index) + `","model_provider":"openai"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("session-%03d.jsonl", index)), []byte(log), 0o600); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		adapter := New(home)
+		if _, err := adapter.Discover(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

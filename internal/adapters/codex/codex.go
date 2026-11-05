@@ -34,10 +34,23 @@ type Adapter struct {
 	directories    *adapters.DirectoryCache
 	sessionFiles   map[string]string
 	metadataByPath map[string]sessionMetadata
+	// metadataSigs remembers the file signature each indexed session log had
+	// when its metadata was read, so refreshSessionIndex can skip unchanged
+	// files instead of re-reading every log on every poll.
+	metadataSigs map[string]adapters.FileSignature
+	// readMetadata is injectable for tests; nil uses readSessionMetadata.
+	readMetadata func(ctx context.Context, path string) (sessionMetadata, bool, error)
 }
 
 func New(home string) *Adapter {
 	return &Adapter{root: filepath.Join(home, ".codex"), cache: adapters.NewSnapshotCache(), directories: adapters.NewDirectoryCache()}
+}
+
+func (a *Adapter) metadataReader() func(ctx context.Context, path string) (sessionMetadata, bool, error) {
+	if a.readMetadata != nil {
+		return a.readMetadata
+	}
+	return readSessionMetadata
 }
 
 func (a *Adapter) ID() string { return adapterID }
@@ -283,25 +296,34 @@ func readSessionMetadata(ctx context.Context, path string) (sessionMetadata, boo
 }
 
 func (a *Adapter) refreshSessionIndex(ctx context.Context, sources []adapters.Source) error {
-	files := make(map[string]string)
-	metadataByPath := make(map[string]sessionMetadata)
+	// Re-reading every session log on every poll made Discover cost O(total
+	// log bytes) per cycle. A session_meta line is written once at the top of
+	// the log and never moves, so the index is kept across cycles keyed by
+	// file signature: unchanged files reuse their cached metadata and only
+	// new or changed files are read.
+	read := a.metadataReader()
+	files := make(map[string]string, len(sources))
+	metadataByPath := make(map[string]sessionMetadata, len(sources))
+	metadataSigs := make(map[string]adapters.FileSignature, len(sources))
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		metadata, ok, err := readSessionMetadata(ctx, source.Path)
+		signature, err := adapters.Signature(source.Path)
 		if err != nil {
-			if os.IsNotExist(err) {
+			continue
+		}
+		metadata, cached := a.metadataByPath[source.Path]
+		if !cached || a.metadataSigs[source.Path] != signature {
+			read, ok, err := read(ctx, source.Path)
+			if err != nil || !ok {
 				continue
 			}
-			continue
-		}
-		if !ok {
-			continue
+			metadata = read
 		}
 		metadataByPath[source.Path] = metadata
-		id := firstNonEmpty(metadata.ID, metadata.SessionID)
-		if id != "" {
+		metadataSigs[source.Path] = signature
+		if id := firstNonEmpty(metadata.ID, metadata.SessionID); id != "" {
 			if _, exists := files[id]; !exists {
 				files[id] = source.Path
 			}
@@ -309,6 +331,7 @@ func (a *Adapter) refreshSessionIndex(ctx context.Context, sources []adapters.So
 	}
 	a.sessionFiles = files
 	a.metadataByPath = metadataByPath
+	a.metadataSigs = metadataSigs
 	return nil
 }
 
