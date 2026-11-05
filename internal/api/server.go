@@ -184,7 +184,10 @@ type catalogTier struct {
 }
 
 type catalogPageData struct {
-	Tiers []catalogTier
+	Tiers          []catalogTier
+	Uncataloged    []database.UncatalogedModel
+	ObservedTokens int64
+	PricedTokens   int64
 }
 
 type sessionsPageData struct {
@@ -1619,7 +1622,7 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 	for _, model := range snapshot.Models {
 		byTier[model.Tier] = append(byTier[model.Tier], model)
 	}
-	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers))}
+	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens}
 	for _, tier := range snapshot.Tiers {
 		models := byTier[tier]
 		if len(models) == 0 {
@@ -2898,8 +2901,10 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
 </head>
 <body><main>
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a><a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
-  <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p></section>
+  <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .Uncataloged}} · {{len .Uncataloged}} uncataloged model{{if ne (len .Uncataloged) 1}}s{{end}} below{{end}}</p>{{end}}</section>
   {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><div class="label">{{.Provider}}</div><div class="model-name" title="{{.ID}}">{{.DisplayName}}</div><div class="model-id">{{.ID}}</div><div class="model-context"><strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div><div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div></article>{{end}}</div></section>{{else}}<p>No catalog models are configured.</p>{{end}}
+  <footer><span>Static YAML-backed catalog · metadata only</span><span><a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
+  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available</span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name" title="{{.ID}}">{{.ID}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{end}}
   <footer><span>Static YAML-backed catalog · metadata only</span><span><a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
 </main></body></html>{{end}}`
 

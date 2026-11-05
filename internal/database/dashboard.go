@@ -74,9 +74,21 @@ type CatalogEntry struct {
 }
 
 type CatalogSnapshot struct {
-	SchemaVersion string         `json:"schema_version"`
-	Models        []CatalogEntry `json:"models"`
-	Tiers         []string       `json:"tiers"`
+	SchemaVersion  string             `json:"schema_version"`
+	Models         []CatalogEntry     `json:"models"`
+	Tiers          []string           `json:"tiers"`
+	Uncataloged    []UncatalogedModel `json:"uncataloged,omitempty"`
+	ObservedTokens int64              `json:"observed_tokens,omitempty"`
+	PricedTokens   int64              `json:"priced_tokens,omitempty"`
+}
+
+// UncatalogedModel is a model identifier observed in usage that the bundled
+// catalog does not know. Its tokens still count toward totals but contribute
+// no cost estimate.
+type UncatalogedModel struct {
+	ID     string `json:"id"`
+	Tokens int64  `json:"tokens"`
+	Events int64  `json:"events"`
 }
 
 func (s *Store) PeriodSummary(ctx context.Context, start, end time.Time) (PeriodSummary, error) {
@@ -262,6 +274,36 @@ FROM usage_events GROUP BY 1`)
 	if err := usageRows.Close(); err != nil {
 		return CatalogSnapshot{}, err
 	}
+	// Usage recorded under a raw alias folds into its catalog model so late
+	// catalog additions and alias-form identifiers stay attributed; whatever
+	// remains is disclosed as uncataloged instead of disappearing.
+	for id, usage := range observed {
+		if _, known := s.catalog.Models[id]; known {
+			continue
+		}
+		if resolved, _, ok := s.catalog.Resolve(id); ok {
+			if _, known := s.catalog.Models[resolved]; known {
+				merged := observed[resolved]
+				merged.tokens += usage.tokens
+				merged.events += usage.events
+				merged.unknown += usage.unknown
+				observed[resolved] = merged
+				delete(observed, id)
+			}
+		}
+	}
+	uncataloged := make([]UncatalogedModel, 0, len(observed))
+	for id, usage := range observed {
+		if _, known := s.catalog.Models[id]; known {
+			result.PricedTokens += usage.tokens
+			result.ObservedTokens += usage.tokens
+			continue
+		}
+		result.ObservedTokens += usage.tokens
+		uncataloged = append(uncataloged, UncatalogedModel{ID: id, Tokens: usage.tokens, Events: usage.events})
+	}
+	sort.Slice(uncataloged, func(left, right int) bool { return uncataloged[left].Tokens > uncataloged[right].Tokens })
+	result.Uncataloged = uncataloged
 	ids := make([]string, 0, len(s.catalog.Models))
 	for id := range s.catalog.Models {
 		ids = append(ids, id)

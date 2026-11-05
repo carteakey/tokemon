@@ -271,6 +271,47 @@ func TestMachineStatusThresholdBoundaries(t *testing.T) {
 	}
 }
 
+func TestCatalogSnapshotDisclosesUncatalogedModels(t *testing.T) {
+	price := 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"alpha": {Provider: "provider", DisplayName: "Alpha", Aliases: []string{"alpha", "provider/alpha"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "catalog-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "provider", Model: "alpha", Tool: "tool", TotalTokens: usage.Int64(1_000_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// raw alias form: must fold into the alpha entry, not list as uncataloged
+		{SchemaVersion: usage.SchemaVersion, EventID: "alias-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "provider", Model: "provider/alpha", Tool: "tool", TotalTokens: usage.Int64(200_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// unknown catalog model: disclosed, not dropped
+		{SchemaVersion: usage.SchemaVersion, EventID: "mystery-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "provider", Model: "mystery-model", Tool: "tool", TotalTokens: usage.Int64(300_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.CatalogSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PricedTokens != 1_200_000 || snapshot.ObservedTokens != 1_500_000 {
+		t.Fatalf("coverage = priced %d of observed %d, want 1200000 of 1500000", snapshot.PricedTokens, snapshot.ObservedTokens)
+	}
+	if len(snapshot.Uncataloged) != 1 || snapshot.Uncataloged[0].ID != "mystery-model" || snapshot.Uncataloged[0].Tokens != 300_000 || snapshot.Uncataloged[0].Events != 1 {
+		t.Fatalf("uncataloged = %+v", snapshot.Uncataloged)
+	}
+	var alpha *CatalogEntry
+	for i := range snapshot.Models {
+		if snapshot.Models[i].ID == "alpha" {
+			alpha = &snapshot.Models[i]
+		}
+	}
+	if alpha == nil || alpha.UsageTokens != 1_200_000 || alpha.UsageEvents != 2 {
+		t.Fatalf("alias usage did not fold into the catalog model: %+v", alpha)
+	}
+}
+
 func TestCatalogSnapshotIncludesTierAliasesAndUsageContext(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{
