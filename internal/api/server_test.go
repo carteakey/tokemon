@@ -18,6 +18,8 @@ import (
 	"github.com/tokemon/tokemon/internal/database"
 	insightai "github.com/tokemon/tokemon/internal/insights"
 	"github.com/tokemon/tokemon/internal/usage"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 const testDashboardToken = "test-dashboard-token"
@@ -905,6 +907,67 @@ func TestAnalyticsExportSupportsCSV(t *testing.T) {
 	testHandler(server).ServeHTTP(jsonResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?dimension=projects&period=30d", nil))
 	if got := jsonResponse.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
 		t.Fatalf("default export content type = %q", got)
+	}
+}
+func TestSettingsShowsAuthModeAndTokenSource(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Token-only mode with an explicit dashboard token (newTestServer default).
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("settings status = %d", response.Code)
+	}
+	body := response.Body.Bytes()
+	for _, want := range []string{"Auth mode: <strong>Dashboard token</strong>", "explicit dashboard token"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("settings page does not contain %q", want)
+		}
+	}
+
+	// Fallback mode: dashboard token came from the documented ingest default.
+	fallbackServer, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "secret", DashboardTokenFallback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackResponse := httptest.NewRecorder()
+	fallbackServer.Handler().ServeHTTP(fallbackResponse, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	// Token auth: Basic auth any username with the dashboard token.
+	fallbackRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	fallbackRequest.SetBasicAuth("ops", "secret")
+	fallbackServer.Handler().ServeHTTP(fallbackResponse, fallbackRequest)
+	for _, want := range []string{"Auth mode: <strong>Dashboard token</strong>", "ingest token (documented fallback)"} {
+		if !bytes.Contains(fallbackResponse.Body.Bytes(), []byte(want)) {
+			t.Fatalf("fallback settings page does not contain %q", want)
+		}
+	}
+
+	// Password account mode.
+	hash, err := bcrypt.GenerateFromPassword([]byte("human-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordServer, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "secret", DashboardUsername: "ops", DashboardPasswordHash: hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordRequest := httptest.NewRequest(http.MethodGet, "/settings", nil)
+	passwordRequest.SetBasicAuth("ops", "human-password")
+	passwordResponse := httptest.NewRecorder()
+	passwordServer.Handler().ServeHTTP(passwordResponse, passwordRequest)
+	if passwordResponse.Code != http.StatusOK {
+		t.Fatalf("password settings status = %d", passwordResponse.Code)
+	}
+	if !bytes.Contains(passwordResponse.Body.Bytes(), []byte("Auth mode: <strong>Password account</strong>")) {
+		t.Fatalf("password settings page missing auth mode: %s", passwordResponse.Body.String())
 	}
 }
 func TestSessionsExportSupportsCSV(t *testing.T) {

@@ -197,11 +197,13 @@ type aliasRow struct {
 }
 
 type settingsPage struct {
-	Models    []aliasRow
-	Machines  []aliasRow
-	CSRFToken string
-	Saved     bool
-	Error     string
+	Models      []aliasRow
+	Machines    []aliasRow
+	CSRFToken   string
+	Saved       bool
+	Error       string
+	AuthMode    string
+	TokenSource string
 }
 
 type catalogTier struct {
@@ -1986,11 +1988,14 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
+	authMode, tokenSource := s.authSummary()
 	page := settingsPage{
-		Models:    modelAliasRows(result.ByModel, modelAliases),
-		Machines:  machineAliasRows(result.ByMachine, machineAliases),
-		CSRFToken: s.csrfToken(),
-		Saved:     r.URL.Query().Get("saved") == "1",
+		Models:      modelAliasRows(result.ByModel, modelAliases),
+		Machines:    machineAliasRows(result.ByMachine, machineAliases),
+		CSRFToken:   s.csrfToken(),
+		Saved:       r.URL.Query().Get("saved") == "1",
+		AuthMode:    authMode,
+		TokenSource: tokenSource,
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -3011,6 +3016,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
   <div class="eyebrow">Display names</div>
   <h1>Settings</h1>
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
+  <p class="intro">Auth mode: <strong>{{.AuthMode}}</strong> · Dashboard token: <strong>{{.TokenSource}}</strong>.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
   {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
   <form action="/settings/aliases" method="post" aria-labelledby="settings-form-title">

@@ -45,15 +45,18 @@ type Config struct {
 	// it and DashboardUsername are both set, the dashboard accepts that
 	// username and password as an alternative to the raw dashboard token.
 	DashboardPasswordHash []byte
-	AllowLoopbackDev      bool
-	TrustedProxyCIDRs     []string
-	Logger                *slog.Logger
-	Metrics               *Metrics
-	RequestTimeout        time.Duration
-	HealthTimeout         time.Duration
-	HeartbeatTimeout      time.Duration
-	IngestTimeout         time.Duration
-	StaleAgentAfter       time.Duration
+	// DashboardTokenFallback records that the dashboard token came from the
+	// documented ingest-token default rather than explicit configuration.
+	DashboardTokenFallback bool
+	AllowLoopbackDev       bool
+	TrustedProxyCIDRs      []string
+	Logger                 *slog.Logger
+	Metrics                *Metrics
+	RequestTimeout         time.Duration
+	HealthTimeout          time.Duration
+	HeartbeatTimeout       time.Duration
+	IngestTimeout          time.Duration
+	StaleAgentAfter        time.Duration
 }
 
 const (
@@ -158,6 +161,30 @@ func dashboardPasswordAuthorized(r *http.Request, username string, hash []byte) 
 		return false
 	}
 	return bcrypt.CompareHashAndPassword(hash, []byte(basicPassword)) == nil
+}
+
+// authSummary describes the effective dashboard authentication posture for the
+// settings page: which mode is active and where the dashboard token came from.
+func (s *Server) authSummary() (mode, tokenSource string) {
+	switch {
+	case s.config.DashboardUsername != "" && len(s.config.DashboardPasswordHash) > 0:
+		mode = "Password account"
+	case s.config.DashboardToken != "":
+		mode = "Dashboard token"
+	case s.config.AllowLoopbackDev:
+		mode = "Loopback development"
+	default:
+		mode = "Closed"
+	}
+	switch {
+	case s.config.DashboardTokenFallback:
+		tokenSource = "ingest token (documented fallback)"
+	case s.config.DashboardToken != "":
+		tokenSource = "explicit dashboard token"
+	default:
+		tokenSource = "none configured"
+	}
+	return mode, tokenSource
 }
 
 // ValidateServeConfig prevents an empty ingest token from silently exposing

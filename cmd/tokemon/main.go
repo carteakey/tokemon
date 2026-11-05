@@ -171,7 +171,9 @@ func runServe(args []string) error {
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
 	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	dashboardTokenBefore := *dashboardToken
 	*dashboardToken = applyDashboardTokenFallback(*dashboardToken, *ingestToken, flags)
+	dashboardTokenFallback := dashboardTokenBefore == "" && *dashboardToken != ""
 	applyServerTimeoutConfig(flags, configValues, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout)
 	if *readTimeout <= 0 || *readHeaderTimeout <= 0 || *writeTimeout <= 0 || *idleTimeout <= 0 || *shutdownTimeout <= 0 {
 		return errors.New("server timeouts must be positive")
@@ -202,13 +204,14 @@ func runServe(args []string) error {
 		})
 	}
 	server, err := api.NewWithConfigAndInsightsAI(store, api.Config{
-		IngestToken:           *ingestToken,
-		DashboardToken:        *dashboardToken,
-		DashboardUsername:     *dashboardUsername,
-		DashboardPasswordHash: []byte(*dashboardPasswordHash),
-		AllowLoopbackDev:      *devLoopback,
-		TrustedProxyCIDRs:     splitConfiguredPaths(*trustedProxyCIDRs),
-		Logger:                slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		IngestToken:            *ingestToken,
+		DashboardToken:         *dashboardToken,
+		DashboardTokenFallback: dashboardTokenFallback,
+		DashboardUsername:      *dashboardUsername,
+		DashboardPasswordHash:  []byte(*dashboardPasswordHash),
+		AllowLoopbackDev:       *devLoopback,
+		TrustedProxyCIDRs:      splitConfiguredPaths(*trustedProxyCIDRs),
+		Logger:                 slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	}, insightsSynthesizer)
 	if err != nil {
 		return err
