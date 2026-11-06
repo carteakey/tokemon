@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"sync"
@@ -43,6 +44,7 @@ func openReadOnlyDB(ctx context.Context, path string) (*sql.DB, error) {
 // instead of silently serving the old inode's data.
 type sqliteHandle struct {
 	db           *sql.DB
+	path         string
 	device       uint64
 	inode        uint64
 	identifiable bool
@@ -53,7 +55,10 @@ type sqliteHandle struct {
 // Opening a modernc SQLite database costs an order of magnitude more than the
 // queries a cycle runs, so per-source handles are kept on the adapter (whose
 // lifetime is the agent process) and validated against the current file
-// identity on every use.
+// identity on every use. A reuse also pings the connection, so one that went
+// bad while cached is reopened instead of failing a cycle; the ping costs a
+// small fraction of the open it guards (see the SQLiteHandles benchmarks in
+// sqlite_test.go).
 type SQLiteHandles struct {
 	mu      sync.Mutex
 	entries map[string]*sqliteHandle
@@ -101,41 +106,34 @@ func (h *SQLiteHandles) Get(ctx context.Context, path string) (*sql.DB, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if handle, ok := h.entries[path]; ok {
-		if identifiable && handle.device == device && handle.inode == inode {
-			// A cheap ping guards against a connection that went bad while
-			// cached (for example after a provider-side recovery); a dead
-			// handle is dropped and reopened below.
-			if err := handle.db.PingContext(ctx); err == nil {
-				h.order.MoveToBack(handle.inserted)
-				return handle.db, nil
-			}
-			_ = handle.db.Close()
-			h.order.Remove(handle.inserted)
-			delete(h.entries, path)
-		} else {
-			_ = handle.db.Close()
-			h.order.Remove(handle.inserted)
-			delete(h.entries, path)
+		// A cheap ping guards against a connection that went bad while
+		// cached (for example after a provider-side recovery): a dead or
+		// stale-inode handle is dropped and reopened below, never served.
+		matches := identifiable && handle.device == device && handle.inode == inode
+		if matches && handle.db.PingContext(ctx) == nil {
+			h.order.MoveToBack(handle.inserted)
+			return handle.db, nil
 		}
-		// The path now refers to a different file: the cached connection
-		// points at the old inode and would serve stale data.
-		_ = handle.db.Close()
-		h.order.Remove(handle.inserted)
-		delete(h.entries, path)
+		reason := "identity_changed"
+		if matches {
+			reason = "connection_lost"
+		}
+		_ = h.removeLocked(handle)
+		logSQLiteHandleEvent("sqlite_handle_reopened", reason, path)
 	}
 
 	db, err := openReadOnlyDB(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	handle := &sqliteHandle{db: db, device: device, inode: inode, identifiable: identifiable}
+	handle := &sqliteHandle{db: db, path: path, device: device, inode: inode, identifiable: identifiable}
 	if len(h.entries) >= h.max {
 		if oldest := h.order.Front(); oldest != nil {
 			if stalePath, ok := oldest.Value.(string); ok {
 				if stale := h.entries[stalePath]; stale != nil {
-					_ = stale.db.Close()
+					logSQLiteHandleEvent("sqlite_handle_evicted", "capacity", stalePath)
+					_ = h.removeLocked(stale)
 				}
-				delete(h.entries, stalePath)
 			}
 			h.order.Remove(oldest)
 		}
@@ -149,10 +147,43 @@ func (h *SQLiteHandles) drop(path string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if handle, ok := h.entries[path]; ok {
-		_ = handle.db.Close()
-		h.order.Remove(handle.inserted)
-		delete(h.entries, path)
+		_ = h.removeLocked(handle)
 	}
+}
+
+// removeLocked closes one cached handle and forgets it. The caller holds h.mu.
+func (h *SQLiteHandles) removeLocked(handle *sqliteHandle) error {
+	err := handle.db.Close()
+	h.order.Remove(handle.inserted)
+	delete(h.entries, handle.path)
+	return err
+}
+
+// Close closes every cached handle and empties the cache. The cache stays
+// usable: a later Get reopens on demand. Adapters currently live for the
+// whole agent process, where exit closes the connections; Close exists so a
+// future adapter shutdown hook can release the handles earlier.
+func (h *SQLiteHandles) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var firstErr error
+	for _, handle := range h.entries {
+		if err := h.removeLocked(handle); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// logSQLiteHandleEvent records a debug cache event for diagnosing a thrashing
+// cache. Like every adapter log it never carries the raw path: the source
+// identity hash correlates the events of one source without exposing it.
+func logSQLiteHandleEvent(message, reason, path string) {
+	logger := slog.Default()
+	if !logger.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	logger.Debug(message, "reason", reason, "source", HashIdentity(path))
 }
 
 func HasTable(ctx context.Context, db *sql.DB, name string) (bool, error) {

@@ -525,7 +525,7 @@ func runDiscover(args []string) error {
 
 func runAgent(args []string) error {
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: agentLogLevel()})))
 	var jsonlPaths stringListFlag
 	serverURL := flags.String("server", envOr("TOKEMON_SERVER_URL", "http://127.0.0.1:8080"), "Tokemon server URL")
 	token := flags.String("token", os.Getenv("TOKEMON_INGEST_TOKEN"), "shared ingestion token")
@@ -715,6 +715,22 @@ func runAgent(args []string) error {
 			return nil
 		case <-timer.C:
 		}
+	}
+}
+
+// agentLogLevel maps TOKEMON_LOG_LEVEL (debug, info, warn, error; default
+// info) onto the agent's JSON log handler so debug diagnostics such as the
+// SQLite handle cache's reopen and evict events can be enabled per deployment.
+func agentLogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TOKEMON_LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 

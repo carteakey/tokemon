@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -496,5 +497,23 @@ func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
 	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	if *dashboardUsername != "flag-user" || *dashboardPasswordHash != "$2a$flaghash" {
 		t.Fatalf("explicit flags were overwritten: username=%q hash=%q", *dashboardUsername, *dashboardPasswordHash)
+	}
+}
+
+func TestAgentLogLevel(t *testing.T) {
+	cases := map[string]slog.Level{
+		"":        slog.LevelInfo,
+		"bogus":   slog.LevelInfo,
+		"debug":   slog.LevelDebug,
+		" DEBUG ": slog.LevelDebug,
+		"warn":    slog.LevelWarn,
+		"error":   slog.LevelError,
+		"INFO":    slog.LevelInfo,
+	}
+	for value, want := range cases {
+		t.Setenv("TOKEMON_LOG_LEVEL", value)
+		if got := agentLogLevel(); got != want {
+			t.Fatalf("agentLogLevel(%q) = %v, want %v", value, got, want)
+		}
 	}
 }
