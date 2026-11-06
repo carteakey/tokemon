@@ -163,6 +163,7 @@ It must not point at `data/tokemon.db` or any production/primary-agent state.
   cp "$tabletop_dir/recovery.db" "$tabletop_db"
   sqlite3 "$tabletop_db" 'PRAGMA integrity_check;'
   ```
+
 - [ ] Run `go run ./cmd/tokemon purge --database "$tabletop_db" --before
       2999-01-01`, record the deleted count, restore the recovery point, and
       verify the original event/token counts return.

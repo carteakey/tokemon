@@ -165,7 +165,7 @@ The threshold table is ordered and append-only: preserve the meaning and asset n
 The initial progression:
 
 | Lifetime tokens | Stage | Working form name |
-|---:|---:|---|
+| ---: | ---: | --- |
 | 0–9 | 0 | Egg |
 | 10–99 | 1 | Bitling |
 | 100–999 | 2 | Bytelet |

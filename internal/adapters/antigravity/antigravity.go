@@ -124,7 +124,7 @@ func (a *Adapter) candidatePaths(root string) ([]string, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("Antigravity source root is not a directory: %s", root)
+		return nil, fmt.Errorf("antigravity source root is not a directory: %s", root)
 	}
 	signature := signatureFromInfo(info)
 	a.mu.Lock()

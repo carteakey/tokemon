@@ -1,0 +1,14 @@
+// Baseline for the markdown gate (README, DEPLOYMENT, docs): everything on
+// by default except the two rules this repository's prose deliberately
+// breaks. New rules apply to new files; widen exceptions only with a reason.
+{
+  "config": {
+    // Prose is wrapped by the author where it reads well; README paragraphs,
+    // spec tables, and link definitions routinely exceed 80 columns on
+    // purpose, and re-wrapping them churns history for no gain.
+    "MD013": false,
+    // The README badge is an inline <img> so the icon renders at a fixed
+    // size instead of blowing up to the heading scale.
+    "MD033": false
+  }
+}

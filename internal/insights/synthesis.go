@@ -509,14 +509,11 @@ func buildRequestBody(model string, input Input) ([]byte, error) {
 	if len(input.ScopeLabels) > 0 {
 		card.ScopeLabels = make([]promptScope, len(input.ScopeLabels))
 		for index, scope := range input.ScopeLabels {
-			card.ScopeLabels[index] = promptScope{Label: scope.Label, Count: scope.Count}
+			card.ScopeLabels[index] = promptScope(scope)
 		}
 	}
 	for index, evidence := range input.Evidence {
-		card.Evidence[index] = promptEvidence{
-			ID: evidence.ID, Category: evidence.Category,
-			Observation: evidence.Observation, Basis: evidence.Basis,
-		}
+		card.Evidence[index] = promptEvidence(evidence)
 	}
 	cardJSON, err := json.Marshal(card)
 	if err != nil {

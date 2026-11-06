@@ -89,7 +89,7 @@ func TestValidateRejectsMissingAndOpaqueStages(t *testing.T) {
 }
 
 func TestValidateRejectsNonRGBAAndUnlistedStage(t *testing.T) {
-	dir, data := writeFixture(t, 0, true)
+	dir, _ := writeFixture(t, 0, true)
 	// A grayscale PNG is valid image data but violates the RGBA release contract.
 	gray := image.NewGray(image.Rect(0, 0, 2, 2))
 	var encoded bytes.Buffer
@@ -103,7 +103,7 @@ func TestValidateRejectsNonRGBAAndUnlistedStage(t *testing.T) {
 		t.Fatalf("non-RGBA asset error = %v", err)
 	}
 
-	dir, data = writeFixture(t, 0, true)
+	dir, data := writeFixture(t, 0, true)
 	if err := os.WriteFile(filepath.Join(dir, "stage-01.png"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}

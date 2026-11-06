@@ -44,6 +44,22 @@ jobs:
             exit 1
           fi
 
+      - name: Run staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.2.2
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      - name: Lint workflow files (actionlint)
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint"
+
+      - name: Lint markdown (README, DEPLOYMENT, docs)
+        run: npx --yes markdownlint-cli2@0.24.0 "README.md" "DEPLOYMENT.md" "docs/**/*.md"
+
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
       - name: Exercise migration compatibility gate
         run: go test ./internal/database -run 'TestOpenBacksUpExistingDatabaseBeforeMigration|TestOpenUsesWALForFileDatabase'
 

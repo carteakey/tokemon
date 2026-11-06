@@ -240,13 +240,6 @@ type sessionSortState struct {
 const dashboardUsageRowsLimit = 5
 
 const (
-	maxIngestBodyBytes         = 10 << 20
-	maxIngestDecompressedBytes = 32 << 20
-	maxEventsPerBatch          = 5000
-	maxHeartbeatBodyBytes      = 1 << 20
-)
-
-const (
 	glyphOff uint8 = iota
 	glyphDim
 	glyphOn
@@ -1423,7 +1416,9 @@ type heartbeatRequest struct {
 	SourceErrorCount int                `json:"source_error_count"`
 }
 
-var errRequestBodyTooLarge = errors.New("request body exceeds the size limit")
+// maxHeartbeatBodyBytes bounds the decompressed heartbeat payload; ingest
+// batch limits live beside the shared body decoder in security.go.
+const maxHeartbeatBodyBytes = 1 << 20
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ingestRequests.Add(1)
@@ -1488,7 +1483,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request heartbeatRequest
-	if err := decodeJSONBody(w, r, 1<<20, &request); err != nil {
+	if err := decodeJSONBody(w, r, maxHeartbeatBodyBytes, &request); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errBodyTooLarge) || errors.Is(err, errBodyRead) {
 			status = http.StatusRequestEntityTooLarge

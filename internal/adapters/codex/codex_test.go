@@ -207,8 +207,7 @@ func TestDiscoveringNewSessionDoesNotInvalidateUnchangedSession(t *testing.T) {
 	if err := os.WriteFile(secondPath, []byte(secondLog), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sources, err = adapter.Discover(context.Background())
-	if err != nil {
+	if _, err = adapter.Discover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
