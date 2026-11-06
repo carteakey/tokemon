@@ -1554,6 +1554,73 @@ func TestAnalyticsUnknownBucketLabelsAreDimensionAware(t *testing.T) {
 	}
 }
 
+func TestCopyIDAffordanceAndTrendChartRegion(t *testing.T) {
+	price := 1.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"test-model": {Provider: "provider", DisplayName: "Test Model", Aliases: []string{"raw-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-07-12", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "copy-id-cataloged", Timestamp: now, MachineID: "machine", SessionID: "sess_0123456789abcdef", Provider: "provider", Model: "raw-model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "copy-id-uncataloged", Timestamp: now, MachineID: "machine", SessionID: "sess_0123456789abcdef", Provider: "provider", Model: "mystery-model", Tool: "codex", TotalTokens: usage.Int64(5), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != 2 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	pages := []struct {
+		path string
+		want []string
+	}{
+		{"/", []string{
+			`class="copy-id" data-copy-value="sess_0123456789abcdef"`,
+			`aria-label="Copy full session ID"`,
+			`closest('.copy-id')`,
+		}},
+		{"/sessions", []string{
+			`class="copy-id" data-copy-value="sess_0123456789abcdef"`,
+			`aria-label="Copy full session ID"`,
+			`closest('.copy-id')`,
+		}},
+		{"/analytics?period=30d", []string{
+			`class="trend-chart period-30d" tabindex="0" role="region" aria-label="Token volume over the selected window"`,
+		}},
+		{"/tokedex", []string{
+			// Cataloged tier: the full-ID row carries the copy affordance.
+			`class="model-id-text">test-model</span>`,
+			`data-copy-value="test-model"`,
+			`aria-label="Copy full model ID"`,
+			// Uncataloged section: copy affordance plus the catalog how-to link.
+			`class="model-name model-name-row" title="mystery-model"`,
+			`data-copy-value="mystery-model"`,
+			`href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex"`,
+			`how to add a model to catalog/models.yaml`,
+			`closest('.copy-id')`,
+		}},
+	}
+	for _, page := range pages {
+		response := httptest.NewRecorder()
+		testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, page.path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", page.path, response.Code, response.Body.String())
+		}
+		for _, want := range page.want {
+			if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
+				t.Errorf("%s missing %q", page.path, want)
+			}
+		}
+	}
+}
+
 func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	for _, test := range []struct {
 		maximum int64
