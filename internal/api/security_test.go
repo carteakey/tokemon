@@ -291,3 +291,184 @@ func TestDashboardPasswordAuthGrantsAndLimitsAccess(t *testing.T) {
 		t.Fatal("password-authenticated settings write without CSRF was accepted")
 	}
 }
+
+// dashboardLoginRequest sends an explicitly-credentialed dashboard request
+// from a fixed remote address so throttling can be exercised per source.
+func dashboardLoginRequest(t *testing.T, server *Server, remote, target string, authorize func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, target, nil)
+	request.RemoteAddr = remote
+	if authorize != nil {
+		authorize(request)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	return response
+}
+
+func TestDashboardPasswordAuthorizedKeepsUsernameAndPrecedence(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	if dashboardPasswordAuthorized(request, "kim", hash) {
+		t.Fatal("request without credentials authorized")
+	}
+	request.SetBasicAuth("kim", "hunter2")
+	if !dashboardPasswordAuthorized(request, "kim", hash) {
+		t.Fatal("matching username and password not authorized")
+	}
+	request.SetBasicAuth("other", "hunter2")
+	if dashboardPasswordAuthorized(request, "kim", hash) {
+		t.Fatal("wrong username authorized")
+	}
+	request.SetBasicAuth("kim", "wrong")
+	if dashboardPasswordAuthorized(request, "kim", hash) {
+		t.Fatal("wrong password authorized")
+	}
+	if dashboardPasswordAuthorized(request, "", hash) || dashboardPasswordAuthorized(request, "kim", nil) {
+		t.Fatal("unconfigured password account authorized")
+	}
+}
+
+func TestDashboardLoginRateLimitBlocksAndEscalates(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "dashboard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Unix(1700000000, 0)
+	server.loginThrottle.now = func() time.Time { return clock }
+	remote := "192.0.2.50:1234"
+	fail := func() *httptest.ResponseRecorder {
+		return dashboardLoginRequest(t, server, remote, "/", func(r *http.Request) { r.SetBasicAuth("tokemon", "wrong") })
+	}
+
+	// Failures below the threshold are allowed through as 401s, and valid
+	// credentials still authenticate (also resetting the partial count).
+	for attempt := 0; attempt < 2; attempt++ {
+		if response := fail(); response.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d status = %d, want %d", attempt+1, response.Code, http.StatusUnauthorized)
+		}
+	}
+	if response := dashboardLoginRequest(t, server, remote, "/", func(r *http.Request) { r.Header.Set("Authorization", "Bearer dashboard") }); response.Code != http.StatusOK {
+		t.Fatalf("valid bearer token status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	// A fresh run of failures: every attempt up to the threshold gets a 401,
+	// the next one is blocked with a Retry-After for the base lockout.
+	for attempt := 0; attempt < loginFailuresAllowed; attempt++ {
+		if response := fail(); response.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d status = %d, want %d", attempt+1, response.Code, http.StatusUnauthorized)
+		}
+	}
+	blocked := fail()
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked status = %d, want %d: %s", blocked.Code, http.StatusTooManyRequests, blocked.Body.String())
+	}
+	if retryAfter := blocked.Header().Get("Retry-After"); retryAfter != "15" {
+		t.Fatalf("Retry-After = %q, want %d", retryAfter, int(loginBaseLockout/time.Second))
+	}
+
+	// A different remote is unaffected, and boundaries outside the dashboard
+	// (health, token-authenticated ingest) stay open for the locked remote.
+	if response := dashboardLoginRequest(t, server, "192.0.2.51:1234", "/", func(r *http.Request) { r.SetBasicAuth("tokemon", "wrong") }); response.Code != http.StatusUnauthorized {
+		t.Fatalf("other remote status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if response := dashboardLoginRequest(t, server, remote, "/healthz", nil); response.Code != http.StatusOK {
+		t.Fatalf("health while dashboard-locked status = %d: %s", response.Code, response.Body.String())
+	}
+	if response := postBatch(t, server, []usage.Event{securityEvent("throttled")}, "secret", remote); response.Code != http.StatusOK {
+		t.Fatalf("ingest while dashboard-locked status = %d: %s", response.Code, response.Body.String())
+	}
+
+	// After the lockout expires the next failure escalates the backoff.
+	clock = clock.Add(loginBaseLockout + time.Second)
+	if response := fail(); response.Code != http.StatusUnauthorized {
+		t.Fatalf("post-lockout failure status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	blocked = fail()
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("escalated status = %d, want %d", blocked.Code, http.StatusTooManyRequests)
+	}
+	if retryAfter := blocked.Header().Get("Retry-After"); retryAfter != "30" {
+		t.Fatalf("escalated Retry-After = %q, want 30", retryAfter)
+	}
+}
+
+func TestDashboardLoginRateLimitResetsOnSuccess(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardUsername: "kim", DashboardPasswordHash: hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Unix(1700000000, 0)
+	server.loginThrottle.now = func() time.Time { return clock }
+	remote := "192.0.2.60:1234"
+	fail := func() *httptest.ResponseRecorder {
+		return dashboardLoginRequest(t, server, remote, "/", func(r *http.Request) { r.SetBasicAuth("kim", "wrong") })
+	}
+
+	for attempt := 0; attempt < loginFailuresAllowed-1; attempt++ {
+		if response := fail(); response.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d status = %d, want %d", attempt+1, response.Code, http.StatusUnauthorized)
+		}
+	}
+	if response := dashboardLoginRequest(t, server, remote, "/", func(r *http.Request) { r.SetBasicAuth("kim", "hunter2") }); response.Code != http.StatusOK {
+		t.Fatalf("correct sign-in after failures status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	// The success cleared the record: a full run of failures is allowed
+	// through again before the remote is locked out.
+	for attempt := 0; attempt < loginFailuresAllowed; attempt++ {
+		if response := fail(); response.Code != http.StatusUnauthorized {
+			t.Fatalf("post-reset failure %d status = %d, want %d", attempt+1, response.Code, http.StatusUnauthorized)
+		}
+	}
+	if blocked := fail(); blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("post-reset locked status = %d, want %d", blocked.Code, http.StatusTooManyRequests)
+	}
+
+	// A quiet window also resets the count: the next failure starts a fresh
+	// burst instead of inheriting the lockout.
+	clock = clock.Add(loginFailureWindow + time.Minute)
+	if response := fail(); response.Code != http.StatusUnauthorized {
+		t.Fatalf("quiet-window failure status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestLoginLockoutEscalationIsBounded(t *testing.T) {
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{failures: 1, want: 0},
+		{failures: loginFailuresAllowed - 1, want: 0},
+		{failures: loginFailuresAllowed, want: 15 * time.Second},
+		{failures: loginFailuresAllowed + 1, want: 30 * time.Second},
+		{failures: loginFailuresAllowed + 2, want: 60 * time.Second},
+		{failures: loginFailuresAllowed + 3, want: 120 * time.Second},
+		{failures: loginFailuresAllowed + 4, want: 240 * time.Second},
+		{failures: loginFailuresAllowed + 5, want: 480 * time.Second},
+		{failures: loginFailuresAllowed + 6, want: loginMaxLockout},
+		{failures: loginFailuresAllowed + 100, want: loginMaxLockout},
+	}
+	for _, test := range tests {
+		if got := loginLockout(test.failures); got != test.want {
+			t.Fatalf("loginLockout(%d) = %s, want %s", test.failures, got, test.want)
+		}
+	}
+}

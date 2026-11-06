@@ -65,6 +65,14 @@ The dashboard accepts either credential:
   then set `TOKEMON_DASHBOARD_USERNAME` and
   `TOKEMON_DASHBOARD_PASSWORD_HASH` (both together; the server refuses to
   start with only one). Sign in as that username with the plaintext password.
+  Passwords are capped at bcrypt's 72-byte input limit — `tokemon passwd`
+  warns and refuses longer ones rather than silently hashing only the first
+  72 bytes.
+
+Failed dashboard sign-in attempts are throttled per remote address: five
+failures within five minutes lock that address out for 15 seconds, doubling
+per further failure up to ten minutes; a successful sign-in clears the count.
+Point uptime monitors at `/healthz`, which stays outside this throttle.
 
 Precedence for each setting is command-line flag, then environment variable,
 then the `--config` server.env file. See DEPLOYMENT.md for the deployment

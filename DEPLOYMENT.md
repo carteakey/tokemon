@@ -66,7 +66,15 @@ or both:
 Generate the password hash with `tokemon passwd` (prompts on the terminal) or
 `tokemon passwd --stdin`; the username and hash must be set together or the
 server refuses to start. Sign in with Basic auth as that username and the
-plaintext password.
+plaintext password. Passwords are capped at bcrypt's 72-byte input limit:
+`tokemon passwd` warns and refuses longer passwords instead of silently
+hashing only the first 72 bytes.
+
+Failed dashboard sign-in attempts are throttled per remote address: five
+failures within five minutes lock that address out for 15 seconds, doubling
+per further failure up to ten minutes, and a successful sign-in clears the
+count. This bounds password guessing without touching token-authenticated
+agent upload or `/healthz`; point uptime monitors at `/healthz`.
 
 Precedence for every setting: command-line flag first, then the environment
 variable, then the `--config` server.env file. `TOKEMON_DASHBOARD_TOKEN`

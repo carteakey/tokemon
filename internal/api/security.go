@@ -16,7 +16,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -150,14 +152,14 @@ func (c Config) validateDashboardPasswordAuth() error {
 
 // dashboardPasswordAuthorized reports whether the request's Basic Auth
 // credentials match the configured dashboard username and password hash. The
-// username must match exactly; the password is verified against the bcrypt
-// digest.
+// username must match exactly (compared in constant time, symmetric with the
+// token path); the password is verified against the bcrypt digest.
 func dashboardPasswordAuthorized(r *http.Request, username string, hash []byte) bool {
 	if username == "" || len(hash) == 0 {
 		return false
 	}
 	basicUsername, basicPassword, ok := r.BasicAuth()
-	if !ok || basicUsername != username {
+	if !ok || !constantTimeEqual(basicUsername, username) {
 		return false
 	}
 	return bcrypt.CompareHashAndPassword(hash, []byte(basicPassword)) == nil
@@ -327,13 +329,161 @@ func (s *Server) dashboardAuthorized(r *http.Request) bool {
 	return false
 }
 
+const (
+	// Dashboard login throttling: after loginFailuresAllowed rejected
+	// attempts the remote address is locked out, with the lockout doubling
+	// per additional failure so sustained guessing decays to about one
+	// attempt per loginMaxLockout. A quiet loginFailureWindow (or any
+	// successful login) clears the record.
+	loginFailuresAllowed  = 5
+	loginFailureWindow    = 5 * time.Minute
+	loginBaseLockout      = 15 * time.Second
+	loginMaxLockout       = 10 * time.Minute
+	loginMaxTrackedRemote = 1024
+)
+
+// loginAttempt tracks consecutive failed dashboard logins from one remote
+// address. firstFailure anchors the burst for observability; the count is
+// reset only after a quiet loginFailureWindow.
+type loginAttempt struct {
+	failures     int
+	firstFailure time.Time
+	lastFailure  time.Time
+	lockedUntil  time.Time
+}
+
+// loginThrottle bounds failed dashboard authentication per remote address.
+// The table is capped so request floods from many spoofed addresses cannot
+// grow it without limit; when full, expired records go first and the least
+// recently active remote is evicted otherwise.
+type loginThrottle struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	entries map[string]*loginAttempt
+}
+
+func newLoginThrottle() *loginThrottle {
+	return &loginThrottle{now: time.Now, entries: make(map[string]*loginAttempt)}
+}
+
+// loginLockout returns the lockout for a burst that has reached the given
+// failure count: the base duration doubled per failure beyond the allowed
+// count, capped at loginMaxLockout. Bursts below the threshold are not locked.
+func loginLockout(failures int) time.Duration {
+	if failures < loginFailuresAllowed {
+		return 0
+	}
+	lockout := loginBaseLockout
+	for excess := failures - loginFailuresAllowed; excess > 0 && lockout < loginMaxLockout; excess-- {
+		lockout *= 2
+	}
+	if lockout > loginMaxLockout {
+		lockout = loginMaxLockout
+	}
+	return lockout
+}
+
+// check reports whether the remote may attempt dashboard authentication and,
+// when it may not, the remaining lockout.
+func (l *loginThrottle) check(remote string) (blocked bool, retryAfter time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	entry, ok := l.entries[remote]
+	if !ok || now.Sub(entry.lastFailure) > loginFailureWindow {
+		return false, 0
+	}
+	if remaining := entry.lockedUntil.Sub(now); remaining > 0 {
+		return true, remaining
+	}
+	return false, 0
+}
+
+func (l *loginThrottle) recordFailure(remote string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	entry, ok := l.entries[remote]
+	if !ok {
+		if len(l.entries) >= loginMaxTrackedRemote {
+			l.evict(now)
+		}
+		entry = &loginAttempt{}
+		l.entries[remote] = entry
+	} else if now.Sub(entry.lastFailure) > loginFailureWindow {
+		// Quiet window: the remote starts a fresh burst instead of
+		// inheriting an earlier lockout escalation.
+		entry.lockedUntil = time.Time{}
+		entry.failures = 0
+	}
+	if entry.failures == 0 {
+		entry.firstFailure = now
+	}
+	entry.failures++
+	entry.lastFailure = now
+	if entry.failures >= loginFailuresAllowed {
+		entry.lockedUntil = now.Add(loginLockout(entry.failures))
+	}
+}
+
+// recordSuccess clears the remote's record so a legitimate sign-in after
+// typos never carries a lockout forward.
+func (l *loginThrottle) recordSuccess(remote string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, remote)
+}
+
+// evict makes room for a new entry: expired records first, then the least
+// recently active remote. Only called while holding l.mu.
+func (l *loginThrottle) evict(now time.Time) {
+	oldestKey := ""
+	oldestFailure := now
+	for remote, entry := range l.entries {
+		expired := entry.lockedUntil.Before(now) && now.Sub(entry.lastFailure) > loginFailureWindow
+		if expired {
+			delete(l.entries, remote)
+			continue
+		}
+		if entry.lastFailure.Before(oldestFailure) {
+			oldestFailure = entry.lastFailure
+			oldestKey = remote
+		}
+	}
+	if len(l.entries) >= loginMaxTrackedRemote && oldestKey != "" {
+		delete(l.entries, oldestKey)
+	}
+}
+
+// loginLimitKey identifies the throttled source. Only the connection's
+// address is used — never client-supplied headers — so the key cannot be
+// rotated by the requester.
+func loginLimitKey(r *http.Request) string {
+	if ip := requestRemoteIP(r); ip != nil {
+		return ip.String()
+	}
+	return r.RemoteAddr
+}
+
 func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remote := loginLimitKey(r)
+		if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
+			seconds := int(retryAfter / time.Second)
+			if retryAfter%time.Second != 0 {
+				seconds++
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed dashboard login attempts; try again later"})
+			return
+		}
 		if !s.dashboardAuthorized(r) {
+			s.loginThrottle.recordFailure(remote)
 			w.Header().Set("WWW-Authenticate", `Basic realm="tokemon"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "dashboard authentication required"})
 			return
 		}
+		s.loginThrottle.recordSuccess(remote)
 		next.ServeHTTP(w, r)
 	})
 }

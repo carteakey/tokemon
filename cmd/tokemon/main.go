@@ -244,6 +244,11 @@ func configuredSecret(values map[string]string, name string) string {
 	return values[name]
 }
 
+// bcrypt only digests the first 72 bytes of a password — the algorithm's
+// input limit — so longer passphrases lose everything past that point.
+// Current x/crypto refuses such passwords outright instead of truncating.
+const maxBcryptPasswordBytes = 72
+
 // runPasswd prints a bcrypt hash of a dashboard login password read from the
 // terminal or, with --stdin, from standard input. Configure the hash together
 // with TOKEMON_DASHBOARD_USERNAME to enable dashboard password authentication.
@@ -265,6 +270,10 @@ func runPasswd(args []string) error {
 	password, err := readPassword(input)
 	if err != nil {
 		return err
+	}
+	if len(password) > maxBcryptPasswordBytes {
+		fmt.Fprintf(os.Stderr, "warning: the password is %d bytes; bcrypt uses at most the first %d\n", len(password), maxBcryptPasswordBytes)
+		return fmt.Errorf("password exceeds bcrypt's %d-byte input limit; use a shorter password", maxBcryptPasswordBytes)
 	}
 	hash, err := bcrypt.GenerateFromPassword(password, bcrypt.DefaultCost)
 	if err != nil {
@@ -1076,7 +1085,7 @@ func printUsage() {
 Commands:
   serve       start the HTTP API and dashboard
   agent       scan local provider usage and upload metadata
-  passwd      generate a bcrypt hash for the dashboard login password
+  passwd      generate a bcrypt hash for the dashboard login password (at most 72 bytes)
   version     print build and platform identity
   import      ingest normalized JSONL into SQLite
   export      export normalized JSONL from SQLite

@@ -346,6 +346,64 @@ func TestRunPasswdGeneratesVerifiableHash(t *testing.T) {
 	}
 }
 
+// runPasswdInput feeds one line to the passwd subcommand and captures stderr,
+// returning whatever it warned about alongside the subcommand error.
+func runPasswdInput(t *testing.T, password string) (string, error) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteString(password + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = reader
+	originalStderr := os.Stderr
+	warningReadBack, warningWriter, err := os.Pipe()
+	if err != nil {
+		os.Stdin = originalStdin
+		t.Fatal(err)
+	}
+	os.Stderr = warningWriter
+	err = run([]string{"passwd", "--stdin"})
+	os.Stdin = originalStdin
+	if closeErr := warningWriter.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	os.Stderr = originalStderr
+	warningBytes, readErr := io.ReadAll(warningReadBack)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(warningBytes), err
+}
+
+// A password beyond bcrypt's 72-byte input limit must produce the stderr
+// warning and a clear refusal, never a hash that silently drops the tail.
+func TestRunPasswdWarnsBeyondBcryptInputLimit(t *testing.T) {
+	warning, err := runPasswdInput(t, strings.Repeat("x", maxBcryptPasswordBytes+1))
+	if err == nil || !strings.Contains(err.Error(), "72") {
+		t.Fatalf("over-limit passwd error = %v, want a 72-byte limit message", err)
+	}
+	if !strings.Contains(warning, "72") {
+		t.Fatalf("passwd stderr = %q, want a bcrypt 72-byte warning", warning)
+	}
+}
+
+func TestRunPasswdAcceptsPasswordAtBcryptInputLimit(t *testing.T) {
+	warning, err := runPasswdInput(t, strings.Repeat("x", maxBcryptPasswordBytes))
+	if err != nil {
+		t.Fatalf("passwd at the %d-byte limit rejected: %v", maxBcryptPasswordBytes, err)
+	}
+	if warning != "" {
+		t.Fatalf("limit-sized password produced a warning: %q", warning)
+	}
+}
+
 func TestRunPasswdRejectsNonTerminalWithoutStdinFlag(t *testing.T) {
 	reader, writer, err := os.Pipe()
 	if err != nil {

@@ -33,6 +33,7 @@ type Server struct {
 	metrics              *Metrics
 	csrfSecret           []byte
 	trustedProxyNetworks []*net.IPNet
+	loginThrottle        *loginThrottle
 	template             *template.Template
 	static               http.Handler
 	recapProvider        InsightsRecapProvider
@@ -1210,6 +1211,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		metrics:              config.Metrics,
 		csrfSecret:           csrfSecret,
 		trustedProxyNetworks: trustedProxyNetworks,
+		loginThrottle:        newLoginThrottle(),
 		template:             page,
 		static:               http.FileServer(http.FS(staticFiles)),
 		recapProvider:        recap,
