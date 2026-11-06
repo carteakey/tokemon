@@ -25,6 +25,23 @@ dependency. They assert the rendered dashboard contract in CI: desktop and
 keyboard focus handlers, tooltip semantics, reduced-motion CSS, and empty-state
 copy. This keeps failures deterministic on a clean Go checkout.
 
+The headless-browser gate (`internal/browsercheck`) complements those contract
+tests with a real Chromium pass over `/`, `/analytics`, `/tokedex`,
+`/sessions`, and `/settings` against a seeded scratch database, run in CI
+right after the Go tests. It asserts the interactive invariants the manual
+passes kept catching (skip link to a real `#main-content`, horizontally
+scrolling regions keyboard-reachable, `aria-sort` on sorted session headers,
+export links using `download`, the Fresh pill) and runs a vendored axe-core
+scan (pinned 4.10.3, MPL-2.0, in `testdata/`) over the WCAG 2.x A/AA tag set.
+The scan emulates `prefers-reduced-motion` so contrast is measured on settled
+text. Violations fail the gate unless allowlisted in `browsercheck_test.go`
+with a documented reason — the current allowlist is only the overview's
+deliberate 60-second auto-reload. Run it locally with:
+
+```bash
+TOKEMON_BROWSER_SMOKE=1 go test ./internal/browsercheck -count=1
+```
+
 After deploying the hub, complete the visual/interactive pass with the
 in-app Browser skill:
 

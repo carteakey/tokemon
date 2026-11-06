@@ -32,6 +32,9 @@ jobs:
       - name: Run tests with the race detector
         run: go test -race ./...
 
+      - name: Browser smoke and accessibility regression (headless Chrome)
+        run: TOKEMON_BROWSER_SMOKE=1 go test ./internal/browsercheck -v -count=1
+
       - name: Run static analysis
         run: go vet ./...
 

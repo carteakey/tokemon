@@ -2503,7 +2503,7 @@ const dashboardTemplate = `<!doctype html>
       <div class="progress-block">
         <div class="progress-row"><span>Next evolution</span>{{if .Evolution.NextThreshold}}<strong>{{compactPtr .Evolution.NextThreshold}} lifetime target</strong>{{else}}<strong>Maximum stage</strong>{{end}}</div>
         <div class="progress-value"><strong id="live-remaining-copy">{{if .Evolution.TokensRemaining}}{{compactPtr .Evolution.TokensRemaining}} <small>to go</small>{{else}}Final form{{end}}</strong><strong id="live-progress-label">{{printf "%.0f" (mul .Evolution.Progress 100)}}%</strong></div>
-        <div class="progress" id="live-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
+        <div class="progress" id="live-progress" role="progressbar" aria-labelledby="live-progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
       </div>
     </article>
   </section>
@@ -2526,13 +2526,13 @@ const dashboardTemplate = `<!doctype html>
       <h2 class="section-title" id="activity-title">Token activity</h2>
       {{if .Activity.ActiveDays}}<div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>{{end}}
     </div>
-    <div class="activity-shell" role="grid" aria-label="Daily token activity for the last 53 weeks">
+    <div class="activity-shell">
       <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
       <div class="activity-scroll">
-        <div class="activity-grid">
+        <div class="activity-grid" role="grid" aria-label="Daily token activity for the last 53 weeks">
           {{range .Activity.Weeks}}
-          <div class="activity-week">
-            <span class="activity-month">{{.MonthLabel}}</span>
+          <div class="activity-week" role="row">
+            <span class="activity-month" role="presentation">{{.MonthLabel}}</span>
             {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}"{{if or .Level .UnknownTokens}} tabindex="0"{{end}}{{end}}></span>{{end}}
           </div>
           {{end}}
