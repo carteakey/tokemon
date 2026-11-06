@@ -90,7 +90,11 @@ jobs:
           test -s dist/sbom.spdx.json
       - name: Build and scan release image
         run: |
-          docker build --pull --tag "$IMAGE:${GITHUB_REF_NAME#v}" .
+          docker build --pull \
+            --build-arg TOKEMON_VERSION="${GITHUB_REF_NAME#v}" \
+            --build-arg TOKEMON_COMMIT="${GITHUB_SHA}" \
+            --build-arg TOKEMON_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "$IMAGE:${GITHUB_REF_NAME#v}" .
           docker save "$IMAGE:${GITHUB_REF_NAME#v}" --output "$RUNNER_TEMP/tokemon-release.tar"
           docker run --rm -v "$RUNNER_TEMP:/scan:ro" aquasec/trivy:0.56.2 \
             image --input /scan/tokemon-release.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
@@ -112,6 +116,9 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           docker buildx build --platform linux/amd64,linux/arm64 \
+            --build-arg TOKEMON_VERSION="$version" \
+            --build-arg TOKEMON_COMMIT="${GITHUB_SHA}" \
+            --build-arg TOKEMON_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --provenance=true --sbom=true --push \
             --tag "$IMAGE:$version" --tag "$IMAGE:v$version" .
           digest="$(docker buildx imagetools inspect "$IMAGE:$version" | awk '/^Digest:/ {print $2; exit}')"
