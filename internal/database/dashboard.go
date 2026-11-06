@@ -199,6 +199,57 @@ GROUP BY session_id, machine_id, provider, tool
 	return result, rows.Err()
 }
 
+// MachineSourceHealth is one source's connector health as of the machine's
+// last health-aware heartbeat. State uses the dashboard's freshness
+// vocabulary (Fresh/Stale/Unknown) for the last successful sync; a non-empty
+// LastErrorClass is the coarse token the agent reported for its latest
+// collection attempt. SourceHash is the agent-side identity hash — the hub
+// never receives raw local paths.
+type MachineSourceHealth struct {
+	Adapter            string  `json:"adapter"`
+	SourceHash         string  `json:"source_hash"`
+	LastSuccessfulSync *string `json:"last_successful_sync,omitempty"`
+	LastErrorClass     string  `json:"last_error_class,omitempty"`
+	State              string  `json:"state"`
+	Age                string  `json:"age"`
+}
+
+// machineSourceHealthState derives the per-source display state from the last
+// successful sync, reusing the machine stale window so the pill, machine
+// status, and source rows agree on what "stale" means.
+func machineSourceHealthState(lastSync string, now time.Time) (state, age string) {
+	seen, err := timeParse(lastSync)
+	if err != nil {
+		return "Unknown", "never synced"
+	}
+	elapsed := now.UTC().Sub(seen.UTC())
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	label := syncAgeLabel(elapsed) + " ago"
+	if elapsed <= MachineStaleWindow {
+		return "Fresh", label
+	}
+	return "Stale", label
+}
+
+// syncAgeLabel mirrors the dashboard freshness pill's duration formatting so
+// per-source ages read like the freshness readout.
+func syncAgeLabel(elapsed time.Duration) string {
+	ms := elapsed.Milliseconds()
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.1fs", float64(ms)/1000)
+	}
+	seconds := (ms + 500) / 1000
+	if seconds < 3600 {
+		return fmt.Sprintf("%dm %02ds", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%dh %02dm", seconds/3600, seconds%3600/60)
+}
+
 func (s *Store) MachinesAt(ctx context.Context, now time.Time) ([]MachineInfo, error) {
 	now = now.In(s.reportingLocation())
 	today := s.dateOnly(now)
@@ -259,7 +310,46 @@ FROM machines ORDER BY last_seen_at DESC, id`)
 		}
 		result = append(result, machine)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	health, err := s.machineSourceHealth(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	for index := range result {
+		result[index].Sources = health[result[index].ID]
+	}
+	return result, nil
+}
+
+// machineSourceHealth loads every machine's per-source connector health and
+// derives the display state and age. Machines whose agents predate the field
+// have no rows and keep their machine-level sync context only.
+func (s *Store) machineSourceHealth(ctx context.Context, now time.Time) (map[string][]MachineSourceHealth, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT machine_id, adapter, source_hash, last_successful_sync, last_error_class
+FROM machine_source_health ORDER BY machine_id, adapter, source_hash`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	health := make(map[string][]MachineSourceHealth)
+	for rows.Next() {
+		var item MachineSourceHealth
+		var machineID, syncedAt string
+		if err := rows.Scan(&machineID, &item.Adapter, &item.SourceHash, &syncedAt, &item.LastErrorClass); err != nil {
+			return nil, err
+		}
+		item.LastErrorClass = strings.TrimSpace(item.LastErrorClass)
+		if strings.TrimSpace(syncedAt) != "" {
+			synced := syncedAt
+			item.LastSuccessfulSync = &synced
+		}
+		item.State, item.Age = machineSourceHealthState(syncedAt, now)
+		health[machineID] = append(health[machineID], item)
+	}
+	return health, rows.Err()
 }
 
 func machineStatus(lastSeen string, now time.Time) string {

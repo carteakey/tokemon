@@ -53,7 +53,7 @@ func TestStatePersistsCursorsAndEventFingerprints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cursor, ok := snapshot.Cursors[sourceKey(report.Adapter, report.Path)]
+	cursor, ok := snapshot.Cursors[SourceKey(report.Adapter, report.Path)]
 	if !ok || cursor.Identity != "file-identity" || cursor.Offset != 42 || cursor.Line != 3 {
 		t.Fatalf("cursor = %+v, present=%t", cursor, ok)
 	}
@@ -63,6 +63,20 @@ func TestStatePersistsCursorsAndEventFingerprints(t *testing.T) {
 	changed := stateEvent("event-1", 20)
 	if pending, err := store.Pending(context.Background(), machineID, []usage.Event{changed}); err != nil || len(pending) != 1 || pending[0].TotalTokens == nil || *pending[0].TotalTokens != 20 {
 		t.Fatalf("changed event was not pending: %+v", pending)
+	}
+
+	// The committed sync time is readable for the heartbeat's per-source
+	// health, keyed the same way as cursors.
+	syncs, err := store.LastSuccessfulSyncs(context.Background(), machineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synced, ok := syncs[SourceKey(report.Adapter, report.Path)]
+	if !ok || !synced.Equal(time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("LastSuccessfulSyncs = %+v, want the committed time for %q", syncs, SourceKey(report.Adapter, report.Path))
+	}
+	if other, err := store.LastSuccessfulSyncs(context.Background(), "machine-b"); err != nil || len(other) != 0 {
+		t.Fatalf("other machine syncs = %+v, err %v, want empty", other, err)
 	}
 }
 
@@ -261,7 +275,7 @@ CREATE TABLE IF NOT EXISTS source_state (
 	if err != nil {
 		t.Fatal(err)
 	}
-	cursor, ok := snapshot.Cursors[sourceKey("codex", "/private/session.jsonl")]
+	cursor, ok := snapshot.Cursors[SourceKey("codex", "/private/session.jsonl")]
 	if !ok || cursor.Offset != 42 || cursor.Line != 3 || cursor.State != "" {
 		t.Fatalf("legacy cursor = %+v, present=%t", cursor, ok)
 	}
@@ -276,7 +290,7 @@ CREATE TABLE IF NOT EXISTS source_state (
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := snapshot.Cursors[sourceKey("codex", "/private/session.jsonl")]; got != committed {
+	if got := snapshot.Cursors[SourceKey("codex", "/private/session.jsonl")]; got != committed {
 		t.Fatalf("migrated schema lost cursor state: %+v != %+v", got, committed)
 	}
 }

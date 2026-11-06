@@ -142,6 +142,121 @@ func TestHeartbeatRequiresTokenAndRecordsMachineMetadata(t *testing.T) {
 	}
 }
 
+func TestHeartbeatSourceHealthStatesAndOldAgentCompat(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendHeartbeat := func(payload string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(payload))
+		request.Header.Set("Authorization", "Bearer secret")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		return response
+	}
+
+	now := time.Now().UTC()
+	freshSync := now.Add(-2 * time.Minute).Format(time.RFC3339)
+	staleSync := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	payload := fmt.Sprintf(`{"machine_id":"linux-box","agent_version":"0.4.2","operating_system":"linux","architecture":"arm64","adapters":[{"id":"codex"}],"source_count":3,"source_error_count":1,"sources":[`+
+		`{"adapter":"codex","identity_hash":"sha256:%s","last_successful_sync":%q},`+
+		`{"adapter":"claude-code","identity_hash":"sha256:%s","last_successful_sync":%q},`+
+		`{"adapter":"hermes","identity_hash":"sha256:%s","last_error_class":"missing"}]}`,
+		strings.Repeat("1", 64), freshSync, strings.Repeat("2", 64), staleSync, strings.Repeat("3", 64))
+	accepted := sendHeartbeat(payload)
+	if accepted.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d, want %d: %s", accepted.Code, http.StatusOK, accepted.Body.String())
+	}
+
+	machinesResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(machinesResponse, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	if machinesResponse.Code != http.StatusOK {
+		t.Fatalf("machines status = %d", machinesResponse.Code)
+	}
+	var machines []database.MachineInfo
+	if err := json.Unmarshal(machinesResponse.Body.Bytes(), &machines); err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || len(machines[0].Sources) != 3 {
+		t.Fatalf("machines = %+v", machines)
+	}
+	// Rows are ordered by adapter: claude-code (stale), codex (fresh), hermes
+	// (unknown, never synced, currently failing).
+	sources := machines[0].Sources
+	if sources[0].Adapter != "claude-code" || sources[0].State != "Stale" || sources[0].LastErrorClass != "" || sources[0].LastSuccessfulSync == nil {
+		t.Fatalf("stale source = %+v", sources[0])
+	}
+	if !strings.HasSuffix(sources[0].Age, " ago") {
+		t.Fatalf("stale source age = %q, want a relative age", sources[0].Age)
+	}
+	if sources[1].Adapter != "codex" || sources[1].State != "Fresh" || sources[1].LastSuccessfulSync == nil {
+		t.Fatalf("fresh source = %+v", sources[1])
+	}
+	if sources[2].Adapter != "hermes" || sources[2].State != "Unknown" || sources[2].Age != "never synced" || sources[2].LastErrorClass != "missing" || sources[2].LastSuccessfulSync != nil {
+		t.Fatalf("unknown source = %+v", sources[2])
+	}
+	// Privacy: the identity hash is the only source identifier; raw local
+	// paths never appear in the read model.
+	if body := machinesResponse.Body.String(); strings.Contains(body, "/Users/") || strings.Contains(body, ".jsonl") {
+		t.Fatalf("machines response leaks a local path:\n%s", body)
+	}
+
+	// The overview machine-health panel renders the per-source pills with the
+	// shared Fresh/Stale/Unknown vocabulary.
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("overview status = %d", page.Code)
+	}
+	for _, want := range []string{"source-health-line", `status-pill connected">Fresh`, `status-pill stale">Stale`, "codex", "missing", "never synced"} {
+		if !bytes.Contains(page.Body.Bytes(), []byte(want)) {
+			t.Errorf("overview missing %q", want)
+		}
+	}
+
+	// Old-agent compatibility: a heartbeat without the sources field keeps
+	// the previously reported rows.
+	oldAgent := sendHeartbeat(`{"machine_id":"linux-box","agent_version":"0.3.0","operating_system":"linux","architecture":"arm64","adapters":[{"id":"codex"}],"source_count":2,"source_error_count":0}`)
+	if oldAgent.Code != http.StatusOK {
+		t.Fatalf("old-agent heartbeat status = %d", oldAgent.Code)
+	}
+	machinesResponse = httptest.NewRecorder()
+	testHandler(server).ServeHTTP(machinesResponse, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	machines = nil
+	if err := json.Unmarshal(machinesResponse.Body.Bytes(), &machines); err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || len(machines[0].Sources) != 3 {
+		t.Fatalf("old-agent heartbeat must keep existing source rows, got %+v", machines)
+	}
+
+	// A health-aware agent with zero sources clears its machine's rows.
+	emptySources := sendHeartbeat(`{"machine_id":"linux-box","agent_version":"0.4.2","operating_system":"linux","architecture":"arm64","adapters":[],"source_count":0,"source_error_count":0,"sources":[]}`)
+	if emptySources.Code != http.StatusOK {
+		t.Fatalf("empty-sources heartbeat status = %d", emptySources.Code)
+	}
+	machinesResponse = httptest.NewRecorder()
+	testHandler(server).ServeHTTP(machinesResponse, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	machines = nil
+	if err := json.Unmarshal(machinesResponse.Body.Bytes(), &machines); err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || len(machines[0].Sources) != 0 {
+		t.Fatalf("empty sources must clear rows, got %+v", machines)
+	}
+
+	// Validation: sources without an identity hash are rejected.
+	rejected := sendHeartbeat(`{"machine_id":"linux-box","agent_version":"0.4.2","sources":[{"adapter":"codex","identity_hash":""}]}`)
+	if rejected.Code != http.StatusBadRequest {
+		t.Fatalf("heartbeat without identity hash status = %d, want %d", rejected.Code, http.StatusBadRequest)
+	}
+}
+
 func TestCatalogSessionTimelineAndMachineHealthReadSurfaces(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -147,17 +149,42 @@ func TestClientHeartbeatSendsDeploymentMetadata(t *testing.T) {
 		if request.MachineID != "machine" || request.AgentVersion != "0.3.0" || len(request.Adapters) != 1 || request.SourceCount != 2 || request.SourceErrorCount != 1 {
 			t.Fatalf("heartbeat = %+v", request)
 		}
+		// Per-source health rides along: identity hashes only, coarse error
+		// classes, and the sync timestamp pointer.
+		if len(request.Sources) != 1 || request.Sources[0].Adapter != "codex" || request.Sources[0].IdentityHash != "sha256:abc" || request.Sources[0].LastErrorClass != "permission" || request.Sources[0].LastSuccessfulSync == nil {
+			t.Fatalf("heartbeat sources = %+v", request.Sources)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
+	synced := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	err := (Client{ServerURL: server.URL, Token: "secret"}).Heartbeat(t.Context(), HeartbeatRequest{
 		MachineID: "machine", AgentVersion: "0.3.0", OperatingSystem: "linux", Architecture: "arm64",
 		Adapters: []AdapterHeartbeat{{ID: "codex", Version: "0.6.0"}}, SourceCount: 2, SourceErrorCount: 1,
+		Sources: []SourceHealthHeartbeat{{Adapter: "codex", IdentityHash: "sha256:abc", LastSuccessfulSync: &synced, LastErrorClass: "permission"}},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSourceErrorClassVocabulary(t *testing.T) {
+	permissionErr := &fs.PathError{Op: "open", Path: "x", Err: fs.ErrPermission}
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{nil, ""},
+		{fmt.Errorf("wrapped: %w", os.ErrNotExist), "missing"},
+		{fmt.Errorf("wrapped: %w", permissionErr), "permission"},
+		{fmt.Errorf("wrapped: %w", context.DeadlineExceeded), "timeout"},
+		{errors.New("something else"), "other"},
+	} {
+		if got := SourceErrorClass(test.err); got != test.want {
+			t.Errorf("SourceErrorClass(%v) = %q, want %q", test.err, got, test.want)
+		}
 	}
 }
 

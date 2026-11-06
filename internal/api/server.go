@@ -1224,6 +1224,19 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"statusClass": func(status string) string {
 			return strings.ToLower(status)
 		},
+		// sourceStateClass maps a per-source freshness state onto the shared
+		// status-pill classes: Fresh is connected-green, Stale warm, Unknown
+		// the neutral pill (same mapping as the data freshness pill).
+		"sourceStateClass": func(state string) string {
+			switch state {
+			case "Fresh":
+				return "connected"
+			case "Stale":
+				return "stale"
+			default:
+				return ""
+			}
+		},
 		"joinAdapters": func(values []string) string {
 			return strings.Join(values, " · ")
 		},
@@ -1406,6 +1419,17 @@ type heartbeatAdapter struct {
 	Version string `json:"version"`
 }
 
+// heartbeatSource is one source's connector health. A nil Sources slice on
+// the request means an older agent without the field: the hub keeps that
+// machine's previously reported rows. An empty non-nil slice is a health-
+// aware agent with zero discovered sources and clears the rows.
+type heartbeatSource struct {
+	Adapter            string     `json:"adapter"`
+	IdentityHash       string     `json:"identity_hash"`
+	LastSuccessfulSync *time.Time `json:"last_successful_sync"`
+	LastErrorClass     string     `json:"last_error_class"`
+}
+
 type heartbeatRequest struct {
 	MachineID        string             `json:"machine_id"`
 	AgentVersion     string             `json:"agent_version"`
@@ -1414,6 +1438,7 @@ type heartbeatRequest struct {
 	Adapters         []heartbeatAdapter `json:"adapters"`
 	SourceCount      int                `json:"source_count"`
 	SourceErrorCount int                `json:"source_error_count"`
+	Sources          []heartbeatSource  `json:"sources"`
 }
 
 // maxHeartbeatBodyBytes bounds the decompressed heartbeat payload; ingest
@@ -1511,6 +1536,29 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many adapters"})
 		return
 	}
+	if len(request.Sources) > 256 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many sources"})
+		return
+	}
+	syncClockSkewLimit := 24 * time.Hour
+	for _, source := range request.Sources {
+		if strings.TrimSpace(source.Adapter) == "" || len([]rune(source.Adapter)) > 128 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source adapters must be non-empty and at most 128 characters"})
+			return
+		}
+		if strings.TrimSpace(source.IdentityHash) == "" || len([]rune(source.IdentityHash)) > 128 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source identity hashes must be non-empty and at most 128 characters"})
+			return
+		}
+		if len(source.LastErrorClass) > 32 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source error class is too long"})
+			return
+		}
+		if source.LastSuccessfulSync != nil && time.Until(source.LastSuccessfulSync.UTC()) > syncClockSkewLimit {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source sync timestamp is too far in the future"})
+			return
+		}
+	}
 	adapterIDs := make([]string, 0, len(request.Adapters))
 	for _, adapter := range request.Adapters {
 		if strings.TrimSpace(adapter.ID) == "" || len([]rune(adapter.ID)) > 128 {
@@ -1528,6 +1576,20 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warn("source_errors", "count", request.SourceErrorCount)
 	}
 	started := time.Now()
+	// Nil stays nil (older agent — keep existing rows); a health-aware agent
+	// always replaces its machine's rows, even with zero sources.
+	var sources []database.AgentSourceHealth
+	if request.Sources != nil {
+		sources = make([]database.AgentSourceHealth, 0, len(request.Sources))
+		for _, source := range request.Sources {
+			sources = append(sources, database.AgentSourceHealth{
+				Adapter:            source.Adapter,
+				SourceHash:         source.IdentityHash,
+				LastSuccessfulSync: source.LastSuccessfulSync,
+				LastErrorClass:     source.LastErrorClass,
+			})
+		}
+	}
 	if err := s.store.RecordHeartbeat(r.Context(), database.AgentHeartbeat{
 		MachineID:        request.MachineID,
 		AgentVersion:     request.AgentVersion,
@@ -1536,6 +1598,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		Adapters:         adapterIDs,
 		SourceCount:      request.SourceCount,
 		SourceErrorCount: request.SourceErrorCount,
+		Sources:          sources,
 	}); err != nil {
 		s.metrics.observeDB(started)
 		s.logger.Error("heartbeat_failed")
@@ -2395,6 +2458,10 @@ const dashboardTemplate = `<!doctype html>
     .health-table th, .sessions-table th { padding-top: 8px; padding-bottom: 8px; vertical-align: bottom; }
     .health-table td:last-child, .sessions-table td:last-child { overflow: visible; color: var(--muted); font-weight: 400; }
     .health-table td.sync-error { color: var(--warm); font-weight: 700; }
+    .source-health { display: block; margin-top: 4px; }
+    .source-health-line { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; }
+    .source-health-line .status-pill { vertical-align: middle; }
+    .source-health-line .sync-error { color: var(--warm); font-weight: 700; }
     .sessions-table td:nth-child(3) { color: var(--text); }
     .first-run { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 16px; padding: 18px 22px; border: 1px solid rgba(155, 187, 160, .24); border-radius: 10px; background: linear-gradient(100deg, rgba(155, 187, 160, .08), rgba(155, 187, 160, .025)); }
     .first-run h2 { margin: 0 0 4px; color: var(--text); font-family: var(--font-display); font-size: 14px; font-weight: 600; letter-spacing: .01em; text-transform: none; }
@@ -2566,7 +2633,7 @@ const dashboardTemplate = `<!doctype html>
 
   <section class="panel health-panel" aria-labelledby="health-title">
     <div class="section-head"><h2 class="section-title" id="health-title">Machine health</h2><a class="section-link" href="/api/v1/machines">Read API</a></div>
-    <div class="health-scroll"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
+    <div class="health-scroll"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}<span class="source-health">{{range .Sources}}<span class="source-health-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">

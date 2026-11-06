@@ -151,13 +151,45 @@ WHERE machine_id = ?`, machineID)
 		if err := rows.Scan(&adapter, &sourcePath, &identity, &offset, &line, &cursorState); err != nil {
 			return StateSnapshot{}, fmt.Errorf("scan agent cursor: %w", err)
 		}
-		snapshot.Cursors[sourceKey(adapter, sourcePath)] = adapters.Cursor{Identity: identity, Offset: offset, Line: line, State: cursorState}
+		snapshot.Cursors[SourceKey(adapter, sourcePath)] = adapters.Cursor{Identity: identity, Offset: offset, Line: line, State: cursorState}
 	}
 	if err := rows.Err(); err != nil {
 		return StateSnapshot{}, fmt.Errorf("read agent cursors: %w", err)
 	}
 
 	return snapshot, nil
+}
+
+// LastSuccessfulSyncs returns the committed last_successful_sync time for
+// every known source of the machine, keyed like cursors (adapter, path). The
+// heartbeat uses it to keep reporting a source's previous successful sync
+// while the source is currently failing. Sources that never committed are
+// simply absent.
+func (s *StateStore) LastSuccessfulSyncs(ctx context.Context, machineID string) (map[string]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT adapter, source_path, last_successful_sync
+FROM source_state
+WHERE machine_id = ?`, machineID)
+	if err != nil {
+		return nil, fmt.Errorf("read agent source syncs: %w", err)
+	}
+	defer rows.Close()
+	syncs := make(map[string]time.Time)
+	for rows.Next() {
+		var adapter, sourcePath, syncedAt string
+		if err := rows.Scan(&adapter, &sourcePath, &syncedAt); err != nil {
+			return nil, fmt.Errorf("scan agent source sync: %w", err)
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, syncedAt)
+		if err != nil {
+			continue
+		}
+		syncs[SourceKey(adapter, sourcePath)] = parsed
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read agent source syncs: %w", err)
+	}
+	return syncs, nil
 }
 
 // Pending returns only new or changed events since the last successful sync.
@@ -260,7 +292,7 @@ func (s *StateStore) Commit(ctx context.Context, machineID string, committed Sta
 		}
 		cursor := report.Cursor
 		cursor.Identity = identity
-		if existing, ok := committed.Cursors[sourceKey(report.Adapter, report.Path)]; ok && existing == cursor {
+		if existing, ok := committed.Cursors[SourceKey(report.Adapter, report.Path)]; ok && existing == cursor {
 			continue
 		}
 		_, err := tx.ExecContext(ctx, `
@@ -303,6 +335,8 @@ ON CONFLICT(machine_id, event_id) DO UPDATE SET
 	return nil
 }
 
-func sourceKey(adapter, path string) string {
+// SourceKey is the (adapter, local source path) map key used for cursors and
+// committed sync times.
+func SourceKey(adapter, path string) string {
 	return adapter + "\x00" + path
 }

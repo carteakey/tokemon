@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -33,14 +36,47 @@ type AdapterHeartbeat struct {
 	Capabilities adapters.Capabilities `json:"capabilities"`
 }
 
+// SourceHealthHeartbeat reports one discovered source's connector state.
+// IdentityHash is the source's existing safe identity ("sha256:…") — raw local
+// paths never leave the machine, and LastErrorClass is a coarse constant
+// token, never the error text, which can carry local paths. LastSuccessfulSync
+// is nil when the source has not synced successfully yet. The field is always
+// serialized (no omitempty) so the hub can tell a health-aware agent sending
+// zero sources from an older agent that omits the field entirely.
+type SourceHealthHeartbeat struct {
+	Adapter            string     `json:"adapter"`
+	IdentityHash       string     `json:"identity_hash"`
+	LastSuccessfulSync *time.Time `json:"last_successful_sync"`
+	LastErrorClass     string     `json:"last_error_class"`
+}
+
 type HeartbeatRequest struct {
-	MachineID        string             `json:"machine_id"`
-	AgentVersion     string             `json:"agent_version"`
-	OperatingSystem  string             `json:"operating_system"`
-	Architecture     string             `json:"architecture"`
-	Adapters         []AdapterHeartbeat `json:"adapters"`
-	SourceCount      int                `json:"source_count"`
-	SourceErrorCount int                `json:"source_error_count"`
+	MachineID        string                  `json:"machine_id"`
+	AgentVersion     string                  `json:"agent_version"`
+	OperatingSystem  string                  `json:"operating_system"`
+	Architecture     string                  `json:"architecture"`
+	Adapters         []AdapterHeartbeat      `json:"adapters"`
+	SourceCount      int                     `json:"source_count"`
+	SourceErrorCount int                     `json:"source_error_count"`
+	Sources          []SourceHealthHeartbeat `json:"sources"`
+}
+
+// SourceErrorClass reduces a collection error to a coarse, path-free token
+// for the per-source heartbeat. The hub displays the class as-is, so the
+// values are a closed vocabulary.
+func SourceErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, os.ErrNotExist):
+		return "missing"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 const (

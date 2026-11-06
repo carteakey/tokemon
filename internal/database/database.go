@@ -62,24 +62,41 @@ type AgentHeartbeat struct {
 	Adapters         []string
 	SourceCount      int
 	SourceErrorCount int
+	// Sources carries per-source connector health. A nil slice means the
+	// agent predates the field and its previously reported rows must be kept
+	// untouched; a non-nil slice (possibly empty) is the machine's current,
+	// authoritative source list.
+	Sources []AgentSourceHealth
+}
+
+// AgentSourceHealth is one source's connector state as reported by the agent.
+// SourceHash is the agent-side safe identity hash — raw local paths never
+// reach the hub — and LastErrorClass is a coarse constant token, never the
+// error text.
+type AgentSourceHealth struct {
+	Adapter            string
+	SourceHash         string
+	LastSuccessfulSync *time.Time
+	LastErrorClass     string
 }
 
 type MachineInfo struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	OperatingSystem  string   `json:"operating_system"`
-	Architecture     string   `json:"architecture"`
-	AgentVersion     string   `json:"agent_version"`
-	DetectedAdapters []string `json:"detected_adapters"`
-	SourceCount      int      `json:"source_count"`
-	SourceErrorCount int      `json:"source_error_count"`
-	FirstSeenAt      string   `json:"first_seen_at"`
-	LastSeenAt       string   `json:"last_seen_at"`
-	Status           string   `json:"status"`
-	SyncContext      string   `json:"sync_context"`
-	TodayTokens      int64    `json:"today_tokens"`
-	WeekTokens       int64    `json:"week_tokens"`
-	LifetimeTokens   int64    `json:"lifetime_tokens"`
+	ID               string                `json:"id"`
+	Name             string                `json:"name"`
+	OperatingSystem  string                `json:"operating_system"`
+	Architecture     string                `json:"architecture"`
+	AgentVersion     string                `json:"agent_version"`
+	DetectedAdapters []string              `json:"detected_adapters"`
+	SourceCount      int                   `json:"source_count"`
+	SourceErrorCount int                   `json:"source_error_count"`
+	FirstSeenAt      string                `json:"first_seen_at"`
+	LastSeenAt       string                `json:"last_seen_at"`
+	Status           string                `json:"status"`
+	SyncContext      string                `json:"sync_context"`
+	Sources          []MachineSourceHealth `json:"sources,omitempty"`
+	TodayTokens      int64                 `json:"today_tokens"`
+	WeekTokens       int64                 `json:"week_tokens"`
+	LifetimeTokens   int64                 `json:"lifetime_tokens"`
 }
 
 type ToolTotal struct {
@@ -497,6 +514,15 @@ CREATE TABLE IF NOT EXISTS machines (
   source_error_count INTEGER NOT NULL DEFAULT 0,
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS machine_source_health (
+  machine_id TEXT NOT NULL,
+  adapter TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  last_successful_sync TEXT NOT NULL DEFAULT '',
+  last_error_class TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (machine_id, adapter, source_hash)
 );
 CREATE TABLE IF NOT EXISTS usage_events (
   event_id TEXT PRIMARY KEY,
@@ -937,9 +963,22 @@ func (s *Store) RecordHeartbeat(ctx context.Context, heartbeat AgentHeartbeat) e
 	if heartbeat.SourceCount < 0 || heartbeat.SourceErrorCount < 0 {
 		return errors.New("heartbeat source counts cannot be negative")
 	}
+	for _, source := range heartbeat.Sources {
+		if strings.TrimSpace(source.Adapter) == "" || strings.TrimSpace(source.SourceHash) == "" {
+			return errors.New("heartbeat source health requires adapter and source hash")
+		}
+	}
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
 	adapters := strings.Join(normalizeAdapterIDs(heartbeat.Adapters), ",")
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin heartbeat transaction: %w", err)
+	}
+	rollback := func(commitErr error) error {
+		_ = tx.Rollback()
+		return commitErr
+	}
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO machines (
     id, name, operating_system, architecture, agent_version,
     detected_adapters, source_count, source_error_count, first_seen_at, last_seen_at
@@ -954,8 +993,36 @@ ON CONFLICT(id) DO UPDATE SET
     source_error_count = excluded.source_error_count,
     last_seen_at = excluded.last_seen_at`,
 		heartbeat.MachineID, heartbeat.MachineID, heartbeat.OperatingSystem, heartbeat.Architecture,
-		heartbeat.AgentVersion, adapters, heartbeat.SourceCount, heartbeat.SourceErrorCount, now, now)
-	return err
+		heartbeat.AgentVersion, adapters, heartbeat.SourceCount, heartbeat.SourceErrorCount, now, now); err != nil {
+		return rollback(fmt.Errorf("record heartbeat: %w", err))
+	}
+	// A health-aware agent's source list is authoritative: replace the
+	// machine's rows every heartbeat. A nil slice means an older agent
+	// without the field — its previously reported rows stay untouched so the
+	// per-source view degrades to stale/unknown instead of vanishing.
+	if heartbeat.Sources != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM machine_source_health WHERE machine_id = ?`, heartbeat.MachineID); err != nil {
+			return rollback(fmt.Errorf("clear source health: %w", err))
+		}
+		for _, source := range heartbeat.Sources {
+			var syncedAt string
+			if source.LastSuccessfulSync != nil {
+				syncedAt = source.LastSuccessfulSync.UTC().Format(time.RFC3339Nano)
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO machine_source_health (
+    machine_id, adapter, source_hash, last_successful_sync, last_error_class, updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(machine_id, adapter, source_hash) DO UPDATE SET
+    last_successful_sync = excluded.last_successful_sync,
+    last_error_class = excluded.last_error_class,
+    updated_at = excluded.updated_at`,
+				heartbeat.MachineID, source.Adapter, source.SourceHash, syncedAt, source.LastErrorClass, now); err != nil {
+				return rollback(fmt.Errorf("record source health: %w", err))
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Machines(ctx context.Context) ([]MachineInfo, error) {

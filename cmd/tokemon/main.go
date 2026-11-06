@@ -615,21 +615,57 @@ func runAgent(args []string) error {
 			return err
 		}
 		events, reports := adapters.CollectWithCursors(ctx, list, *machineID, snapshot.Cursors)
+		// Per-source health: committed sync times survive agent restarts, so
+		// a currently failing source can still report when it last worked.
+		// A state-read failure must not skip collection or upload.
+		lastSyncs, err := stateStore.LastSuccessfulSyncs(ctx, *machineID)
+		if err != nil {
+			slog.Default().Warn("source_health_state_error")
+			lastSyncs = nil
+		}
 		var sourceErrors []error
 		sourceCount := 0
+		sourceHealth := make([]localagent.SourceHealthHeartbeat, 0, len(reports))
 		for _, report := range reports {
 			if report.Path != "" {
 				sourceCount++
 			}
+			entry := localagent.SourceHealthHeartbeat{Adapter: report.Adapter}
 			if report.Err != nil {
 				err := fmt.Errorf("%s source collection failed", report.Adapter)
 				sourceErrors = append(sourceErrors, err)
 				slog.Default().Warn("source_error", "adapter", report.Adapter, "path_present", report.Path != "")
-				continue
+				entry.LastErrorClass = localagent.SourceErrorClass(report.Err)
+				if report.Path != "" {
+					if synced, ok := lastSyncs[localagent.SourceKey(report.Adapter, report.Path)]; ok {
+						syncedUTC := synced.UTC()
+						entry.LastSuccessfulSync = &syncedUTC
+					}
+				}
+			} else {
+				if *verbose {
+					fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
+				}
+				syncedNow := time.Now().UTC()
+				entry.LastSuccessfulSync = &syncedNow
 			}
-			if *verbose {
-				fmt.Printf("%s %s: %d session snapshots\n", report.Adapter, displayHome(report.Path, *home), report.Events)
+			// Same safe-identity chain as the state store's commit: the
+			// cursor or source identity is already hashed; raw paths are
+			// never sent. A failed discovery has no source at all, so it
+			// reports under a stable adapter-level pseudo-source instead of
+			// disappearing from the per-source view.
+			identity := report.Cursor.Identity
+			if identity == "" {
+				identity = report.Source.Identity
 			}
+			if identity == "" && report.Path != "" {
+				identity = adapters.HashIdentity(report.Adapter + ":" + report.Path)
+			}
+			if identity == "" {
+				identity = adapters.HashIdentity(report.Adapter + ":discover")
+			}
+			entry.IdentityHash = identity
+			sourceHealth = append(sourceHealth, entry)
 		}
 		snapshotCount := len(events)
 		if !*includeProjects {
@@ -648,6 +684,7 @@ func runAgent(args []string) error {
 			Adapters:         heartbeatAdapters,
 			SourceCount:      sourceCount,
 			SourceErrorCount: len(sourceErrors),
+			Sources:          sourceHealth,
 		}); err != nil {
 			// Heartbeats are diagnostic and must never prevent a successful data
 			// upload or advance/rollback local cursor state.
