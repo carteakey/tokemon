@@ -1452,6 +1452,108 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	}
 }
 
+func TestAnalyticsUnknownBucketLabelsAreDimensionAware(t *testing.T) {
+	// All five dimensions get a dimension-aware label for the empty bucket.
+	wantLabels := map[string]string{
+		"projects":   "Unknown project",
+		"models":     "Unknown model",
+		"machines":   "Unknown machine",
+		"harnesses":  "Unknown harness",
+		"providers":  "Unknown provider",
+		"everything": "Unknown project", // unknown dimensions default to projects
+	}
+	for dimension, want := range wantLabels {
+		if got := analyticsUnknownLabel(dimension); got != want {
+			t.Errorf("analyticsUnknownLabel(%q) = %q, want %q", dimension, got, want)
+		}
+	}
+	if got := breakdownDisplayName("projects", nil, "Unknown"); got != "Unknown project" {
+		t.Errorf("breakdownDisplayName projects sentinel = %q", got)
+	}
+	if got := breakdownDisplayName("projects", nil, "project-a"); got != "project-a" {
+		t.Errorf("breakdownDisplayName projects real name = %q", got)
+	}
+
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The two sentinels reachable through ingest: the empty project and the
+	// Claude adapter's literal "unknown" model. Both funnel into the store's
+	// 'Unknown'/'unknown' bucket; the display layer picks the label.
+	events := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "unknown-labels-project", Timestamp: time.Now().UTC(),
+			MachineID: "machine-one", SessionID: "session-one", Provider: "anthropic",
+			Model: "claude", Tool: "claude-code", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "unknown-labels-model", Timestamp: time.Now().UTC(),
+			MachineID: "machine-one", SessionID: "session-two", Project: "project-b", Provider: "anthropic",
+			Model: "unknown", Tool: "claude-code", TotalTokens: usage.Int64(30), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"},
+		},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != 2 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	for _, test := range []struct{ dimension, label string }{
+		{"projects", "Unknown project"},
+		{"models", "Unknown model"},
+	} {
+		page := httptest.NewRecorder()
+		testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/analytics?period=30d&dimension="+test.dimension, nil))
+		if page.Code != http.StatusOK {
+			t.Fatalf("analytics page (%s) status = %d: %s", test.dimension, page.Code, page.Body.String())
+		}
+		if !bytes.Contains(page.Body.Bytes(), []byte(`class="unknown-value">`+test.label+`</span>`)) {
+			t.Errorf("analytics %s breakdown missing unknown label %q", test.dimension, test.label)
+		}
+		if !bytes.Contains(page.Body.Bytes(), []byte(">"+test.label+" share</th>")) {
+			t.Errorf("analytics %s usage-share table missing %q column header", test.dimension, test.label)
+		}
+
+		csvResponse := httptest.NewRecorder()
+		testHandler(server).ServeHTTP(csvResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=30d&dimension="+test.dimension+"&format=csv", nil))
+		if csvResponse.Code != http.StatusOK {
+			t.Fatalf("analytics csv (%s) status = %d", test.dimension, csvResponse.Code)
+		}
+		if !strings.Contains(csvResponse.Body.String(), ","+test.label+",") {
+			t.Errorf("analytics %s csv missing %q name cell: %s", test.dimension, test.label, csvResponse.Body.String())
+		}
+	}
+
+	// The JSON API keeps the raw sentinel — display-time mapping only.
+	jsonResponse := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(jsonResponse, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=30d&dimension=projects", nil))
+	if jsonResponse.Code != http.StatusOK {
+		t.Fatalf("analytics json status = %d", jsonResponse.Code)
+	}
+	var exported database.Analytics
+	if err := json.Unmarshal(jsonResponse.Body.Bytes(), &exported); err != nil {
+		t.Fatalf("decode analytics export: %v", err)
+	}
+	if len(exported.Breakdown) != 2 {
+		t.Fatalf("json export breakdown rows = %d, want 2: %+v", len(exported.Breakdown), exported.Breakdown)
+	}
+	var sentinel *database.AnalyticsBreakdown
+	for index := range exported.Breakdown {
+		if exported.Breakdown[index].Name == "Unknown" {
+			sentinel = &exported.Breakdown[index]
+		}
+	}
+	if sentinel == nil || sentinel.Tokens != 50 {
+		t.Fatalf("json export must keep the raw sentinel, got %+v", exported.Breakdown)
+	}
+}
+
 func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	for _, test := range []struct {
 		maximum int64

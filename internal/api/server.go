@@ -735,6 +735,52 @@ func analyticsDimensionLabel(dimension string) string {
 	}
 }
 
+// analyticsUnknownLabel is the dimension-aware display label for the empty
+// breakdown bucket. The store COALESCEs every dimension to the raw sentinel
+// 'Unknown' (kept verbatim in the DB expression and JSON API); the overview
+// spells the concept out per dimension ("Unknown project"), so the analytics
+// page and CSV do the same at display time.
+func analyticsUnknownLabel(dimension string) string {
+	switch dimension {
+	case "harnesses":
+		return "Unknown harness"
+	case "providers":
+		return "Unknown provider"
+	case "models":
+		return "Unknown model"
+	case "machines":
+		return "Unknown machine"
+	default:
+		return "Unknown project"
+	}
+}
+
+// isUnknownBucketName reports whether a breakdown bucket name is the empty
+// bucket sentinel. The store writes 'Unknown', while model rows can also
+// carry the Claude adapter's literal "unknown"; both spell the same concept.
+func isUnknownBucketName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "unknown")
+}
+
+// breakdownDisplayName renders one breakdown/share name for display: the
+// empty bucket becomes the dimension-aware unknown label and real names keep
+// their per-dimension formatting (model/machine aliases, harness names).
+func breakdownDisplayName(dimension string, aliases map[string]string, name string) string {
+	if isUnknownBucketName(name) {
+		return analyticsUnknownLabel(dimension)
+	}
+	switch dimension {
+	case "models":
+		return modelDisplayName(aliases, name)
+	case "machines":
+		return machineDisplayName(aliases, name)
+	case "harnesses":
+		return harnessName(name)
+	default:
+		return name
+	}
+}
+
 func analyticsPeakPoint(points []database.AnalyticsPoint) database.AnalyticsPoint {
 	if len(points) == 0 {
 		return database.AnalyticsPoint{}
@@ -1074,6 +1120,9 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"analyticsDateLabel":   analyticsDateTickLabel,
 		"shareDateLabel":       analyticsShareDateTickLabel,
 		"dimensionLabel":       analyticsDimensionLabel,
+		"unknownLabel":         analyticsUnknownLabel,
+		"isUnknownName":        isUnknownBucketName,
+		"breakdownName":        breakdownDisplayName,
 		"analyticsTime":        analyticsShortTime,
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
@@ -1964,7 +2013,9 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeAnalyticsCSV streams the current breakdown as RFC 4180 CSV, honoring
-// the active dimension and filters. Names are raw identifiers; share is the
+// the active dimension and filters. Names are raw identifiers except the
+// empty bucket, which gets the dimension-aware unknown label matching the
+// analytics page (the JSON export keeps the raw sentinel). Share is the
 // rendered percentage. No invented pricing or derived fields.
 func writeAnalyticsCSV(w http.ResponseWriter, result database.Analytics) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
@@ -1976,10 +2027,14 @@ func writeAnalyticsCSV(w http.ResponseWriter, result database.Analytics) {
 		return
 	}
 	for _, row := range result.Breakdown {
+		name := row.Name
+		if isUnknownBucketName(name) {
+			name = analyticsUnknownLabel(result.Filter.Dimension)
+		}
 		if err := writer.Write([]string{
 			csvFormulaSafe(result.Filter.Dimension),
 			csvFormulaSafe(result.Filter.Period),
-			csvFormulaSafe(row.Name),
+			csvFormulaSafe(name),
 			strconv.FormatInt(row.Tokens, 10),
 			strconv.FormatInt(row.Events, 10),
 			strconv.FormatInt(row.Sessions, 10),
@@ -3498,7 +3553,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       <div class="table-scroll breakdown-scroll" tabindex="0" aria-label="Analytics breakdown table, scrollable">
         <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
-          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if eq $.Filter.Dimension "models"}}{{if eq .Name "unknown"}}<span class="unknown-value">Unknown model</span>{{else}}{{modelDisplayName $.ModelAliases .Name}}{{end}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
+          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases .Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
@@ -3509,7 +3564,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <div class="section-head"><h2 class="section-title" id="share-title">Usage share</h2><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
     {{if .SharePoints}}
     <div class="share-legend" aria-label="Usage share legend">
-      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $series.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $series.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $series.Name}}{{else}}{{$series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
+      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if isUnknownName $series.Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
     </div>
     <div class="share-visual">
       <div class="share-y-axis" aria-label="Share scale"><span style="bottom: 100%">100%</span><span style="bottom: 50%">50%</span><span style="bottom: 0">0%</span></div>
@@ -3541,7 +3596,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       </div>
     </div>
     <div class="sr-only" id="share-data-table">
-      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}<th scope="col">{{.Name}} share</th>{{end}}</tr></thead><tbody>
+      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}{{if isUnknownName .Name}}<th scope="col">{{unknownLabel $.Filter.Dimension}} share</th>{{else}}<th scope="col">{{.Name}} share</th>{{end}}{{end}}</tr></thead><tbody>
         {{range .SharePoints}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td>{{range .Values}}<td>{{printf "%.1f%%" (mul .Share 100)}}</td>{{end}}</tr>{{end}}
       </tbody></table>
     </div>
