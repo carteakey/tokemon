@@ -996,6 +996,13 @@ classify each machine as Connected (≤5 minutes), Stale (>5 and ≤30 minutes),
 Offline (>30 minutes). Recent sessions remain metadata-only and show known versus
 unavailable token, cost, duration, and accuracy fields without conversation data.
 
+Post-v0.2: the machine-health panel also breaks connector status down per
+source — one line per discovered source with a freshness pill for that
+source's last successful sync (Fresh within the same 30-minute stale window
+the data-freshness pill uses, Stale after it, Unknown when the source has
+never synced) plus the latest error class when collection failed, so one
+quiet connector is visible even while another source stays active.
+
 Post-v0.2: the Today summary carries a **data-freshness pill** reflecting the
 age of the newest persisted event, so a stalled connector is visible on the
 card itself. Session identifiers render as readable display names (the `ses_…`
@@ -1498,9 +1505,29 @@ deployment metadata only:
   "architecture": "arm64",
   "adapters": [{"id": "codex", "version": "0.6.0"}],
   "source_count": 4,
-  "source_error_count": 0
+  "source_error_count": 0,
+  "sources": [
+    {
+      "adapter": "codex",
+      "identity_hash": "sha256:…",
+      "last_successful_sync": "2026-11-06T15:04:05Z",
+      "last_error_class": ""
+    }
+  ]
 }
 ```
+
+Post-v0.2: each entry in `sources` reports one discovered source's connector
+health — the adapter, a `sha256` identity hash (the same safe identity the
+agent derives for cursors; local paths never leave the machine), the time of
+the last successful sync (absent until the source has synced once), and a
+coarse `last_error_class` (`missing`, `permission`, `timeout`, or `other`)
+instead of error text, which could carry local paths. A source that is
+failing reports its previous successful sync, so a down connector stays
+visible with its error class. The field is always serialized: the hub treats
+a missing `sources` field as an older agent and keeps that machine's
+previously reported rows, while a present — possibly empty — list is the
+machine's current, authoritative source set.
 
 ### HTTP lifecycle and operational telemetry
 
@@ -1537,6 +1564,20 @@ error logs omit query strings, bodies, credentials, and local paths.
 - `source_error_count`
 - `first_seen_at`
 - `last_seen_at`
+
+### `machine_source_health`
+
+Post-v0.2 per-source connector health from the heartbeat's `sources` list;
+surfaced through `GET /api/v1/machines` as each machine's `sources` array
+with a derived freshness state. A nil heartbeat list (older agent) leaves
+existing rows untouched; a present list replaces the machine's rows.
+
+- `machine_id`
+- `adapter`
+- `source_hash`
+- `last_successful_sync` (empty until the source has synced once)
+- `last_error_class`
+- `updated_at`
 
 ### `usage_events`
 

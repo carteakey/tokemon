@@ -385,6 +385,23 @@ go run ./cmd/tokemon agent \
 
 For a managed agent, inspect the native supervisor logs after installation. The agent reports source health and deployment metadata through its authenticated heartbeat without sending local paths or provider record content.
 
+## Per-source connector health
+
+Every agent heartbeat carries a `sources` list alongside the machine totals:
+one entry per discovered source with the adapter name, a `sha256` identity
+hash (local paths never leave the machine), the time of the last successful
+sync, and — when the latest collection attempt failed — a coarse error class:
+`missing` (source absent), `permission` (unreadable), `timeout`, or `other`.
+Error text is never sent because it can contain local paths.
+
+The dashboard's machine-health panel shows one pill per source: Fresh within
+30 minutes of that source's last successful sync, Stale after that, and
+Unknown when the source has never synced. A currently failing source reports
+its previous successful sync, so a down connector appears as a stale pill
+plus its error class instead of disappearing behind the global freshness
+number. Agents older than per-source health keep their last reported rows
+until a health-aware agent replaces them.
+
 ## Upgrade and stop
 
 To rebuild the Compose hub from the current checkout:
