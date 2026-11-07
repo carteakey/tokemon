@@ -267,9 +267,12 @@ func newSessionSecret(dashboardToken string) ([]byte, error) {
 }
 
 // credentialFingerprint binds a session to the password account it was
-// issued for; changing the username or hash invalidates every session.
+// issued for; changing the username or hash invalidates every session. It is
+// a one-way, domain-separated digest — never the hash material itself.
 func credentialFingerprint(username string, hash []byte) []byte {
 	digest := sha256.New()
+	_, _ = digest.Write([]byte("tokemon/credential-fingerprint/v1"))
+	_, _ = digest.Write([]byte{0})
 	_, _ = digest.Write([]byte(username))
 	_, _ = digest.Write([]byte{0})
 	_, _ = digest.Write(hash)
@@ -631,6 +634,9 @@ func sessionAuthenticated(r *http.Request) bool {
 
 func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Authenticated pages and read APIs must never come from a browser
+		// cache (server-side caching is unaffected — response header only).
+		w.Header().Set("Cache-Control", "no-store")
 		remote := loginLimitKey(r)
 		// Throttle before any credential work so a locked-out client cannot
 		// burn bcrypt CPU.

@@ -66,7 +66,16 @@ func TestLoginFormRendersOnlyWithPasswordAccount(t *testing.T) {
 		t.Fatalf("login page status = %d", page.Code)
 	}
 	body := page.Body.String()
-	for _, want := range []string{`name="csrf_token"`, `autocomplete="username"`, `autocomplete="current-password"`, `action="/login"`} {
+	for _, want := range []string{
+		`name="csrf_token"`,
+		`autocomplete="username"`,
+		`autocomplete="current-password"`,
+		`action="/login"`,
+		`<label for="login-username">Username</label>`,
+		`<label for="login-password">Password</label>`,
+		`for="login-username"`,
+		`for="login-password"`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("login page missing %q", want)
 		}
@@ -174,6 +183,9 @@ func TestLoginRejectsBadCredentialsAndCSRF(t *testing.T) {
 	}
 	if !strings.Contains(wrong.Body.String(), "Invalid username or password.") || strings.Contains(wrong.Body.String(), "hunter2") {
 		t.Error("wrong-password response leaks the password or lacks the generic message")
+	}
+	if !strings.Contains(wrong.Body.String(), `role="alert"`) {
+		t.Error("wrong-password response missing role=alert on the error")
 	}
 	if session := findCookie(wrong, sessionCookieName); session != nil {
 		t.Error("wrong password set a session cookie")
@@ -443,6 +455,24 @@ func seedOneEvent(t *testing.T, store *database.Store) {
 	}
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCredentialFingerprintIsDomainSeparatedAndRotates(t *testing.T) {
+	hash := []byte("$2a$10$N9qo8uLOickgx2ZMRZoMye.IjPeGqBvQFGvJgkpXkQdUvYX0hJ7Ea")
+	baseline := credentialFingerprint("ops", hash)
+	if len(baseline) != sessionFingerprintBytes {
+		t.Fatalf("fingerprint length = %d, want %d", len(baseline), sessionFingerprintBytes)
+	}
+	if string(baseline) == string(hash[:sessionFingerprintBytes]) {
+		t.Fatal("fingerprint is the hash material itself, not a one-way digest")
+	}
+	// Rotating either credential invalidates outstanding sessions.
+	if other := credentialFingerprint("root", hash); string(other) == string(baseline) {
+		t.Error("fingerprint ignores the username")
+	}
+	if other := credentialFingerprint("ops", []byte("$2a$10$differenthashvaluehere.ABCDEFGHIJKLMNOPQRSTUVWX")); string(other) == string(baseline) {
+		t.Error("fingerprint ignores the password hash")
 	}
 }
 
