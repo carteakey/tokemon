@@ -33,7 +33,7 @@ func TestOverviewServesStaleWhileRefreshing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := server.cachedOverview(context.Background())
+	first, _, err := server.cachedOverview(context.Background())
 	if err != nil {
 		t.Fatalf("warm overview: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestOverviewServesStaleWhileRefreshing(t *testing.T) {
 	server.invalidateOverviewCache()
 
 	// The invalidated cache still serves the last good result immediately.
-	stale, err := server.cachedOverview(context.Background())
+	stale, _, err := server.cachedOverview(context.Background())
 	if err != nil {
 		t.Fatalf("stale overview: %v", err)
 	}

@@ -202,6 +202,7 @@ type Overview struct {
 	Threads        int64                    `json:"threads"`
 	Accuracy       map[usage.Accuracy]int64 `json:"accuracy"`
 	NewestEvent    *time.Time               `json:"newest_event,omitempty"`
+	Machines       []MachineInfo            `json:"machines"`
 }
 
 // AnalyticsQuery describes the bounded, metadata-only slice shown by the
@@ -1372,6 +1373,13 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 		result.Cache.HitRate = float64(result.Cache.CachedTokens) / float64(result.Cache.EligibleTokens)
 	}
 	result.Activity, err = s.Activity(ctx, time.Now())
+	if err != nil {
+		return Overview{}, err
+	}
+	// The machine cards ride along with the overview so callers that cache the
+	// overview (SWR) also cache the per-machine lifetime/today/week aggregates
+	// instead of repeating their full-table scan on every render.
+	result.Machines, err = s.MachinesAt(ctx, time.Now())
 	if err != nil {
 		return Overview{}, err
 	}

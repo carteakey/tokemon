@@ -26,7 +26,7 @@ func TestCachedComputesSurviveCanceledTriggeringRequest(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := server.cachedOverview(canceled); err != nil {
+	if _, _, err := server.cachedOverview(canceled); err != nil {
 		t.Fatalf("cachedOverview with a canceled triggering request = %v, want success", err)
 	}
 	if _, err := server.cachedEvolution(canceled); err != nil {
