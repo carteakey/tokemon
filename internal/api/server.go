@@ -1923,9 +1923,32 @@ func nullCostCell(value *float64) string {
 	return strconv.FormatFloat(*value, 'f', -1, 64)
 }
 
+// sharedComputeTimeout bounds a cache compute that is detached from the
+// request that triggered it. A client disconnect (a reload, the dashboard's
+// auto-refresh, a closed tab) must not abort a compute other requests are
+// waiting on; the timeout still bounds a pathological compute.
+const sharedComputeTimeout = 30 * time.Second
+
+// detachedComputeContext keeps the request's values but drops its
+// cancellation, so a shared cache compute survives the triggering client
+// going away.
+func detachedComputeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), sharedComputeTimeout)
+}
+
+// clientGone reports whether an error is the request context ending (client
+// disconnected or deadline exceeded). Handlers must not write a 5xx for it:
+// there is no client left to read it, and it is not a server failure.
+func clientGone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedEvolution(r.Context())
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1959,12 +1982,14 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 		s.evolutionReady = make(chan struct{})
 		s.evolutionMu.Unlock()
 
-		result, err := s.computeEvolution(ctx)
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.computeEvolution(computeCtx)
+		cancel()
 
 		s.evolutionMu.Lock()
 		ready := s.evolutionReady
 		s.evolutionReady = nil
-		if s.evolutionGeneration == generation {
+		if s.evolutionGeneration == generation && !clientGone(err) {
 			s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
 		}
 		s.evolutionMu.Unlock()
@@ -2026,12 +2051,14 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) 
 		s.overviewReady = make(chan struct{})
 		s.overviewMu.Unlock()
 
-		result, err := s.store.Overview(ctx)
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.store.Overview(computeCtx)
+		cancel()
 
 		s.overviewMu.Lock()
 		ready := s.overviewReady
 		s.overviewReady = nil
-		if s.overviewGeneration == generation {
+		if s.overviewGeneration == generation && !clientGone(err) {
 			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: time.Now()}
 		}
 		s.overviewMu.Unlock()
@@ -2086,10 +2113,12 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 		generation := s.analyticsGeneration
 		s.analyticsMu.Unlock()
 
-		result, err := s.store.Analytics(ctx, query)
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.store.Analytics(computeCtx, query)
+		cancel()
 
 		s.analyticsMu.Lock()
-		if s.analyticsGeneration == generation {
+		if s.analyticsGeneration == generation && !clientGone(err) {
 			s.analyticsCache[key] = &analyticsCacheEntry{result: result, err: err, fetched: time.Now()}
 		} else {
 			delete(s.analyticsCache, key)
@@ -2113,6 +2142,9 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2124,6 +2156,9 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2235,6 +2270,9 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedAnalytics(r.Context(), query)
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2269,6 +2307,9 @@ func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2334,6 +2375,9 @@ func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) timelineAPI(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2351,6 +2395,9 @@ func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2408,6 +2455,9 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	result, err := s.cachedOverview(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
