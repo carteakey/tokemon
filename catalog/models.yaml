@@ -139,7 +139,7 @@ models:
   claude-opus-4.5-plus:
     provider: anthropic
     display_name: Claude Opus 4.5–4.8
-    aliases: [claude-opus-4-5, claude-opus-4-5-20251101, claude-opus-4-6, claude-opus-4-6-20260205, claude-opus-4-7, claude-opus-4-8]
+    aliases: [claude-opus-4-5, claude-opus-4-5-20251101, claude-opus-4-6, claude-opus-4-6-20260205, claude-opus-4-6-thinking, claude-opus-4-7, claude-opus-4-8]
     tier: S
     pricing:
       currency: USD
@@ -180,3 +180,226 @@ models:
       cached_input_per_million: 0.1
       cache_write_per_million: 1.25
       output_per_million: 5
+
+  # ——— Observed-in-usage additions (2026-11-07 audit of the live deployment).
+  # Prices are filled in only where public per-token pricing is verified;
+  # everything else carries mode: unknown and stays unpriced rather than
+  # inventing numbers. Tiers follow the model family where that is known and
+  # stay Unranked otherwise.
+
+  claude-opus-5-5:
+    provider: anthropic
+    display_name: Claude Opus 5.5
+    aliases: [claude-opus-5-5, anthropic/claude-opus-5-5]
+    tier: S
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  claude-sonnet-5-5:
+    provider: anthropic
+    display_name: Claude Sonnet 5.5
+    aliases: [claude-sonnet-5-5, anthropic/claude-sonnet-5-5]
+    tier: A
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  claude-sonnet-5:
+    provider: anthropic
+    display_name: Claude Sonnet 5
+    aliases: [claude-sonnet-5, anthropic/claude-sonnet-5]
+    tier: A
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  claude-haiku-5-5:
+    provider: anthropic
+    display_name: Claude Haiku 5.5
+    aliases: [claude-haiku-5-5, anthropic/claude-haiku-5-5]
+    tier: B
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gpt-6.1-sol:
+    provider: openai
+    display_name: GPT-6.1 Sol
+    aliases: [gpt-6.1, openai/gpt-6.1, gpt-6.1-sol, openai/gpt-6.1-sol]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gpt-6.1-terra:
+    provider: openai
+    display_name: GPT-6.1 Terra
+    aliases: [gpt-6.1-terra, openai/gpt-6.1-terra]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gpt-6-luna:
+    provider: openai
+    display_name: GPT-6 Luna
+    aliases: [gpt-6, openai/gpt-6, gpt-6-luna, openai/gpt-6-luna]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gpt-6-sol:
+    provider: openai
+    display_name: GPT-6 Sol
+    aliases: [gpt-6-sol, openai/gpt-6-sol]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gpt-6-astra:
+    provider: openai
+    display_name: GPT-6 Astra
+    aliases: [gpt-6-astra, openai/gpt-6-astra]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  codex-auto-review:
+    provider: openai
+    display_name: Codex Auto Review
+    aliases: [codex-auto-review]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  glm-5.3-flash:
+    provider: zai
+    display_name: GLM-5.3 Flash
+    aliases: [glm-5.3-flash, GLM-5.3-Flash, GLM-5.3, glm-5.3]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gemini-3-flash:
+    provider: google
+    display_name: Gemini 3 Flash
+    aliases: [gemini-3-flash, gemini-3-flash-a, gemini-3-flash-b, gemini-3-flash-medium-a]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gemini-3.6-flash:
+    provider: google
+    display_name: Gemini 3.6 Flash
+    aliases: [gemini-3.6-flash]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  gemini-3.7-flash:
+    provider: google
+    display_name: Gemini 3.7 Flash
+    aliases: [gemini-3.7-flash]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  nemotron-3.5-super-vl-120b-a12b:
+    provider: nvidia
+    display_name: Nemotron 3.5 Super VL 120B-A12B
+    aliases: [nvidia/nemotron-3.5-super-vl-120b-a12b, private/nvidia/nemotron-3.5-super-120b-a12b]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  deepseek-v4-1-flash:
+    provider: deepseek
+    display_name: DeepSeek V4.1 Flash
+    aliases: [deepseek-v4-1-flash-1017]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  deepseek-v4-flash-free:
+    provider: deepseek
+    display_name: DeepSeek V4 Flash (free tier)
+    aliases: [deepseek-v4-flash-free]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  deepseek-v4-pro:
+    provider: deepseek
+    display_name: DeepSeek V4 Pro
+    aliases: [deepseek-ai/deepseek-v4-pro]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  qwen3.8-flash-next:
+    provider: alibaba
+    display_name: Qwen 3.8 Flash Next
+    aliases: [qwen38-flash-next-plat, qwen3.8-flash-next-iq3_xxs-ple_q8]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  space-bunny-free:
+    provider: opencode
+    display_name: Space Bunny (free tier)
+    aliases: [space-bunny-free]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  muse-spark-1.2-contributor-free:
+    provider: opencode
+    display_name: Muse Spark 1.2 (contributor free tier)
+    aliases: [muse-spark-1.2-contributor-free]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-07
+
+  mistral-large-latest:
+    provider: mistral
+    display_name: Mistral Large
+    aliases: [mistral-large-latest]
+    pricing:
+      currency: USD
+      mode: standard
+      verified_at: 2026-11-07
+      source: https://mistral.ai/pricing/
+      input_per_million: 2
+      output_per_million: 6
+
+  codestral-latest:
+    provider: mistral
+    display_name: Codestral
+    aliases: [codestral-latest]
+    pricing:
+      currency: USD
+      mode: standard
+      verified_at: 2026-11-07
+      source: https://mistral.ai/pricing/
+      input_per_million: 0.3
+      output_per_million: 0.9

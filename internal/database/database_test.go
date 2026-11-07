@@ -402,6 +402,83 @@ func TestCatalogSnapshotDisclosesUncatalogedModels(t *testing.T) {
 	}
 }
 
+func TestBundledCatalogCoversObservedModels(t *testing.T) {
+	// Fixture from the 2026-11-07 audit of the live deployment
+	// (SELECT COALESCE(NULLIF(canonical_model,''),raw_model) FROM usage_events
+	// GROUP BY 1): every distinct model observed in real usage. Each one must
+	// either resolve into the bundled catalog or be explicitly disclosed as
+	// uncataloged by the snapshot — never silently dropped or invented into.
+	observed := []string{
+		"gpt-5.6-luna", "GLM-5.3-Flash", "claude-sonnet-5-5", "claude-opus-5-5",
+		"gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "claude-sonnet-5", "gpt-5.5",
+		"gpt-6.1-terra", "glm-5.3-flash", "claude-sonnet-4", "gpt-6-sol",
+		"gpt-5.6-terra", "gpt-5.2-codex", "nvidia/nemotron-3.5-super-vl-120b-a12b",
+		"codex-auto-review", "deepseek-v4-1-flash-1017", "deepseek-v4-flash-free",
+		"gemini-3-flash-a", "gpt-6-astra", "space-bunny-free",
+		"muse-spark-1.2-contributor-free", "unknown", "gemini-default",
+		"gemini-3.6-flash", "GLM-5.3", "claude-haiku-4.5", "qwen38-flash-next-plat",
+		"claude-opus-4.5-plus", "gpt-5-codex", "deepseek-ai/deepseek-v4-pro",
+		"gemini-3-flash-medium-a", "gemini-3.7-flash", "claude-haiku-5-5",
+		"gpt-5.4-mini", "claude-opus-4-6-thinking", "private/nvidia/nemotron-3.5-super-120b-a12b",
+		"gemini-3-flash-b", "mistral-large-latest", "codestral-latest",
+		"qwen3.8-flash-next-iq3_xxs-ple_q8", "<synthetic>",
+	}
+	// The Unknown sentinel, the adapter's default placeholder, and synthetic
+	// markers are not real models: they stay disclosed as uncataloged.
+	wantUncataloged := map[string]bool{"unknown": true, "gemini-default": true, "<synthetic>": true}
+
+	bundled, err := catalog.Load(filepath.Join("..", "..", "catalog", "models.yaml"))
+	if err != nil {
+		t.Fatalf("load bundled catalog: %v", err)
+	}
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), bundled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	events := make([]usage.Event, 0, len(observed))
+	for index, model := range observed {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion, EventID: fmt.Sprintf("catalog-audit-%02d", index),
+			Timestamp: time.Now().UTC(), MachineID: "audit-machine", Provider: "audit",
+			Model: model, Tool: "codex", InputTokens: usage.Int64(10), OutputTokens: usage.Int64(5),
+			TotalTokens: usage.Int64(15), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(observed) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	snapshot, err := store.CatalogSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUncataloged := make(map[string]bool, len(snapshot.Uncataloged))
+	for _, item := range snapshot.Uncataloged {
+		gotUncataloged[item.ID] = true
+		if !wantUncataloged[item.ID] {
+			t.Errorf("observed model %q is not covered by the bundled catalog; add an entry or an alias", item.ID)
+		}
+	}
+	for id := range wantUncataloged {
+		if !gotUncataloged[id] {
+			t.Errorf("expected %q to stay disclosed as uncataloged, got %+v", id, snapshot.Uncataloged)
+		}
+	}
+	// Every remaining observed model must resolve directly against the
+	// bundled catalog (several fold into one entry via aliases).
+	for _, model := range observed {
+		if wantUncataloged[model] {
+			continue
+		}
+		if _, _, ok := bundled.Resolve(model); !ok {
+			t.Errorf("observed model %q does not resolve against the bundled catalog", model)
+		}
+	}
+}
+
 func TestCatalogSnapshotIncludesTierAliasesAndUsageContext(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{

@@ -132,11 +132,22 @@ func validateModel(id string, model Model) error {
 	if pricing.Currency != "USD" {
 		return fmt.Errorf("model %q pricing currency must be USD", id)
 	}
-	if pricing.Mode != "standard" {
-		return fmt.Errorf("model %q pricing mode must be standard", id)
-	}
-	if pricing.InputPricePerMillion == nil || pricing.OutputPricePerMillion == nil {
-		return fmt.Errorf("model %q input and output prices are required", id)
+	switch pricing.Mode {
+	case "standard":
+		// Published per-token pricing: every rate the estimates rely on must
+		// be present and cite its source.
+		if pricing.InputPricePerMillion == nil || pricing.OutputPricePerMillion == nil {
+			return fmt.Errorf("model %q input and output prices are required", id)
+		}
+	case "unknown":
+		// Observed in usage but no verified public per-token pricing is
+		// available. Rates stay nil — catalog.Estimate reports those events
+		// as unpriced instead of inventing numbers — while verified_at
+		// records when the unknown status was confirmed. Source is optional:
+		// set it only when the provider has a canonical pricing page to
+		// re-check.
+	default:
+		return fmt.Errorf("model %q pricing mode must be standard or unknown", id)
 	}
 	for name, price := range map[string]*float64{
 		"input": pricing.InputPricePerMillion, "output": pricing.OutputPricePerMillion,
@@ -154,9 +165,11 @@ func validateModel(id string, model Model) error {
 			return fmt.Errorf("model %q effective_from: %w", id, err)
 		}
 	}
-	source, err := url.ParseRequestURI(pricing.Source)
-	if err != nil || source.Scheme != "https" || source.Host == "" {
-		return fmt.Errorf("model %q pricing source must be an absolute HTTPS URL", id)
+	if pricing.Source != "" || pricing.Mode == "standard" {
+		source, err := url.ParseRequestURI(pricing.Source)
+		if err != nil || source.Scheme != "https" || source.Host == "" {
+			return fmt.Errorf("model %q pricing source must be an absolute HTTPS URL", id)
+		}
 	}
 	return nil
 }
