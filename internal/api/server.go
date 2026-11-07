@@ -2243,34 +2243,27 @@ func (s *Server) startOverviewRefreshLocked() {
 }
 
 // WarmCaches pre-computes the overview (with its pre-rendered dashboard) and
-// the default analytics window so the first request after a restart serves
-// cached bytes instead of paying the cold compute. The two warms run
-// concurrently — the analytics compute is the long pole and must not queue
-// behind the overview. The compute is detached from the caller's context (a
-// shutdown signal racing the warm must not leave the first request cold) and
-// bounded by sharedComputeTimeout. Failures are logged at debug: every cache
-// stays lazily computed on demand.
+// then the default analytics window, strictly in that order: the two full
+// scans contend on the same SQLite database, and running them concurrently
+// on a cold page cache slows the overview compute the first / joins from
+// ~0.7s to ~13s (live regression, 2026-11-07). The analytics warm is the
+// long pole and still starts as early as the overview+pre-render allows.
+// The compute is detached from the caller's context — a shutdown signal
+// racing the warm must not leave the first request cold — and bounded by
+// sharedComputeTimeout per compute. Failures are logged at debug: every
+// cache stays lazily computed on demand.
 func (s *Server) WarmCaches(ctx context.Context) {
 	computeCtx, cancel := detachedComputeContext(ctx)
 	defer cancel()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if result, fetched, err := s.cachedOverview(computeCtx); err != nil {
-			s.logger.Debug("warmup_overview_failed", "error", err.Error())
-		} else if _, err := s.buildDashboardHTML(computeCtx, result, fetched); err != nil {
-			s.logger.Debug("warmup_dashboard_failed", "error", err.Error())
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		query := database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}
-		if _, err := s.cachedAnalytics(computeCtx, query); err != nil {
-			s.logger.Debug("warmup_analytics_failed", "error", err.Error())
-		}
-	}()
-	wg.Wait()
+	if result, fetched, err := s.cachedOverview(computeCtx); err != nil {
+		s.logger.Debug("warmup_overview_failed", "error", err.Error())
+	} else if _, err := s.buildDashboardHTML(computeCtx, result, fetched); err != nil {
+		s.logger.Debug("warmup_dashboard_failed", "error", err.Error())
+	}
+	query := database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}
+	if _, err := s.cachedAnalytics(computeCtx, query); err != nil {
+		s.logger.Debug("warmup_analytics_failed", "error", err.Error())
+	}
 }
 
 func (s *Server) invalidateOverviewCache() {
