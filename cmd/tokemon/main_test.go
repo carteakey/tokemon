@@ -5,6 +5,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,12 +26,16 @@ func TestRunCatalogValidate(t *testing.T) {
 
 func TestServeHTTPGracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.NotFoundHandler()}
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
-	if err := serveHTTP(ctx, server, time.Second); err != nil {
+	if err := serveHTTP(ctx, server, listener, time.Second); err != nil {
 		t.Fatalf("serveHTTP shutdown: %v", err)
 	}
 }

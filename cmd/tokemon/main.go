@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -227,9 +228,12 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Tokemon listening on http://%s\n", *addr)
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Tokemon listening on http://%s\n", listener.Addr().String())
 	httpServer := &http.Server{
-		Addr:              *addr,
 		Handler:           server.Handler(),
 		ReadTimeout:       *readTimeout,
 		ReadHeaderTimeout: *readHeaderTimeout,
@@ -238,7 +242,11 @@ func runServe(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveHTTP(ctx, httpServer, *shutdownTimeout)
+	// With the listener bound, warm the dashboard and default analytics in
+	// the background so the first request after a restart serves pre-rendered
+	// bytes. Never blocks startup: the compute is detached and time-bounded.
+	go server.WarmCaches(ctx)
+	return serveHTTP(ctx, httpServer, listener, *shutdownTimeout)
 }
 
 func configuredValue(values map[string]string, name string) string {
@@ -977,10 +985,10 @@ func applyServerTimeoutConfig(flags *flag.FlagSet, values map[string]string, rea
 	}
 }
 
-func serveHTTP(ctx context.Context, server *http.Server, shutdownTimeout time.Duration) error {
+func serveHTTP(ctx context.Context, server *http.Server, listener net.Listener, shutdownTimeout time.Duration) error {
 	result := make(chan error, 1)
 	go func() {
-		result <- server.ListenAndServe()
+		result <- server.Serve(listener)
 	}()
 	select {
 	case err := <-result:

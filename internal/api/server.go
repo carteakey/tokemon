@@ -2242,6 +2242,25 @@ func (s *Server) startOverviewRefreshLocked() {
 	}()
 }
 
+// WarmCaches pre-computes the overview (with its pre-rendered dashboard) and
+// the default analytics window so the first request after a restart serves
+// cached bytes instead of paying the cold compute. The compute is detached
+// from the caller's context — a shutdown signal racing the warm must not
+// leave the first request cold — and bounded by sharedComputeTimeout.
+// Failures are logged at debug: every cache stays lazily computed on demand.
+func (s *Server) WarmCaches(ctx context.Context) {
+	computeCtx, cancel := detachedComputeContext(ctx)
+	defer cancel()
+	if result, fetched, err := s.cachedOverview(computeCtx); err != nil {
+		s.logger.Debug("warmup_overview_failed", "error", err.Error())
+	} else if _, err := s.buildDashboardHTML(computeCtx, result, fetched); err != nil {
+		s.logger.Debug("warmup_dashboard_failed", "error", err.Error())
+	}
+	if _, err := s.cachedAnalytics(computeCtx, database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}); err != nil {
+		s.logger.Debug("warmup_analytics_failed", "error", err.Error())
+	}
+}
+
 func (s *Server) invalidateOverviewCache() {
 	s.overviewMu.Lock()
 	s.overviewGeneration++
