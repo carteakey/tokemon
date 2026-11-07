@@ -228,6 +228,12 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// Warm the dashboard and default analytics while the listener and server
+	// come up, so the compute overlaps process startup instead of queueing
+	// behind it. Detached and time-bounded; never blocks startup or healthz.
+	go server.WarmCaches(ctx)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return err
@@ -240,12 +246,6 @@ func runServe(args []string) error {
 		WriteTimeout:      *writeTimeout,
 		IdleTimeout:       *idleTimeout,
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	// With the listener bound, warm the dashboard and default analytics in
-	// the background so the first request after a restart serves pre-rendered
-	// bytes. Never blocks startup: the compute is detached and time-bounded.
-	go server.WarmCaches(ctx)
 	return serveHTTP(ctx, httpServer, listener, *shutdownTimeout)
 }
 
