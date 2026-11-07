@@ -320,12 +320,13 @@ func validSessionCookie(value string, secret []byte, now time.Time, fingerprint 
 
 // sessionCookie builds the session cookie with the approved attributes.
 func sessionCookie(value string, maxAge int, secure bool) *http.Cookie {
+	// Max-Age alone (RFC 6265): an Expires value injected from the wall
+	// clock adds drift without information.
 	return &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
-		Expires:  time.Now().Add(time.Duration(maxAge) * time.Second),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   secure,
@@ -333,7 +334,8 @@ func sessionCookie(value string, maxAge int, secure bool) *http.Cookie {
 }
 
 // trustedProxyHTTPS reports whether a trusted proxy asserts the request
-// arrived over HTTPS; only then may X-Forwarded-Proto set the Secure flag.
+// arrived over HTTPS; only then may X-Forwarded-Proto set the Secure flag
+// and the request scheme used by the origin checks.
 func (s *Server) trustedProxyHTTPS(r *http.Request) bool {
 	if len(s.trustedProxyNetworks) == 0 {
 		return false
@@ -367,7 +369,16 @@ func safeRedirectPath(value string) string {
 		}
 	}
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host != "" || parsed.Scheme != "" || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(value, "//") || strings.HasPrefix(value, "/\\") {
+	if err != nil || parsed.Host != "" || parsed.Scheme != "" || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") {
+		return "/"
+	}
+	// The value may already be form-decoded, but url.Parse leaves percent
+	// escapes inside the path: decode once more so double-encoded protocol
+	// relative forms (%2F%2F) and backslash variants cannot slip through.
+	if decoded, decErr := url.PathUnescape(parsed.Path); decErr == nil && (strings.HasPrefix(decoded, "//") || strings.HasPrefix(decoded, "/\\") || strings.Contains(decoded, "\\")) {
+		return "/"
+	}
+	if strings.HasPrefix(value, "//") || strings.HasPrefix(value, "/\\") {
 		return "/"
 	}
 	return value
@@ -721,7 +732,7 @@ func (s *Server) verifyDashboardPassword(username, password string) bool {
 	return bcrypt.CompareHashAndPassword(s.config.DashboardPasswordHash, []byte(password)) == nil
 }
 
-func sameOrigin(value string, r *http.Request) bool {
+func (s *Server) sameOrigin(value string, r *http.Request) bool {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Host, r.Host) {
 		return false
@@ -729,8 +740,11 @@ func sameOrigin(value string, r *http.Request) bool {
 	if parsed.Scheme == "" {
 		return true
 	}
+	// Behind a TLS-terminating trusted proxy the connection is plaintext but
+	// the page (and the browser's Origin) is https; honor the proxy's
+	// assertion so those deployments do not self-reject.
 	requestScheme := "http"
-	if r.TLS != nil {
+	if r.TLS != nil || s.trustedProxyHTTPS(r) {
 		requestScheme = "https"
 	}
 	return strings.EqualFold(parsed.Scheme, requestScheme)
@@ -738,16 +752,16 @@ func sameOrigin(value string, r *http.Request) bool {
 
 // requireSameOrigin is the login/logout bar: the token is not the gate, so
 // at least one of Origin/Referer must be present and same-origin.
-func requireSameOrigin(r *http.Request) bool {
+func (s *Server) requireSameOrigin(r *http.Request) bool {
 	if strings.TrimSpace(r.Header.Get("Origin")) == "" && strings.TrimSpace(r.Header.Get("Referer")) == "" {
 		return false
 	}
-	return validSettingsOrigin(r)
+	return s.validSettingsOrigin(r)
 }
 
-func validSettingsOrigin(r *http.Request) bool {
+func (s *Server) validSettingsOrigin(r *http.Request) bool {
 	for _, header := range []string{"Origin", "Referer"} {
-		if value := strings.TrimSpace(r.Header.Get(header)); value != "" && !sameOrigin(value, r) {
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" && !s.sameOrigin(value, r) {
 			return false
 		}
 	}

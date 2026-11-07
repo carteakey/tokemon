@@ -476,6 +476,81 @@ func TestCredentialFingerprintIsDomainSeparatedAndRotates(t *testing.T) {
 	}
 }
 
+func TestLoginRequestBodyLimit(t *testing.T) {
+	server, _, _ := newLoginTestServer(t)
+	huge := strings.Repeat("a", 16_000)
+	form := url.Values{"username": {"ops"}, "password": {"hunter2"}, "csrf_token": {server.csrfToken()}, "next": {huge}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	sameOriginReferer(request)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized login body status = %d, want 413", response.Code)
+	}
+}
+
+func TestTrustedProxyHTTPSOriginAccepted(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := database.Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithConfig(store, Config{
+		IngestToken: "secret", DashboardToken: "secret",
+		DashboardUsername: "ops", DashboardPasswordHash: hash,
+		TrustedProxyCIDRs: []string{"10.0.0.0/8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The connection is plaintext but a trusted proxy asserts https: the
+	// https Origin must be accepted (previously the scheme check
+	// self-rejected TLS-terminated deployments).
+	form := url.Values{"username": {"ops"}, "password": {"hunter2"}, "csrf_token": {server.csrfToken()}, "next": {"/"}}
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.RemoteAddr = "10.0.0.5:1234"
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("Origin", "https://example.com")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("proxy-https login status = %d, want 303: %s", response.Code, response.Body.String())
+	}
+	session := findCookie(response, sessionCookieName)
+	if session == nil || !session.Secure {
+		t.Fatalf("session cookie missing or not Secure behind trusted https proxy: %+v", session)
+	}
+	if !session.Expires.IsZero() {
+		t.Errorf("session cookie carries an Expires attribute; Max-Age is authoritative")
+	}
+}
+
+func TestLoginRejectsDecodedProtocolRelativeNext(t *testing.T) {
+	server, _, _ := newLoginTestServer(t)
+	for _, next := range []string{
+		"/%2F%2Fevil.example", // double-encoded protocol-relative
+		"/%5Cevil.example",    // encoded backslash
+		"//evil.example",      // raw protocol-relative
+		"/\\evil.example",     // raw backslash
+	} {
+		form := url.Values{"username": {"ops"}, "password": {"hunter2"}, "csrf_token": {server.csrfToken()}, "next": {next}}
+		request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		sameOriginReferer(request)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if location := response.Header().Get("Location"); location == next || strings.Contains(location, "evil") {
+			t.Errorf("next %q redirected to %q", next, location)
+		}
+	}
+}
+
 func TestSessionCookieAttributesTable(t *testing.T) {
 	cookie := sessionCookie("value", 60, true)
 	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Path != "/" || !cookie.Secure {

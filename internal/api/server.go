@@ -1983,21 +1983,43 @@ func (s *Server) renderLogin(w http.ResponseWriter, status int, page loginPageDa
 	}
 }
 
+// renderLoginMessage renders the login form with an error, preserving the
+// next target from the query — used before the POST body has been parsed.
+func (s *Server) renderLoginMessage(w http.ResponseWriter, status int, csrfToken, next, message string) {
+	w.WriteHeader(status)
+	s.renderLogin(w, status, loginPageData{CSRFToken: csrfToken, Next: safeRedirectPath(next), Error: message})
+}
+
+// maxLoginFormBytes bounds the login/logout POST bodies; the forms carry a
+// handful of short fields.
+const maxLoginFormBytes = 8 << 10
+
 func (s *Server) loginSubmit(w http.ResponseWriter, r *http.Request) {
 	if !s.passwordAccountConfigured() {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginFormBytes)
 	remote := loginLimitKey(r)
-	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.FormValue("next"))}
+	// Parse the (bounded) form first — a later FormValue would consume the
+	// body and swallow the size error — then the throttle, so a locked-out
+	// client never reaches bcrypt.
+	if err := r.ParseForm(); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.renderLoginMessage(w, http.StatusRequestEntityTooLarge, s.csrfToken(), r.URL.Query().Get("next"), "Sign-in form is too large.")
+			return
+		}
+		s.renderLoginMessage(w, http.StatusBadRequest, s.csrfToken(), r.URL.Query().Get("next"), "Could not read the sign-in form.")
+		return
+	}
+	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.Form.Get("next"))}
 	render := func(status int, message string) {
 		page.Error = message
 		w.WriteHeader(status)
 		s.renderLogin(w, status, page)
 	}
-	// Throttle before any credential work, sharing the per-remote budget
-	// with Basic/Bearer attempts.
 	if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
 		seconds := int(retryAfter / time.Second)
 		if retryAfter%time.Second != 0 {
@@ -2007,13 +2029,9 @@ func (s *Server) loginSubmit(w http.ResponseWriter, r *http.Request) {
 		render(http.StatusTooManyRequests, "Too many failed attempts. Try again in "+strconv.Itoa(seconds)+" seconds.")
 		return
 	}
-	if !requireSameOrigin(r) || !s.validCSRFToken(r.FormValue("csrf_token")) {
+	if !s.requireSameOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
 		s.logger.Warn("login_rejected", "reason", "csrf")
 		render(http.StatusForbidden, "Sign-in rejected: the request did not come from this page. Reload and try again.")
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		render(http.StatusBadRequest, "Could not read the sign-in form.")
 		return
 	}
 	username := strings.TrimSpace(r.Form.Get("username"))
@@ -2044,7 +2062,8 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if !requireSameOrigin(r) || !s.validCSRFToken(r.FormValue("csrf_token")) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginFormBytes)
+	if !s.requireSameOrigin(r) || !s.validCSRFToken(r.FormValue("csrf_token")) {
 		s.logger.Warn("logout_rejected", "reason", "csrf")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "logout rejected: same-origin request required"})
 		return
@@ -2956,7 +2975,7 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 		writeAccessibleError(w, http.StatusBadRequest, "Invalid settings form.")
 		return
 	}
-	if !validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
+	if !s.validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
 		writeAccessibleError(w, http.StatusForbidden, "The settings form could not be verified. Reload the page and try again.")
 		return
 	}
@@ -3066,7 +3085,7 @@ const dashboardTemplate = `<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
     .hero > .panel, .content-grid > .panel { min-width: 0; }
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
@@ -3993,7 +4012,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
     .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible, .settings-link.active { border-color: var(--accent); color: var(--accent); }
+    .settings-link:hover, .settings-link:focus-visible, .settings-link.active { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .settings-body { max-width: 920px; padding: 0 10px 4px; }
     .eyebrow { margin-top: 26px; color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     h1, h2 { margin: 0; font-family: var(--font-data); }
@@ -4034,7 +4053,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
     <nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav>
-    <a class="settings-link active" href="/settings" aria-label="Settings" title="Settings" aria-current="page">⚙</a>
+    <a class="settings-link active" href="/settings" aria-label="Settings" title="Settings" aria-current="page">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
   </header>
   <div class="settings-body">
   <div class="eyebrow">Display names</div>
@@ -4093,7 +4112,7 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
     a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; }
     .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); }
     .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; }
-    .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--line-bright); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); }
+    .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--line-bright); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .heading { padding:26px 10px 14px; } .eyebrow,.section-title,.model-meta,.label { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; color:var(--text); font:700 clamp(28px,4vw,44px)/1 var(--font-display); } .heading p { max-width:780px; margin:10px 0 0; color:var(--muted); }
     .tier { margin-top:12px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-head { display:flex; align-items:center; justify-content:space-between; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .tier-head h2 { margin:0; color:var(--warm); font:700 13px/1 var(--font-data); letter-spacing:.12em; text-transform:uppercase; } .catalog-help { color:var(--accent); text-decoration:underline; text-underline-offset:2px; } .catalog-help:hover,.catalog-help:focus-visible { color:var(--text); }
     .tier-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; padding:12px 16px 16px; } .model-card { min-width:0; padding:13px; border:1px solid var(--line); border-radius:6px; background:var(--surface-raised); } .model-name { margin:7px 0 0; overflow:hidden; color:var(--text); font:700 18px/1.15 var(--font-display); text-overflow:ellipsis; white-space:nowrap; } .model-name-row { display:flex; align-items:center; gap:6px; } .model-name-text { overflow:hidden; min-width:0; text-overflow:ellipsis; } .model-id { margin-top:4px; display:flex; align-items:center; gap:6px; color:var(--faint); font:10px var(--font-data); } .model-id-text { overflow:hidden; min-width:0; text-overflow:ellipsis; white-space:nowrap; }
@@ -4159,7 +4178,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
     :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
     @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--line-bright); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--line-bright); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .heading { display:flex; align-items:end; justify-content:space-between; gap:20px; padding:25px 10px 15px; } .eyebrow,.section-title,label,th { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; font:700 clamp(28px,4vw,42px)/1 var(--font-display); } .heading-copy { margin:9px 0 0; color:var(--muted); } .action { display:inline-flex; align-items:center; min-height:38px; padding:10px 13px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; white-space:nowrap; }
     .panel { border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-panel { padding:14px 16px; } .filter-form { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); align-items:end; gap:10px; } label { display:grid; gap:7px; color:var(--faint); } select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } select:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions button,.filter-actions a { min-height:36px; padding:9px 11px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions .apply { border-color:var(--accent); color:var(--accent); }
     .session-panel { margin-top:10px; overflow:hidden; } .section-head { display:flex; align-items:start; justify-content:space-between; gap:14px; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .section-meta { color:var(--faint); font:10px var(--font-data); } .table-scroll { overflow-x:auto; padding:0 16px 12px; } table { width:100%; min-width:1060px; border-collapse:collapse; table-layout:auto; } th,td { padding:10px 0; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th:first-child,td:first-child { width:100%; overflow-wrap:anywhere; } th { color:var(--faint); } td { color:var(--muted); font:12px/1.25 var(--font-data); } th:not(:first-child),td:not(:first-child) { padding-left:18px; text-align:right; white-space:nowrap; } td:nth-child(3) { color:var(--text); } td:first-child { color:var(--text); font-weight:600; } td:nth-child(2),td:nth-child(3) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .subline { display:block; margin-top:4px; overflow:hidden; color:var(--faint); font-size:10px; font-weight:400; text-overflow:ellipsis; white-space:nowrap; } .copy-id { display:inline-flex; align-items:center; flex:none; margin-left:6px; padding:2px 6px; border:1px solid var(--line-bright); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); } .unknown { color:var(--warm); } .empty-row td { padding:32px 0; color:var(--faint); text-align:left; }
@@ -4224,7 +4243,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .analytics-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
     .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     h2.section-title { margin: 0; }
@@ -4761,7 +4780,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
     .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
     .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--line-bright); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--line-bright); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
     .eyebrow, .label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     h1 { margin: 8px 0 0; font: 700 clamp(27px, 4vw, 42px)/1 var(--font-display); letter-spacing: .01em; }
