@@ -2166,17 +2166,26 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	aliases, err := s.store.DisplayAliases(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
 	machines, err := s.store.MachinesAt(r.Context(), time.Now())
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	sessions, err := s.store.Sessions(r.Context(), database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()})
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2227,6 +2236,9 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	aliases, err := s.store.DisplayAliases(r.Context())
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2280,6 +2292,9 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	aliases, err := s.store.DisplayAliases(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2341,6 +2356,9 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	aliases, err := s.store.DisplayAliases(r.Context())
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
 		return
 	}
@@ -2465,6 +2483,9 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	aliases, err := s.store.DisplayAliases(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
