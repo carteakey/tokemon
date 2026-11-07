@@ -93,6 +93,46 @@ const exportInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// sourceHealthInvariantJS asserts the overview machine-health panel: one
+// line per reported source, a Fresh/Stale/Unknown pill on each, the error
+// class inline on the failing source, the machine-level sync-error cell, and
+// the metadata-only promise (no local paths anywhere in the DOM).
+const sourceHealthInvariantJS = `(() => {
+	const problems = [];
+	const lines = Array.from(document.querySelectorAll('.source-health-line'));
+	if (lines.length !== 4) {
+		problems.push('expected 4 source health lines, found ' + lines.length);
+	}
+	const states = new Set(['Fresh', 'Stale', 'Unknown']);
+	for (const line of lines) {
+		const pill = line.querySelector('.status-pill');
+		if (!pill || !states.has(pill.textContent.trim())) {
+			problems.push('source line lacks a Fresh/Stale/Unknown pill: ' + line.textContent.trim());
+		}
+	}
+	for (const adapter of ['claude-code', 'codex', 'zcode', 'opencode']) {
+		if (lines.filter(line => line.textContent.includes(adapter)).length !== 1) {
+			problems.push('adapter ' + adapter + ' does not render exactly one source line');
+		}
+	}
+	const errorLine = lines.find(line => line.textContent.includes('opencode'));
+	if (!errorLine || !(errorLine.querySelector('.sync-error') || {}).textContent || !errorLine.querySelector('.sync-error').textContent.includes('upload_failed')) {
+		problems.push('erroring source does not show its error class inline');
+	}
+	const unknownLine = lines.find(line => line.textContent.includes('zcode'));
+	if (!unknownLine || !unknownLine.textContent.includes('never synced')) {
+		problems.push('unknown source does not say never synced');
+	}
+	if (!document.querySelector('td.sync-error')) {
+		problems.push('machine row does not flag the sync-error cell');
+	}
+	const dom = document.documentElement.innerHTML;
+	if (dom.includes('/Users/') || dom.includes('/home/')) {
+		problems.push('page DOM contains a raw local path');
+	}
+	return JSON.stringify(problems);
+})()`
+
 const freshnessInvariantJS = `(() => {
 	const problems = [];
 	const pill = document.querySelector('.status-pill.connected');
@@ -178,7 +218,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		path       string
 		invariants []string
 	}{
-		{path: "/", invariants: []string{freshnessInvariantJS}},
+		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS}},
 		{path: "/tokedex"},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
@@ -359,7 +399,26 @@ func startSeededServer(t *testing.T, enableTokedex bool) string {
 	if _, err := store.Ingest(context.Background(), events); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordHeartbeat(context.Background(), database.AgentHeartbeat{MachineID: "smoke-laptop", OperatingSystem: "darwin", Architecture: "arm64", SourceCount: 1, SourceErrorCount: 0}); err != nil {
+	// One machine, four connector-health shapes: fresh sync, stale sync,
+	// a source that never synced, and a stale source reporting an error
+	// class — the exact rows the machine-health panel must render.
+	now := time.Now().UTC()
+	freshSync := now.Add(-time.Minute)
+	staleSync := now.Add(-2 * time.Hour)
+	staleErrSync := now.Add(-90 * time.Minute)
+	if err := store.RecordHeartbeat(context.Background(), database.AgentHeartbeat{
+		MachineID:        "smoke-laptop",
+		OperatingSystem:  "darwin",
+		Architecture:     "arm64",
+		SourceCount:      4,
+		SourceErrorCount: 1,
+		Sources: []database.AgentSourceHealth{
+			{Adapter: "claude-code", SourceHash: "smoke-hash-fresh", LastSuccessfulSync: &freshSync},
+			{Adapter: "codex", SourceHash: "smoke-hash-stale", LastSuccessfulSync: &staleSync},
+			{Adapter: "zcode", SourceHash: "smoke-hash-unknown"},
+			{Adapter: "opencode", SourceHash: "smoke-hash-error", LastSuccessfulSync: &staleErrSync, LastErrorClass: "upload_failed"},
+		},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	server, err := api.NewWithConfig(store, api.Config{
