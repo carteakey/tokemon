@@ -2031,7 +2031,13 @@ const overviewCacheTTL = time.Minute
 func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) {
 	for {
 		s.overviewMu.Lock()
-		if cached := s.overviewCache; cached != nil && time.Since(cached.fetched) < overviewCacheTTL {
+		if cached := s.overviewCache; cached != nil {
+			// Stale-while-revalidate: serve whatever we have immediately and
+			// refresh in the background when it is past the TTL. A reader never
+			// waits on a recompute, even right after an ingest invalidated it.
+			if time.Since(cached.fetched) >= overviewCacheTTL && s.overviewReady == nil {
+				s.startOverviewRefreshLocked()
+			}
 			result, err := cached.result, cached.err
 			s.overviewMu.Unlock()
 			return result, err
@@ -2045,6 +2051,7 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) 
 				return database.Overview{}, ctx.Err()
 			}
 		}
+		// No cache yet: the first render computes synchronously so it has data.
 		// Remember the invalidation generation so a compute that started before
 		// an ingest cannot install its stale result after the ingest completed.
 		generation := s.overviewGeneration
@@ -2067,10 +2074,36 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, error) 
 	}
 }
 
+// startOverviewRefreshLocked starts one background overview refresh. The
+// caller holds overviewMu; readers keep serving the cached result while it
+// runs, and the generation guard drops a result that an ingest superseded.
+func (s *Server) startOverviewRefreshLocked() {
+	generation := s.overviewGeneration
+	ready := make(chan struct{})
+	s.overviewReady = ready
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.store.Overview(ctx)
+
+		s.overviewMu.Lock()
+		if s.overviewGeneration == generation && !clientGone(err) {
+			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.overviewReady = nil
+		s.overviewMu.Unlock()
+		close(ready)
+	}()
+}
+
 func (s *Server) invalidateOverviewCache() {
 	s.overviewMu.Lock()
 	s.overviewGeneration++
-	s.overviewCache = nil
+	if s.overviewCache != nil {
+		// Keep the last good result so readers are served immediately; the
+		// zero fetched time marks it stale and the next request refreshes it.
+		s.overviewCache.fetched = time.Time{}
+	}
 	s.overviewMu.Unlock()
 }
 

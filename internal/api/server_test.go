@@ -864,14 +864,24 @@ func TestOverviewEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(payload))
 	accepted := httptest.NewRecorder()
 	handler.ServeHTTP(accepted, request)
-	if accepted.Code != http.StatusOK || server.overviewCache != nil {
-		t.Fatalf("ingest response = %d %s, overview cache was not invalidated", accepted.Code, accepted.Body.String())
+	if accepted.Code != http.StatusOK {
+		t.Fatalf("ingest response = %d %s", accepted.Code, accepted.Body.String())
 	}
 
-	refreshed := httptest.NewRecorder()
-	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
-	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) || server.overviewCache == nil || server.overviewCache == cached {
-		t.Fatalf("refreshed overview response = %d %s, cache = %#v", refreshed.Code, refreshed.Body.String(), server.overviewCache)
+	// Stale-while-revalidate: the ingest marks the cached result stale but
+	// keeps it, so the next reader is served immediately while one background
+	// compute refreshes it. Poll until the refreshed value is visible.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		refreshed := httptest.NewRecorder()
+		handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+		if refreshed.Code == http.StatusOK && strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("overview did not refresh after ingest: %d %s", refreshed.Code, refreshed.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
