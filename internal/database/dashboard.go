@@ -79,7 +79,29 @@ type CatalogSnapshot struct {
 	Tiers          []string           `json:"tiers"`
 	Uncataloged    []UncatalogedModel `json:"uncataloged,omitempty"`
 	ObservedTokens int64              `json:"observed_tokens,omitempty"`
-	PricedTokens   int64              `json:"priced_tokens,omitempty"`
+	// PricedTokens counts usage on cataloged models whose pricing mode is
+	// standard with published rates — the only usage the dashboard can
+	// honestly call priced. Cataloged models with mode unknown (rates not
+	// published) are counted separately so the coverage line cannot claim
+	// 100% priced while rates are missing.
+	PricedTokens           int64 `json:"priced_tokens,omitempty"`
+	CatalogedUnknownTokens int64 `json:"cataloged_unknown_tokens,omitempty"`
+	// UncatalogedModels counts identifiers missing from the catalog that are
+	// real models. The documented non-model sentinels stay disclosed in
+	// Uncataloged verbatim but are not counted here.
+	UncatalogedModels int `json:"uncataloged_models,omitempty"`
+}
+
+// nonModelSentinelIDs are observed identifiers that are not real models, kept
+// out of the uncataloged-model count while remaining fully disclosed in the
+// Uncataloged section: the Unknown-model vocabulary sentinel, synthetic
+// event markers, and adapter default placeholders. The bundled-catalog
+// coverage test pins exactly this set as the deliberately-uncataloged
+// disclosure.
+var nonModelSentinelIDs = map[string]bool{
+	"unknown":        true,
+	"<synthetic>":    true,
+	"gemini-default": true,
 }
 
 // UncatalogedModel is a model identifier observed in usage that the bundled
@@ -418,17 +440,25 @@ FROM usage_events GROUP BY 1`)
 		}
 	}
 	uncataloged := make([]UncatalogedModel, 0, len(observed))
+	uncatalogedModels := 0
 	for id, usage := range observed {
-		if _, known := s.catalog.Models[id]; known {
-			result.PricedTokens += usage.tokens
-			result.ObservedTokens += usage.tokens
+		result.ObservedTokens += usage.tokens
+		if model, known := s.catalog.Models[id]; known {
+			if model.Pricing.Mode == "standard" && model.Pricing.InputPricePerMillion != nil && model.Pricing.OutputPricePerMillion != nil {
+				result.PricedTokens += usage.tokens
+			} else {
+				result.CatalogedUnknownTokens += usage.tokens
+			}
 			continue
 		}
-		result.ObservedTokens += usage.tokens
 		uncataloged = append(uncataloged, UncatalogedModel{ID: id, Tokens: usage.tokens, Events: usage.events})
+		if !nonModelSentinelIDs[id] {
+			uncatalogedModels++
+		}
 	}
 	sort.Slice(uncataloged, func(left, right int) bool { return uncataloged[left].Tokens > uncataloged[right].Tokens })
 	result.Uncataloged = uncataloged
+	result.UncatalogedModels = uncatalogedModels
 	ids := make([]string, 0, len(s.catalog.Models))
 	for id := range s.catalog.Models {
 		ids = append(ids, id)

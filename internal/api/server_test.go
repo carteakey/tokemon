@@ -1669,6 +1669,55 @@ func TestAnalyticsUnknownBucketLabelsAreDimensionAware(t *testing.T) {
 	}
 }
 
+func TestTokedexCoverageLineAccountsForUnknownPricing(t *testing.T) {
+	// The Tokedex line must not claim unknown-mode (unpublished rates)
+	// catalog entries as priced, and the uncataloged count must exclude the
+	// documented non-model sentinels.
+	price := 2.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"priced-model":   {Provider: "test", DisplayName: "Priced Model", Aliases: []string{"priced-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"awaiting-rates": {Provider: "test", DisplayName: "Awaiting Rates", Aliases: []string{"awaiting-alias"}, Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "line-priced", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "priced-model", Tool: "tool", TotalTokens: usage.Int64(1_000_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "line-awaiting", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "awaiting-alias", Tool: "tool", TotalTokens: usage.Int64(400_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "line-mystery", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "mystery-model", Tool: "tool", TotalTokens: usage.Int64(200_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "line-sentinel", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "unknown", Tool: "tool", TotalTokens: usage.Int64(100_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		"Pricing coverage:",
+		"in cataloged models with unpublished rates",
+		"1 uncataloged model below",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("tokedex coverage line missing %q", want)
+		}
+	}
+	// The old line counted every disclosed identifier as a model.
+	if strings.Contains(body, "3 uncataloged models") {
+		t.Errorf("tokedex coverage line still counts sentinels as models:\n%s", body[:600])
+	}
+}
+
 func TestCopyIDAffordanceAndTrendChartRegion(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{

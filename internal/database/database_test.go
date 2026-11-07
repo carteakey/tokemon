@@ -479,6 +479,54 @@ func TestBundledCatalogCoversObservedModels(t *testing.T) {
 	}
 }
 
+func TestCatalogSnapshotPricedCoverageDistinguishesUnknownMode(t *testing.T) {
+	// The Tokedex coverage line must not claim usage on unknown-mode entries
+	// (no published rates) as priced — the regression behind ea5ac1b8, where
+	// adding unpriced catalog entries pushed the line to a false 100%.
+	price := 2.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"priced-model":   {Provider: "test", DisplayName: "Priced", Aliases: []string{"priced-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"awaiting-rates": {Provider: "test", DisplayName: "Awaiting Rates", Aliases: []string{"awaiting-rates", "awaiting-alias"}, Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"}},
+	})
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "cov-priced", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "priced-model", Tool: "tool", TotalTokens: usage.Int64(1_000_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// Raw alias form of an unknown-mode entry: cataloged, not priced.
+		{SchemaVersion: usage.SchemaVersion, EventID: "cov-awaiting", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "awaiting-alias", Tool: "tool", TotalTokens: usage.Int64(400_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// A real model missing from the catalog.
+		{SchemaVersion: usage.SchemaVersion, EventID: "cov-mystery", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "mystery-model", Tool: "tool", TotalTokens: usage.Int64(200_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		// Documented non-model sentinels: disclosed, never counted as models.
+		{SchemaVersion: usage.SchemaVersion, EventID: "cov-sentinel", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "unknown", Tool: "tool", TotalTokens: usage.Int64(100_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "cov-synthetic", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "<synthetic>", Tool: "tool", TotalTokens: usage.Int64(50_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.CatalogSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ObservedTokens != 1_750_000 {
+		t.Errorf("observed tokens = %d, want 1750000", snapshot.ObservedTokens)
+	}
+	if snapshot.PricedTokens != 1_000_000 {
+		t.Errorf("priced tokens = %d, want 1000000 (standard-mode rates only)", snapshot.PricedTokens)
+	}
+	if snapshot.CatalogedUnknownTokens != 400_000 {
+		t.Errorf("cataloged unknown tokens = %d, want 400000", snapshot.CatalogedUnknownTokens)
+	}
+	if len(snapshot.Uncataloged) != 3 {
+		t.Fatalf("uncataloged = %+v, want mystery-model plus the two sentinels", snapshot.Uncataloged)
+	}
+	if snapshot.UncatalogedModels != 1 {
+		t.Errorf("uncataloged model count = %d, want 1 (sentinels excluded)", snapshot.UncatalogedModels)
+	}
+}
+
 func TestCatalogSnapshotIncludesTierAliasesAndUsageContext(t *testing.T) {
 	price := 1.0
 	modelCatalog := catalog.MustNew(map[string]catalog.Model{
