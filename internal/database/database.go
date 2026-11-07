@@ -231,6 +231,11 @@ type AnalyticsComparison struct {
 	PreviousTokens     int64    `json:"previous_tokens"`
 	PreviousEvents     int64    `json:"previous_events"`
 	TokenChangePercent *float64 `json:"token_change_percent,omitempty"`
+	// PreviousCacheHitRate is the previous equal-length window's cache hit
+	// rate, nil when that window had no cacheable input. It powers the
+	// analytics page's cache-efficiency insight without a second query: the
+	// previous summary is already computed for the token comparison.
+	PreviousCacheHitRate *float64 `json:"previous_cache_hit_rate,omitempty"`
 }
 
 type AnalyticsPoint struct {
@@ -1476,15 +1481,21 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 		// The comparison consumes only token and event totals, so the previous
 		// window aggregates in SQL instead of repeating the row-by-row summary
 		// scan.
-		var previousTokens, previousEvents int64
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0), COUNT(*)
-FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, &previousEvents); err != nil {
+		var previousTokens, previousEvents, previousCached, previousEligible int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0), COUNT(*),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0)
+FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, &previousEvents, &previousCached, &previousEligible); err != nil {
 			return Analytics{}, err
 		}
 		comparison := &AnalyticsComparison{PreviousTokens: previousTokens, PreviousEvents: previousEvents}
 		if previousTokens > 0 {
 			change := float64(result.Summary.Tokens-previousTokens) * 100 / float64(previousTokens)
 			comparison.TokenChangePercent = &change
+		}
+		if previousEligible > 0 {
+			rate := float64(previousCached) / float64(previousEligible)
+			comparison.PreviousCacheHitRate = &rate
 		}
 		result.Comparison = comparison
 	}

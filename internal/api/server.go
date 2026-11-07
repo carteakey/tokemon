@@ -120,6 +120,7 @@ type analyticsPageData struct {
 	AverageThread  int64
 	AxisMax        int64
 	AxisTicks      []analyticsAxisTick
+	Insights       []analyticsInsight
 }
 
 type analyticsAxisTick struct {
@@ -864,6 +865,165 @@ func analyticsAverageThread(summary database.AnalyticsSummary) int64 {
 		return 0
 	}
 	return summary.SessionTokens / summary.Threads
+}
+
+// analyticsInsight is one compact usage-analysis card for the analytics
+// page's Insights strip. Everything is derived from the Analytics result the
+// page already loaded — no extra queries — and missing inputs render with the
+// dashboard's Unknown vocabulary. State feeds the shared comparison pill
+// classes (up/down/flat; empty is neutral or unknown).
+type analyticsInsight struct {
+	ID     string
+	Label  string
+	Value  string
+	State  string
+	Detail string
+}
+
+// analyticsMoverShareThreshold keeps the mover card honest: sub-0.1pt share
+// drift across a window is noise, not a trend.
+const analyticsMoverShareThreshold = 0.1
+
+func analyticsInsights(result database.Analytics, now time.Time, modelAliases, machineAliases map[string]string) []analyticsInsight {
+	var insights []analyticsInsight
+
+	// Spend burn rate: the window's daily cost average and, for day-bucketed
+	// windows, what the current month totals at that pace. Hour buckets and
+	// unpriced-only windows have no honest rate, so they stay Unknown.
+	if result.Bucket == "day" && len(result.Points) > 0 {
+		daily := result.Summary.EstimatedCost.Amount / float64(len(result.Points))
+		if result.Summary.EstimatedCost.PricedTokens > 0 {
+			year, month, _ := now.Date()
+			daysInMonth := time.Date(year, month+1, 0, 0, 0, 0, 0, now.Location()).Day()
+			projected := daily * float64(daysInMonth)
+			insights = append(insights, analyticsInsight{
+				ID:    "burn_rate",
+				Label: "Spend burn rate",
+				Value: money(daily) + "/day",
+				Detail: fmt.Sprintf("At this window's pace, %s lands around %s.",
+					now.Format("January"), money(projected)),
+			})
+		} else {
+			insights = append(insights, analyticsInsight{
+				ID:    "burn_rate",
+				Label: "Spend burn rate",
+				Value: "Unknown",
+				Detail: fmt.Sprintf("No priced usage in this window%s.",
+					unpricedSuffix(result.Summary.EstimatedCost.UnpricedTokens)),
+			})
+		}
+	}
+
+	// Top mover: the series whose share of the window moved most between its
+	// first and second half, so a shifting mix is visible without reading the
+	// share chart. Single-bucket windows have no halves and are omitted.
+	if len(result.SharePoints) >= 2 {
+		mid := len(result.SharePoints) / 2
+		best := -1
+		var bestDelta, bestFirst, bestSecond float64
+		for index := range result.ShareSeries {
+			if result.ShareSeries[index].Name == "Other" {
+				continue
+			}
+			var first, second float64
+			for _, point := range result.SharePoints[:mid] {
+				first += point.Values[index].Share
+			}
+			for _, point := range result.SharePoints[mid:] {
+				second += point.Values[index].Share
+			}
+			first /= float64(max(mid, 1))
+			second /= float64(max(len(result.SharePoints)-mid, 1))
+			if delta := (second - first) * 100; best == -1 || abs64(delta) > abs64(bestDelta) {
+				best, bestDelta, bestFirst, bestSecond = index, delta, first, second
+			}
+		}
+		if best >= 0 && abs64(bestDelta) >= analyticsMoverShareThreshold {
+			name := result.ShareSeries[best].Name
+			detailName := name
+			switch result.Filter.Dimension {
+			case "models":
+				detailName = modelDisplayName(modelAliases, name)
+			case "machines":
+				detailName = machineDisplayName(machineAliases, name)
+			}
+			direction := "down"
+			if bestDelta > 0 {
+				direction = "up"
+			}
+			insights = append(insights, analyticsInsight{
+				ID:    "top_mover",
+				Label: "Top mover",
+				Value: fmt.Sprintf("%+.1f pts", bestDelta),
+				State: direction,
+				Detail: fmt.Sprintf("%s held %.0f%% of the window's first half and %.0f%% of the second half.",
+					detailName, bestFirst*100, bestSecond*100),
+			})
+		}
+	}
+
+	// Cache efficiency: this window's hit rate with the previous window's as
+	// the baseline. The previous rate rides along in Comparison at no extra
+	// query cost.
+	if result.Summary.Cache.EligibleTokens > 0 {
+		current := result.Summary.Cache.HitRate * 100
+		insight := analyticsInsight{
+			ID:     "cache_efficiency",
+			Label:  "Cache efficiency",
+			Value:  fmt.Sprintf("%.1f%%", current),
+			Detail: fmt.Sprintf("%s of eligible input tokens were served from cache.", commas(result.Summary.Cache.CachedTokens)),
+		}
+		if result.Comparison != nil && result.Comparison.PreviousCacheHitRate != nil {
+			delta := current - *result.Comparison.PreviousCacheHitRate*100
+			insight.State = "flat"
+			if delta > 0 {
+				insight.State = "up"
+			} else if delta < 0 {
+				insight.State = "down"
+			}
+			insight.Detail = fmt.Sprintf("%s of eligible input tokens were served from cache, %+.1f pts vs the previous window.",
+				commas(result.Summary.Cache.CachedTokens), delta)
+		}
+		insights = append(insights, insight)
+	} else {
+		insights = append(insights, analyticsInsight{
+			ID:     "cache_efficiency",
+			Label:  "Cache efficiency",
+			Value:  "Unknown",
+			Detail: "No cacheable input tokens in this window.",
+		})
+	}
+
+	// Catalog coverage: the share of window tokens without pricing, the same
+	// gap the Tokedex coverage line reports. Directionless on purpose — the
+	// fix is adding catalog entries, not a trend line — and omitted when the
+	// window is fully priced.
+	total := result.Summary.EstimatedCost.PricedTokens + result.Summary.EstimatedCost.UnpricedTokens
+	if result.Summary.EstimatedCost.UnpricedTokens > 0 && total > 0 {
+		unpriced := float64(result.Summary.EstimatedCost.UnpricedTokens) * 100 / float64(total)
+		insights = append(insights, analyticsInsight{
+			ID:    "unpriced_share",
+			Label: "Catalog coverage",
+			Value: fmt.Sprintf("%.1f%%", unpriced),
+			Detail: fmt.Sprintf("%s of %s window tokens lack catalog pricing and contribute no cost estimate.",
+				commas(result.Summary.EstimatedCost.UnpricedTokens), commas(total)),
+		})
+	}
+	return insights
+}
+
+func abs64(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func unpricedSuffix(unpriced int64) string {
+	if unpriced > 0 {
+		return fmt.Sprintf(" · %s unpriced tokens", commas(unpriced))
+	}
+	return ""
 }
 
 func analyticsChangeLabel(value *float64) string {
@@ -2095,6 +2255,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AverageThread:  analyticsAverageThread(result.Summary),
 		AxisMax:        axisMax,
 		AxisTicks:      analyticsAxisTicks(axisMax),
+		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -3463,6 +3624,10 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--line-bright); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
     .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .insights-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-top: 10px; }
+    .insight { min-width: 0; padding: 11px 14px; border: 1px dashed var(--line-bright); border-radius: 7px; background: transparent; }
+    .insight-value { margin-top: 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; color: var(--text); font: 700 17px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .insight-detail { margin-top: 6px; color: var(--muted); font: 11px/1.4 var(--font-data); }
     .stat { min-width: 0; min-height: 94px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); animation: stat-in 300ms both; }
     .stat:nth-child(2) { animation-delay: 25ms; }
     .stat:nth-child(3) { animation-delay: 50ms; }
@@ -3715,6 +3880,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}{{if .Summary.EstimatedCost.UnpricedTokens}} · unpriced: {{commas .Summary.EstimatedCost.UnpricedTokens}}{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens{{if .Summary.EstimatedCost.UnpricedTokens}} · {{commas .Summary.EstimatedCost.UnpricedTokens}} unpriced{{end}}</div>{{end}}</article>
   </section>
   {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
+
+  {{if .Insights}}<section class="insights-strip" aria-label="Usage insights">{{range .Insights}}<article class="insight"><div class="stat-label">{{.Label}}</div><div class="insight-value">{{.Value}}{{if .State}}<span class="comparison {{.State}}"><strong aria-hidden="true">{{if eq .State "up"}}▲{{else if eq .State "down"}}▼{{else}}—{{end}}</strong><span class="sr-only">{{if eq .State "up"}}rising{{else if eq .State "down"}}falling{{else}}flat{{end}}</span></span>{{end}}</div><div class="insight-detail">{{.Detail}}</div></article>{{end}}</section>{{end}}
 
   <section class="analytics-grid">
     <article class="panel trend-panel" aria-labelledby="trend-title">

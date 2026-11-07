@@ -1736,6 +1736,227 @@ func TestCopyIDAffordanceAndTrendChartRegion(t *testing.T) {
 	}
 }
 
+func TestAnalyticsInsightsComputations(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	previousRate := 0.25
+
+	full := database.Analytics{
+		Bucket: "day",
+		Filter: database.AnalyticsQuery{Period: "30d", Dimension: "models"},
+		Summary: database.AnalyticsSummary{
+			Tokens:        1000,
+			EstimatedCost: database.CostSummary{Amount: 30, PricedTokens: 800, UnpricedTokens: 200},
+			Cache:         database.CacheSummary{HitRate: 0.5, CachedTokens: 250, EligibleTokens: 500},
+		},
+		Comparison: &database.AnalyticsComparison{PreviousCacheHitRate: &previousRate},
+		Points:     make([]database.AnalyticsPoint, 15),
+		ShareSeries: []database.AnalyticsShareSeries{
+			{Name: "model-a"},
+			{Name: "model-b"},
+			{Name: "Other"},
+		},
+		SharePoints: []database.AnalyticsSharePoint{
+			{Values: []database.AnalyticsShareSeries{{Name: "model-a", Share: 0.2}, {Name: "model-b", Share: 0.6}, {Name: "Other", Share: 0.2}}},
+			{Values: []database.AnalyticsShareSeries{{Name: "model-a", Share: 0.2}, {Name: "model-b", Share: 0.6}, {Name: "Other", Share: 0.2}}},
+			{Values: []database.AnalyticsShareSeries{{Name: "model-a", Share: 0.5}, {Name: "model-b", Share: 0.4}, {Name: "Other", Share: 0.1}}},
+			{Values: []database.AnalyticsShareSeries{{Name: "model-a", Share: 0.5}, {Name: "model-b", Share: 0.4}, {Name: "Other", Share: 0.1}}},
+		},
+	}
+	insights := analyticsInsights(full, now, nil, nil)
+	byID := make(map[string]analyticsInsight, len(insights))
+	for _, insight := range insights {
+		byID[insight.ID] = insight
+	}
+
+	// Burn rate: $30 across 15 day buckets, November has 30 days.
+	burn, ok := byID["burn_rate"]
+	if !ok {
+		t.Fatalf("burn rate insight missing: %+v", insights)
+	}
+	if burn.Value != "$2.00/day" {
+		t.Errorf("burn rate value = %q, want $2.00/day", burn.Value)
+	}
+	if !strings.Contains(burn.Detail, "$60.00") || !strings.Contains(burn.Detail, "November") {
+		t.Errorf("burn rate detail = %q, want a $60.00 November projection", burn.Detail)
+	}
+
+	// Top mover: model-a's share doubles between halves (+30 pts), model-b
+	// drops (−20 pts); "Other" must be excluded from consideration.
+	mover, ok := byID["top_mover"]
+	if !ok {
+		t.Fatalf("top mover insight missing: %+v", insights)
+	}
+	if mover.Value != "+30.0 pts" || mover.State != "up" || !strings.Contains(mover.Detail, "model-a") {
+		t.Errorf("top mover = %+v, want model-a +30.0 pts up", mover)
+	}
+
+	// Cache efficiency: 50% now vs 25% previous → up 25 pts.
+	cache, ok := byID["cache_efficiency"]
+	if !ok {
+		t.Fatalf("cache efficiency insight missing: %+v", insights)
+	}
+	if cache.Value != "50.0%" || cache.State != "up" || !strings.Contains(cache.Detail, "+25.0 pts") {
+		t.Errorf("cache efficiency = %+v, want 50.0%% up with +25.0 pts", cache)
+	}
+
+	// Catalog coverage: 200 unpriced of 1000 total.
+	coverage, ok := byID["unpriced_share"]
+	if !ok {
+		t.Fatalf("catalog coverage insight missing: %+v", insights)
+	}
+	if coverage.Value != "20.0%" || !strings.Contains(coverage.Detail, "200") {
+		t.Errorf("catalog coverage = %+v, want 20.0%% with 200 unpriced", coverage)
+	}
+
+	// A fully priced window omits the coverage card instead of showing 0.0%%.
+	pricedOnly := full
+	pricedOnly.Summary.EstimatedCost.UnpricedTokens = 0
+	for _, insight := range analyticsInsights(pricedOnly, now, nil, nil) {
+		if insight.ID == "unpriced_share" {
+			t.Errorf("fully priced window produced a coverage card: %+v", insight)
+		}
+	}
+
+	// Missing inputs render with the Unknown vocabulary: no priced usage and
+	// no cacheable input both stay Unknown; an hour-bucketed window has no
+	// burn rate at all.
+	unknown := database.Analytics{
+		Bucket: "day",
+		Filter: database.AnalyticsQuery{Period: "30d"},
+		Summary: database.AnalyticsSummary{
+			Tokens:        40,
+			EstimatedCost: database.CostSummary{UnpricedTokens: 40},
+		},
+		Points: []database.AnalyticsPoint{{Tokens: 40}},
+	}
+	insights = analyticsInsights(unknown, now, nil, nil)
+	byID = make(map[string]analyticsInsight, len(insights))
+	for _, insight := range insights {
+		byID[insight.ID] = insight
+	}
+	if burn, ok := byID["burn_rate"]; !ok || burn.Value != "Unknown" || !strings.Contains(burn.Detail, "No priced usage") {
+		t.Errorf("unpriced burn rate = %+v, want Unknown with the no-priced-usage line", burn)
+	}
+	if cache, ok := byID["cache_efficiency"]; !ok || cache.Value != "Unknown" {
+		t.Errorf("no-cacheable-input cache insight = %+v, want Unknown", cache)
+	}
+	if mover, ok := byID["top_mover"]; ok {
+		t.Errorf("single-point window produced a mover card: %+v", mover)
+	}
+	if coverage, ok := byID["unpriced_share"]; !ok || coverage.Value != "100.0%" {
+		t.Errorf("fully unpriced coverage = %+v, want 100.0%%", coverage)
+	}
+
+	// Hour buckets (24h view) have no honest month projection.
+	hourly := database.Analytics{Bucket: "hour", Filter: database.AnalyticsQuery{Period: "24h"}}
+	for _, insight := range analyticsInsights(hourly, now, nil, nil) {
+		if insight.ID == "burn_rate" {
+			t.Errorf("hour bucket produced a burn-rate card: %+v", insight)
+		}
+	}
+}
+
+func TestAnalyticsInsightsStripRender(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	var events []usage.Event
+	// Current window: model-a early in the week, model-b late, both with
+	// cache tokens and cost so every insight slot has real data.
+	seed := func(dayOffset int, model string, eventID string) {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion, EventID: eventID, Timestamp: now.AddDate(0, 0, -dayOffset),
+			MachineID: "machine-one", SessionID: "session-" + eventID, Provider: "anthropic",
+			Model: model, Tool: "codex", InputTokens: usage.Int64(100), CacheReadTokens: usage.Int64(modelDayOffsetCache(dayOffset)),
+			TotalTokens: usage.Int64(150), Cost: usage.Float64(2.0), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		})
+	}
+	seed(1, "model-a", "insight-a1")
+	seed(2, "model-a", "insight-a2")
+	seed(5, "model-b", "insight-b1")
+	seed(6, "model-b", "insight-b2")
+	// The last event carries no cost, so the window has unpriced tokens and
+	// the catalog-coverage card has something to report.
+	for index := range events {
+		if events[index].EventID == "insight-b2" {
+			events[index].Cost = nil
+		}
+	}
+	// Previous window: one fully cached event gives a 0.5 hit-rate baseline.
+	events = append(events, usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "insight-prev", Timestamp: now.AddDate(0, 0, -10),
+		MachineID: "machine-one", SessionID: "session-prev", Provider: "anthropic",
+		Model: "model-a", Tool: "codex", InputTokens: usage.Int64(100), CacheReadTokens: usage.Int64(100),
+		TotalTokens: usage.Int64(200), Cost: usage.Float64(1.0), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	})
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/analytics?period=7d", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("analytics page status = %d: %s", page.Code, page.Body.String())
+	}
+	for _, want := range []string{
+		`aria-label="Usage insights"`,
+		"Spend burn rate",
+		"/day",
+		"Top mover",
+		" pts",
+		"Cache efficiency",
+		"Catalog coverage",
+		"unpriced",
+	} {
+		if !bytes.Contains(page.Body.Bytes(), []byte(want)) {
+			t.Errorf("analytics page insights strip missing %q", want)
+		}
+	}
+	// The previous window's cache rate is lower than the current one, so the
+	// efficiency card must carry the falling direction with a visible arrow
+	// and a screen-reader word.
+	for _, want := range []string{`comparison down`, "▼", "falling"} {
+		if !bytes.Contains(page.Body.Bytes(), []byte(want)) {
+			t.Errorf("analytics page insights strip missing %q", want)
+		}
+	}
+
+	// The comparison rides along in the JSON API for the same window.
+	export := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(export, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/export?period=7d&dimension=models", nil))
+	if export.Code != http.StatusOK {
+		t.Fatalf("analytics export status = %d", export.Code)
+	}
+	var exported database.Analytics
+	if err := json.Unmarshal(export.Body.Bytes(), &exported); err != nil {
+		t.Fatalf("decode analytics export: %v", err)
+	}
+	if exported.Comparison == nil || exported.Comparison.PreviousCacheHitRate == nil {
+		t.Fatalf("comparison missing previous cache rate: %+v", exported.Comparison)
+	}
+	if *exported.Comparison.PreviousCacheHitRate < 0.499 || *exported.Comparison.PreviousCacheHitRate > 0.501 {
+		t.Errorf("previous cache hit rate = %v, want 0.5", *exported.Comparison.PreviousCacheHitRate)
+	}
+}
+
+// modelDayOffsetCache gives early-week events a 50% cache rate and late-week
+// events ~17%, so the window halves move the model mix and the cache rate.
+func modelDayOffsetCache(dayOffset int) int64 {
+	if dayOffset <= 2 {
+		return 50
+	}
+	return 20
+}
+
 func TestAnalyticsChartScaleAndDateTicks(t *testing.T) {
 	for _, test := range []struct {
 		maximum int64
