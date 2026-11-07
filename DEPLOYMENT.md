@@ -116,6 +116,24 @@ docker compose -f deploy/docker-compose.yml down
 
 ## Release integrity and safe upgrades
 
+### Pre-tag dry run
+
+Tag only release-ready commits. Before creating `v<VERSION>`, check out the
+candidate commit and run the release gates against it:
+
+```bash
+git checkout <candidate-sha>
+bash deploy/release-check.sh
+```
+
+or dispatch the **Release check** workflow with the candidate SHA. The check
+runs the headless browser smoke and accessibility regression, builds the image
+with the release build args and asserts its `version`/`commit` identity, runs
+the trivy HIGH/CRITICAL container gate, and the full test suite with the race
+detector. v0.4.2 had to re-point its tag because the container gate first ran
+after tagging; this check exists so that failure happens before the tag
+exists.
+
 Release artifacts are four architecture-specific archives (macOS/Linux,
 amd64/arm64), `checksums.txt`, and an SPDX JSON SBOM. The release workflow
 signs the checksums, every archive, and the SBOM with Cosign's keyless GitHub

@@ -24,6 +24,15 @@ change → test → deploy → verify
 
 Do not report a change complete after tests alone. Deploy the affected Tokemon service to the active target, then verify its health and the changed behavior. For server or dashboard changes, deploy the primary Mac hub and verify its Tailscale URL; for agent changes, redeploy each affected enrolled machine. Keep the deployment scoped to the changed component and preserve persistent data.
 
+## Release tagging
+
+Tag only release-ready commits: check out the candidate commit and run
+`bash deploy/release-check.sh` (or dispatch the **Release check** workflow
+with the candidate SHA) before creating `v<VERSION>`. The check runs the
+browser smoke, the image identity assertion, the trivy container gate, and
+the race suite. v0.4.2 had to re-point its tag because these gates only ran
+after tagging.
+
 ## Luna worker orchestration
 
 Use Sol for planning, orchestration, and reviews.
