@@ -79,10 +79,14 @@ type dashboardHTMLCache struct {
 // requests for the same filter reuse one compute instead of stacking full
 // scans on the store.
 type analyticsCacheEntry struct {
+	query   database.AnalyticsQuery
 	result  database.Analytics
 	err     error
 	fetched time.Time
 	ready   chan struct{}
+	// hasResult marks an entry that has completed one compute, so stale-served
+	// readers are distinguishable from a first-ever compute still in flight.
+	hasResult bool
 }
 
 type evolutionResponse struct {
@@ -2270,7 +2274,9 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 	key := analyticsCacheKey(query)
 	for {
 		s.analyticsMu.Lock()
-		if entry, ok := s.analyticsCache[key]; ok && entry.ready != nil {
+		if entry, ok := s.analyticsCache[key]; ok && entry.ready != nil && !entry.hasResult {
+			// A first-ever compute is in flight and there is no last good
+			// result to serve, so the reader waits for it.
 			s.analyticsMu.Unlock()
 			select {
 			case <-entry.ready:
@@ -2279,7 +2285,13 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 				return database.Analytics{}, ctx.Err()
 			}
 		}
-		if entry, ok := s.analyticsCache[key]; ok && time.Since(entry.fetched) < analyticsCacheTTL {
+		if entry, ok := s.analyticsCache[key]; ok && entry.hasResult {
+			// Stale-while-revalidate: serve whatever we have immediately and
+			// refresh in the background when it is past the TTL. A reader never
+			// waits on a recompute, even right after an ingest invalidated it.
+			if time.Since(entry.fetched) >= analyticsCacheTTL && entry.ready == nil {
+				s.startAnalyticsRefreshLocked(key, entry)
+			}
 			result, err := entry.result, entry.err
 			s.analyticsMu.Unlock()
 			return result, err
@@ -2287,7 +2299,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 		if s.analyticsCache == nil {
 			s.analyticsCache = make(map[string]*analyticsCacheEntry)
 		}
-		computing := &analyticsCacheEntry{ready: make(chan struct{})}
+		computing := &analyticsCacheEntry{query: query, ready: make(chan struct{})}
 		s.analyticsCache[key] = computing
 		generation := s.analyticsGeneration
 		s.analyticsMu.Unlock()
@@ -2298,7 +2310,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 
 		s.analyticsMu.Lock()
 		if s.analyticsGeneration == generation && !clientGone(err) {
-			s.analyticsCache[key] = &analyticsCacheEntry{result: result, err: err, fetched: time.Now()}
+			s.analyticsCache[key] = &analyticsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true}
 		} else {
 			delete(s.analyticsCache, key)
 		}
@@ -2309,10 +2321,39 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 	}
 }
 
+// startAnalyticsRefreshLocked starts one background analytics refresh for one
+// filter key. The caller holds analyticsMu; readers keep serving the cached
+// result while it runs, and the generation guard drops a result that an
+// ingest superseded.
+func (s *Server) startAnalyticsRefreshLocked(key string, entry *analyticsCacheEntry) {
+	generation := s.analyticsGeneration
+	entry.ready = make(chan struct{})
+	ready := entry.ready
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.store.Analytics(ctx, entry.query)
+
+		s.analyticsMu.Lock()
+		if s.analyticsGeneration == generation && !clientGone(err) {
+			s.analyticsCache[key] = &analyticsCacheEntry{query: entry.query, result: result, err: err, fetched: time.Now(), hasResult: true}
+		}
+		entry.ready = nil
+		s.analyticsMu.Unlock()
+		close(ready)
+	}()
+}
+
 func (s *Server) invalidateAnalyticsCache() {
 	s.analyticsMu.Lock()
 	s.analyticsGeneration++
-	s.analyticsCache = nil
+	for _, entry := range s.analyticsCache {
+		if entry.ready == nil {
+			// Keep the last good result so readers are served immediately; the
+			// zero fetched time marks it stale and the next request refreshes it.
+			entry.fetched = time.Time{}
+		}
+	}
 	s.analyticsMu.Unlock()
 }
 

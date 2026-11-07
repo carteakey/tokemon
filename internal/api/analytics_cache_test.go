@@ -73,9 +73,38 @@ func TestAnalyticsCacheServesAndInvalidates(t *testing.T) {
 	if accepted.Code != http.StatusOK {
 		t.Fatalf("ingest status = %d: %s", accepted.Code, accepted.Body.String())
 	}
+	// The invalidated cache serves the last good result immediately while one
+	// background compute refreshes it.
 	third := fetch()
-	if third == first {
-		t.Fatal("analytics payload did not change after ingest; the cache was not invalidated")
+	if third != first {
+		t.Fatal("stale analytics payload changed immediately after ingest; stale-while-revalidate is not serving the cached result")
+	}
+	// A reader that lands while the background refresh is still running must
+	// also be served the stale result instead of waiting on the recompute.
+	if fourth := fetch(); fourth != first {
+		t.Fatal("reader during the background refresh waited for or diverged from the stale result")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		server.analyticsMu.Lock()
+		refreshed := false
+		for _, entry := range server.analyticsCache {
+			if !entry.fetched.IsZero() {
+				refreshed = true
+			}
+		}
+		server.analyticsMu.Unlock()
+		if refreshed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background analytics refresh did not complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fresh := fetch()
+	if fresh == first {
+		t.Fatal("analytics payload did not change after the background refresh; the cache was not invalidated")
 	}
 
 	// A different filter is an independent cache entry, not a stale share.
