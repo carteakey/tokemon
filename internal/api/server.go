@@ -87,6 +87,10 @@ type analyticsCacheEntry struct {
 	// hasResult marks an entry that has completed one compute, so stale-served
 	// readers are distinguishable from a first-ever compute still in flight.
 	hasResult bool
+	// lastUse tracks the most recent serve for eviction: the cache is bounded,
+	// and a filter that keeps being read must not be evicted ahead of one that
+	// has gone quiet.
+	lastUse time.Time
 }
 
 type evolutionResponse struct {
@@ -2292,6 +2296,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 			if time.Since(entry.fetched) >= analyticsCacheTTL && entry.ready == nil {
 				s.startAnalyticsRefreshLocked(key, entry)
 			}
+			entry.lastUse = time.Now()
 			result, err := entry.result, entry.err
 			s.analyticsMu.Unlock()
 			return result, err
@@ -2301,6 +2306,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 		}
 		computing := &analyticsCacheEntry{query: query, ready: make(chan struct{})}
 		s.analyticsCache[key] = computing
+		s.evictAnalyticsEntriesLocked()
 		generation := s.analyticsGeneration
 		s.analyticsMu.Unlock()
 
@@ -2310,7 +2316,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 
 		s.analyticsMu.Lock()
 		if s.analyticsGeneration == generation && !clientGone(err) {
-			s.analyticsCache[key] = &analyticsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true}
+			s.analyticsCache[key] = &analyticsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
 		} else {
 			delete(s.analyticsCache, key)
 		}
@@ -2336,12 +2342,42 @@ func (s *Server) startAnalyticsRefreshLocked(key string, entry *analyticsCacheEn
 
 		s.analyticsMu.Lock()
 		if s.analyticsGeneration == generation && !clientGone(err) {
-			s.analyticsCache[key] = &analyticsCacheEntry{query: entry.query, result: result, err: err, fetched: time.Now(), hasResult: true}
+			s.analyticsCache[key] = &analyticsCacheEntry{query: entry.query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
 		}
 		entry.ready = nil
 		s.analyticsMu.Unlock()
 		close(ready)
 	}()
+}
+
+// analyticsCacheMaxEntries bounds how many filter combinations the analytics
+// cache retains. SWR keeps the last result per filter for the process
+// lifetime, so an unbounded map would grow with every distinct filter a
+// client tries.
+const analyticsCacheMaxEntries = 64
+
+// evictAnalyticsEntriesLocked drops the least recently served entries until
+// the cache is within its bound. Entries with a compute in flight are never
+// evicted: their waiters hold the ready channel and the generation guard
+// expects them to stay installed. If every entry is in flight, eviction
+// waits for the next insert.
+func (s *Server) evictAnalyticsEntriesLocked() {
+	for len(s.analyticsCache) > analyticsCacheMaxEntries {
+		victim := ""
+		var oldest time.Time
+		for key, entry := range s.analyticsCache {
+			if entry.ready != nil {
+				continue
+			}
+			if victim == "" || entry.lastUse.Before(oldest) {
+				victim, oldest = key, entry.lastUse
+			}
+		}
+		if victim == "" {
+			return
+		}
+		delete(s.analyticsCache, victim)
+	}
 }
 
 func (s *Server) invalidateAnalyticsCache() {
