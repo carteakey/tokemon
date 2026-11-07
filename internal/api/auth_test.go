@@ -428,6 +428,36 @@ func TestLoginRedirectDefaultsToRoot(t *testing.T) {
 	}
 }
 
+func TestTokenOnlyDeploymentKeepsBasicChallengeForHTML(t *testing.T) {
+	// Without a password account there is no form: anonymous HTML
+	// navigations keep the 401 Basic challenge so credentials embedded in
+	// the URL (and the browser smoke) keep working.
+	hash := []byte{}
+	_ = hash
+	store, err := database.Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/analytics?period=7d", nil)
+	request.Header.Set("Accept", "text/html,application/xhtml+xml")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("token-only anonymous HTML status = %d, want 401 with the Basic challenge", response.Code)
+	}
+	if response.Header().Get("WWW-Authenticate") != `Basic realm="tokemon"` {
+		t.Error("token-only deployment missing the Basic challenge")
+	}
+	if location := response.Header().Get("Location"); location != "" {
+		t.Errorf("token-only deployment redirected to %q instead of challenging", location)
+	}
+}
+
 func TestAnonymousHTMLNavigationRedirectsToLogin(t *testing.T) {
 	server, _, _ := newLoginTestServer(t)
 	request := httptest.NewRequest(http.MethodGet, "/analytics?period=7d", nil)

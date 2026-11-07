@@ -636,13 +636,6 @@ const (
 	authMethodCredentials = "credentials"
 )
 
-// sessionAuthenticated reports whether the request reached the handler
-// through a login-session cookie (used to render the logout affordance).
-func sessionAuthenticated(r *http.Request) bool {
-	method, _ := r.Context().Value(authMethodKey).(string)
-	return method == authMethodSession
-}
-
 func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Authenticated pages and read APIs must never come from a browser
@@ -685,7 +678,12 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 				return
 			}
 			w.Header().Set("Cache-Control", "no-store")
-			if wantsHTML(r) {
+			// A password deployment sends browsers to the form; a token-only
+			// deployment keeps the Basic challenge so credentials embedded
+			// in the URL (and API clients) keep working — Chrome answers the
+			// challenge automatically, which is how the smoke and scripted
+			// readers authenticate.
+			if wantsHTML(r) && s.passwordAccountConfigured() {
 				http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 				return
 			}

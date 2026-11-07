@@ -65,6 +65,11 @@ the Basic Auth prompt:
   Secure on TLS (including trusted-proxy-terminated HTTPS), 12-hour lifetime,
   reissued fresh on every login. Changing the username, the password hash, or
   the dashboard token invalidates all sessions.
+- The session-signing key is derived from the dashboard token (explicit or
+  the ingest-token fallback). A deployment with no dashboard token at all
+  uses a random per-process signing key instead: sessions then reset on
+  restart, so prefer setting an explicit token when sessions must survive
+  one.
 - `POST /logout` (button in the dashboard header) clears the cookie. Sessions
   are stateless: there is no server-side revocation, so a copied cookie stays
   valid until TTL or credential rotation.

@@ -2667,7 +2667,7 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 	for _, model := range snapshot.Models {
 		byTier[model.Tier] = append(byTier[model.Tier], model)
 	}
-	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels, CanLogout: sessionAuthenticated(r), CSRFToken: s.csrfToken()}
+	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels, CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
 	for _, tier := range snapshot.Tiers {
 		models := byTier[tier]
 		if len(models) == 0 {
@@ -2702,7 +2702,7 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir), CanLogout: sessionAuthenticated(r), CSRFToken: s.csrfToken()}
+	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir), CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
@@ -2771,7 +2771,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AxisTicks:      analyticsAxisTicks(axisMax),
 		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
 		Quotas:         quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
-		CanLogout:      sessionAuthenticated(r),
+		CanLogout:      s.passwordAccountConfigured(),
 		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
@@ -2833,7 +2833,7 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 		HourlyMax:      insightDistributionMax(result.Hourly),
 		WeekdayMax:     insightDistributionMax(result.Weekdays),
 		Recap:          s.insightsRecap(r.Context(), result),
-		CanLogout:      sessionAuthenticated(r),
+		CanLogout:      s.passwordAccountConfigured(),
 		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "insights", page); err != nil {
@@ -2962,7 +2962,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		Saved:       r.URL.Query().Get("saved") == "1",
 		AuthMode:    authMode,
 		TokenSource: tokenSource,
-		CanLogout:   sessionAuthenticated(r),
+		CanLogout:   s.passwordAccountConfigured(),
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
