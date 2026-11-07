@@ -24,6 +24,10 @@ change → test → deploy → verify
 
 Do not report a change complete after tests alone. Deploy the affected Tokemon service to the active target, then verify its health and the changed behavior. For server or dashboard changes, deploy the primary Mac hub and verify its Tailscale URL; for agent changes, redeploy each affected enrolled machine. Keep the deployment scoped to the changed component and preserve persistent data.
 
+When more than one agent is shipping at once, follow `docs/ship-loop.md`:
+one supervisor owns the gate and the push, workers implement in their own
+worktrees, and every result is gated at its exact commit before landing.
+
 ## Release tagging
 
 Tag only release-ready commits: check out the candidate commit and run
