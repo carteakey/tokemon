@@ -27,6 +27,7 @@ import (
 	"github.com/tokemon/tokemon/internal/api"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
+	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
 )
 
@@ -126,6 +127,62 @@ const sourceHealthInvariantJS = `(() => {
 	const dom = document.documentElement.innerHTML;
 	if (dom.includes('/Users/') || dom.includes('/home/')) {
 		problems.push('page DOM contains a raw local path');
+	}
+	return JSON.stringify(problems);
+})()`
+
+// quotaAbsentInvariantJS guards the no-quotas default: the analytics page
+// must not render the panel section at all.
+const quotaAbsentInvariantJS = `(() => {
+	const problems = [];
+	if (document.getElementById('quota-title') || document.querySelector('.quota-panel')) {
+		problems.push('quota panel rendered without quotas configured');
+	}
+	return JSON.stringify(problems);
+})()`
+
+// quotaConfiguredInvariantJS asserts the analytics quota panel with two
+// configured budgets: an over-budget row (over styling, 120 percent track,
+// pace detail) and an under-budget row (plain fill, 20 percent track).
+const quotaConfiguredInvariantJS = `(() => {
+	const problems = [];
+	if (!document.getElementById('quota-title')) {
+		problems.push('configured quota panel section is missing');
+		return JSON.stringify(problems);
+	}
+	const rows = Array.from(document.querySelectorAll('.quota-panel .quota'));
+	if (rows.length !== 2) {
+		problems.push('expected 2 quota rows, found ' + rows.length);
+	}
+	const byLabel = (needle) => rows.find(row => row.textContent.includes(needle));
+	const over = byLabel('OpenAI cap');
+	const under = byLabel('Anthropic cap');
+	if (!over || !under) {
+		problems.push('quota rows missing the seeded labels');
+		return JSON.stringify(problems);
+	}
+	const trackLabel = (row) => (row.querySelector('.quota-track') || {}).getAttribute ? row.querySelector('.quota-track').getAttribute('aria-label') : '';
+	const figures = over.querySelector('.quota-figures');
+	if (!figures || !figures.textContent.includes('60,000,000 tokens / 50,000,000 tokens')) {
+		problems.push('over-budget figures wrong: ' + (figures ? figures.textContent : 'none'));
+	}
+	if (!trackLabel(over).includes('120 percent of the quota used')) {
+		problems.push('over-budget track aria-label wrong: ' + trackLabel(over));
+	}
+	if (!over.querySelector('.quota-fill.over')) {
+		problems.push('over-budget row lacks the .quota-fill.over styling');
+	}
+	if (!under.querySelector('.quota-fill') || under.querySelector('.quota-fill.over')) {
+		problems.push('under-budget fill styling wrong');
+	}
+	if (!trackLabel(under).includes('20 percent of the quota used')) {
+		problems.push('under-budget track aria-label wrong: ' + trackLabel(under));
+	}
+	for (const row of [over, under]) {
+		const detail = row.querySelector('.insight-detail');
+		if (!detail || !detail.textContent.trim()) {
+			problems.push('quota row lacks the pace/reset detail line');
+		}
 	}
 	return JSON.stringify(problems);
 })()`
@@ -239,7 +296,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		invariants []string
 	}{
 		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
-		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS}},
+		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
 		{path: "/tokedex"},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
 		{path: "/settings"},
@@ -343,6 +400,26 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		if pressed, _ := readState(); pressed != "false" {
 			t.Fatalf("resume left aria-pressed = %q, want false", pressed)
 		}
+	})
+
+	// The quota panel on /analytics: configured budgets render the label,
+	// figures, an accessible track, and the over-budget styling; the main
+	// loop's no-quota server already asserts the section is absent.
+	t.Run("quota-panel", func(t *testing.T) {
+		quotaURL := startQuotaServer(t)
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(quotaURL+"/analytics?period=all&dimension=models")); err != nil {
+			t.Fatalf("navigation to quota analytics failed: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("body")); err != nil {
+			t.Fatalf("quota analytics never became ready: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+			t.Fatalf("could not settle animations: %v", err)
+		}
+		for _, invariant := range []string{sharedInvariantJS, exportInvariantJS, quotaConfiguredInvariantJS} {
+			assertNoProblems(t, ctx, invariant)
+		}
+		assertAxeAllowlist(t, ctx, "/analytics")
 	})
 }
 
@@ -492,6 +569,13 @@ func startSeededServer(t *testing.T, enableTokedex bool) string {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return serveStore(t, store, enableTokedex)
+}
+
+// serveStore wraps an already-seeded store in the real handler on a loopback
+// port and returns the Basic-auth base URL the browser signs in with.
+func serveStore(t *testing.T, store *database.Store, enableTokedex bool) string {
+	t.Helper()
 	server, err := api.NewWithConfig(store, api.Config{
 		IngestToken:    "smoke-ingest",
 		DashboardToken: dashboardToken,
@@ -509,4 +593,61 @@ func startSeededServer(t *testing.T, enableTokedex bool) string {
 	go http.Serve(listener, server.Handler())
 	host := listener.Addr().String()
 	return fmt.Sprintf("http://tokemon:%s@%s", dashboardToken, host)
+}
+
+// startQuotaServer opens a scratch store with two configured quotas and
+// seeds one over-budget and one under-budget provider for the current
+// monthly period, then serves it for the quota-panel subtest.
+func startQuotaServer(t *testing.T) string {
+	t.Helper()
+	tokensBudget := int64(50_000_000)
+	quotas := []quota.Quota{
+		{Provider: "openai", Label: "OpenAI cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &tokensBudget}},
+		{Provider: "anthropic", Label: "Anthropic cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &tokensBudget}},
+	}
+	store, err := database.OpenWithLocation(filepath.Join(t.TempDir(), "quota.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	start, _ := quota.PeriodFor(time.Now().UTC(), 1, time.UTC)
+	base := start.Add(time.Hour)
+	events := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "smoke-quota-over",
+			Timestamp:     base,
+			MachineID:     "smoke-laptop",
+			Project:       "smoke-project",
+			Provider:      "openai",
+			Model:         "gpt-5",
+			Tool:          "codex",
+			InputTokens:   usage.Int64(30_000_000),
+			OutputTokens:  usage.Int64(30_000_000),
+			TotalTokens:   usage.Int64(60_000_000),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "smoke"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "smoke-quota-under",
+			Timestamp:     base.Add(time.Hour),
+			MachineID:     "smoke-laptop",
+			Project:       "smoke-project",
+			Provider:      "anthropic",
+			Model:         "claude-sonnet-4",
+			Tool:          "claude-code",
+			InputTokens:   usage.Int64(6_000_000),
+			OutputTokens:  usage.Int64(4_000_000),
+			TotalTokens:   usage.Int64(10_000_000),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "smoke"},
+		},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	return serveStore(t, store, false)
 }
