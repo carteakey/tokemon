@@ -20,10 +20,15 @@ import (
 )
 
 type Store struct {
-	db        *sql.DB
-	catalog   *catalog.Catalog
-	location  *time.Location
-	lock      *databaseLock
+	db       *sql.DB
+	catalog  *catalog.Catalog
+	location *time.Location
+	lock     *databaseLock
+
+	facetsMu      sync.Mutex
+	facetsCache   *AnalyticsFacets
+	facetsFetched time.Time
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -829,6 +834,11 @@ adapter, adapter_version
 	if err := tx.Commit(); err != nil {
 		return result, err
 	}
+	if result.Accepted > 0 || result.Duplicates > 0 {
+		// A refresh can change canonical_model without a new accepted row, so
+		// any successful write invalidates the cached facets.
+		s.invalidateFacetsCache()
+	}
 	after, err := s.LifetimeTokens(ctx)
 	if err != nil {
 		return result, err
@@ -1463,13 +1473,17 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 		previousEnd := start
 		previousStart := previousEnd.Add(-end.Sub(start))
 		previousWhere, previousArgs := analyticsWhere(query, previousStart, previousEnd)
-		var previous AnalyticsSummary
-		if err := s.analyticsSummary(ctx, previousWhere, previousArgs, &previous); err != nil {
+		// The comparison consumes only token and event totals, so the previous
+		// window aggregates in SQL instead of repeating the row-by-row summary
+		// scan.
+		var previousTokens, previousEvents int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0), COUNT(*)
+FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, &previousEvents); err != nil {
 			return Analytics{}, err
 		}
-		comparison := &AnalyticsComparison{PreviousTokens: previous.Tokens, PreviousEvents: previous.Events}
-		if previous.Tokens > 0 {
-			change := float64(result.Summary.Tokens-previous.Tokens) * 100 / float64(previous.Tokens)
+		comparison := &AnalyticsComparison{PreviousTokens: previousTokens, PreviousEvents: previousEvents}
+		if previousTokens > 0 {
+			change := float64(result.Summary.Tokens-previousTokens) * 100 / float64(previousTokens)
 			comparison.TokenChangePercent = &change
 		}
 		result.Comparison = comparison
@@ -1500,7 +1514,7 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 	if err != nil {
 		return Analytics{}, err
 	}
-	result.Facets, err = s.analyticsFacets(ctx)
+	result.Facets, err = s.Facets(ctx)
 	if err != nil {
 		return Analytics{}, err
 	}
@@ -2503,6 +2517,38 @@ func (s *Store) analyticsFacets(ctx context.Context) (AnalyticsFacets, error) {
 		}
 	}
 	return result, nil
+}
+
+// facetsCacheTTL bounds how long cached filter facets may be served without
+// any ingest writing to the store; the ingest path invalidates immediately.
+// The facets are filter-independent distinct-value scans, the single most
+// expensive part of Store.Analytics on a large database, and every dashboard
+// page needs them — so repeat renders within the TTL reuse one compute.
+const facetsCacheTTL = time.Minute
+
+// Facets returns the distinct machines, providers, models, and tools present
+// in the store. Unlike Analytics it costs only the facet queries, so handlers
+// that need just the filter values do not pay for the full aggregation.
+func (s *Store) Facets(ctx context.Context) (AnalyticsFacets, error) {
+	s.facetsMu.Lock()
+	defer s.facetsMu.Unlock()
+	if s.facetsCache != nil && time.Since(s.facetsFetched) < facetsCacheTTL {
+		return *s.facetsCache, nil
+	}
+	result, err := s.analyticsFacets(ctx)
+	if err != nil {
+		return AnalyticsFacets{}, err
+	}
+	cached := result
+	s.facetsCache = &cached
+	s.facetsFetched = time.Now()
+	return result, nil
+}
+
+func (s *Store) invalidateFacetsCache() {
+	s.facetsMu.Lock()
+	s.facetsCache = nil
+	s.facetsMu.Unlock()
 }
 
 func (s *Store) Events(ctx context.Context) ([]usage.Event, error) {

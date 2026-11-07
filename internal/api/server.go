@@ -45,6 +45,9 @@ type Server struct {
 	overviewCache        *overviewCacheEntry
 	overviewReady        chan struct{}
 	overviewGeneration   uint64
+	analyticsMu          sync.Mutex
+	analyticsCache       map[string]*analyticsCacheEntry
+	analyticsGeneration  uint64
 }
 
 type evolutionCacheEntry struct {
@@ -57,6 +60,17 @@ type overviewCacheEntry struct {
 	result  database.Overview
 	err     error
 	fetched time.Time
+}
+
+// analyticsCacheEntry caches one filter combination's full Analytics result.
+// ready is non-nil while a compute for the key is in flight, so concurrent
+// requests for the same filter reuse one compute instead of stacking full
+// scans on the store.
+type analyticsCacheEntry struct {
+	result  database.Analytics
+	err     error
+	fetched time.Time
+	ready   chan struct{}
 }
 
 type evolutionResponse struct {
@@ -1490,6 +1504,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("ingest_completed", "events", len(request.Events), "accepted", result.Accepted, "duplicates", result.Duplicates, "rejected", result.Rejected)
 	s.invalidateEvolutionCache()
 	s.invalidateOverviewCache()
+	s.invalidateAnalyticsCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -1870,6 +1885,67 @@ func (s *Server) invalidateOverviewCache() {
 	s.overviewMu.Unlock()
 }
 
+// analyticsCacheTTL bounds how long a cached Analytics result may be served
+// without any ingest writing to the store; the ingest path invalidates
+// immediately. Each Analytics render costs several passes over the window's
+// rows, so repeat renders of one filter within the TTL reuse one compute.
+const analyticsCacheTTL = time.Minute
+
+// analyticsCacheKey identifies the filter combination a cached result was
+// computed for. Now is deliberately excluded: it moves per request and the
+// TTL already bounds how far the cached window may lag.
+func analyticsCacheKey(query database.AnalyticsQuery) string {
+	return query.Period + "\x1f" + query.Dimension + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool
+}
+
+func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQuery) (database.Analytics, error) {
+	key := analyticsCacheKey(query)
+	for {
+		s.analyticsMu.Lock()
+		if entry, ok := s.analyticsCache[key]; ok && entry.ready != nil {
+			s.analyticsMu.Unlock()
+			select {
+			case <-entry.ready:
+				continue
+			case <-ctx.Done():
+				return database.Analytics{}, ctx.Err()
+			}
+		}
+		if entry, ok := s.analyticsCache[key]; ok && time.Since(entry.fetched) < analyticsCacheTTL {
+			result, err := entry.result, entry.err
+			s.analyticsMu.Unlock()
+			return result, err
+		}
+		if s.analyticsCache == nil {
+			s.analyticsCache = make(map[string]*analyticsCacheEntry)
+		}
+		computing := &analyticsCacheEntry{ready: make(chan struct{})}
+		s.analyticsCache[key] = computing
+		generation := s.analyticsGeneration
+		s.analyticsMu.Unlock()
+
+		result, err := s.store.Analytics(ctx, query)
+
+		s.analyticsMu.Lock()
+		if s.analyticsGeneration == generation {
+			s.analyticsCache[key] = &analyticsCacheEntry{result: result, err: err, fetched: time.Now()}
+		} else {
+			delete(s.analyticsCache, key)
+		}
+		ready := computing.ready
+		s.analyticsMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) invalidateAnalyticsCache() {
+	s.analyticsMu.Lock()
+	s.analyticsGeneration++
+	s.analyticsCache = nil
+	s.analyticsMu.Unlock()
+}
+
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	result, err := s.cachedOverview(r.Context())
@@ -1947,7 +2023,7 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	analytics, err := s.store.Analytics(r.Context(), query)
+	analytics, err := s.store.Facets(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1958,7 +2034,7 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics.Facets, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
+	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
@@ -1994,7 +2070,7 @@ func sessionSortStates(r *http.Request, activeSort, activeDir string) map[string
 func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	started := time.Now()
-	result, err := s.store.Analytics(r.Context(), query)
+	result, err := s.cachedAnalytics(r.Context(), query)
 	s.metrics.observeDB(started)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2027,7 +2103,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) analyticsAPI(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -2054,7 +2130,7 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
 		return
 	}
-	analytics, err := s.store.Analytics(r.Context(), query)
+	facets, err := s.store.Facets(r.Context())
 	if err != nil {
 		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
 		return
@@ -2067,7 +2143,7 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 	modelAliases, machineAliases := aliasMaps(aliases)
 	page := insightsPageData{
 		Insights:       result,
-		Facets:         analytics.Facets,
+		Facets:         facets,
 		ModelAliases:   modelAliases,
 		MachineAliases: machineAliases,
 		HourlyMax:      insightDistributionMax(result.Hourly),
@@ -2093,7 +2169,7 @@ func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) timelineAPI(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -2109,7 +2185,7 @@ func (s *Server) timelineAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) analyticsExport(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Analytics(r.Context(), analyticsQueryFromRequest(r))
+	result, err := s.cachedAnalytics(r.Context(), analyticsQueryFromRequest(r))
 	s.metrics.observeDB(started)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
