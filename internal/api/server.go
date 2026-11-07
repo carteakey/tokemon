@@ -33,6 +33,7 @@ type Server struct {
 	logger               *slog.Logger
 	metrics              *Metrics
 	csrfSecret           []byte
+	sessionSecret        []byte
 	trustedProxyNetworks []*net.IPNet
 	loginThrottle        *loginThrottle
 	template             *template.Template
@@ -105,6 +106,8 @@ type dashboardPage struct {
 	Machines       []database.MachineInfo
 	Sessions       []database.SessionRecord
 	Freshness      dataFreshness
+	CanLogout      bool
+	CSRFToken      string
 }
 
 // dataFreshness describes how recent the newest persisted event is, using the
@@ -142,6 +145,8 @@ type analyticsPageData struct {
 	AxisTicks      []analyticsAxisTick
 	Insights       []analyticsInsight
 	Quotas         []quotaView
+	CanLogout      bool
+	CSRFToken      string
 }
 
 type analyticsAxisTick struct {
@@ -221,6 +226,8 @@ type insightsPageData struct {
 	database.Insights
 	Facets         database.AnalyticsFacets
 	ModelAliases   map[string]string
+	CanLogout      bool
+	CSRFToken      string
 	MachineAliases map[string]string
 	HourlyMax      int64
 	WeekdayMax     int64
@@ -241,6 +248,7 @@ type settingsPage struct {
 	Error       string
 	AuthMode    string
 	TokenSource string
+	CanLogout   bool
 }
 
 type catalogTier struct {
@@ -255,6 +263,8 @@ type catalogPageData struct {
 	PricedTokens           int64
 	CatalogedUnknownTokens int64
 	UncatalogedModels      int
+	CanLogout              bool
+	CSRFToken              string
 }
 
 type sessionsPageData struct {
@@ -262,6 +272,8 @@ type sessionsPageData struct {
 	Filter         database.AnalyticsQuery
 	Facets         database.AnalyticsFacets
 	ModelAliases   map[string]string
+	CanLogout      bool
+	CSRFToken      string
 	MachineAliases map[string]string
 	Sorts          map[string]sessionSortState
 }
@@ -1442,6 +1454,10 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if err != nil {
 		return nil, err
 	}
+	sessionSecret, err := newSessionSecret(config.DashboardToken)
+	if err != nil {
+		return nil, err
+	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
 		"tokedexEnabled":  func() bool { return config.EnableTokedex },
 		"commas":          commas,
@@ -1562,6 +1578,9 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if _, err := page.Parse(sessionsTemplate); err != nil {
 		return nil, err
 	}
+	if _, err := page.Parse(loginTemplate); err != nil {
+		return nil, err
+	}
 	if _, err := page.Parse(insightsTemplate); err != nil {
 		return nil, err
 	}
@@ -1575,6 +1594,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		logger:               config.Logger,
 		metrics:              config.Metrics,
 		csrfSecret:           csrfSecret,
+		sessionSecret:        sessionSecret,
 		trustedProxyNetworks: trustedProxyNetworks,
 		loginThrottle:        newLoginThrottle(),
 		template:             page,
@@ -1590,6 +1610,9 @@ func (s *Server) Handler() http.Handler {
 	dashboard := func(handler http.Handler) http.Handler {
 		return s.withDeadline(s.config.RequestTimeout, s.dashboardAuth(handler))
 	}
+	mux.Handle("GET /login", s.withDeadline(s.config.RequestTimeout, http.HandlerFunc(s.loginPage)))
+	mux.Handle("POST /login", s.withDeadline(s.config.RequestTimeout, http.HandlerFunc(s.loginSubmit)))
+	mux.Handle("POST /logout", s.withDeadline(s.config.RequestTimeout, http.HandlerFunc(s.logout)))
 	mux.Handle("GET /", dashboard(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /analytics", dashboard(http.HandlerFunc(s.analyticsPage)))
 	mux.Handle("GET /data", dashboard(http.HandlerFunc(s.analyticsPage)))
@@ -1681,7 +1704,10 @@ func (s *Server) requestLogging(next http.Handler) http.Handler {
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
+		// same-origin (not no-referrer): the login and logout forms must send
+		// a same-origin Referer/Origin for the POST origin check, while
+		// cross-origin requests still carry no referrer at all.
+		w.Header().Set("Referrer-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1931,6 +1957,108 @@ func (s *Server) quotasAPI(w http.ResponseWriter, r *http.Request) {
 		statuses = []database.QuotaStatus{}
 	}
 	writeJSON(w, http.StatusOK, statuses)
+}
+
+// ——— Login form ———
+
+type loginPageData struct {
+	CSRFToken string
+	Next      string
+	Error     string
+}
+
+func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
+	if !s.passwordAccountConfigured() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.URL.Query().Get("next"))}
+	s.renderLogin(w, http.StatusOK, page)
+}
+
+func (s *Server) renderLogin(w http.ResponseWriter, status int, page loginPageData) {
+	if err := s.template.ExecuteTemplate(w, "login", page); err != nil {
+		s.logger.Error("login_render_failed", "err", err.Error())
+	}
+}
+
+func (s *Server) loginSubmit(w http.ResponseWriter, r *http.Request) {
+	if !s.passwordAccountConfigured() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	remote := loginLimitKey(r)
+	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.FormValue("next"))}
+	render := func(status int, message string) {
+		page.Error = message
+		w.WriteHeader(status)
+		s.renderLogin(w, status, page)
+	}
+	// Throttle before any credential work, sharing the per-remote budget
+	// with Basic/Bearer attempts.
+	if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
+		seconds := int(retryAfter / time.Second)
+		if retryAfter%time.Second != 0 {
+			seconds++
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		render(http.StatusTooManyRequests, "Too many failed attempts. Try again in "+strconv.Itoa(seconds)+" seconds.")
+		return
+	}
+	if !requireSameOrigin(r) || !s.validCSRFToken(r.FormValue("csrf_token")) {
+		s.logger.Warn("login_rejected", "reason", "csrf")
+		render(http.StatusForbidden, "Sign-in rejected: the request did not come from this page. Reload and try again.")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		render(http.StatusBadRequest, "Could not read the sign-in form.")
+		return
+	}
+	username := strings.TrimSpace(r.Form.Get("username"))
+	page.Next = safeRedirectPath(r.Form.Get("next"))
+	if !s.verifyDashboardPassword(username, r.Form.Get("password")) {
+		s.loginThrottle.recordFailure(remote)
+		s.logger.Warn("login_failed")
+		render(http.StatusUnauthorized, "Invalid username or password.")
+		return
+	}
+	s.loginThrottle.recordSuccess(remote)
+	now := time.Now()
+	value, err := mintSessionCookieValue(s.sessionSecret, now, now.Add(sessionTTL),
+		credentialFingerprint(username, s.config.DashboardPasswordHash))
+	if err != nil {
+		s.logger.Error("session_mint_failed", "err", err.Error())
+		render(http.StatusInternalServerError, "Could not start a session. Try again.")
+		return
+	}
+	http.SetCookie(w, sessionCookie(value, int(sessionTTL/time.Second), s.cookieSecure(r)))
+	s.logger.Info("login_succeeded")
+	http.Redirect(w, r, page.Next, http.StatusSeeOther)
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if !s.passwordAccountConfigured() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if !requireSameOrigin(r) || !s.validCSRFToken(r.FormValue("csrf_token")) {
+		s.logger.Warn("logout_rejected", "reason", "csrf")
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "logout rejected: same-origin request required"})
+		return
+	}
+	http.SetCookie(w, sessionCookie("", -1, s.cookieSecure(r)))
+	if _, err := r.Cookie(sessionCookieName); err != nil {
+		// No session to end (Basic/Bearer user clicked the affordance): send
+		// them back where they were instead of the login page.
+		s.logger.Info("logout_no_session")
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	s.logger.Info("logout")
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func (s *Server) catalogAPI(w http.ResponseWriter, r *http.Request) {
@@ -2486,7 +2614,11 @@ func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overvie
 	if len(sessions) > 8 {
 		sessions = sessions[:8]
 	}
-	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now())}
+	// The pre-rendered page is served to every authenticated user, so the
+	// logout affordance keys on the password account being configured, not
+	// on the per-request auth method. POST /logout is a no-op redirect for
+	// credentials-authenticated users.
+	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now()), CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
 	var buffer bytes.Buffer
 	if err := s.template.ExecuteTemplate(&buffer, "dashboard", page); err != nil {
 		return nil, err
@@ -2516,7 +2648,7 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 	for _, model := range snapshot.Models {
 		byTier[model.Tier] = append(byTier[model.Tier], model)
 	}
-	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels}
+	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels, CanLogout: sessionAuthenticated(r), CSRFToken: s.csrfToken()}
 	for _, tier := range snapshot.Tiers {
 		models := byTier[tier]
 		if len(models) == 0 {
@@ -2551,7 +2683,7 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
+	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir), CanLogout: sessionAuthenticated(r), CSRFToken: s.csrfToken()}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
@@ -2620,6 +2752,8 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AxisTicks:      analyticsAxisTicks(axisMax),
 		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
 		Quotas:         quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
+		CanLogout:      sessionAuthenticated(r),
+		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -2680,6 +2814,8 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 		HourlyMax:      insightDistributionMax(result.Hourly),
 		WeekdayMax:     insightDistributionMax(result.Weekdays),
 		Recap:          s.insightsRecap(r.Context(), result),
+		CanLogout:      sessionAuthenticated(r),
+		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "insights", page); err != nil {
 		return
@@ -2807,6 +2943,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		Saved:       r.URL.Query().Get("saved") == "1",
 		AuthMode:    authMode,
 		TokenSource: tokenSource,
+		CanLogout:   sessionAuthenticated(r),
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -3168,7 +3305,7 @@ const dashboardTemplate = `<!doctype html>
         <button type="button" id="refresh-now" class="refresh-btn">Refresh now</button>
         <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false">Pause auto-refresh</button>
       </div>
-      <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
+      <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
     </div>
   </header>
 
@@ -3970,12 +4107,49 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
   {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div><div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div></article>{{end}}</div></section>{{else}}<p>No catalog models are configured.</p>{{end}}
   {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{end}}
   <footer><span>Static YAML-backed catalog · metadata only</span><span><a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
 </main>{{copyIDScript}}</body></html>{{end}}`
+
+const loginTemplate = `{{define "login"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="/static/tokemon/token-dex.png"><title>Tokemon · Sign in</title>
+  <style>
+    :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
+    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; padding:20px; }
+    .login-card { width:min(360px,100%); padding:26px 24px; border:1px solid var(--line-bright); border-radius:12px; background:var(--surface); }
+    .brand-row { display:flex; align-items:center; gap:10px; margin-bottom:6px; } .brand-mark { width:30px; height:30px; image-rendering:pixelated; } .brand-name { font:700 15px/1 var(--font-display); letter-spacing:.08em; color:var(--text); }
+    .login-lead { margin:0 0 18px; color:var(--muted); font-size:13px; }
+    label { display:grid; gap:6px; margin-top:12px; color:var(--faint); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; }
+    input { width:100%; padding:10px 11px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); font:13px var(--font-data); }
+    input:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); outline-offset:2px; }
+    button { width:100%; margin-top:16px; min-height:40px; border:1px solid var(--accent); border-radius:5px; background:transparent; color:var(--accent); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; cursor:pointer; }
+    button:hover,button:focus-visible { background:rgba(155,187,160,.12); outline:2px solid var(--accent); outline-offset:2px; }
+    .login-error { margin:0 0 4px; padding:9px 11px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:12px/1.4 var(--font-data); }
+    .login-note { margin:16px 0 0; color:var(--faint); font-size:10px; }
+    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms !important; transition-duration:.01ms !important; } }
+  </style>
+</head>
+<body><main class="login-card">
+  <div class="brand-row"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="30" height="30"><span class="brand-name">TOKEMON</span></div>
+  <p class="login-lead">Sign in to the usage dashboard.</p>
+  {{if .Error}}<p class="login-error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <input type="hidden" name="next" value="{{.Next}}">
+    <label for="login-username">Username</label>
+    <input id="login-username" name="username" type="text" autocomplete="username" required>
+    <label for="login-password">Password</label>
+    <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="login-note">Local-first · metadata only · no conversation content</p>
+</main></body></html>{{end}}`
 
 const sessionsTemplate = `{{define "sessions"}}<!doctype html>
 <html lang="en">
@@ -3993,7 +4167,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" download href="{{sessionsExportURL .Filter "json"}}">Export sessions JSON</a><a class="action" download href="{{sessionsExportURL .Filter "csv"}}">Export sessions CSV</a></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
   <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll" tabindex="0" role="region" aria-label="Session timeline table, scrollable"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
@@ -4268,7 +4442,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
-    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
+    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
   </header>
 
   <section class="analytics-heading">
@@ -4677,7 +4851,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
       {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
-    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
+    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
   </header>
 
   <section class="heading">

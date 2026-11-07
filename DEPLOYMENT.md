@@ -51,6 +51,30 @@ curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/metrics
 
 Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port.
 
+## Dashboard login form
+
+When a password account is configured (`TOKEMON_DASHBOARD_USERNAME` +
+`TOKEMON_DASHBOARD_PASSWORD_HASH`), browsers get a real login page instead of
+the Basic Auth prompt:
+
+- `GET /login` renders a CSRF-protected form; `POST /login` verifies against
+  the bcrypt hash with the same constant-time username compare and per-IP
+  login throttle that protects every dashboard route. The login page returns
+  404 when no password account is configured.
+- Successful sign-ins set a `tokemon_session` cookie: HttpOnly, SameSite=Lax,
+  Secure on TLS (including trusted-proxy-terminated HTTPS), 12-hour lifetime,
+  reissued fresh on every login. Changing the username, the password hash, or
+  the dashboard token invalidates all sessions.
+- `POST /logout` (button in the dashboard header) clears the cookie. Sessions
+  are stateless: there is no server-side revocation, so a copied cookie stays
+  valid until TTL or credential rotation.
+- Only wrong credentials consume the login-throttle budget; expired or forged
+  cookies are cleared and redirect without locking the human out.
+- Basic Auth, Bearer tokens, and trusted-proxy identities keep working as
+  before — the form is additive. HTML navigations without any credentials
+  redirect to `/login`; API callers without credentials still get `401` with
+  the Basic challenge.
+
 ## Usage quotas
 
 Optional: define monthly usage budgets and the dashboard plots the current

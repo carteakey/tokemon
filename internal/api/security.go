@@ -3,13 +3,16 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"golang.org/x/crypto/bcrypt"
 	"io"
 	"log/slog"
@@ -20,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var (
@@ -230,6 +234,146 @@ func (s *Server) csrfToken() string {
 func (s *Server) validCSRFToken(value string) bool {
 	expected := s.csrfToken()
 	return subtle.ConstantTimeCompare([]byte(value), []byte(expected)) == 1
+}
+
+// ——— Session cookie ———
+//
+// The login form exchanges verified credentials for a stateless, HMAC-signed
+// session cookie. The signing key is domain-separated from the dashboard
+// token (explicit or ingest fallback); a deployment without any token gets a
+// random per-process key, which means sessions reset on restart. The bcrypt
+// hash is a verifier, not a secret: it only appears inside the signed
+// payload as a short fingerprint, so rotating credentials invalidates
+// outstanding sessions without ever making the hash key material.
+
+const (
+	sessionCookieName       = "tokemon_session"
+	sessionTTL              = 12 * time.Hour
+	sessionPayloadParts     = 5
+	sessionFingerprintBytes = 8
+)
+
+func newSessionSecret(dashboardToken string) ([]byte, error) {
+	if dashboardToken != "" {
+		mac := hmac.New(sha256.New, []byte(dashboardToken))
+		_, _ = mac.Write([]byte("tokemon/session/v1"))
+		return mac.Sum(nil), nil
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate session key: %w", err)
+	}
+	return key, nil
+}
+
+// credentialFingerprint binds a session to the password account it was
+// issued for; changing the username or hash invalidates every session.
+func credentialFingerprint(username string, hash []byte) []byte {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(username))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(hash)
+	return digest.Sum(nil)[:sessionFingerprintBytes]
+}
+
+// mintSessionCookieValue signs one session token: payload is
+// "v1|<expiry unix>|<nonce>|<fingerprint>", signed with the session key.
+func mintSessionCookieValue(secret []byte, now, expiry time.Time, fingerprint []byte) (string, error) {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate session nonce: %w", err)
+	}
+	payload := fmt.Sprintf("v1|%d|%s|%s", expiry.Unix(),
+		base64.RawURLEncoding.EncodeToString(nonce),
+		hex.EncodeToString(fingerprint))
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(payload))
+	return payload + "|" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+// validSessionCookie reports whether the cookie value is well-formed,
+// correctly signed, unexpired, and bound to the current password account.
+func validSessionCookie(value string, secret []byte, now time.Time, fingerprint []byte) bool {
+	parts := strings.Split(value, "|")
+	if len(parts) != sessionPayloadParts {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(strings.Join(parts[:4], "|")))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(parts[4]), []byte(expected)) != 1 {
+		return false
+	}
+	expiry, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Unix(expiry, 0).Before(now) {
+		return false
+	}
+	fingerprintHex := parts[3]
+	if len(fingerprintHex) != hex.EncodedLen(sessionFingerprintBytes) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(fingerprintHex), []byte(hex.EncodeToString(fingerprint))) == 1
+}
+
+// sessionCookie builds the session cookie with the approved attributes.
+func sessionCookie(value string, maxAge int, secure bool) *http.Cookie {
+	return &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   maxAge,
+		Expires:  time.Now().Add(time.Duration(maxAge) * time.Second),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+	}
+}
+
+// trustedProxyHTTPS reports whether a trusted proxy asserts the request
+// arrived over HTTPS; only then may X-Forwarded-Proto set the Secure flag.
+func (s *Server) trustedProxyHTTPS(r *http.Request) bool {
+	if len(s.trustedProxyNetworks) == 0 {
+		return false
+	}
+	ip := requestRemoteIP(r)
+	if ip == nil {
+		return false
+	}
+	for _, network := range s.trustedProxyNetworks {
+		if network.Contains(ip) {
+			return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+		}
+	}
+	return false
+}
+
+// safeRedirectPath allows only same-origin relative paths for the post-login
+// redirect: a single leading slash, no protocol-relative or scheme forms, no
+// control characters, bounded length. Anything else falls back to "/".
+func safeRedirectPath(value string) string {
+	const maxRedirectLength = 512
+	if value == "" || len(value) > maxRedirectLength {
+		return "/"
+	}
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return "/"
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return "/"
+		}
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host != "" || parsed.Scheme != "" || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(value, "//") || strings.HasPrefix(value, "/\\") {
+		return "/"
+	}
+	return value
+}
+
+// wantsHTML reports whether the request is a browser navigation (as opposed
+// to an API call), which decides between a login redirect and a JSON 401.
+func wantsHTML(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
 func requestRemoteIP(r *http.Request) net.IP {
@@ -469,27 +613,106 @@ func loginLimitKey(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+type authMethodContextKey string
+
+const authMethodKey authMethodContextKey = "auth_method"
+
+const (
+	authMethodSession     = "session"
+	authMethodCredentials = "credentials"
+)
+
+// sessionAuthenticated reports whether the request reached the handler
+// through a login-session cookie (used to render the logout affordance).
+func sessionAuthenticated(r *http.Request) bool {
+	method, _ := r.Context().Value(authMethodKey).(string)
+	return method == authMethodSession
+}
+
 func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remote := loginLimitKey(r)
+		// Throttle before any credential work so a locked-out client cannot
+		// burn bcrypt CPU.
 		if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
 			seconds := int(retryAfter / time.Second)
 			if retryAfter%time.Second != 0 {
 				seconds++
 			}
 			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			w.Header().Set("Cache-Control", "no-store")
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed dashboard login attempts; try again later"})
 			return
 		}
+		// A session cookie is handled exclusively: valid means authenticated,
+		// invalid or expired means clear + treat as anonymous — never a
+		// throttle failure.
+		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+			fingerprint := credentialFingerprint(s.config.DashboardUsername, s.config.DashboardPasswordHash)
+			if s.passwordAccountConfigured() &&
+				validSessionCookie(cookie.Value, s.sessionSecret, time.Now(), fingerprint) {
+				s.loginThrottle.recordSuccess(remote)
+				ctx := context.WithValue(r.Context(), authMethodKey, authMethodSession)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			http.SetCookie(w, sessionCookie("", -1, s.cookieSecure(r)))
+		}
 		if !s.dashboardAuthorized(r) {
-			s.loginThrottle.recordFailure(remote)
+			// Only rejected credentials consume the login budget; a bare
+			// navigation redirects browsers to the form instead.
+			if s.hasPresentedCredentials(r) {
+				s.loginThrottle.recordFailure(remote)
+				w.Header().Set("WWW-Authenticate", `Basic realm="tokemon"`)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "dashboard authentication required"})
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			if wantsHTML(r) {
+				http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="tokemon"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "dashboard authentication required"})
 			return
 		}
 		s.loginThrottle.recordSuccess(remote)
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), authMethodKey, authMethodCredentials)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// cookieSecure sets the Secure attribute when the connection is TLS or a
+// trusted proxy asserts the request arrived over HTTPS.
+// hasPresentedCredentials reports whether the request actually carried auth
+// material. Only rejected credentials consume the login throttle — a bare
+// navigation with no cookie must never burn the budget.
+func (s *Server) hasPresentedCredentials(r *http.Request) bool {
+	return r.Header.Get("Authorization") != "" || s.trustedProxyUser(r) != ""
+}
+
+func (s *Server) cookieSecure(r *http.Request) bool {
+	return r.TLS != nil || s.trustedProxyHTTPS(r)
+}
+
+// passwordAccountConfigured reports whether a username + bcrypt hash pair is
+// configured; the login form and session cookies only exist for it.
+func (s *Server) passwordAccountConfigured() bool {
+	return s.config.DashboardUsername != "" && len(s.config.DashboardPasswordHash) > 0
+}
+
+// verifyDashboardPassword checks a username/password pair against the
+// configured account with a constant-time username compare and bcrypt.
+func (s *Server) verifyDashboardPassword(username, password string) bool {
+	if !s.passwordAccountConfigured() {
+		return false
+	}
+	if !constantTimeEqual(username, s.config.DashboardUsername) {
+		// Burn comparable time so a wrong username is indistinguishable.
+		_ = bcrypt.CompareHashAndPassword(s.config.DashboardPasswordHash, []byte(password))
+		return false
+	}
+	return bcrypt.CompareHashAndPassword(s.config.DashboardPasswordHash, []byte(password)) == nil
 }
 
 func sameOrigin(value string, r *http.Request) bool {
@@ -505,6 +728,15 @@ func sameOrigin(value string, r *http.Request) bool {
 		requestScheme = "https"
 	}
 	return strings.EqualFold(parsed.Scheme, requestScheme)
+}
+
+// requireSameOrigin is the login/logout bar: the token is not the gate, so
+// at least one of Origin/Referer must be present and same-origin.
+func requireSameOrigin(r *http.Request) bool {
+	if strings.TrimSpace(r.Header.Get("Origin")) == "" && strings.TrimSpace(r.Header.Get("Referer")) == "" {
+		return false
+	}
+	return validSettingsOrigin(r)
 }
 
 func validSettingsOrigin(r *http.Request) bool {
