@@ -90,12 +90,19 @@ jobs:
           test -s dist/sbom.spdx.json
       - name: Build and scan release image
         run: |
+          version="${GITHUB_REF_NAME#v}"
           docker build --pull \
-            --build-arg TOKEMON_VERSION="${GITHUB_REF_NAME#v}" \
+            --build-arg TOKEMON_VERSION="$version" \
             --build-arg TOKEMON_COMMIT="${GITHUB_SHA}" \
             --build-arg TOKEMON_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --tag "$IMAGE:${GITHUB_REF_NAME#v}" .
-          docker save "$IMAGE:${GITHUB_REF_NAME#v}" --output "$RUNNER_TEMP/tokemon-release.tar"
+            --tag "$IMAGE:$version" .
+          # A dev-stamped image must never reach the publish step again
+          # (v0.4.2 shipped 'version: dev' because nothing checked).
+          image_identity="$(docker run --rm --network none --entrypoint /tokemon "$IMAGE:$version" version)"
+          printf '%s\n' "$image_identity"
+          grep -Fx "version: $version" <<<"$image_identity" || { echo "image reports the wrong version; expected $version" >&2; exit 1; }
+          grep -Fx "commit: ${GITHUB_SHA}" <<<"$image_identity" || { echo "image reports the wrong commit; expected ${GITHUB_SHA}" >&2; exit 1; }
+          docker save "$IMAGE:$version" --output "$RUNNER_TEMP/tokemon-release.tar"
           docker run --rm -v "$RUNNER_TEMP:/scan:ro" aquasec/trivy:0.56.2 \
             image --input /scan/tokemon-release.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
       - name: Log in to GHCR
