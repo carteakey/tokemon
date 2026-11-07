@@ -2771,7 +2771,6 @@ const dashboardTemplate = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="60">
   <meta name="theme-color" content="#10110f">
   <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
   <title>Tokemon · Overview</title>
@@ -2817,6 +2816,11 @@ const dashboardTemplate = `<!doctype html>
     button { font: inherit; }
     main { width: min(1408px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
     .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
+    .topbar-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 12px; }
+    .refresh-control { display: inline-flex; gap: 6px; }
+    .refresh-btn { padding: 6px 9px; border: 1px solid var(--line-bright); border-radius: 4px; background: transparent; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+    .refresh-btn:hover, .refresh-btn:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .refresh-btn[aria-pressed="true"] { border-color: var(--warm); color: var(--warm); }
     .brand { display: flex; align-items: center; gap: 12px; }
     .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, .22)); }
     .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
@@ -3058,7 +3062,13 @@ const dashboardTemplate = `<!doctype html>
       {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
-    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
+    <div class="topbar-actions">
+      <div class="refresh-control">
+        <button type="button" id="refresh-now" class="refresh-btn">Refresh now</button>
+        <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false">Pause auto-refresh</button>
+      </div>
+      <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
+    </div>
   </header>
 
   <section class="hero" aria-labelledby="hero-title">
@@ -3394,6 +3404,62 @@ const dashboardTemplate = `<!doctype html>
   pollLifetime();
   window.setInterval(pollLifetime, 2000);
   document.addEventListener('visibilitychange', pollLifetime);
+
+  // Auto-refresh replaces the old 60s meta refresh: a client timer drives a
+  // server re-render, pausable from the topbar, never firing while a copy or
+  // selection is in progress, and restoring keyboard focus across the reload.
+  const AUTO_REFRESH_MS = 60000;
+  const AUTO_REFRESH_KEY = 'tokemon-auto-refresh';
+  const FOCUS_KEY = 'tokemon-restore-focus';
+  const autoPaused = () => { try { return sessionStorage.getItem(AUTO_REFRESH_KEY) === 'paused'; } catch (_) { return false; } };
+  const setAutoPaused = (paused) => { try { sessionStorage.setItem(AUTO_REFRESH_KEY, paused ? 'paused' : 'on'); } catch (_) {} };
+
+  const autoToggle = document.getElementById('auto-refresh-toggle');
+  const renderAutoToggle = () => {
+    const paused = autoPaused();
+    autoToggle.setAttribute('aria-pressed', String(paused));
+    autoToggle.textContent = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
+  };
+  renderAutoToggle();
+  autoToggle.addEventListener('click', () => {
+    setAutoPaused(!autoPaused());
+    renderAutoToggle();
+    autoToggle.focus();
+  });
+  document.getElementById('refresh-now').addEventListener('click', () => location.reload());
+
+  const focusSelector = (el) => {
+    if (el.id) return '#' + CSS.escape(el.id);
+    if (el.matches('a[href]')) return 'a[href="' + el.getAttribute('href') + '"]';
+    const label = el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || el.getAttribute('title');
+    if (label) return el.tagName.toLowerCase() + '[aria-label="' + label.replace(/"/g, '\\"') + '"]';
+    return null;
+  };
+  const stashFocus = () => {
+    const el = document.activeElement;
+    if (!el || el === document.body) return;
+    const selector = focusSelector(el);
+    if (!selector) return;
+    try { sessionStorage.setItem(FOCUS_KEY, JSON.stringify({ selector: selector, at: Date.now() })); } catch (_) {}
+  };
+  const restoreFocus = () => {
+    let stashed = null;
+    try { stashed = JSON.parse(sessionStorage.getItem(FOCUS_KEY) || 'null'); } catch (_) {}
+    if (!stashed) return;
+    try { sessionStorage.removeItem(FOCUS_KEY); } catch (_) {}
+    if (Date.now() - stashed.at > 5000) return;
+    const el = document.querySelector(stashed.selector);
+    if (el) el.focus({ preventScroll: true });
+  };
+  restoreFocus();
+
+  const autoRefreshTick = () => {
+    if (autoPaused() || document.hidden) return;
+    if (String(window.getSelection ? window.getSelection() : '').length > 0) return;
+    stashFocus();
+    location.reload();
+  };
+  window.setInterval(autoRefreshTick, AUTO_REFRESH_MS);
 
   const tooltip = document.createElement('div');
   tooltip.className = 'activity-tooltip';

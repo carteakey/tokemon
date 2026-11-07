@@ -41,19 +41,13 @@ var axeTags = []string{"wcag2a", "wcag21a", "wcag2aa", "wcag21aa"}
 
 // axeAllowlist maps a page path to the axe violation ids the release accepts
 // for now, each with the reason it stands. Anything unlisted fails the gate.
-// The allowlist is deliberately tiny: 2026-11-06's verified scan flagged only
-// the overview's auto-reload, and everything else the first pass surfaced
-// (progressbar name, heatmap grid anatomy, animation-race contrast) was fixed
-// outright in the same change.
-var axeAllowlist = map[string]map[string]string{
-	"/": {
-		// The overview intentionally auto-reloads every 60s (WCAG 2.2.1's
-		// real-time data case) so a pinned dashboard stays current. Making
-		// the timing adjustable or adding a pause control is a product
-		// change, not a markup fix; revisit there, not here.
-		"meta-refresh": "deliberate 60s dashboard auto-reload",
-	},
-}
+// The allowlist is deliberately empty since 2026-11-07: every violation the
+// scans surfaced (progressbar name, heatmap grid anatomy, animation-race
+// contrast, the overview meta refresh) was fixed outright rather than
+// allowed. The overview now refreshes through a pausable client control, so
+// nothing is exempt from the WCAG 2.x A/AA scan. Keep it that way; fix, or
+// land an allowlist entry with a reason, never silently.
+var axeAllowlist = map[string]map[string]string{}
 
 // The invariant scripts return a JSON array of problem strings; empty means
 // the page keeps its contract.
@@ -77,6 +71,9 @@ const sharedInvariantJS = `(() => {
 				problems.push('overflowing region not keyboard reachable: ' + el.tagName + '.' + el.className);
 			}
 		}
+	}
+	if (document.querySelector('meta[http-equiv="refresh"]')) {
+		problems.push('meta refresh is back; the overview must use the pause/refresh control instead');
 	}
 	return JSON.stringify(problems);
 })()`
@@ -129,6 +126,29 @@ const sourceHealthInvariantJS = `(() => {
 	const dom = document.documentElement.innerHTML;
 	if (dom.includes('/Users/') || dom.includes('/home/')) {
 		problems.push('page DOM contains a raw local path');
+	}
+	return JSON.stringify(problems);
+})()`
+
+// refreshControlInvariantJS asserts the overview topbar control that
+// replaced the meta refresh: a labeled manual refresh and a pause toggle
+// exposing its state via aria-pressed.
+const refreshControlInvariantJS = `(() => {
+	const problems = [];
+	const refresh = document.getElementById('refresh-now');
+	if (!refresh || refresh.textContent.trim() !== 'Refresh now') {
+		problems.push('overview lacks the labeled Refresh now button');
+	}
+	const toggle = document.getElementById('auto-refresh-toggle');
+	if (!toggle) {
+		problems.push('overview lacks the auto-refresh pause toggle');
+	} else {
+		if (toggle.getAttribute('aria-pressed') === null) {
+			problems.push('auto-refresh toggle lacks aria-pressed');
+		}
+		if (!['Pause auto-refresh', 'Resume auto-refresh'].includes(toggle.textContent.trim())) {
+			problems.push('auto-refresh toggle has an unexpected label: ' + toggle.textContent.trim());
+		}
 	}
 	return JSON.stringify(problems);
 })()`
@@ -218,7 +238,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		path       string
 		invariants []string
 	}{
-		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS}},
+		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS}},
 		{path: "/tokedex"},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
@@ -271,6 +291,57 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		if linkCount != 0 {
 			t.Fatalf("disabled deployment still renders %d Tokedex nav links", linkCount)
+		}
+	})
+
+	// The pause toggle keeps its state across the reloads it controls, and
+	// unpausing restores the default auto-refresh.
+	t.Run("overview-refresh-pause", func(t *testing.T) {
+		stateJS := `(() => { const toggle = document.getElementById('auto-refresh-toggle'); return JSON.stringify({ pressed: toggle.getAttribute('aria-pressed'), label: toggle.textContent.trim() }); })()`
+		navigate := func() {
+			t.Helper()
+			if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/")); err != nil {
+				t.Fatalf("navigation failed: %v", err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.WaitReady("#auto-refresh-toggle")); err != nil {
+				t.Fatalf("pause toggle never appeared: %v", err)
+			}
+		}
+		readState := func() (pressed, label string) {
+			t.Helper()
+			stateJSON, err := chromedp.Run(ctx, chromedp.Evaluate[string](stateJS))
+			if err != nil {
+				t.Fatalf("could not read the toggle state: %v", err)
+			}
+			var state struct {
+				Pressed string `json:"pressed"`
+				Label   string `json:"label"`
+			}
+			if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+				t.Fatalf("toggle state malformed JSON %q: %v", stateJSON, err)
+			}
+			return state.Pressed, state.Label
+		}
+		navigate()
+		if pressed, label := readState(); pressed != "false" || label != "Pause auto-refresh" {
+			t.Fatalf("fresh overview toggle state = (%q, %q), want (false, Pause auto-refresh)", pressed, label)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("could not click the pause toggle: %v", err)
+		}
+		if pressed, label := readState(); pressed != "true" || label != "Resume auto-refresh" {
+			t.Fatalf("paused toggle state = (%q, %q), want (true, Resume auto-refresh)", pressed, label)
+		}
+		// A reload — exactly what the control gates — must not lose the pause.
+		navigate()
+		if pressed, label := readState(); pressed != "true" || label != "Resume auto-refresh" {
+			t.Fatalf("pause did not survive the reload: (%q, %q)", pressed, label)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("could not resume auto-refresh: %v", err)
+		}
+		if pressed, _ := readState(); pressed != "false" {
+			t.Fatalf("resume left aria-pressed = %q, want false", pressed)
 		}
 	})
 }
