@@ -1,3 +1,62 @@
+## Unreleased
+
+A performance and honesty pass: the dashboard and analytics pages stay fast
+across ingest cycles, the machine health panel gained per-source connector
+state, usage quotas became trackable, and the release pipeline learned to
+check itself before tagging.
+
+### Upgrade notes
+
+- The Tokedex catalog UI ships opt-in: `/tokedex` and `/catalog` answer 404
+  and drop out of the navigation until `tokemon serve --enable-tokedex` (or
+  `TOKEMON_ENABLE_TOKEDEX`) is set. The catalog and models read APIs stay
+  open.
+- Usage-vs-quota tracking is off by default: point `tokemon serve --quotas`
+  (or `TOKEMON_QUOTAS`) at a quotas YAML file defining monthly provider
+  budgets; without a file nothing changes.
+- The overview's unconditional 60-second meta refresh is replaced by an
+  explicit control: "Refresh now" reloads on demand and "Pause auto-refresh"
+  (remembered per session) stops the timer, per WCAG 2.2.1.
+
+### Changes
+
+- Sped up the dashboard and analytics pages under ingest churn: the overview
+  serves a pre-rendered page that the background refresh rebuilds (warm
+  requests drop from seconds to milliseconds), machine lifetime/today/week
+  aggregates are computed with the cached overview instead of per render,
+  and analytics results are cached per filter and re-served stale while one
+  refresh runs — no page load waits on a recompute after an ingest.
+- Fixed 500 "context canceled" errors when a reader reloaded mid-compute:
+  shared cache computes run detached from the triggering request, and
+  handlers no longer fail when the client goes away.
+- Added per-source connector health: heartbeats report each source's last
+  successful sync and a coarse error class (never raw paths), the machine
+  health panel shows a Fresh/Stale/Unknown pill per source, and the browser
+  smoke covers the panel's four health shapes.
+- Added the analytics Insights strip: four deterministic, usage-derived stats
+  under the stat row with honest Unknown and omission states.
+- Filled the model catalog: 23 new entries folding observed raw model forms
+  into canonical names, and priced-coverage accounting that separates
+  cataloged models with unpublished rates from genuinely uncataloged ones.
+- Hardened dashboard authentication: constant-time username comparison, a
+  bcrypt 72-byte input limit warning in `tokemon passwd`, and bounded rate
+  limiting with backoff for failed login attempts.
+- Improved dashboard accessibility and polish: the analytics trend chart is a
+  labelled region, session/model IDs gained a click-to-copy affordance, the
+  catalog help links to the how-to guide, and analytics "Unknown" buckets
+  label themselves per dimension (Unknown project, model, machine, harness,
+  provider).
+- Rounded out CI: staticcheck, actionlint, markdownlint, and go mod tidy
+  gates, plus a headless-browser smoke with an axe-core accessibility
+  regression gate.
+- Hardened the release pipeline: the container image bakes and asserts the
+  real version and commit, and a pre-tag dry run (browser smoke, image
+  identity, trivy scan, race suite) runs against a candidate commit before
+  tagging.
+- Agent internals: one SQLite handle cleanup path with reopen and evict
+  debug logging (via `TOKEMON_LOG_LEVEL`) and a Close hook for future
+  adapter shutdown wiring.
+
 ## 0.4.2
 
 The dashboard quality release: authentication options, accessibility,
