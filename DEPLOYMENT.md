@@ -62,6 +62,7 @@ or both:
 | `TOKEMON_DASHBOARD_TOKEN` | `--dashboard-token` | Dashboard + read-API token (Basic auth `tokemon:<token>` or `Bearer <token>`) |
 | `TOKEMON_DASHBOARD_USERNAME` | `--dashboard-username` | Human sign-in username; must be set together with the hash |
 | `TOKEMON_DASHBOARD_PASSWORD_HASH` | `--dashboard-password-hash` | bcrypt hash of the human password |
+| `TOKEMON_ENABLE_TOKEDEX` | `--enable-tokedex` | Expose the `/tokedex` catalog page and its navigation link (default off) |
 
 Generate the password hash with `tokemon passwd` (prompts on the terminal) or
 `tokemon passwd --stdin`; the username and hash must be set together or the
@@ -69,6 +70,13 @@ server refuses to start. Sign in with Basic auth as that username and the
 plaintext password. Passwords are capped at bcrypt's 72-byte input limit:
 `tokemon passwd` warns and refuses longer passwords instead of silently
 hashing only the first 72 bytes.
+
+Tokedex is opt-in: by default the `/tokedex` and `/catalog` pages answer 404
+and no navigation link advertises them, while the catalog read API
+(`/api/v1/catalog`) keeps working. Set `TOKEMON_ENABLE_TOKEDEX=true` (or
+`--enable-tokedex`) once your deployment wants the page; see
+[docs/tokedex-roadmap.md](docs/tokedex-roadmap.md) for what the UI still
+needs before it is considered finished.
 
 Failed dashboard sign-in attempts are throttled per remote address: five
 failures within five minutes lock that address out for 15 seconds, doubling

@@ -25,7 +25,7 @@ import (
 const testDashboardToken = "test-dashboard-token"
 
 func newTestServer(store *database.Store, ingestToken string) (*Server, error) {
-	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: testDashboardToken, AllowLoopbackDev: true})
+	return NewWithConfig(store, Config{IngestToken: ingestToken, DashboardToken: testDashboardToken, AllowLoopbackDev: true, EnableTokedex: true})
 }
 
 func testHandler(server *Server) http.Handler {
@@ -254,6 +254,63 @@ func TestHeartbeatSourceHealthStatesAndOldAgentCompat(t *testing.T) {
 	rejected := sendHeartbeat(`{"machine_id":"linux-box","agent_version":"0.4.2","sources":[{"adapter":"codex","identity_hash":""}]}`)
 	if rejected.Code != http.StatusBadRequest {
 		t.Fatalf("heartbeat without identity hash status = %d, want %d", rejected.Code, http.StatusBadRequest)
+	}
+}
+
+// The catalog UI is opt-in (TOKEMON_ENABLE_TOKEDEX, default off): the page
+// routes 404 for authenticated users, the nav link disappears everywhere, and
+// the read API and the auth boundary are unchanged.
+func TestTokedexGatedBehindEnableFlag(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokedex-gate.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	disabled, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "dashboard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(server *Server, path string, authenticate bool) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		if authenticate {
+			request.SetBasicAuth("tokemon", "dashboard")
+		}
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		return response
+	}
+
+	if response := get(disabled, "/tokedex", true); response.Code != http.StatusNotFound {
+		t.Fatalf("disabled /tokedex status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+	if response := get(disabled, "/catalog", true); response.Code != http.StatusNotFound {
+		t.Fatalf("disabled /catalog status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+	// The auth boundary stays intact: without credentials the route is still a
+	// 401, not a 404, so the flag state does not leak to anonymous probes.
+	if response := get(disabled, "/tokedex", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled unauthenticated /tokedex status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	for _, path := range []string{"/", "/analytics", "/sessions", "/settings"} {
+		if body := get(disabled, path, true).Body.String(); strings.Contains(body, `href="/tokedex"`) {
+			t.Fatalf("%s still advertises the gated Tokedex link", path)
+		}
+	}
+	// The catalog read API is not part of the UI gate.
+	if response := get(disabled, "/api/v1/catalog", true); response.Code != http.StatusOK {
+		t.Fatalf("disabled /api/v1/catalog status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	enabled, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: "dashboard", EnableTokedex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := get(enabled, "/tokedex", true); response.Code != http.StatusOK {
+		t.Fatalf("enabled /tokedex status = %d: %s", response.Code, response.Body.String())
+	}
+	if body := get(enabled, "/", true).Body.String(); !strings.Contains(body, `href="/tokedex"`) {
+		t.Fatal("enabled overview lost the Tokedex navigation link")
 	}
 }
 

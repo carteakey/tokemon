@@ -1320,6 +1320,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		return nil, err
 	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
+		"tokedexEnabled":  func() bool { return config.EnableTokedex },
 		"commas":          commas,
 		"commasPtr":       commasPtr,
 		"activityTooltip": activityTooltip,
@@ -2232,6 +2233,15 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
+	if !s.config.EnableTokedex {
+		// The catalog UI is opt-in (TOKEMON_ENABLE_TOKEDEX, see
+		// docs/tokedex-roadmap.md): hide the route instead of rendering a
+		// page the release does not consider finished. The check runs after
+		// dashboard auth, so unauthenticated requests still see 401 and the
+		// read API (/api/v1/catalog) is unaffected.
+		http.NotFound(w, r)
+		return
+	}
 	snapshot, err := s.store.CatalogSnapshot(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2877,7 +2887,7 @@ const dashboardTemplate = `<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link active" href="/" aria-current="page">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
-      <a class="nav-link" href="/tokedex">Tokedex</a>
+      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
@@ -3551,7 +3561,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
 <main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
-    <nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link" href="/sessions">Sessions</a></nav>
+    <nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav>
     <a class="settings-link active" href="/settings" aria-label="Settings" title="Settings" aria-current="page">⚙</a>
   </header>
   <div class="settings-body">
@@ -3625,7 +3635,7 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a><a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
   <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
   {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div><div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div></article>{{end}}</div></section>{{else}}<p>No catalog models are configured.</p>{{end}}
   {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{end}}
@@ -3648,7 +3658,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a><a class="nav-link" href="/tokedex">Tokedex</a><a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a></header>
   <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><a class="action" download href="{{sessionsExportURL .Filter "json"}}">Export sessions JSON</a><a class="action" download href="{{sessionsExportURL .Filter "csv"}}">Export sessions CSV</a></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
   <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll" tabindex="0" role="region" aria-label="Session timeline table, scrollable"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
@@ -3911,7 +3921,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
-      <a class="nav-link" href="/tokedex">Tokedex</a>
+      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>
@@ -4311,7 +4321,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
-      <a class="nav-link" href="/tokedex">Tokedex</a>
+      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
       <a class="nav-link" href="/sessions">Sessions</a>
     </nav>
     <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>

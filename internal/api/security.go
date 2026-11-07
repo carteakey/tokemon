@@ -51,14 +51,18 @@ type Config struct {
 	// documented ingest-token default rather than explicit configuration.
 	DashboardTokenFallback bool
 	AllowLoopbackDev       bool
-	TrustedProxyCIDRs      []string
-	Logger                 *slog.Logger
-	Metrics                *Metrics
-	RequestTimeout         time.Duration
-	HealthTimeout          time.Duration
-	HeartbeatTimeout       time.Duration
-	IngestTimeout          time.Duration
-	StaleAgentAfter        time.Duration
+	// EnableTokedex exposes the /tokedex catalog page and its navigation
+	// link. It defaults to false: the catalog UI is still maturing (see
+	// docs/tokedex-roadmap.md), so deployments opt in explicitly.
+	EnableTokedex     bool
+	TrustedProxyCIDRs []string
+	Logger            *slog.Logger
+	Metrics           *Metrics
+	RequestTimeout    time.Duration
+	HealthTimeout     time.Duration
+	HeartbeatTimeout  time.Duration
+	IngestTimeout     time.Duration
+	StaleAgentAfter   time.Duration
 }
 
 const (

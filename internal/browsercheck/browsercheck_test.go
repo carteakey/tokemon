@@ -148,7 +148,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	if os.Getenv("TOKEMON_BROWSER_SMOKE") != "1" {
 		t.Skip("set TOKEMON_BROWSER_SMOKE=1 with a local Chrome to run the browser smoke")
 	}
-	baseURL := startSeededServer(t)
+	baseURL := startSeededServer(t, true)
 	allocatorCtx, cancelAllocator := chromedp.NewExecAllocator(context.Background(),
 		append(chromedp.DefaultExecAllocatorOptions[:],
 			chromedp.NoSandbox,
@@ -201,6 +201,38 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			assertAxeAllowlist(t, ctx, page.path)
 		})
 	}
+
+	// With the default configuration the catalog UI is opt-in: the route
+	// answers 404 for an authenticated user and no page advertises it.
+	t.Run("tokedex-disabled", func(t *testing.T) {
+		disabledURL := startSeededServer(t, false)
+		disabledCtx, cancelDisabled := chromedp.NewContext(allocatorCtx)
+		defer cancelDisabled()
+		disabledRunCtx, cancelRun := context.WithTimeout(disabledCtx, 30*time.Second)
+		defer cancelRun()
+		if _, err := chromedp.Call(disabledRunCtx, emulation.SetEmulatedMedia, emulation.SetEmulatedMediaParams{
+			Features: []*emulation.MediaFeature{{Name: "prefers-reduced-motion", Value: "reduce"}},
+		}); err != nil {
+			t.Fatalf("could not emulate reduced motion: %v", err)
+		}
+		response, err := chromedp.Run(disabledRunCtx, chromedp.NavigateResponse(disabledURL+"/tokedex"))
+		if err != nil {
+			t.Fatalf("navigation to disabled /tokedex failed: %v", err)
+		}
+		if response.Status != http.StatusNotFound {
+			t.Fatalf("disabled /tokedex status = %d, want %d", response.Status, http.StatusNotFound)
+		}
+		if _, err := chromedp.Run(disabledRunCtx, chromedp.Navigate(disabledURL+"/")); err != nil {
+			t.Fatalf("navigation to disabled overview failed: %v", err)
+		}
+		linkCount, err := chromedp.Run(disabledRunCtx, chromedp.Evaluate[int](`document.querySelectorAll('a.nav-link[href="/tokedex"]').length`))
+		if err != nil {
+			t.Fatalf("nav link check failed: %v", err)
+		}
+		if linkCount != 0 {
+			t.Fatalf("disabled deployment still renders %d Tokedex nav links", linkCount)
+		}
+	})
 }
 
 // assertNoProblems evaluates an invariant script and fails with the reported
@@ -263,8 +295,9 @@ func assertAxeAllowlist(t *testing.T, ctx context.Context, path string) {
 
 // startSeededServer opens a scratch database, seeds enough usage for every
 // page to render with data, and serves the real handler on a loopback port.
-// The browser signs in with Basic auth via URL credentials.
-func startSeededServer(t *testing.T) string {
+// The browser signs in with Basic auth via URL credentials. enableTokedex
+// mirrors the TOKEMON_ENABLE_TOKEDEX default-off gate.
+func startSeededServer(t *testing.T, enableTokedex bool) string {
 	t.Helper()
 	store, err := database.Open(filepath.Join(t.TempDir(), "smoke.db"), catalog.Empty())
 	if err != nil {
@@ -332,6 +365,7 @@ func startSeededServer(t *testing.T) string {
 	server, err := api.NewWithConfig(store, api.Config{
 		IngestToken:    "smoke-ingest",
 		DashboardToken: dashboardToken,
+		EnableTokedex:  enableTokedex,
 		Logger:         slog.New(slog.DiscardHandler),
 	})
 	if err != nil {

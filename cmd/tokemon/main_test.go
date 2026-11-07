@@ -469,6 +469,7 @@ func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dashboardToken := flags.String("dashboard-token", "", "")
 	devLoopback := flags.Bool("dev-loopback", false, "")
+	enableTokedex := flags.Bool("enable-tokedex", false, "")
 	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", "", "")
 	dashboardUsername := flags.String("dashboard-username", "", "")
 	dashboardPasswordHash := flags.String("dashboard-password-hash", "", "")
@@ -476,15 +477,20 @@ func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
 	values := map[string]string{
 		"TOKEMON_DASHBOARD_USERNAME":      "kim",
 		"TOKEMON_DASHBOARD_PASSWORD_HASH": "$2a$10$examplehashfromconfigfile",
+		"TOKEMON_ENABLE_TOKEDEX":          "true",
 	}
-	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	if *dashboardUsername != "kim" || *dashboardPasswordHash != "$2a$10$examplehashfromconfigfile" {
 		t.Fatalf("config-file values lost: username=%q hash=%q", *dashboardUsername, *dashboardPasswordHash)
+	}
+	if !*enableTokedex {
+		t.Fatal("config-file TOKEMON_ENABLE_TOKEDEX=true was ignored")
 	}
 
 	flags = flag.NewFlagSet("serve", flag.ContinueOnError)
 	dashboardToken = flags.String("dashboard-token", "", "")
 	devLoopback = flags.Bool("dev-loopback", false, "")
+	enableTokedex = flags.Bool("enable-tokedex", false, "")
 	trustedProxyCIDRs = flags.String("trusted-proxy-cidrs", "", "")
 	dashboardUsername = flags.String("dashboard-username", "", "")
 	dashboardPasswordHash = flags.String("dashboard-password-hash", "", "")
@@ -494,9 +500,28 @@ func TestApplyServerSecurityConfigPasswordPairing(t *testing.T) {
 	if err := flags.Set("dashboard-password-hash", "$2a$flaghash"); err != nil {
 		t.Fatal(err)
 	}
-	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	if *dashboardUsername != "flag-user" || *dashboardPasswordHash != "$2a$flaghash" {
 		t.Fatalf("explicit flags were overwritten: username=%q hash=%q", *dashboardUsername, *dashboardPasswordHash)
+	}
+	if !*enableTokedex {
+		t.Fatal("config-file TOKEMON_ENABLE_TOKEDEX=true was ignored when other flags were set")
+	}
+
+	// An explicit --enable-tokedex=false beats the config file's true.
+	flags = flag.NewFlagSet("serve", flag.ContinueOnError)
+	dashboardToken = flags.String("dashboard-token", "", "")
+	devLoopback = flags.Bool("dev-loopback", false, "")
+	enableTokedex = flags.Bool("enable-tokedex", false, "")
+	trustedProxyCIDRs = flags.String("trusted-proxy-cidrs", "", "")
+	dashboardUsername = flags.String("dashboard-username", "", "")
+	dashboardPasswordHash = flags.String("dashboard-password-hash", "", "")
+	if err := flags.Set("enable-tokedex", "false"); err != nil {
+		t.Fatal(err)
+	}
+	applyServerSecurityConfig(flags, values, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	if *enableTokedex {
+		t.Fatal("explicit --enable-tokedex=false was overwritten by the config file")
 	}
 }
 

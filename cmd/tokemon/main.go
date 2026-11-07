@@ -146,6 +146,7 @@ func runServe(args []string) error {
 	dashboardUsername := flags.String("dashboard-username", os.Getenv("TOKEMON_DASHBOARD_USERNAME"), "dashboard login username for password authentication")
 	dashboardPasswordHash := flags.String("dashboard-password-hash", os.Getenv("TOKEMON_DASHBOARD_PASSWORD_HASH"), "bcrypt hash of the dashboard login password (generate with: tokemon passwd)")
 	devLoopback := flags.Bool("dev-loopback", envBool("TOKEMON_DEV_LOOPBACK"), "allow empty ingest token only on an explicit loopback listener")
+	enableTokedex := flags.Bool("enable-tokedex", envBool("TOKEMON_ENABLE_TOKEDEX"), "expose the /tokedex catalog page and its navigation link (default off; see docs/tokedex-roadmap.md)")
 	trustedProxyCIDRs := flags.String("trusted-proxy-cidrs", os.Getenv("TOKEMON_TRUSTED_PROXY_CIDRS"), "comma-separated proxy CIDRs allowed to assert X-Forwarded-User")
 	readTimeout := flags.Duration("read-timeout", configDurationEnv("TOKEMON_SERVER_READ_TIMEOUT", defaultReadTimeout), "maximum duration for reading a request")
 	readHeaderTimeout := flags.Duration("read-header-timeout", configDurationEnv("TOKEMON_SERVER_READ_HEADER_TIMEOUT", defaultReadHeaderTimeout), "maximum duration for reading request headers")
@@ -170,7 +171,7 @@ func runServe(args []string) error {
 		return err
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
-	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
+	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	dashboardTokenBefore := *dashboardToken
 	*dashboardToken = applyDashboardTokenFallback(*dashboardToken, *ingestToken, flags)
 	dashboardTokenFallback := dashboardTokenBefore == "" && *dashboardToken != ""
@@ -210,6 +211,7 @@ func runServe(args []string) error {
 		DashboardUsername:      *dashboardUsername,
 		DashboardPasswordHash:  []byte(*dashboardPasswordHash),
 		AllowLoopbackDev:       *devLoopback,
+		EnableTokedex:          *enableTokedex,
 		TrustedProxyCIDRs:      splitConfiguredPaths(*trustedProxyCIDRs),
 		Logger:                 slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	}, insightsSynthesizer)
@@ -892,7 +894,7 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 	}
 }
 
-func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, dashboardToken *string, devLoopback *bool, trustedProxyCIDRs *string, dashboardUsername *string, dashboardPasswordHash *string) {
+func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, dashboardToken *string, devLoopback *bool, enableTokedex *bool, trustedProxyCIDRs *string, dashboardUsername *string, dashboardPasswordHash *string) {
 	if !flagWasSet(flags, "dashboard-token") && os.Getenv("TOKEMON_DASHBOARD_TOKEN") == "" {
 		if value := values["TOKEMON_DASHBOARD_TOKEN"]; value != "" {
 			*dashboardToken = value
@@ -912,6 +914,13 @@ func applyServerSecurityConfig(flags *flag.FlagSet, values map[string]string, da
 		if value := strings.TrimSpace(values["TOKEMON_DEV_LOOPBACK"]); value != "" {
 			if parsed, err := strconv.ParseBool(value); err == nil {
 				*devLoopback = parsed
+			}
+		}
+	}
+	if !flagWasSet(flags, "enable-tokedex") && os.Getenv("TOKEMON_ENABLE_TOKEDEX") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_ENABLE_TOKEDEX"]); value != "" {
+			if parsed, err := strconv.ParseBool(value); err == nil {
+				*enableTokedex = parsed
 			}
 		}
 	}
