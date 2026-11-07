@@ -28,6 +28,7 @@ import (
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	insightai "github.com/tokemon/tokemon/internal/insights"
+	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/internal/version"
 	"golang.org/x/crypto/bcrypt"
@@ -155,6 +156,7 @@ func runServe(args []string) error {
 	shutdownTimeout := flags.Duration("shutdown-timeout", configDurationEnv("TOKEMON_SERVER_SHUTDOWN_TIMEOUT", defaultShutdownTimeout), "bounded graceful shutdown duration")
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
 	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
+	quotasPath := flags.String("quotas", envOr("TOKEMON_QUOTAS", ""), "usage quotas YAML path (optional; no file disables quota tracking)")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -190,7 +192,14 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	store, err := database.OpenWithLocation(*databasePath, modelCatalog, location)
+	var quotas []quota.Quota
+	if strings.TrimSpace(*quotasPath) != "" {
+		quotas, err = quota.Load(*quotasPath)
+		if err != nil {
+			return err
+		}
+	}
+	store, err := database.OpenWithLocation(*databasePath, modelCatalog, location, quotas...)
 	if err != nil {
 		return err
 	}

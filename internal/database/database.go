@@ -15,6 +15,7 @@ import (
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/evolution"
+	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
 	_ "modernc.org/sqlite"
 )
@@ -24,6 +25,7 @@ type Store struct {
 	catalog  *catalog.Catalog
 	location *time.Location
 	lock     *databaseLock
+	quotas   []quota.Quota
 
 	facetsMu      sync.Mutex
 	facetsCache   *AnalyticsFacets
@@ -375,13 +377,14 @@ type Insights struct {
 // result-oriented naming.
 type InsightsResult = Insights
 
-func Open(path string, modelCatalog *catalog.Catalog) (*Store, error) {
-	return OpenWithLocation(path, modelCatalog, time.UTC)
+func Open(path string, modelCatalog *catalog.Catalog, quotas ...quota.Quota) (*Store, error) {
+	return OpenWithLocation(path, modelCatalog, time.UTC, quotas...)
 }
 
 // OpenWithLocation opens the store and uses location for all calendar
-// bucketing. Event timestamps remain stored as UTC instants.
-func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time.Location) (*Store, error) {
+// bucketing. Event timestamps remain stored as UTC instants. Optional
+// operator-defined usage quotas power the dashboard's quota panel.
+func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time.Location, quotas ...quota.Quota) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is required")
 	}
@@ -449,7 +452,7 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 			return nil, fmt.Errorf("enable database WAL mode: got %q", journalMode)
 		}
 	}
-	store := &Store{db: db, catalog: modelCatalog, location: location, lock: lock}
+	store := &Store{db: db, catalog: modelCatalog, location: location, lock: lock, quotas: quotas}
 	if existing {
 		version, err := schemaVersion(context.Background(), db)
 		if err != nil {

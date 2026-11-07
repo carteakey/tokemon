@@ -51,6 +51,43 @@ curl --fail -u "tokemon:${TOKEMON_INGEST_TOKEN}" http://localhost:18787/metrics
 
 Open [localhost:18787](http://localhost:18787) to view the dashboard. The default host port is `18787`; set `TOKEMON_PORT` before starting Compose to use another port.
 
+## Usage quotas
+
+Optional: define monthly usage budgets and the dashboard plots the current
+period against them on `/analytics` (cumulative per-day line, quota marker,
+linear-pace projection with an overage date). Quotas are operator-defined in
+a static YAML file — providers do not report quota data, and Tokemon never
+invents provider-reported numbers:
+
+| Setting | Flag | Purpose |
+| --- | --- | --- |
+| `TOKEMON_QUOTAS` | `--quotas` | Path to `quotas.yaml`; unset (the default) disables quota tracking |
+
+Example `quotas.yaml`:
+
+```yaml
+schema_version: 1
+quotas:
+  - provider: openai
+    label: OpenAI monthly cap
+    reset_day: 1
+    budget:
+      tokens_per_month: 50000000
+  - provider: anthropic
+    model: claude-opus-5-5
+    label: Opus cap
+    reset_day: 15
+    budget:
+      cost_per_month: 250
+```
+
+`reset_day` is the day of month the period restarts (1–28; day 29+ clamps to
+each month's last day, the standard billing-cycle convention) in the hub's
+configured analytics timezone. A `model` field narrows a quota to one model
+(most-specific quota wins); omitting `provider` makes a catch-all. Cost
+budgets measure priced usage only — a cost quota with no priced rows reads
+Unknown, never zero. The same data is available at `/api/v1/quotas`.
+
 ## Dashboard authentication
 
 The dashboard (and the read API) accept two credential kinds; configure either

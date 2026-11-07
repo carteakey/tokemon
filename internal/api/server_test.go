@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	insightai "github.com/tokemon/tokemon/internal/insights"
+	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
 
 	"golang.org/x/crypto/bcrypt"
@@ -1782,6 +1784,93 @@ func TestTokedexCoverageLineAccountsForUnknownPricing(t *testing.T) {
 	// The old line counted every disclosed identifier as a model.
 	if strings.Contains(body, "3 uncataloged models") {
 		t.Errorf("tokedex coverage line still counts sentinels as models:\n%s", body[:600])
+	}
+}
+
+func TestAnalyticsQuotaPanel(t *testing.T) {
+	// Without quotas the panel is absent entirely — no empty chrome.
+	bare := catalog.MustNew(map[string]catalog.Model{})
+	store, err := database.OpenWithLocation(filepath.Join(t.TempDir(), "bare.db"), bare, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = database.OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), bare, time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/analytics", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("analytics status = %d", page.Code)
+	}
+	if strings.Contains(page.Body.String(), "Config-defined budgets") {
+		t.Fatal("quota panel rendered without quotas configured")
+	}
+
+	// With quotas the panel renders the bar, figures, projection detail and
+	// the reset date; over-budget rows use the over styling.
+	tokensBudget := int64(50_000_000)
+	quotas := []quota.Quota{{Provider: "openai", Label: "OpenAI cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &tokensBudget}}}
+	quotaStore, err := database.OpenWithLocation(filepath.Join(t.TempDir(), "quota.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer quotaStore.Close()
+	quotaServer, err := newTestServer(quotaStore, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := quota.PeriodFor(time.Now(), 1, time.UTC)
+	event := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "quota-panel", Timestamp: start.Add(time.Hour),
+		MachineID: "machine", SessionID: "session-quota", Provider: "openai", Model: "gpt-6.1-sol",
+		Tool: "codex", InputTokens: usage.Int64(30_000_000), OutputTokens: usage.Int64(30_000_000),
+		TotalTokens: usage.Int64(60_000_000), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+	if result, err := quotaStore.Ingest(context.Background(), []usage.Event{event}); err != nil || result.Accepted != 1 {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	page = httptest.NewRecorder()
+	testHandler(quotaServer).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/analytics", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("analytics with quotas status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		`id="quota-title">Quota`,
+		"OpenAI cap",
+		"60,000,000 tokens / 50,000,000 tokens",
+		`quota-fill over`,
+		"Pace projects around",
+		"on this pace the budget is crossed around",
+		"· resets " + end.Format("2006-01-02"),
+		"120 percent of the quota used",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("quota panel missing %q", want)
+		}
+	}
+
+	// The JSON endpoint exposes the same statuses for scripting.
+	api := httptest.NewRecorder()
+	testHandler(quotaServer).ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/v1/quotas", nil))
+	if api.Code != http.StatusOK || api.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("quotas api status = %d", api.Code)
+	}
+	var statuses []database.QuotaStatus
+	if err := json.Unmarshal(api.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].State != "over" || statuses[0].TokensUsed != 60_000_000 {
+		t.Fatalf("quotas api = %+v", statuses)
 	}
 }
 

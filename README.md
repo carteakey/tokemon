@@ -80,6 +80,8 @@ keys.
 
 The overview shows lifetime tokens, today/week context with a data-freshness pill, token mix, a 53-week activity field, machine health, recent metadata-only sessions, and breakdowns by project, provider, model, and machine. Open `/analytics` for trends, comparisons, filters, selected-breakdown share over time, and JSON or CSV export. `/tokedex` (opt-in via `TOKEMON_ENABLE_TOKEDEX`, default off while the UI matures — see `docs/tokedex-roadmap.md`) renders the bundled YAML model tiers, aliases, pricing provenance, and observed usage context (including uncataloged models); `/sessions` provides a filterable, sortable metadata-only session timeline with JSON and CSV export.
 
+Operator-defined usage budgets (`quotas.yaml`) render on `/analytics` as a quota panel: the current period's cumulative usage against each budget with a linear-pace projection and an overage date; without a quotas file the page simply omits the panel. See DEPLOYMENT.md for the schema.
+
 The machine-health panel breaks connector status down per source: one line per discovered source with a Fresh/Stale/Unknown pill for that source's last successful sync and, when collection failed, the error class — `missing`, `permission`, `timeout`, or `other` — so a single quiet connector is visible even while another stays active. Sources are identified by a hash only; local paths never leave the machine.
 
 Read APIs include `/api/v1/analytics/timeline`, `/api/v1/sessions` (plus `/api/v1/sessions/export`), `/api/v1/machines`, `/api/v1/catalog`, and `/api/v1/models`. Filters affect only the requested analytics/session view; lifetime evolution and the primary token counter remain global.

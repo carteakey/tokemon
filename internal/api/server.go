@@ -121,6 +121,7 @@ type analyticsPageData struct {
 	AxisMax        int64
 	AxisTicks      []analyticsAxisTick
 	Insights       []analyticsInsight
+	Quotas         []quotaView
 }
 
 type analyticsAxisTick struct {
@@ -1028,6 +1029,108 @@ func unpricedSuffix(unpriced int64) string {
 	return ""
 }
 
+// quotaView is one rendered row of the analytics page's quota panel.
+// Percent is the measured usage against the primary budget dimension
+// (tokens when a token budget exists, otherwise cost); Fill clamps it for
+// the bar width so over-budget rows stay on the track.
+type quotaView struct {
+	database.QuotaStatus
+	DisplayLabel string
+	UsedLabel    string
+	BudgetLabel  string
+	Percent      float64
+	Fill         float64
+	Detail       string
+	Over         bool
+}
+
+func quotaViews(statuses []database.QuotaStatus) []quotaView {
+	views := make([]quotaView, 0, len(statuses))
+	for _, status := range statuses {
+		view := quotaView{QuotaStatus: status}
+		view.DisplayLabel = quotaDisplayLabel(status)
+		switch {
+		case status.TokensBudget != nil:
+			view.UsedLabel = commas(status.TokensUsed) + " tokens"
+			view.BudgetLabel = commas(*status.TokensBudget) + " tokens"
+			if *status.TokensBudget > 0 {
+				view.Percent = float64(status.TokensUsed) * 100 / float64(*status.TokensBudget)
+			}
+		case status.CostBudget != nil:
+			if status.CostUsed != nil {
+				view.UsedLabel = money(*status.CostUsed)
+				if *status.CostBudget > 0 {
+					view.Percent = *status.CostUsed * 100 / *status.CostBudget
+				}
+			} else {
+				view.UsedLabel = "Unknown"
+			}
+			view.BudgetLabel = money(*status.CostBudget)
+		}
+		view.Fill = view.Percent
+		if view.Fill > 100 {
+			view.Fill = 100
+		}
+		view.Over = status.State == "over"
+		view.Detail = quotaDetail(status)
+		views = append(views, view)
+	}
+	return views
+}
+
+func quotaDisplayLabel(status database.QuotaStatus) string {
+	if status.Label != "" {
+		return status.Label
+	}
+	switch {
+	case status.Provider != "" && status.Model != "":
+		return status.Provider + " · " + status.Model
+	case status.Provider != "":
+		return status.Provider
+	default:
+		return "All usage"
+	}
+}
+
+// plural suffixes a count without pulling the dashboard package's helper.
+func plural(count int64) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// quotaDetail is the one-line explanation under each quota bar. Missing
+// measurements say Unknown rather than presenting a zero.
+func quotaDetail(status database.QuotaStatus) string {
+	detail := ""
+	switch {
+	case status.State == "unknown":
+		detail = "Cost unknown — no priced usage in this period yet."
+	case status.TokensUsed == 0 && status.CostUsed == nil:
+		detail = "No usage in this period yet."
+	case status.ProjectedTokens != nil && status.ProjectedOverageDate != "":
+		detail = fmt.Sprintf("Pace projects around %s tokens by %s; on this pace the budget is crossed around %s.",
+			compact(*status.ProjectedTokens), status.PeriodEnd, status.ProjectedOverageDate)
+	case status.ProjectedTokens != nil:
+		detail = fmt.Sprintf("Pace projects around %s tokens by %s — within budget.",
+			compact(*status.ProjectedTokens), status.PeriodEnd)
+	case status.ProjectedCost != nil && status.ProjectedOverageDate != "":
+		detail = fmt.Sprintf("Pace projects around %s by %s; on this pace the budget is crossed around %s.",
+			money(*status.ProjectedCost), status.PeriodEnd, status.ProjectedOverageDate)
+	case status.ProjectedCost != nil:
+		detail = fmt.Sprintf("Pace projects around %s by %s — within budget.",
+			money(*status.ProjectedCost), status.PeriodEnd)
+	default:
+		detail = fmt.Sprintf("Used since %s.", status.PeriodStart)
+	}
+	if status.UnknownTotalEvents > 0 {
+		detail += fmt.Sprintf(" · %s event%s with unknown totals", commas(status.UnknownTotalEvents), plural(status.UnknownTotalEvents))
+	}
+	detail += fmt.Sprintf(" · resets %s", status.PeriodEnd)
+	return detail
+}
+
 func analyticsChangeLabel(value *float64) string {
 	if value == nil {
 		return "No earlier baseline"
@@ -1481,6 +1584,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/events/batch", s.withDeadline(s.config.IngestTimeout, http.HandlerFunc(s.ingest)))
 	mux.Handle("POST /api/v1/agents/heartbeat", s.withDeadline(s.config.HeartbeatTimeout, http.HandlerFunc(s.heartbeat)))
 	mux.Handle("GET /api/v1/machines", dashboard(http.HandlerFunc(s.machines)))
+	mux.Handle("GET /api/v1/quotas", dashboard(http.HandlerFunc(s.quotasAPI)))
 	mux.Handle("GET /api/v1/catalog", dashboard(http.HandlerFunc(s.catalogAPI)))
 	mux.Handle("GET /api/v1/models", dashboard(http.HandlerFunc(s.modelsAPI)))
 	mux.Handle("GET /api/v1/sessions", dashboard(http.HandlerFunc(s.sessionsAPI)))
@@ -1797,6 +1901,16 @@ func (s *Server) machines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) quotasAPI(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	statuses := s.store.QuotaStatus(r.Context(), time.Now())
+	s.metrics.observeDB(started)
+	if statuses == nil {
+		statuses = []database.QuotaStatus{}
+	}
+	writeJSON(w, http.StatusOK, statuses)
 }
 
 func (s *Server) catalogAPI(w http.ResponseWriter, r *http.Request) {
@@ -2354,6 +2468,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AxisMax:        axisMax,
 		AxisTicks:      analyticsAxisTicks(axisMax),
 		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
+		Quotas:         quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -3744,6 +3859,15 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .insight { min-width: 0; padding: 11px 14px; border: 1px dashed var(--line-bright); border-radius: 7px; background: transparent; }
     .insight-value { margin-top: 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; color: var(--text); font: 700 17px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .insight-detail { margin-top: 6px; color: var(--muted); font: 11px/1.4 var(--font-data); }
+    .quota-panel { margin-top: 10px; padding: 12px 16px; }
+    .quota-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+    .quota { min-width: 0; padding: 11px 13px; border: 1px dashed var(--line-bright); border-radius: 7px; }
+    .quota-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .quota-head strong { color: var(--text); font: 700 12px/1.2 var(--font-data); }
+    .quota-figures { overflow: hidden; color: var(--muted); font: 11px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .quota-track { margin-top: 8px; height: 10px; overflow: hidden; background: var(--line); border-radius: 999px; }
+    .quota-fill { height: 100%; background: var(--accent-dim); transition: width 300ms cubic-bezier(.2, .75, .25, 1); }
+    .quota-fill.over { background: #d88b7e; }
     .stat { min-width: 0; min-height: 94px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); animation: stat-in 300ms both; }
     .stat:nth-child(2) { animation-delay: 25ms; }
     .stat:nth-child(3) { animation-delay: 50ms; }
@@ -3998,6 +4122,15 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
 
   {{if .Insights}}<section class="insights-strip" aria-label="Usage insights">{{range .Insights}}<article class="insight"><div class="stat-label">{{.Label}}</div><div class="insight-value">{{.Value}}{{if .State}}<span class="comparison {{.State}}"><strong aria-hidden="true">{{if eq .State "up"}}▲{{else if eq .State "down"}}▼{{else}}—{{end}}</strong><span class="sr-only">{{if eq .State "up"}}rising{{else if eq .State "down"}}falling{{else}}flat{{end}}</span></span>{{end}}</div><div class="insight-detail">{{.Detail}}</div></article>{{end}}</section>{{end}}
+
+  {{if .Quotas}}<section class="panel quota-panel" aria-labelledby="quota-title">
+    <div class="section-head"><h2 class="section-title" id="quota-title">Quota</h2><div class="section-meta">Config-defined budgets · current period</div></div>
+    <div class="quota-list">{{range .Quotas}}<div class="quota">
+      <div class="quota-head"><strong>{{.DisplayLabel}}</strong><span class="quota-figures">{{.UsedLabel}} / {{.BudgetLabel}}</span></div>
+      <div class="quota-track" role="img" aria-label="{{.DisplayLabel}}: {{printf "%.0f" .Percent}} percent of the quota used"><div class="quota-fill{{if .Over}} over{{end}}" style="width: {{printf "%.1f" .Fill}}%"></div></div>
+      <div class="insight-detail">{{.Detail}}</div>
+    </div>{{end}}</div>
+  </section>{{end}}
 
   <section class="analytics-grid">
     <article class="panel trend-panel" aria-labelledby="trend-title">
