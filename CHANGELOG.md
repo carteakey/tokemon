@@ -1,12 +1,24 @@
-## Unreleased
+## 0.4.3
 
-A performance and honesty pass: the dashboard and analytics pages stay fast
-across ingest cycles, the machine health panel gained per-source connector
-state, usage quotas became trackable, and the release pipeline learned to
-check itself before tagging.
+A speed and account pass: pages stay fast across ingest cycles and cold
+restarts, the dashboard gained a real login form with signed sessions, the
+machine health panel gained per-source connector state, usage quotas became
+trackable, and the release pipeline learned to check itself before tagging.
 
 ### Upgrade notes
 
+- **Login form (new):** when a password account is configured
+  (`TOKEMON_DASHBOARD_USERNAME` + `TOKEMON_DASHBOARD_PASSWORD_HASH`), browsers
+  get a real login page and a `tokemon_session` cookie (HttpOnly,
+  SameSite=Lax, Secure on TLS or trusted-proxy-terminated HTTPS, 12-hour
+  lifetime) instead of the Basic Auth prompt. Only wrong credentials consume
+  the login-throttle budget — expired or forged cookies are cleared and
+  redirect without locking a human out. Sessions are stateless: there is no
+  server-side revocation, so a copied cookie stays valid until TTL or
+  credential rotation. Without a password account nothing changes (the form
+  is a 404 and session cookies are never accepted); deployments with no
+  dashboard token reset sessions on restart. Basic Auth, Bearer tokens, and
+  trusted-proxy identities keep working unchanged.
 - The Tokedex catalog UI ships opt-in: `/tokedex` and `/catalog` answer 404
   and drop out of the navigation until `tokemon serve --enable-tokedex` (or
   `TOKEMON_ENABLE_TOKEDEX`) is set. The catalog and models read APIs stay
@@ -24,15 +36,29 @@ check itself before tagging.
   serves a pre-rendered page that the background refresh rebuilds (warm
   requests drop from seconds to milliseconds), machine lifetime/today/week
   aggregates are computed with the cached overview instead of per render,
-  and analytics results are cached per filter and re-served stale while one
-  refresh runs — no page load waits on a recompute after an ingest.
+  and analytics results are cached per filter (bounded at 64 filters) and
+  re-served stale while one refresh runs — no page load waits on a recompute
+  after an ingest.
+- Sped up cold starts: as the listener comes up, the server warms its caches
+  in the background — the overview and its pre-rendered dashboard first, then
+  the default analytics window, strictly in that order because the two full
+  scans contend on the same SQLite database. Once the warm-up completes,
+  readers get cached bytes immediately; a request arriving while a warm-up
+  compute is still in flight joins it and pays the remaining time, so the
+  very first page after a restart can still wait on part of the recompute.
 - Fixed 500 "context canceled" errors when a reader reloaded mid-compute:
   shared cache computes run detached from the triggering request, and
   handlers no longer fail when the client goes away.
+- Added a real login form for the password account: CSRF-protected form with
+  same-origin Origin/Referer enforcement on login and logout, a signed
+  stateless session cookie whose key is derived from the dashboard token
+  (random per-process key when no token exists), an open-redirect-safe `next`
+  parameter, and a login throttle shared with Basic/Bearer attempts that is
+  checked before any bcrypt work.
 - Added per-source connector health: heartbeats report each source's last
   successful sync and a coarse error class (never raw paths), the machine
   health panel shows a Fresh/Stale/Unknown pill per source, and the browser
-  smoke covers the panel's four health shapes.
+  smoke covers the panel's four health shapes and the quota panel.
 - Added the analytics Insights strip: four deterministic, usage-derived stats
   under the stat row with honest Unknown and omission states.
 - Filled the model catalog: 23 new entries folding observed raw model forms
