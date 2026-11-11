@@ -141,5 +141,6 @@ export const cloneCommand = `git clone --branch v0.4.2 https://github.com/cartea
 cd tokemon`;
 
 export const localCommand = `go run ./cmd/tokemon serve --addr 127.0.0.1:8080 \\
-  --dev-loopback --database ./data/tokemon.db
+  --dev-loopback --database ./data/tokemon.db &
+until curl -sf http://127.0.0.1:8080/healthz >/dev/null; do sleep 1; done
 go run ./cmd/tokemon agent --server http://127.0.0.1:8080 --once`;
