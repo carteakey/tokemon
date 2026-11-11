@@ -47,16 +47,6 @@ func requestHost() string {
 	return "example.com"
 }
 
-func loginForm(t *testing.T, server *Server, username, password, next string) (*httptest.ResponseRecorder, *http.Request, *http.Request) {
-	t.Helper()
-	form := url.Values{"username": {username}, "password": {password}, "next": {next}}
-	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	sameOriginReferer(request)
-	request.PostForm = form
-	return nil, request, nil
-}
-
 func TestLoginFormRendersOnlyWithPasswordAccount(t *testing.T) {
 	server, _, _ := newLoginTestServer(t)
 
