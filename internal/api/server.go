@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/evolution"
 	insightai "github.com/tokemon/tokemon/internal/insights"
@@ -256,8 +257,41 @@ type catalogTier struct {
 	Models []database.CatalogEntry
 }
 
+// catalogTierInfo is one legend row: a tier letter and what it means.
+type catalogTierInfo struct {
+	Name        string
+	Description string
+}
+
+// catalogTierDescriptions explains the bundled tier letters. Tiers are an
+// editorial grouping in catalog/models.yaml, not a measurement of quality,
+// and the legend copy says so explicitly so the page cannot imply otherwise.
+var catalogTierDescriptions = map[string]string{
+	"S":        "Frontier capability — the strongest fit for hard, long-running work.",
+	"A":        "Strong general-purpose models for most coding and analysis work.",
+	"B":        "Balanced everyday models; cheaper defaults for routine tasks.",
+	"C":        "Lightweight models for high-volume or simple jobs.",
+	"D":        "Minimal models; lowest cost, narrow use.",
+	"Unranked": "Not yet tiered; the catalog has no editorial ranking for this family.",
+}
+
+// catalogTierLegend builds one row per tier that actually has models, in the
+// catalog's tier order. A legend for an empty tier would be noise.
+func catalogTierLegend(tiers []catalogTier) []catalogTierInfo {
+	legend := make([]catalogTierInfo, 0, len(tiers))
+	for _, tier := range tiers {
+		description, ok := catalogTierDescriptions[tier.Name]
+		if !ok {
+			description = "Editorial tier from the bundled catalog."
+		}
+		legend = append(legend, catalogTierInfo{Name: tier.Name, Description: description})
+	}
+	return legend
+}
+
 type catalogPageData struct {
 	Tiers                  []catalogTier
+	TierLegend             []catalogTierInfo
 	Uncataloged            []database.UncatalogedModel
 	ObservedTokens         int64
 	PricedTokens           int64
@@ -1533,9 +1567,18 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		},
 		"priceValue": func(value *float64) string {
 			if value == nil {
-				return "—"
+				// Unknown is a value, not zero: a missing rate must never
+				// render as a free model or as an empty cell.
+				return "Unknown"
 			}
 			return fmt.Sprintf("$%.3f/M", *value)
+		},
+		// pricingKnown reports whether a catalog entry carries the published
+		// rates the dashboard can honestly price usage with. It mirrors the
+		// PricedTokens accounting in Store.CatalogSnapshot: standard mode plus
+		// both input and output rates.
+		"pricingKnown": func(pricing catalog.Pricing) bool {
+			return pricing.Mode == "standard" && pricing.InputPricePerMillion != nil && pricing.OutputPricePerMillion != nil
 		},
 		"statusClass": func(status string) string {
 			return strings.ToLower(status)
@@ -2675,6 +2718,7 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 		}
 		page.Tiers = append(page.Tiers, catalogTier{Name: tier, Models: models})
 	}
+	page.TierLegend = catalogTierLegend(page.Tiers)
 	if err := s.template.ExecuteTemplate(w, "catalog", page); err != nil {
 		return
 	}
@@ -4118,6 +4162,7 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
     .tier-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; padding:12px 16px 16px; } .model-card { min-width:0; padding:13px; border:1px solid var(--line); border-radius:6px; background:var(--surface-raised); } .model-name { margin:7px 0 0; overflow:hidden; color:var(--text); font:700 18px/1.15 var(--font-display); text-overflow:ellipsis; white-space:nowrap; } .model-name-row { display:flex; align-items:center; gap:6px; } .model-name-text { overflow:hidden; min-width:0; text-overflow:ellipsis; } .model-id { margin-top:4px; display:flex; align-items:center; gap:6px; color:var(--faint); font:10px var(--font-data); } .model-id-text { overflow:hidden; min-width:0; text-overflow:ellipsis; white-space:nowrap; }
     .model-context { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); color:var(--muted); font:11px/1.35 var(--font-data); } .model-context strong { color:var(--text); } .aliases { margin-top:10px; color:var(--faint); font:10px/1.35 var(--font-data); } .aliases code { color:var(--muted); }
     .pricing { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px; margin-top:10px; color:var(--muted); font:10px var(--font-data); } .pricing span:nth-child(even) { color:var(--text); text-align:right; }
+    .tier-legend { margin-top:12px; padding:12px 16px 14px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-legend h2 { margin:0; } .legend-source { margin:8px 0 0; color:var(--muted); font-size:12px; } .legend-source code { color:var(--faint); font-family:var(--font-data); font-size:11px; } .legend-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:6px 20px; margin:10px 0 0; } .legend-row { display:flex; gap:8px; } .legend-row dt { flex:none; width:66px; color:var(--warm); font:700 11px/1.5 var(--font-data); text-transform:uppercase; } .legend-row dd { margin:0; color:var(--muted); font:11px/1.5 var(--font-data); } .pricing-unknown { margin:10px 0 0; padding-top:10px; border-top:1px solid var(--line); color:var(--warm); font:10px/1.35 var(--font-data); } .empty-note { margin:14px 16px 16px; color:var(--faint); font:12px/1.5 var(--font-data); } .empty { margin:12px 10px 0; color:var(--faint); font:12px/1.5 var(--font-data); }
     footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; }
     .copy-id { display:inline-flex; align-items:center; flex:none; padding:2px 6px; border:1px solid var(--line-bright); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); }
     @media (max-width:900px) { .tier-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
@@ -4128,9 +4173,10 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
-  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div><div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div></article>{{end}}</div></section>{{else}}<p>No catalog models are configured.</p>{{end}}
-  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{end}}
-  <footer><span>Static YAML-backed catalog · metadata only</span><span><a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
+  {{if .TierLegend}}<section class="tier-legend" aria-labelledby="tier-legend-title"><h2 class="section-title" id="tier-legend-title">Tier legend</h2><p class="legend-source">Tiers are editorial groupings from the bundled <code>catalog/models.yaml</code> — a maintainer judgment, not measured model quality. They say nothing about your measured usage or spend.</p><dl class="legend-list">{{range .TierLegend}}<div class="legend-row"><dt>{{.Name}}</dt><dd>{{.Description}}</dd></div>{{end}}</dl></section>{{end}}
+  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context">{{if .UsageEvents}}<strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}{{else}}No usage recorded yet{{end}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div>{{if pricingKnown .Pricing}}<div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div>{{else}}<p class="pricing-unknown">Rates not published yet · cost estimates stay Unknown, not zero{{if .Pricing.VerifiedAt}} · status checked {{.Pricing.VerifiedAt}}{{end}}</p>{{end}}</article>{{end}}</div></section>{{else}}<p class="empty-note">No catalog models are configured. Add entries to <code>catalog/models.yaml</code> to populate the Tokedex.</p>{{end}}
+  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{else}}<p class="empty-note">{{if .ObservedTokens}}Every observed model resolves to a bundled catalog entry; nothing is uncataloged.{{else}}No usage has been observed yet, so there is nothing to reconcile against the catalog.{{end}}</p>{{end}}
+  <footer><span>Static YAML-backed catalog · metadata only</span><span>Unknown pricing stays Unknown, never zero · <a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
 </main>{{copyIDScript}}</body></html>{{end}}`
 
 const loginTemplate = `{{define "login"}}<!doctype html>

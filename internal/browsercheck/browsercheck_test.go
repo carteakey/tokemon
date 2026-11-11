@@ -79,6 +79,58 @@ const sharedInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// tokedexInvariantJS asserts the Tokedex MVP states on the enabled page: the
+// tier legend explains the letters and their bundled-YAML provenance, an
+// unpublished-rates model says so instead of showing empty pricing, a
+// zero-usage catalog model says so instead of rendering zero, and a fully
+// cataloged deployment states that nothing is uncataloged.
+const tokedexInvariantJS = `(() => {
+	const problems = [];
+	const legend = document.querySelector('.tier-legend');
+	if (!legend) {
+		problems.push('missing tier legend');
+	} else {
+		const rows = legend.querySelectorAll('.legend-row');
+		if (rows.length !== 3) {
+			problems.push('expected 3 tier legend rows (S, A, B), found ' + rows.length);
+		}
+		const text = legend.textContent;
+		if (!text.includes('not measured model quality')) {
+			problems.push('tier legend does not say tiers are not measured quality');
+		}
+		for (const tier of ['S', 'A', 'B']) {
+			if (!Array.from(rows).some(row => row.querySelector('dt') && row.querySelector('dt').textContent.trim() === tier)) {
+				problems.push('tier legend lacks a row for tier ' + tier);
+			}
+		}
+	}
+	const unknown = Array.from(document.querySelectorAll('.pricing-unknown'));
+	if (unknown.length !== 1) {
+		problems.push('expected exactly 1 unpublished-rates card, found ' + unknown.length);
+	} else if (!unknown[0].textContent.includes('Rates not published yet')) {
+		problems.push('unpublished-rates card lacks the standard copy');
+	}
+	const zeroHeading = document.querySelector('h3[title="smoke-zero-usage"]');
+	const zeroCard = zeroHeading ? zeroHeading.closest('.model-card') : null;
+	if (!zeroCard) {
+		problems.push('zero-usage catalog model card is missing');
+	} else {
+		if (!zeroCard.textContent.includes('No usage recorded yet')) {
+			problems.push('zero-usage catalog model lacks its empty state');
+		}
+		if (/\b0 tokens/.test(zeroCard.textContent)) {
+			problems.push('zero-usage catalog model renders a zero token count');
+		}
+	}
+	if (!document.body.textContent.includes('Every observed model resolves')) {
+		problems.push('fully cataloged deployment lacks the uncataloged empty state');
+	}
+	if (document.getElementById('uncataloged-title')) {
+		problems.push('uncataloged section rendered with nothing uncataloged');
+	}
+	return JSON.stringify(problems);
+})()`
+
 // exportInvariantJS asserts every export anchor opts into a download instead
 // of navigating the dashboard away and losing filter state.
 const exportInvariantJS = `(() => {
@@ -297,7 +349,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	}{
 		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
-		{path: "/tokedex"},
+		{path: "/tokedex", invariants: []string{tokedexInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
 		{path: "/settings"},
 	}
@@ -481,13 +533,34 @@ func assertAxeAllowlist(t *testing.T, ctx context.Context, path string) {
 	}
 }
 
+// smokeCatalog seeds the enabled Tokedex with the states the MVP must render:
+// a priced model with usage, an unpublished-rates model with usage, and a
+// priced model with no usage at all.
+func smokeCatalog() *catalog.Catalog {
+	price := 3.0
+	return catalog.MustNew(map[string]catalog.Model{
+		"claude-sonnet-4": {
+			Provider: "anthropic", DisplayName: "Claude Sonnet 4", Aliases: []string{"claude-sonnet-4"}, Tier: "S",
+			Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com/pricing", InputPricePerMillion: &price, OutputPricePerMillion: &price},
+		},
+		"gpt-5": {
+			Provider: "openai", DisplayName: "GPT-5", Aliases: []string{"gpt-5"}, Tier: "A",
+			Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"},
+		},
+		"smoke-zero-usage": {
+			Provider: "openai", DisplayName: "Smoke Zero Usage", Aliases: []string{"smoke-zero-usage"}, Tier: "B",
+			Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com/pricing", InputPricePerMillion: &price, OutputPricePerMillion: &price},
+		},
+	})
+}
+
 // startSeededServer opens a scratch database, seeds enough usage for every
 // page to render with data, and serves the real handler on a loopback port.
 // The browser signs in with Basic auth via URL credentials. enableTokedex
 // mirrors the TOKEMON_ENABLE_TOKEDEX default-off gate.
 func startSeededServer(t *testing.T, enableTokedex bool) string {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "smoke.db"), catalog.Empty())
+	store, err := database.Open(filepath.Join(t.TempDir(), "smoke.db"), smokeCatalog())
 	if err != nil {
 		t.Fatal(err)
 	}

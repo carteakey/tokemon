@@ -1787,6 +1787,142 @@ func TestTokedexCoverageLineAccountsForUnknownPricing(t *testing.T) {
 	}
 }
 
+func TestTokedexTierLegendAndEmptyStates(t *testing.T) {
+	// The Tokedex MVP states: every tier that has models gets a legend row
+	// saying tiers are bundled YAML judgment, unknown pricing says rates are
+	// not published yet, zero-usage models say so instead of rendering zero,
+	// and a fully cataloged deployment says nothing is uncataloged.
+	price := 2.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"priced-model": {Provider: "test", DisplayName: "Priced Model", Aliases: []string{"priced-model"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"zero-model":   {Provider: "test", DisplayName: "Zero Model", Aliases: []string{"zero-model"}, Tier: "A", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"awaiting":     {Provider: "test", DisplayName: "Awaiting Rates", Aliases: []string{"awaiting"}, Tier: "B", Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"}},
+		"unfamiliar":   {Provider: "test", DisplayName: "Unfamiliar", Aliases: []string{"unfamiliar"}, Tier: "Z", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "mvp-priced", Timestamp: now, MachineID: "machine", Provider: "test", Model: "priced-model", Tool: "tool", TotalTokens: usage.Int64(1_000_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "mvp-awaiting", Timestamp: now, MachineID: "machine", Provider: "test", Model: "awaiting", Tool: "tool", TotalTokens: usage.Int64(400_000), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		// Tier legend: one row per populated tier, and the provenance caveat.
+		`id="tier-legend-title">Tier legend</h2>`,
+		"a maintainer judgment, not measured model quality",
+		"Frontier capability",
+		"Balanced everyday models",
+		"Not yet tiered",
+		// Unknown pricing: explicit copy, never a zero or an empty cell.
+		"Rates not published yet",
+		"status checked 2026-11-07",
+		// Zero-usage catalog model: an empty state, not "0 tokens".
+		"No usage recorded yet",
+		// Fully cataloged: the uncataloged empty state replaces the section.
+		"Every observed model resolves to a bundled catalog entry",
+		// Nullable numeric rule survives on the page.
+		"Unknown pricing stays Unknown, never zero",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("tokedex MVP page missing %q", want)
+		}
+	}
+	if rows := strings.Count(body, `class="legend-row"`); rows != 4 {
+		t.Errorf("tier legend rows = %d, want 4 (S, A, B, Unranked)", rows)
+	}
+	if strings.Contains(body, `>0</strong> tokens`) {
+		t.Errorf("zero-usage model still renders a zero token count")
+	}
+	if strings.Contains(body, `id="uncataloged-title"`) {
+		t.Errorf("fully cataloged deployment still renders the uncataloged section")
+	}
+	if strings.Contains(body, "No catalog models are configured.") {
+		t.Errorf("populated catalog rendered the empty-catalog state")
+	}
+}
+
+func TestTokedexEmptyCatalogStates(t *testing.T) {
+	// An empty catalog with no usage must explain both absences instead of
+	// rendering bare chrome.
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		"No catalog models are configured.",
+		"Add entries to <code>catalog/models.yaml</code> to populate the Tokedex.",
+		"No usage has been observed yet, so there is nothing to reconcile against the catalog.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("empty-catalog page missing %q", want)
+		}
+	}
+	if strings.Contains(body, `id="tier-legend-title"`) {
+		t.Errorf("empty catalog rendered a tier legend with nothing to explain")
+	}
+	if strings.Contains(body, "Every observed model resolves") {
+		t.Errorf("empty catalog claimed every observed model is cataloged")
+	}
+}
+
+func TestTokedexUncatalogedSectionStillRenders(t *testing.T) {
+	// Usage on an identifier the catalog does not know keeps the uncataloged
+	// section; the empty state must not swallow it.
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "uncat", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "test", Model: "mystery-model", Tool: "tool", TotalTokens: usage.Int64(5), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}}
+	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	if !strings.Contains(body, `id="uncataloged-title"`) || !strings.Contains(body, "mystery-model") {
+		t.Fatalf("uncataloged section missing for an unknown observed model")
+	}
+	if strings.Contains(body, "Every observed model resolves") {
+		t.Fatalf("uncataloged empty state rendered alongside a real uncataloged model")
+	}
+}
+
 func TestAnalyticsQuotaPanel(t *testing.T) {
 	// Without quotas the panel is absent entirely — no empty chrome.
 	bare := catalog.MustNew(map[string]catalog.Model{})
