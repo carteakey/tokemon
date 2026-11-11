@@ -1,25 +1,32 @@
-# Tokemon handoff — 2026-11-09
+# Tokemon handoff — 2026-11-11
 
-Written by supervisor23 at the end of the 2026-11-07/09 batch. Everything
-below is verified against the live hub and `origin/main`.
+Written by supervisor-oc (opencode) after taking the team over from
+supervisor23 and cutting v0.4.3. Everything below is verified against the
+live hub and `origin/main`.
 
 ## TL;DR
 
-- `origin/main = 605dd7b` (auth: token-only deployments keep the Basic
-  challenge; LOW-1 doc; static CanLogout), clean.
-- **v0.4.2 is published**: https://github.com/carteakey/tokemon/releases/tag/v0.4.2
-  (tag at `19db504`).
-- **v0.4.3 candidate is `605dd7b`** — not tagged yet. `## Unreleased` is in
-  `CHANGELOG.md`; a release-notes draft lives at
-  `/Users/kchauhan/repos/release-notes-v0.4.3-draft.md`.
-- The live Mac hub runs the current `605dd7b` binary with the **password
-  login form** enabled (`admin` / the password in
-  `~/.config/tokemon/server.env`). Tokedex is hidden (`TOKEMON_ENABLE_TOKEDEX`
-  unset); quotas are off (`TOKEMON_QUOTAS` unset).
-- 38 commits landed after the v0.4.2 tag (19 commits after the previous
-  handoff's `f5bac22`).
-- The team session is closed; workers are done. Three durable tasks remain:
-  the v0.4.3 cut, the release-notes draft update, and the Tokedex MVP slice.
+- `origin/main = 2ac1021` (release: prepare v0.4.3), clean.
+- **v0.4.3 is published**: https://github.com/carteakey/tokemon/releases/tag/v0.4.3
+  (annotated tag on `2ac1021`; release workflow `42934366817`).
+- The live Mac hub now runs the **v0.4.3** binary (`version: 0.4.3`,
+  `commit: 2ac1021…`) with the **password login form** enabled (`admin` /
+  the password in `~/.config/tokemon/server.env`). Tokedex is hidden
+  (`TOKEMON_ENABLE_TOKEDEX` unset); quotas are off (`TOKEMON_QUOTAS` unset).
+- The release gate passed on the exact tagged commit in a clean worktree
+  (browser smoke, image identity, trivy HIGH/CRITICAL, full `-race`), and the
+  published assets were verified independently (checksums, cosign
+  signatures, SBOM, image digest + reported version).
+- Two durable tasks remain: the Tokedex MVP slice (in progress) and a new
+  analytics-performance investigation. The v0.4.3 cut and the notes draft
+  are done.
+- **Team mechanics caveat:** the previous supervisor and workers were
+  registered to `wD` panes that no longer existed, so the team could not be
+  woken. The takeover, and the re-pointing of worker panes, were done by
+  hand-editing the team store; see `carteakey/herding#52`. The zcode workers
+  later died on a provider quota (`exceed quota limit`, code 1005) while
+  `herding team heartbeat` still reported them `HEALTHY`; see
+  `carteakey/herding#55`.
 
 ## What shipped (post-0.4.2, on main)
 
@@ -47,8 +54,8 @@ below is verified against the live hub and `origin/main`.
 ## Live hub
 
 - Service: launchd `com.tokemon.server`, binary `~/.local/bin/tokemon`
-  (`605dd7b`), config `~/.config/tokemon/server.env`, DB
-  `~/repos/tokemon/data/tokemon.db` (~88MB, ~118k events), catalog
+  (`0.4.3`, `2ac1021`), config `~/.config/tokemon/server.env`, DB
+  `~/repos/tokemon/data/tokemon.db` (~119k events), catalog
   `~/Library/Application Support/Tokemon/models.yaml`.
 - Auth: password account enabled (`TOKEMON_DASHBOARD_USERNAME` +
   `TOKEMON_DASHBOARD_PASSWORD_HASH`). The dashboard token fallback still
@@ -58,11 +65,14 @@ below is verified against the live hub and `origin/main`.
   `303` to `next` + `tokemon_session` cookie; logout → `303 /login` and
   cookie cleared; Basic/Bearer unchanged; `/tokedex` 404; `/api/v1/quotas`
   200; logout without CSRF 403.
-- Timings: warm `/` ~1ms, warm `/analytics` ~15–30ms. Cold restart:
-  `healthz` ~13s (environmental: launchd/Gatekeeper/cold page cache), first
-  `/` ~4s and first `/analytics` ~4s while the warm compute is in flight;
-  the sequential warm-up removes the 12.8s contention the concurrent
-  variant caused.
+- Timings (v0.4.3, live ingest on): warm `/` ~1.7ms. Warm `/analytics` is
+  **not** the 15–30ms the previous handoff recorded — five consecutive warm
+  requests measured 3.97s / 0.16s / 0.33s / 2.35s / 1.18s. The agent is
+  ingesting ~300–400 events/hour and each ingest appears to invalidate the
+  analytics cache, so a request that lands during or just after a recompute
+  pays for it. Tracked as board task `039bbe0f`. Cold restart: `healthz`
+  ~13–14s (environmental: launchd/Gatekeeper/cold page cache), first `/`
+  ~4s and first `/analytics` ~4–8s while the warm compute is in flight.
 - **Restart gotcha:** after replacing the binary, macOS kills the unsigned
   copy (`rc=137`). Run `xattr -d com.apple.provenance ~/.local/bin/tokemon`
   and `codesign --force --sign - ~/.local/bin/tokemon`, then
@@ -96,17 +106,21 @@ below is verified against the live hub and `origin/main`.
 
 ## Open work (Herdr board)
 
-- `cfd49e95` **Release v0.4.3** — supervisor-owned. Candidate `605dd7b`.
-  Run `bash deploy/release-check.sh` on the exact candidate, promote
-  `## Unreleased` to `## 0.4.3`, tag `v0.4.3`, push, verify the published
-  assets independently.
-- `e1190139` **Update the v0.4.3 notes draft** — replace the login hashes
-  with the landed ones, match the final sequential warm-up shape, mark the
-  rehearsal PASS-on-`1b5389e` / re-run-on-candidate, drop the
-  not-yet-verifiable section once everything is landed.
 - `eaca1130` **Tokedex roadmap MVP** — tier explanations + empty/unknown
   states (items 2 and 4 of `docs/tokedex-roadmap.md`). Tokedex stays gated
-  off until the MVP set is merged and reviewed.
+  off until the MVP set is merged and reviewed. In progress on `wG:p6`.
+- `039bbe0f` **Perf: warm `/analytics` is 2-4s under live ingest** — measured
+  on the live hub after the v0.4.3 deploy: five consecutive warm requests
+  returned 3.97s / 0.16s / 0.33s / 2.35s / 1.18s while warm `/` returned
+  1.7ms. Either the documented 15–30ms was measured between ingests, or the
+  stale-while-revalidate path does not hold while the agent ingests
+  (~300–400 events/hour). Unassigned.
+- `cfd49e95` **Release v0.4.3** — done. `e1190139` **notes draft** — done
+  (its content was folded into the `## 0.4.3` CHANGELOG section, which had
+  been missing the login-form and cold-start entries).
+- `8b62af88` **Review the v0.4.3 candidate** — was in progress when the zcode
+  workers died on quota; re-dispatched on opencode, review range is now
+  `4383771..2ac1021`.
 
 GitHub issues #23–#33 mirror the older board items; several are now shipped
 (release assertions, pre-tag dry run, meta-refresh, browser smoke, page
@@ -137,16 +151,31 @@ perf, analytics insights, Tokedex flag, catalog pricing, overview SWR).
    `tokemon-wt-quota-chart`) and several landed feature branches remain.
    Clean them up after confirming the work is landed; keep `main`.
 
-## Release v0.4.3 checklist
+## Release v0.4.3 checklist — DONE
 
-1. `bash deploy/release-check.sh` on `605dd7b` (browser smoke, image
-   identity, trivy, race). The script was rehearsed successfully on
-   `1b5389e`; re-run on the final candidate.
-2. Promote `## Unreleased` to `## 0.4.3` in `CHANGELOG.md` and update the
-   release-notes draft.
-3. Tag `v0.4.3` and push; the Release workflow publishes signed assets.
-4. Verify the published release independently (checksums, signatures,
-   SBOM, image reports `0.4.3` — the bake fix landed as `02d4305`).
+1. `bash deploy/release-check.sh` on `2ac1021` (browser smoke, image
+   identity, trivy, race) — PASS. `deploy/release-guard.sh --tracked` and
+   `--context .` both clean.
+2. `## Unreleased` promoted to `## 0.4.3`, with the login-form and
+   cold-start entries folded in from the notes draft (the section predated
+   both).
+3. Tag `v0.4.3` (annotated) pushed with `main`; Release workflow published
+   signed assets.
+4. Verified independently: all four tarballs + `sbom.spdx.json` match
+   `checksums.txt`; `cosign verify-blob` OK for `checksums.txt`,
+   `image-digest.txt`, `sbom.spdx.json` and the linux/amd64 tarball against
+   identity `https://github.com/carteakey/tokemon/`; image
+   `ghcr.io/carteakey/tokemon:0.4.3` pulls to `sha256:149df131…` (matching
+   `image-digest.txt`) and reports `version: 0.4.3`.
+5. Deployed to the hub and verified: `/healthz` 200 after 14s, anonymous
+   HTML `/` → `303 /login?next=%2F`, `/login` 200, Bearer and Basic 200,
+   `/tokedex` 404, `/api/v1/quotas` 200, warm `/` 1.7ms.
+
+**Open:** CI on `main` has not completed a single run since 2026-11-07 —
+every run is cancelled ~2 minutes in, including a manual re-run with no
+concurrent push. There is no `concurrency` block in any workflow, so the
+cancellation is external to the repo config. Gate on local runs until that
+is explained.
 
 ## How to operate
 
