@@ -1923,6 +1923,156 @@ func TestTokedexUncatalogedSectionStillRenders(t *testing.T) {
 	}
 }
 
+func TestTokedexFilterSortAndSearchControls(t *testing.T) {
+	// The card grid is filtered, sorted, and searched entirely in the browser:
+	// the controls are labeled, every card carries the metadata the script
+	// reads, and the full grid is server-rendered so it survives without JS.
+	price := 2.0
+	modelCatalog := catalog.MustNew(map[string]catalog.Model{
+		"claude-sonnet-4": {Provider: "anthropic", DisplayName: "Claude Sonnet 4", Aliases: []string{"claude-sonnet-4", "sonnet"}, Tier: "S", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+		"gpt-5":           {Provider: "openai", DisplayName: "GPT-5", Aliases: []string{"gpt-5"}, Tier: "A", Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"}},
+		"zero-usage":      {Provider: "openai", DisplayName: "Zero Usage", Aliases: []string{"zero-usage"}, Tier: "B", Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com", InputPricePerMillion: &price, OutputPricePerMillion: &price}},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", modelCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	events := []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "filter-sonnet-1", Timestamp: now, MachineID: "machine", Provider: "anthropic", Model: "claude-sonnet-4", Tool: "tool", TotalTokens: usage.Int64(700), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "filter-sonnet-2", Timestamp: now, MachineID: "machine", Provider: "anthropic", Model: "claude-sonnet-4", Tool: "tool", TotalTokens: usage.Int64(300), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "filter-gpt", Timestamp: now, MachineID: "machine", Provider: "openai", Model: "gpt-5", Tool: "tool", TotalTokens: usage.Int64(300), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "filter-mystery", Timestamp: now, MachineID: "machine", Provider: "openai", Model: "mystery-model", Tool: "tool", TotalTokens: usage.Int64(5), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "test", AdapterVersion: "1"}},
+	}
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		// The filter panel reuses the analytics filter-form styling.
+		`class="panel filter-panel" aria-label="Catalog filters"`,
+		`class="filter-form" method="get" action="/tokedex" role="search"`,
+		`data-tokedex-filters`,
+		// Every control has an explicit label association.
+		`<label for="tokedex-search">Search<input id="tokedex-search" name="q" type="search"`,
+		`<label for="tokedex-sort">Sort<select id="tokedex-sort" name="sort">`,
+		`<label for="tokedex-tier">Tier<select id="tokedex-tier" name="tier">`,
+		`<label for="tokedex-provider">Provider<select id="tokedex-provider" name="provider">`,
+		`<label for="tokedex-pricing">Pricing<select id="tokedex-pricing" name="pricing">`,
+		// Sort by tokens, events, and name.
+		`<option value="catalog">Catalog order</option>`,
+		`<option value="tokens">Tokens (high to low)</option>`,
+		`<option value="events">Events (high to low)</option>`,
+		`<option value="name">Name (A–Z)</option>`,
+		// Filter by tier (including the uncataloged section), provider, and pricing.
+		`<option value="S">S</option>`,
+		`<option value="A">A</option>`,
+		`<option value="B">B</option>`,
+		`<option value="Uncataloged">Uncataloged</option>`,
+		`<option value="anthropic">anthropic</option>`,
+		`<option value="openai">openai</option>`,
+		`<option value="priced">Priced</option>`,
+		`<option value="unknown">Unknown</option>`,
+		// Reset works as a plain link without JS and is intercepted with it.
+		`<a href="/tokedex" data-filter-reset>Reset</a>`,
+		// A polite result count, plus the no-JS explanation.
+		`role="status" data-filter-status>Showing all 4 models.`,
+		`<noscript><p class="filter-note">Sorting, filtering, and search need JavaScript.`,
+		// Card metadata: display name + aliases for search, tier/provider/
+		// pricing for filters, tokens/events for sorting.
+		`data-model-card data-name="Claude Sonnet 4" data-search="Claude Sonnet 4 claude-sonnet-4 sonnet" data-tier="S" data-provider="anthropic" data-pricing="priced" data-tokens="1000" data-events="2"`,
+		`data-model-card data-name="GPT-5" data-search="GPT-5 gpt-5" data-tier="A" data-provider="openai" data-pricing="unknown" data-tokens="300" data-events="1"`,
+		`data-model-card data-name="Zero Usage" data-search="Zero Usage zero-usage" data-tier="B" data-provider="openai" data-pricing="priced" data-tokens="0" data-events="0"`,
+		`data-model-card data-name="mystery-model" data-search="mystery-model" data-tier="Uncataloged" data-provider="" data-pricing="unknown" data-tokens="5" data-events="1"`,
+		// Section hooks let the script hide empty tiers and reorder cards.
+		`aria-labelledby="tier-S" data-filter-section`,
+		`data-tier-count data-total="1"`,
+		`data-card-grid`,
+		`data-filter-empty hidden>No models match these filters.`,
+		// Client-side behavior: live search, change filters, per-tier sort.
+		`search.addEventListener('input', apply)`,
+		`control.addEventListener('change', apply)`,
+		`card.hidden = !match`,
+		`sectionCards.sort(compare).forEach((card) => grid.append(card))`,
+		`a.dataset.name.localeCompare(b.dataset.name)`,
+		// Mobile contract: the filter form collapses with the rest of the page.
+		`@media (max-width:620px)`,
+		`.filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); }`,
+		`@media (max-width:420px) { .filter-form { grid-template-columns:1fr; }`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("tokedex filter page missing %q", want)
+		}
+	}
+	// Progressive enhancement: the whole grid is in the HTML, not built by JS.
+	if cards := strings.Count(body, `<article class="model-card" data-model-card`); cards != 4 {
+		t.Errorf("server-rendered model cards = %d, want 4", cards)
+	}
+	if strings.Contains(body, `data-model-card hidden`) {
+		t.Error("a model card is hidden in the server-rendered markup")
+	}
+	// No inline event handlers: the page follows the existing script-block
+	// pattern instead of attributes a strict CSP would reject.
+	for _, forbidden := range []string{"onclick=", "onchange=", "oninput=", "onsubmit="} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("tokedex page uses an inline event handler %q", forbidden)
+		}
+	}
+}
+
+func TestTokedexFilterPanelAbsentWithoutModels(t *testing.T) {
+	// Nothing to filter means no filter chrome: the empty-catalog state
+	// already explains the absence.
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("tokedex status = %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, unwanted := range []string{`class="panel filter-panel"`, `data-tokedex-filters`, `id="tokedex-search"`, `data-filter-status`, `data-filter-empty hidden`} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("empty catalog rendered filter chrome %q", unwanted)
+		}
+	}
+}
+
+func TestCatalogProvidersDeduplicatesAndSorts(t *testing.T) {
+	tiers := []catalogTier{
+		{Name: "S", Models: []database.CatalogEntry{{Provider: "openai"}, {Provider: "anthropic"}}},
+		{Name: "A", Models: []database.CatalogEntry{{Provider: "openai"}, {Provider: ""}}},
+	}
+	got := catalogProviders(tiers)
+	want := []string{"anthropic", "openai"}
+	if len(got) != len(want) {
+		t.Fatalf("catalogProviders = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("catalogProviders = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestAnalyticsQuotaPanel(t *testing.T) {
 	// Without quotas the panel is absent entirely — no empty chrome.
 	bare := catalog.MustNew(map[string]catalog.Model{})

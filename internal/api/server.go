@@ -289,9 +289,29 @@ func catalogTierLegend(tiers []catalogTier) []catalogTierInfo {
 	return legend
 }
 
+// catalogProviders lists the distinct providers present in the rendered
+// tiers, sorted so the client-side provider filter keeps a stable order.
+func catalogProviders(tiers []catalogTier) []string {
+	seen := make(map[string]bool)
+	providers := make([]string, 0, len(tiers))
+	for _, tier := range tiers {
+		for _, model := range tier.Models {
+			if model.Provider == "" || seen[model.Provider] {
+				continue
+			}
+			seen[model.Provider] = true
+			providers = append(providers, model.Provider)
+		}
+	}
+	sort.Strings(providers)
+	return providers
+}
+
 type catalogPageData struct {
 	Tiers                  []catalogTier
 	TierLegend             []catalogTierInfo
+	Providers              []string
+	ModelCount             int
 	Uncataloged            []database.UncatalogedModel
 	ObservedTokens         int64
 	PricedTokens           int64
@@ -2719,6 +2739,8 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 		page.Tiers = append(page.Tiers, catalogTier{Name: tier, Models: models})
 	}
 	page.TierLegend = catalogTierLegend(page.Tiers)
+	page.Providers = catalogProviders(page.Tiers)
+	page.ModelCount = len(snapshot.Models) + len(snapshot.Uncataloged)
 	if err := s.template.ExecuteTemplate(w, "catalog", page); err != nil {
 		return
 	}
@@ -4163,21 +4185,112 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
     .model-context { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); color:var(--muted); font:11px/1.35 var(--font-data); } .model-context strong { color:var(--text); } .aliases { margin-top:10px; color:var(--faint); font:10px/1.35 var(--font-data); } .aliases code { color:var(--muted); }
     .pricing { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px; margin-top:10px; color:var(--muted); font:10px var(--font-data); } .pricing span:nth-child(even) { color:var(--text); text-align:right; }
     .tier-legend { margin-top:12px; padding:12px 16px 14px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-legend h2 { margin:0; } .legend-source { margin:8px 0 0; color:var(--muted); font-size:12px; } .legend-source code { color:var(--faint); font-family:var(--font-data); font-size:11px; } .legend-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:6px 20px; margin:10px 0 0; } .legend-row { display:flex; gap:8px; } .legend-row dt { flex:none; width:66px; color:var(--warm); font:700 11px/1.5 var(--font-data); text-transform:uppercase; } .legend-row dd { margin:0; color:var(--muted); font:11px/1.5 var(--font-data); } .pricing-unknown { margin:10px 0 0; padding-top:10px; border-top:1px solid var(--line); color:var(--warm); font:10px/1.35 var(--font-data); } .empty-note { margin:14px 16px 16px; color:var(--faint); font:12px/1.5 var(--font-data); } .empty { margin:12px 10px 0; color:var(--faint); font:12px/1.5 var(--font-data); }
+    .filter-panel { margin-top:12px; padding:14px 16px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-form { display:grid; grid-template-columns:minmax(0,1.6fr) repeat(4,minmax(0,1fr)) auto; align-items:end; gap:10px; } .filter-form label { display:grid; gap:7px; color:var(--faint); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } .filter-form input[type="search"],.filter-form select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--line-bright); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } .filter-form input[type="search"]:focus-visible,.filter-form select:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); outline-offset:2px; } .filter-form input::placeholder { color:var(--faint); opacity:1; } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions a { display:inline-flex; align-items:center; min-height:36px; padding:9px 11px; border:1px solid var(--line-bright); border-radius:4px; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions a:hover,.filter-actions a:focus-visible { border-color:var(--accent); color:var(--accent); } .filter-status { margin:10px 0 0; color:var(--faint); font:11px/1.4 var(--font-data); } .filter-note { margin:8px 0 0; color:var(--warm); font:11px/1.4 var(--font-data); }
     footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; }
     .copy-id { display:inline-flex; align-items:center; flex:none; padding:2px 6px; border:1px solid var(--line-bright); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); }
-    @media (max-width:900px) { .tier-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-    @media (max-width:620px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:center; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } .nav-link { padding:6px 7px; font-size:10px; } .tier-grid { grid-template-columns:1fr; padding:10px; } footer { flex-direction:column; gap:4px; } }
+    @media (max-width:900px) { .tier-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-form { grid-template-columns:repeat(3,minmax(0,1fr)); } .filter-form label:first-child { grid-column:1 / -1; } .filter-actions { grid-column:span 3; } }
+    @media (max-width:620px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:center; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } .nav-link { padding:6px 7px; font-size:10px; } .tier-grid { grid-template-columns:1fr; padding:10px; } .filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-actions { grid-column:span 2; } footer { flex-direction:column; gap:4px; } }
+    @media (max-width:420px) { .filter-form { grid-template-columns:1fr; } .filter-form label:first-child { grid-column:auto; } .filter-actions { grid-column:auto; } }
     @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
   <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
+  {{if .ModelCount}}<section class="panel filter-panel" aria-label="Catalog filters"><form class="filter-form" method="get" action="/tokedex" role="search" aria-label="Filter and sort catalog models" data-tokedex-filters><label for="tokedex-search">Search<input id="tokedex-search" name="q" type="search" placeholder="Name or alias" autocomplete="off" spellcheck="false"></label><label for="tokedex-sort">Sort<select id="tokedex-sort" name="sort"><option value="catalog">Catalog order</option><option value="tokens">Tokens (high to low)</option><option value="events">Events (high to low)</option><option value="name">Name (A–Z)</option></select></label><label for="tokedex-tier">Tier<select id="tokedex-tier" name="tier"><option value="">All tiers</option>{{range .Tiers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{if .Uncataloged}}<option value="Uncataloged">Uncataloged</option>{{end}}</select></label><label for="tokedex-provider">Provider<select id="tokedex-provider" name="provider"><option value="">All providers</option>{{range .Providers}}<option value="{{.}}">{{.}}</option>{{end}}</select></label><label for="tokedex-pricing">Pricing<select id="tokedex-pricing" name="pricing"><option value="">All pricing</option><option value="priced">Priced</option><option value="unknown">Unknown</option></select></label><div class="filter-actions"><a href="/tokedex" data-filter-reset>Reset</a></div></form><p class="filter-status" role="status" data-filter-status>Showing all {{.ModelCount}} model{{if ne .ModelCount 1}}s{{end}}.</p><noscript><p class="filter-note">Sorting, filtering, and search need JavaScript. The full catalog is listed below.</p></noscript></section>{{end}}
   {{if .TierLegend}}<section class="tier-legend" aria-labelledby="tier-legend-title"><h2 class="section-title" id="tier-legend-title">Tier legend</h2><p class="legend-source">Tiers are editorial groupings from the bundled <code>catalog/models.yaml</code> — a maintainer judgment, not measured model quality. They say nothing about your measured usage or spend.</p><dl class="legend-list">{{range .TierLegend}}<div class="legend-row"><dt>{{.Name}}</dt><dd>{{.Description}}</dd></div>{{end}}</dl></section>{{end}}
-  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}"><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid">{{range .Models}}<article class="model-card"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context">{{if .UsageEvents}}<strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}{{else}}No usage recorded yet{{end}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div>{{if pricingKnown .Pricing}}<div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div>{{else}}<p class="pricing-unknown">Rates not published yet · cost estimates stay Unknown, not zero{{if .Pricing.VerifiedAt}} · status checked {{.Pricing.VerifiedAt}}{{end}}</p>{{end}}</article>{{end}}</div></section>{{else}}<p class="empty-note">No catalog models are configured. Add entries to <code>catalog/models.yaml</code> to populate the Tokedex.</p>{{end}}
-  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title"><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid">{{range .Uncataloged}}<article class="model-card"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{else}}<p class="empty-note">{{if .ObservedTokens}}Every observed model resolves to a bundled catalog entry; nothing is uncataloged.{{else}}No usage has been observed yet, so there is nothing to reconcile against the catalog.{{end}}</p>{{end}}
+  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}" data-filter-section><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta" data-tier-count data-total="{{len .Models}}">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid" data-card-grid>{{range .Models}}<article class="model-card" data-model-card data-name="{{.DisplayName}}" data-search="{{.DisplayName}}{{range .Aliases}} {{.}}{{end}}" data-tier="{{.Tier}}" data-provider="{{.Provider}}" data-pricing="{{if pricingKnown .Pricing}}priced{{else}}unknown{{end}}" data-tokens="{{.UsageTokens}}" data-events="{{.UsageEvents}}"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context">{{if .UsageEvents}}<strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}{{else}}No usage recorded yet{{end}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div>{{if pricingKnown .Pricing}}<div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div>{{else}}<p class="pricing-unknown">Rates not published yet · cost estimates stay Unknown, not zero{{if .Pricing.VerifiedAt}} · status checked {{.Pricing.VerifiedAt}}{{end}}</p>{{end}}</article>{{end}}</div></section>{{else}}<p class="empty-note">No catalog models are configured. Add entries to <code>catalog/models.yaml</code> to populate the Tokedex.</p>{{end}}
+  {{if .ModelCount}}<p class="empty-note" data-filter-empty hidden>No models match these filters. Clear or adjust the controls above.</p>{{end}}
+  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title" data-filter-section><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid" data-card-grid>{{range .Uncataloged}}<article class="model-card" data-model-card data-name="{{.ID}}" data-search="{{.ID}}" data-tier="Uncataloged" data-provider="" data-pricing="unknown" data-tokens="{{.Tokens}}" data-events="{{.Events}}"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{else}}<p class="empty-note">{{if .ObservedTokens}}Every observed model resolves to a bundled catalog entry; nothing is uncataloged.{{else}}No usage has been observed yet, so there is nothing to reconcile against the catalog.{{end}}</p>{{end}}
   <footer><span>Static YAML-backed catalog · metadata only</span><span>Unknown pricing stays Unknown, never zero · <a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
-</main>{{copyIDScript}}</body></html>{{end}}`
+</main>{{copyIDScript}}
+{{if .ModelCount}}<script>
+  (() => {
+    'use strict';
+    const form = document.querySelector('[data-tokedex-filters]');
+    if (!form) return;
+    const search = document.getElementById('tokedex-search');
+    const sort = document.getElementById('tokedex-sort');
+    const tier = document.getElementById('tokedex-tier');
+    const provider = document.getElementById('tokedex-provider');
+    const pricing = document.getElementById('tokedex-pricing');
+    const status = document.querySelector('[data-filter-status]');
+    const empty = document.querySelector('[data-filter-empty]');
+    const reset = document.querySelector('[data-filter-reset]');
+    const sections = Array.from(document.querySelectorAll('[data-filter-section]'));
+    const cards = Array.from(document.querySelectorAll('[data-model-card]'));
+    if (!search || !sort || !tier || !provider || !pricing || cards.length === 0) return;
+    // Catalog order is the server-rendered order; keep it so the default
+    // sort can restore the page exactly as it was delivered.
+    const originalOrder = new Map(cards.map((card, index) => [card, index]));
+    const normalize = (value) => (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const searchTerms = () => normalize(search.value).split(' ').filter(Boolean);
+    const matches = (card, terms) => {
+      if (tier.value && card.dataset.tier !== tier.value) return false;
+      if (provider.value && card.dataset.provider !== provider.value) return false;
+      if (pricing.value && card.dataset.pricing !== pricing.value) return false;
+      if (terms.length === 0) return true;
+      const haystack = normalize(card.dataset.search);
+      return terms.every((term) => haystack.includes(term));
+    };
+    const compare = (a, b) => {
+      if (sort.value === 'tokens' || sort.value === 'events') {
+        const key = sort.value === 'tokens' ? 'tokens' : 'events';
+        const delta = Number(b.dataset[key]) - Number(a.dataset[key]);
+        if (delta !== 0) return delta;
+        return a.dataset.name.localeCompare(b.dataset.name);
+      }
+      if (sort.value === 'name') return a.dataset.name.localeCompare(b.dataset.name);
+      return originalOrder.get(a) - originalOrder.get(b);
+    };
+    let statusTimer = 0;
+    const announce = (text) => {
+      if (!status || status.textContent === text) return;
+      window.clearTimeout(statusTimer);
+      statusTimer = window.setTimeout(() => { status.textContent = text; }, 200);
+    };
+    const apply = () => {
+      const terms = searchTerms();
+      let visible = 0;
+      for (const section of sections) {
+        const sectionCards = Array.from(section.querySelectorAll('[data-model-card]'));
+        let shown = 0;
+        for (const card of sectionCards) {
+          const match = matches(card, terms);
+          card.hidden = !match;
+          if (match) shown += 1;
+        }
+        section.hidden = shown === 0;
+        const count = section.querySelector('[data-tier-count]');
+        if (count) {
+          const total = Number(count.dataset.total);
+          count.textContent = shown === total ? total + ' model' + (total === 1 ? '' : 's') : shown + ' of ' + total + ' models';
+        }
+        visible += shown;
+        const grid = section.querySelector('[data-card-grid]');
+        if (grid) sectionCards.sort(compare).forEach((card) => grid.append(card));
+      }
+      if (empty) empty.hidden = visible !== 0;
+      const filtered = terms.length > 0 || tier.value !== '' || provider.value !== '' || pricing.value !== '';
+      const sortLabels = { tokens: 'tokens', events: 'events', name: 'name' };
+      const suffix = sortLabels[sort.value] ? ' · sorted by ' + sortLabels[sort.value] + ' within each tier' : '';
+      announce((filtered ? 'Showing ' + visible + ' of ' + cards.length + ' models.' : 'Showing all ' + cards.length + ' models.') + suffix);
+    };
+    const resetAll = () => {
+      search.value = '';
+      sort.value = 'catalog';
+      tier.value = '';
+      provider.value = '';
+      pricing.value = '';
+      apply();
+    };
+    form.addEventListener('submit', (event) => event.preventDefault());
+    search.addEventListener('input', apply);
+    [sort, tier, provider, pricing].forEach((control) => control.addEventListener('change', apply));
+    if (reset) reset.addEventListener('click', (event) => { event.preventDefault(); resetAll(); search.focus(); });
+    apply();
+  })();
+</script>{{end}}</body></html>{{end}}`
 
 const loginTemplate = `{{define "login"}}<!doctype html>
 <html lang="en">

@@ -22,6 +22,11 @@ What the page already does:
   A 2026-11-12 verification pass priced the top observed models against
   provider pages; the live hub's copy now covers 97.3% of observed tokens
   (up from 32.5%) once redeployed (item 1).
+- Client-side sort / filter / search over the card grid (item 3, shipped
+  2026-11-12): sort by tokens, events, or name within each tier; filter by
+  tier, provider, and priced-vs-unknown pricing; free-text search over display
+  names and aliases. No new endpoints or query parameters — the controls are
+  progressive enhancement over the fully server-rendered grid.
 - Standardized empty/unknown states (item 4, shipped 2026-11-10): models with
   unpublished rates say "Rates not published yet" instead of rendering empty
   pricing, zero-usage catalog models say "No usage recorded yet" instead of
@@ -38,10 +43,9 @@ What the page already does:
   (WCAG 2.x A/AA) is clean on the page, and the dependency-free contract
   tests cover the mobile breakpoint.
 
-What it does not do: no per-model detail view, no sorting/filtering/search
-on the card grid, no alias management (aliasing lives in Settings and the
-two surfaces do not reference each other), and pricing still has a small
-`mode: unknown` tail (item 1).
+What it does not do: no per-model detail view, no alias management (aliasing
+lives in Settings and the two surfaces do not reference each other), and
+pricing still has a small `mode: unknown` tail (item 1).
 
 ## Roadmap items
 
@@ -104,12 +108,20 @@ else can land after the flag ships.
    `catalog/models.yaml` — a maintainer judgment, not measured model
    quality. Covered by a render test and a browsercheck invariant.
 
-3. **[MVP] Sort / filter / search over the card grid (M).** The grid is
-   static; with 35+ catalog models plus uncataloged entries, finding one is
-   manual scanning. Client-side only (no new endpoints): sort by tokens /
-   events / name, filter by tier / provider / priced-vs-unknown, and a
-   free-text search over display names and aliases. Reuse the analytics
-   filter-form styling to stay visually consistent.
+3. **[MVP] Sort / filter / search over the card grid (M). — SHIPPED
+   2026-11-12.** The filter panel above the legend reuses the analytics
+   filter-form styling: sort by tokens, events, or name (within each tier, so
+   the editorial grouping survives), filter by tier (including the
+   uncataloged section), provider, and priced-vs-unknown pricing, and a
+   free-text search over display names and aliases. Client-side only — no new
+   endpoints, no query parameters — and the full grid stays server-rendered,
+   so a JS-disabled page still lists every card with a `<noscript>` note
+   explaining the controls need JavaScript. Empty tier sections are hidden,
+   the tier counts become "N of M", a polite status region reports "Showing N
+   of M models", and a "No models match these filters" state replaces an
+   empty grid. Covered by a render test, a provider-dedupe unit test, and a
+   browsercheck invariant that drives search, every filter, reset, and
+   per-tier sorting; axe stays clean.
 
 4. **[MVP] Empty and unknown states (S). — SHIPPED 2026-11-10.**
    `mode: unknown` pricing renders "Rates not published yet · cost estimates
@@ -150,9 +162,9 @@ else can land after the flag ships.
 
 A deployment may flip `TOKEMON_ENABLE_TOKEDEX=true` when:
 
-- [ ] Items 1–4 (**[MVP]** set) are merged and gated. Items 1 (pricing
-      verification), 2 (tier legend), and 4 (empty/unknown states) shipped
-      2026-11-10/12; item 3 (sort/filter/search) remains.
+- [ ] Items 1–4 (**[MVP]** set) are merged and gated. Items 2 (tier
+      legend) and 4 (empty/unknown states) shipped 2026-11-10, items 1
+      (pricing verification) and 3 (sort/filter/search) shipped 2026-11-12.
 - [ ] The pricing-coverage header is honest for the deployment's catalog
       copy (remember: the hub loads the catalog from
       `~/Library/Application Support/Tokemon/models.yaml`, not the repo —

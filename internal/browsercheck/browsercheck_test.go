@@ -131,6 +131,95 @@ const tokedexInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// tokedexFilterInvariantJS drives the client-side catalog controls: every
+// control is labeled and keyboard reachable, and search, tier/provider/pricing
+// filters, reset, and per-tier sorting actually change the visible card set.
+const tokedexFilterInvariantJS = `(() => {
+	const problems = [];
+	const ids = ['tokedex-search', 'tokedex-sort', 'tokedex-tier', 'tokedex-provider', 'tokedex-pricing'];
+	const controls = {};
+	for (const id of ids) {
+		const control = document.getElementById(id);
+		if (!control) {
+			problems.push('missing filter control #' + id);
+			continue;
+		}
+		controls[id] = control;
+		const label = document.querySelector('label[for="' + id + '"]');
+		if (!label || !label.textContent.trim()) {
+			problems.push('filter control #' + id + ' has no associated label');
+		}
+		if (control.disabled || control.getAttribute('tabindex') === '-1') {
+			problems.push('filter control #' + id + ' is not keyboard reachable');
+		}
+	}
+	const panel = document.querySelector('[data-tokedex-filters]');
+	if (!panel || !panel.getAttribute('aria-label')) {
+		problems.push('filter panel is missing its accessible name');
+	}
+	const status = document.querySelector('[data-filter-status]');
+	if (!status || status.getAttribute('role') !== 'status') {
+		problems.push('filter result count is not a status region');
+	}
+	if (!document.querySelector('[data-filter-reset]')) {
+		problems.push('missing reset control');
+	}
+	if (problems.length > 0) return JSON.stringify(problems);
+	const visible = () => Array.from(document.querySelectorAll('[data-model-card]')).filter((card) => !card.hidden);
+	const set = (id, value) => {
+		const control = controls[id];
+		control.value = value;
+		control.dispatchEvent(new Event(control.tagName === 'INPUT' ? 'input' : 'change', { bubbles: true }));
+	};
+	const total = visible().length;
+	if (total !== 4) {
+		problems.push('expected 4 visible model cards before filtering, found ' + total);
+	}
+	set('tokedex-search', 'sonnet');
+	const byName = visible();
+	if (byName.length !== 1 || byName[0].dataset.name !== 'Claude Sonnet 4') {
+		problems.push('display-name search did not narrow to Claude Sonnet 4: ' + byName.map((card) => card.dataset.name).join(', '));
+	}
+	set('tokedex-search', 'gpt-5');
+	const byAlias = visible();
+	if (byAlias.length !== 1 || byAlias[0].dataset.name !== 'GPT-5') {
+		problems.push('alias search did not narrow to GPT-5: ' + byAlias.map((card) => card.dataset.name).join(', '));
+	}
+	document.querySelector('[data-filter-reset]').click();
+	if (visible().length !== total) {
+		problems.push('reset did not restore the full grid');
+	}
+	set('tokedex-provider', 'openai');
+	const openai = visible();
+	if (openai.length !== 2 || openai.some((card) => card.dataset.provider !== 'openai')) {
+		problems.push('provider filter did not limit the grid to the openai cards');
+	}
+	set('tokedex-provider', '');
+	set('tokedex-pricing', 'unknown');
+	const unknown = visible();
+	if (unknown.length !== 1 || unknown[0].dataset.pricing !== 'unknown') {
+		problems.push('pricing filter did not limit the grid to unknown-priced cards');
+	}
+	set('tokedex-pricing', '');
+	set('tokedex-tier', 'B');
+	const tierB = visible();
+	if (tierB.length !== 1 || tierB[0].dataset.tier !== 'B') {
+		problems.push('tier filter did not limit the grid to tier B');
+	}
+	set('tokedex-tier', '');
+	const tierS = () => Array.from(document.querySelectorAll('section[aria-labelledby="tier-S"] [data-model-card]'));
+	set('tokedex-sort', 'tokens');
+	if (!tierS()[0] || tierS()[0].dataset.name !== 'Claude Sonnet 4') {
+		problems.push('sort by tokens did not put the most-used tier S model first');
+	}
+	set('tokedex-sort', 'name');
+	if (!tierS()[0] || tierS()[0].dataset.name !== 'Aardvark Smoke') {
+		problems.push('sort by name did not put the alphabetically-first tier S model first');
+	}
+	document.querySelector('[data-filter-reset]').click();
+	return JSON.stringify(problems);
+})()`
+
 // exportInvariantJS asserts every export anchor opts into a download instead
 // of navigating the dashboard away and losing filter state.
 const exportInvariantJS = `(() => {
@@ -349,7 +438,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	}{
 		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
-		{path: "/tokedex", invariants: []string{tokedexInvariantJS}},
+		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
 		{path: "/settings"},
 	}
@@ -549,6 +638,12 @@ func smokeCatalog() *catalog.Catalog {
 		},
 		"smoke-zero-usage": {
 			Provider: "openai", DisplayName: "Smoke Zero Usage", Aliases: []string{"smoke-zero-usage"}, Tier: "B",
+			Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com/pricing", InputPricePerMillion: &price, OutputPricePerMillion: &price},
+		},
+		// A second tier-S model with no usage gives the sort invariant two
+		// cards to reorder (tokens puts Claude first, name puts Aardvark first).
+		"smoke-sort-model": {
+			Provider: "anthropic", DisplayName: "Aardvark Smoke", Aliases: []string{"smoke-sort-model"}, Tier: "S",
 			Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com/pricing", InputPricePerMillion: &price, OutputPricePerMillion: &price},
 		},
 	})
