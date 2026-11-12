@@ -10,6 +10,31 @@
   `/analytics` median 17ms → 8ms (max 2.5s → 18ms), `/sessions` median 450ms →
   70ms (max 3.1s → 115ms), `/healthz` max 669ms → 1.2ms. See
   `docs/analytics-latency.md`.
+- **A valid session is no longer throttled.** `dashboardAuth` checked the login
+  throttle before the session cookie, so a locked-out IP (a shared/NAT address,
+  or anyone who mistyped a password earlier) got `429` even with a valid
+  session. The cheap HMAC cookie is now validated first; the throttle runs only
+  for requests that still present credential material, before any bcrypt work.
+  Bare navigations no longer consume the login budget, and the `POST /login`
+  throttle is unchanged. Fixes #40.
+- **Analytics invalidations are coalesced behind a 2s window.** Every accepted
+  ingest invalidated the analytics cache, so a steady stream started a ~0.5s
+  refresh roughly once per ingest. An entry refreshed within
+  `analyticsMinRefreshInterval` now defers its next refresh to the window's
+  end, so a burst of N ingests starts at most one recompute. Stale-while-
+  revalidate is unchanged; the cost is at most 2s of extra staleness after an
+  ingest. Verified on a scratch instance: a single ingest appeared in 131ms, a
+  10-event burst coalesced to one refresh and appeared after ~2.0s with no
+  events lost.
+
+### Tests
+
+- **The release browser smoke now covers the login/session/logout flow.** It
+  drives a real headless Chrome through the form, a rejected password (401 +
+  `role="alert"`), a successful login (303 + session cookie), logout without
+  the CSRF token (403), logout with it (303 + cookie cleared), and the
+  signed-out redirect. This is the gap that let the v0.4.3 anonymous-HTML
+  redirect regression reach the gate. Fixes #39.
 
 ## 0.4.4
 
