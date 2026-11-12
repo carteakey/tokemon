@@ -121,3 +121,40 @@ func TestAnalyticsCacheServesAndInvalidates(t *testing.T) {
 		t.Fatalf("sessions status = %d", response.Code)
 	}
 }
+
+// A warm analytics render must not need the database. After an ingest the
+// background refresh can hold the store's single connection for a long query
+// (the facets scans dominate), and a reader that still issues a query pays that
+// refresh's latency — the 0.3-1s "warm" renders measured on the live hub. The
+// page caches the display aliases so a warm render is pure template work.
+func TestAnalyticsPageWarmRenderNeedsNoDatabase(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{cacheBenchEvent("ev-warm", "machine-a", 100)}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	render := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/analytics", nil))
+		return response
+	}
+	if response := render(); response.Code != http.StatusOK {
+		t.Fatalf("cold analytics status = %d, body %s", response.Code, response.Body.String())
+	}
+	// Closing the store makes any remaining query fail, so a 200 here proves
+	// the warm render served the cached analytics result and the cached
+	// aliases without waiting on the database connection.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response := render(); response.Code != http.StatusOK {
+		t.Fatalf("warm analytics status = %d after the store closed, body %s", response.Code, response.Body.String())
+	}
+}

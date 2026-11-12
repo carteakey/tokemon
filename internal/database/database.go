@@ -31,6 +31,10 @@ type Store struct {
 	facetsCache   *AnalyticsFacets
 	facetsFetched time.Time
 
+	aliasesMu     sync.Mutex
+	aliasesCache  []DisplayAlias
+	aliasesCached bool
+
 	closeOnce sync.Once
 	closeErr  error
 }

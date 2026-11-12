@@ -18,7 +18,17 @@ type DisplayAlias struct {
 	Alias    string `json:"alias"`
 }
 
+// DisplayAliases returns the model and machine display names. The rows are
+// tiny, but the read still needs the store's single connection, which a
+// background analytics refresh can hold for a long query. Caching them keeps a
+// warm page render free of database work, so it never queues behind a refresh.
+// SetDisplayAlias is the only writer and drops the cache.
 func (s *Store) DisplayAliases(ctx context.Context) ([]DisplayAlias, error) {
+	s.aliasesMu.Lock()
+	defer s.aliasesMu.Unlock()
+	if s.aliasesCached {
+		return s.aliasesCache, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT kind, identity, alias FROM display_aliases ORDER BY kind, identity`)
 	if err != nil {
 		return nil, err
@@ -36,7 +46,16 @@ func (s *Store) DisplayAliases(ctx context.Context) ([]DisplayAlias, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	s.aliasesCache = aliases
+	s.aliasesCached = true
 	return aliases, nil
+}
+
+func (s *Store) invalidateAliasesCache() {
+	s.aliasesMu.Lock()
+	s.aliasesCache = nil
+	s.aliasesCached = false
+	s.aliasesMu.Unlock()
 }
 
 func (s *Store) SetDisplayAlias(ctx context.Context, kind, identity, alias string) error {
@@ -56,13 +75,19 @@ func (s *Store) SetDisplayAlias(ctx context.Context, kind, identity, alias strin
 		return fmt.Errorf("alias must be 48 characters or fewer")
 	}
 	if alias == "" {
-		_, err := s.db.ExecContext(ctx, `DELETE FROM display_aliases WHERE kind = ? AND identity = ?`, kind, identity)
-		return err
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM display_aliases WHERE kind = ? AND identity = ?`, kind, identity); err != nil {
+			return err
+		}
+		s.invalidateAliasesCache()
+		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO display_aliases (kind, identity, alias, updated_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(kind, identity) DO UPDATE SET alias = excluded.alias, updated_at = excluded.updated_at
-`, kind, identity, alias, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
+`, kind, identity, alias, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	s.invalidateAliasesCache()
+	return nil
 }
