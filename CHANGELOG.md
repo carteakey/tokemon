@@ -49,6 +49,25 @@
   median request-path rebuild vs 27.8µs for the pre-rendered page. Warm `/` on
   the live hub is 0.6–1.6ms. See `docs/analytics-latency.md`.
 
+### Accessibility
+
+- **Overflowing regions are keyboard-reachable.** The overview's daily activity,
+  machine health, and recent sessions regions (and the analytics usage-share
+  chart) scroll horizontally at common widths but had no `tabindex`, so a
+  keyboard-only user could not scroll them. They now expose
+  `tabindex="0" role="region"` with a descriptive label; the analytics
+  dimension nav gets a `tabindex` only, so it keeps its navigation landmark.
+- **The browser gate now renders three viewports.** Every gated page runs at
+  1280×800, 768×900, and 390×844 with the shared invariants and the axe scan,
+  so narrow-width accessibility is no longer unguarded. `/insights` and
+  `/login` joined both gates; doing so surfaced and fixed two pre-existing
+  `/insights` violations (insight cards missing a `role="list"` parent, and the
+  Apply-filters button inheriting the UA button fill at 2.36:1 contrast). The
+  axe allowlist stays empty.
+- **Small consistency fixes:** the sessions export links are grouped instead of
+  pushed to opposite ends of the header, and sortable session headers finally
+  have a hover/focus/active style (`.session-sort` had no CSS rule at all).
+
 ### Tests
 
 - **The release browser smoke now covers the login/session/logout flow.** It
