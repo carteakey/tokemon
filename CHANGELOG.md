@@ -26,6 +26,18 @@
   ingest. Verified on a scratch instance: a single ingest appeared in 131ms, a
   10-event burst coalesced to one refresh and appeared after ~2.0s with no
   events lost.
+- **Overlapping quotas no longer double-count.** `Store.QuotaStatus` measured
+  every configured quota independently, so an event inside a provider+model
+  quota also counted toward the provider quota and a catch-all, contradicting
+  the documented "most specific matching quota applies" rule. Each event is now
+  attributed to exactly one quota — the most specific match — and specificity
+  ranks by the number of non-empty match fields, so a model-only quota beats a
+  catch-all deterministically. Fixes #36.
+- **`reset_day` 29–31 is accepted and clamps as documented.** `Validate`
+  rejected anything above 28, so the documented "day 31 resets on Feb 28/29"
+  clamping path was unreachable from config. `reset_day` now accepts 1–31 and
+  the clamping is pinned by tests for February (leap and non-leap) and 30-day
+  months. Fixes #37.
 
 ### Tests
 
