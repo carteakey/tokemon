@@ -174,7 +174,7 @@ cat > "$plist_path" <<EOF
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>$escaped_log_dir/server.log</string>
   <key>StandardErrorPath</key>

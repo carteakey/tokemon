@@ -57,6 +57,14 @@ grep -F -- '<string>--config</string>' "$plist" >/dev/null || {
   exit 1
 }
 
+# The dashboard is an interactive server; launchd's Background process type
+# schedules it at priority 4 and stretches every request by an order of
+# magnitude under load (docs/analytics-latency.md).
+grep -A1 -F '<key>ProcessType</key>' "$plist" | grep -F '<string>Interactive</string>' >/dev/null || {
+  printf 'server LaunchAgent does not run at interactive scheduling priority\n' >&2
+  exit 1
+}
+
 if HOME="$home" TOKEMON_INGEST_TOKEN= \
   bash "$root/deploy/macos/install-server.sh" \
     --binary /usr/bin/true --catalog "$tmp/catalog.yaml" --database "$tmp/tokemon.db" \

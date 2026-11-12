@@ -1,3 +1,16 @@
+## Unreleased
+
+### Fixed
+
+- **The dashboard server runs at interactive scheduling priority.** The macOS
+  LaunchAgent was written with `ProcessType=Background`, so launchd scheduled
+  the hub at priority 4 and stretched every request under load. The installer
+  now writes `ProcessType=Interactive`, and the installer smoke asserts the
+  plist value. On the live hub the process priority moved from 4 to 31:
+  `/analytics` median 17ms → 8ms (max 2.5s → 18ms), `/sessions` median 450ms →
+  70ms (max 3.1s → 115ms), `/healthz` max 669ms → 1.2ms. See
+  `docs/analytics-latency.md`.
+
 ## 0.4.4
 
 A correctness-and-cost pass: the Tokedex MVP is complete behind its flag,

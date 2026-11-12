@@ -80,18 +80,38 @@ At normal shell priority the same workload measured 10-13ms before the fix and
 the live hub's condition (`ProcessType=Background`). The fix removes the
 dependency on the refresh either way; the priority is what made it visible.
 
+## Scheduling priority
+
+The live hub ran under launchd with `ProcessType=Background`, which macOS
+schedules at priority 4. That is the wrong class for an interactive dashboard
+server: every query stretches by roughly an order of magnitude under load, and
+it is what made the analytics refresh visible to readers in the first place.
+
+`deploy/macos/install-server.sh` now writes `ProcessType=Interactive`, and the
+installer smoke asserts the plist value so it cannot regress. After reloading
+the live LaunchAgent the process priority moved from 4 to 31.
+
+Twenty consecutive warm requests per path, live hub, ingest running, before
+(priority 4) and after (priority 31):
+
+| Path | Before: median / max | After: median / max |
+| --- | --- | --- |
+| `/healthz` | ~0.5ms / 669ms | 0.7ms / 1.2ms |
+| `/` | ~1.0ms / 1.3ms | 0.9ms / 1.3ms |
+| `/analytics` | 17ms / 2518ms | 8.2ms / 17.5ms |
+| `/sessions` | 450ms / 3147ms | 70ms / 115ms |
+
+Before numbers are the `duration_ms` values the hub logged at priority 4. The
+priority change does not replace the cache fix; it removes the scheduling
+penalty that amplified every remaining cost.
+
 ## Not fixed here (follow-ups)
 
 - **Refresh on every ingest.** Every accepted batch invalidates the analytics
-  cache, so a steady 1 event/10s stream starts a ~0.5s refresh every 10s (3.8-5.5s
-  at priority 4). Coalescing invalidations behind a short minimum staleness
-  window would cut that duty cycle and shorten the window in which any reader
-  can queue behind a refresh.
-- **`ProcessType=Background` in `deploy/macos/install-server.sh`.** The hub is an
-  interactive dashboard server, but launchd schedules it at priority 4; under
-  load every query and every request stretches by roughly an order of
-  magnitude. Changing the live service is a deployment decision, so it is
-  called out here rather than changed.
+  cache, so a steady 1 event/10s stream starts a ~0.5s refresh every 10s.
+  Coalescing invalidations behind a short minimum staleness window would cut
+  that duty cycle and shorten the window in which any reader can queue behind a
+  refresh.
 - **Dashboard pre-render race.** After a background overview refresh installs a
   fresh entry, the pre-rendered HTML is rebuilt in that goroutine. A `GET /`
   arriving in that window misses the HTML cache, rebuilds the page, and runs a
