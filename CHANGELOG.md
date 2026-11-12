@@ -38,6 +38,16 @@
   clamping path was unreachable from config. `reset_day` now accepts 1–31 and
   the clamping is pinned by tests for February (leap and non-leap) and 30-day
   months. Fixes #37.
+- **The dashboard pre-render is published with its overview entry.** The
+  background overview refresh installed the new entry and only then rendered
+  the page, so a `GET /` in that window missed the page cache and rebuilt it on
+  the request path — including a `Sessions` query that queued behind the
+  analytics refresh (756–934ms observed). The rendered page now rides on the
+  overview entry and is built before the entry is published, so a fresh
+  overview is never visible without its page and the two can never be stitched
+  from different entries. Measured on a 20k-event synthetic database: 80.7ms
+  median request-path rebuild vs 27.8µs for the pre-rendered page. Warm `/` on
+  the live hub is 0.6–1.6ms. See `docs/analytics-latency.md`.
 
 ### Tests
 
