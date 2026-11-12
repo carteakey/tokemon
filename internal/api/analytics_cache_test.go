@@ -73,24 +73,39 @@ func TestAnalyticsCacheServesAndInvalidates(t *testing.T) {
 	if accepted.Code != http.StatusOK {
 		t.Fatalf("ingest status = %d: %s", accepted.Code, accepted.Body.String())
 	}
-	// The invalidated cache serves the last good result immediately while one
-	// background compute refreshes it.
+	// The invalidated cache serves the last good result immediately; the
+	// coalescing window defers the background refresh so a burst of ingests
+	// cannot start one recompute each.
 	third := fetch()
 	if third != first {
 		t.Fatal("stale analytics payload changed immediately after ingest; stale-while-revalidate is not serving the cached result")
 	}
-	// A reader that lands while the background refresh is still running must
-	// also be served the stale result instead of waiting on the recompute.
+	// A reader that lands while the coalescing window still holds must also be
+	// served the stale result instead of waiting on or starting a recompute.
 	if fourth := fetch(); fourth != first {
-		t.Fatal("reader during the background refresh waited for or diverged from the stale result")
+		t.Fatal("reader inside the coalescing window waited for or diverged from the stale result")
+	}
+	// Fast-forward past the coalescing window and read again: that reader is
+	// still served stale and is the one that triggers the background refresh.
+	server.analyticsMu.Lock()
+	var warmed time.Time
+	for _, entry := range server.analyticsCache {
+		if entry.fetched.After(warmed) {
+			warmed = entry.fetched
+		}
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.analyticsMu.Unlock()
+	if fifth := fetch(); fifth != first {
+		t.Fatal("reader after the coalescing window waited for or diverged from the stale result")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		server.analyticsMu.Lock()
-		refreshed := false
+		refreshed := len(server.analyticsCache) > 0
 		for _, entry := range server.analyticsCache {
-			if !entry.fetched.IsZero() {
-				refreshed = true
+			if !entry.fetched.After(warmed) {
+				refreshed = false
 			}
 		}
 		server.analyticsMu.Unlock()

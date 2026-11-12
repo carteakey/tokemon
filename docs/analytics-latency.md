@@ -105,13 +105,32 @@ Before numbers are the `duration_ms` values the hub logged at priority 4. The
 priority change does not replace the cache fix; it removes the scheduling
 penalty that amplified every remaining cost.
 
+## Invalidation coalescing
+
+Every accepted batch still invalidates the analytics cache, but the
+invalidation no longer forces an immediate refresh. `invalidateAnalyticsCache`
+records a refresh deadline on each cache entry: an entry refreshed within
+`analyticsMinRefreshInterval` (2 seconds, `internal/api/server.go`) defers its
+next refresh until the window elapses, and a burst of N ingests inside the
+window therefore starts at most one ~0.5s recompute instead of N. A steady
+1 event/10s stream now refreshes at most once per 2s window rather than once
+per ingest, which cuts the refresh duty cycle and the window in which a reader
+can queue behind a refresh.
+
+Freshness trade-off: after an ingest, a cached analytics result can be at most
+`analyticsMinRefreshInterval` (2s) staler than the store. Readers keep the
+stale-while-revalidate contract — the last good result is served immediately
+and a reader never blocks on a recompute once a last-good result exists. An
+entry last refreshed before the window is due on the next read exactly as
+before, and without an ingest `analyticsCacheTTL` (60s) still bounds staleness.
+
+Regression tests: `internal/api/analytics_coalesce_test.go` (a burst of
+invalidations produces one refresh, a reader inside the window is served the
+cached result, an entry older than the window still refreshes on the next
+read) and the ingest flow in `TestAnalyticsCacheServesAndInvalidates`.
+
 ## Not fixed here (follow-ups)
 
-- **Refresh on every ingest.** Every accepted batch invalidates the analytics
-  cache, so a steady 1 event/10s stream starts a ~0.5s refresh every 10s.
-  Coalescing invalidations behind a short minimum staleness window would cut
-  that duty cycle and shorten the window in which any reader can queue behind a
-  refresh.
 - **Dashboard pre-render race.** After a background overview refresh installs a
   fresh entry, the pre-rendered HTML is rebuilt in that goroutine. A `GET /`
   arriving in that window misses the HTML cache, rebuilds the page, and runs a

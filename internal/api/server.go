@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/catalog"
@@ -51,8 +52,12 @@ type Server struct {
 	analyticsMu          sync.Mutex
 	analyticsCache       map[string]*analyticsCacheEntry
 	analyticsGeneration  uint64
-	dashboardMu          sync.Mutex
-	dashboardHTML        *dashboardHTMLCache
+	// analyticsRefreshes counts background analytics refreshes started since
+	// process start. Tests assert on it to prove invalidation coalescing;
+	// production code never reads it.
+	analyticsRefreshes atomic.Int64
+	dashboardMu        sync.Mutex
+	dashboardHTML      *dashboardHTMLCache
 }
 
 type evolutionCacheEntry struct {
@@ -93,6 +98,12 @@ type analyticsCacheEntry struct {
 	// and a filter that keeps being read must not be evicted ahead of one that
 	// has gone quiet.
 	lastUse time.Time
+	// refreshDue is the earliest time an ingest-invalidated entry may start
+	// its next refresh; zero means no invalidation is pending and
+	// analyticsCacheTTL alone governs staleness. It is what coalesces a burst
+	// of ingest invalidations into one refresh; see
+	// analyticsMinRefreshInterval for the staleness it trades.
+	refreshDue time.Time
 }
 
 type evolutionResponse struct {
@@ -2501,6 +2512,15 @@ func (s *Server) invalidateOverviewCache() {
 // rows, so repeat renders of one filter within the TTL reuse one compute.
 const analyticsCacheTTL = time.Minute
 
+// analyticsMinRefreshInterval coalesces ingest invalidations: an entry
+// invalidated within this interval of its last refresh defers its next
+// refresh until the interval elapses, so a burst of N ingests starts at most
+// one recompute instead of N. The trade-off is that after an ingest a cached
+// result can be at most this much staler than the store; readers still serve
+// the last good result immediately and never wait on a recompute. Without an
+// invalidation, analyticsCacheTTL still bounds staleness.
+const analyticsMinRefreshInterval = 2 * time.Second
+
 // analyticsCacheKey identifies the filter combination a cached result was
 // computed for. Now is deliberately excluded: it moves per request and the
 // TTL already bounds how far the cached window may lag.
@@ -2525,9 +2545,12 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 		}
 		if entry, ok := s.analyticsCache[key]; ok && entry.hasResult {
 			// Stale-while-revalidate: serve whatever we have immediately and
-			// refresh in the background when it is past the TTL. A reader never
-			// waits on a recompute, even right after an ingest invalidated it.
-			if time.Since(entry.fetched) >= analyticsCacheTTL && entry.ready == nil {
+			// refresh in the background when it is past the TTL or past the
+			// coalescing deadline an ingest set. A reader never waits on a
+			// recompute, even right after an ingest invalidated it.
+			stale := time.Since(entry.fetched) >= analyticsCacheTTL ||
+				(!entry.refreshDue.IsZero() && !time.Now().Before(entry.refreshDue))
+			if stale && entry.ready == nil {
 				s.startAnalyticsRefreshLocked(key, entry)
 			}
 			entry.lastUse = time.Now()
@@ -2566,6 +2589,7 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 // result while it runs, and the generation guard drops a result that an
 // ingest superseded.
 func (s *Server) startAnalyticsRefreshLocked(key string, entry *analyticsCacheEntry) {
+	s.analyticsRefreshes.Add(1)
 	generation := s.analyticsGeneration
 	entry.ready = make(chan struct{})
 	ready := entry.ready
@@ -2614,15 +2638,30 @@ func (s *Server) evictAnalyticsEntriesLocked() {
 	}
 }
 
+// invalidateAnalyticsCache marks every analytics entry stale after an ingest.
+// Ingests arrive in bursts and each refresh costs a full scan, so an entry
+// refreshed within analyticsMinRefreshInterval defers its next refresh to the
+// window's end instead of refreshing on the next read: a burst of N
+// invalidations coalesces into at most one recompute per window. The deadline
+// derives from the entry's last refresh, so later invalidations inside the
+// same window never extend it, and an entry last refreshed before the window
+// stays due on the next read exactly as before. Entries with a compute in
+// flight are left alone: their generation guard drops a result this
+// invalidation superseded, and the already-elapsed deadline brings the next
+// reader back.
 func (s *Server) invalidateAnalyticsCache() {
+	now := time.Now()
 	s.analyticsMu.Lock()
 	s.analyticsGeneration++
 	for _, entry := range s.analyticsCache {
-		if entry.ready == nil {
-			// Keep the last good result so readers are served immediately; the
-			// zero fetched time marks it stale and the next request refreshes it.
-			entry.fetched = time.Time{}
+		if entry.ready != nil {
+			continue
 		}
+		due := now
+		if windowEnd := entry.fetched.Add(analyticsMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		entry.refreshDue = due
 	}
 	s.analyticsMu.Unlock()
 }
