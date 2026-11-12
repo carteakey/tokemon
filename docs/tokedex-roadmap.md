@@ -19,6 +19,9 @@ What the page already does:
   measured model quality (item 2, shipped 2026-11-10).
 - Observed usage context per model (lifetime tokens, event counts) and a
   pricing-coverage header (`priced / observed`, `mode: unknown` disclosure).
+  A 2026-11-12 verification pass priced the top observed models against
+  provider pages; the live hub's copy now covers 97.3% of observed tokens
+  (up from 32.5%) once redeployed (item 1).
 - Standardized empty/unknown states (item 4, shipped 2026-11-10): models with
   unpublished rates say "Rates not published yet" instead of rendering empty
   pricing, zero-usage catalog models say "No usage recorded yet" instead of
@@ -37,8 +40,8 @@ What the page already does:
 
 What it does not do: no per-model detail view, no sorting/filtering/search
 on the card grid, no alias management (aliasing lives in Settings and the
-two surfaces do not reference each other), and pricing is still mostly
-`mode: unknown` (item 1).
+two surfaces do not reference each other), and pricing still has a small
+`mode: unknown` tail (item 1).
 
 ## Roadmap items
 
@@ -46,14 +49,53 @@ Estimates are focused worker sessions: S ≤ half a day, M = 1–2 days,
 L = 3+ days. Items marked **[MVP]** are the minimum viable set; everything
 else can land after the flag ships.
 
-1. **[MVP] Pricing verification pass (S–M, largely research).** The catalog
-   is honest but mostly unpriced: recent entries use `mode: unknown`, and
-   the live hub's coverage line confirms most observed tokens carry no cost.
-   Verify input/output rates against provider pricing pages for the top
-   observed models, set `mode: standard` with `verified_at` + `source`, and
-   keep `mode: unknown` for the rest. Depends on the pricing task's schema
-   decisions. Without this, a "dex" about models shows little more than
-   names and raw token counts.
+1. **[MVP] Pricing verification pass (S–M, largely research). — SHIPPED
+   2026-11-12.** Every rate added in this pass was read from a provider
+   pricing page fetched that day, and each newly priced entry records the
+   exact `source` URL plus `verified_at: 2026-11-12`. Ten models moved from
+   `mode: unknown` to `mode: standard`:
+   - Anthropic (`platform.claude.com/docs/en/about-claude/pricing`):
+     Claude Opus 5.5 ($4/$20), Sonnet 5.5 ($2/$10), Sonnet 5 ($2/$10).
+   - OpenAI (`developers.openai.com/api/docs/pricing`): GPT-6.1 Sol
+     ($2/$10), GPT-6.1 Terra ($1/$5), GPT-6 Luna ($0.10/$0.50), GPT-6 Sol
+     ($2/$10), GPT-6 Astra ($10/$50).
+   - Z.ai (`docs.z.ai/guides/overview/pricing`): GLM-5.3 Flash
+     ($0.15/$0.50).
+   - Google (`ai.google.dev/gemini-api/docs/pricing`): Gemini 3.6 Flash
+     ($0.75/$3.75).
+
+   Normalization conventions: OpenAI rates are the published short-context
+   (≤272K) standard tier — long-context rates are higher and are not encoded;
+   Anthropic `cache_write_per_million` is the 5-minute cache-write rate;
+   cached-input rates are recorded where the page states them.
+
+   Coverage on the live hub's usage (22.64B observed tokens, read-only copy):
+   priced tokens rose from **32.5% (7.36B)** to **97.3% (22.03B)**;
+   cataloged-but-unpublished tokens fell from 67.3% to 2.5%; uncataloged
+   identifiers are 0.2% (only the documented non-model sentinels).
+
+   Deliberately left `mode: unknown`, with the reason:
+   - Claude Haiku 5.5 — tiered by prompt length (≤100K vs >100K tokens), so
+     no single input/output rate is honest.
+   - DeepSeek V4.1 Flash and V4 Pro — peak/off-peak time-of-day rates (2x
+     spread); the schema has one rate.
+   - Gemini 3 Flash — the page publishes `gemini-3-flash-preview`, a
+     different model ID; no rate for the stable ID.
+   - Gemini 3.7 Flash — not listed on the pricing page at all.
+   - Nemotron 3.5 Super VL 120B-A12B — NVIDIA publishes model cards, not a
+     per-token API rate.
+   - Qwen 3.8 Flash Next — no public rate for this exact variant.
+   - Codex Auto Review — not a published model with a rate card.
+   - DeepSeek V4 Flash (free), Space Bunny (free), Muse Spark 1.2
+     (contributor free) — plan/free-tier identifiers, no per-token rate.
+
+   Known drift left for a follow-up: the 2026-07-12 OpenAI rates for
+   `gpt-5.6-luna` ($1/$6) and `gpt-5.6-terra` ($2.50/$15) are higher than the
+   current page ($0.20/$1.20 and $2/$12), and `gpt-5.6-sol`'s page rate
+   ($4/$20) is explicitly promotional through 2026-11-30 while the catalog
+   carries $5/$30. These were not rewritten in this pass because encoding
+   promotional or newly-cut rates is a policy decision, not a fetch. Gemini
+   3.6 Flash also has an announced increase to $1.50/$7.50 on 2027-01-01.
 
 2. **[MVP] Tier explanations (S). — SHIPPED 2026-11-10.** The page now
    renders a legend above the tier sections: one row per populated tier
@@ -108,9 +150,9 @@ else can land after the flag ships.
 
 A deployment may flip `TOKEMON_ENABLE_TOKEDEX=true` when:
 
-- [ ] Items 1–4 (**[MVP]** set) are merged and gated. Items 2 (tier
-      legend) and 4 (empty/unknown states) shipped 2026-11-10; items 1
-      (pricing verification) and 3 (sort/filter/search) remain.
+- [ ] Items 1–4 (**[MVP]** set) are merged and gated. Items 1 (pricing
+      verification), 2 (tier legend), and 4 (empty/unknown states) shipped
+      2026-11-10/12; item 3 (sort/filter/search) remains.
 - [ ] The pricing-coverage header is honest for the deployment's catalog
       copy (remember: the hub loads the catalog from
       `~/Library/Application Support/Tokemon/models.yaml`, not the repo —

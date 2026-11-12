@@ -186,6 +186,12 @@ models:
   # everything else carries mode: unknown and stays unpriced rather than
   # inventing numbers. Tiers follow the model family where that is known and
   # stay Unranked otherwise.
+  #
+  # 2026-11-12 pricing verification pass: entries below cite the provider page
+  # fetched that day. OpenAI rates are the published short-context (≤272K)
+  # standard tier; long-context (>272K) rates are higher and are not encoded.
+  # Anthropic cache_write_per_million is the 5-minute cache-write rate. Models
+  # whose public page only states tiered or time-of-day rates stay unknown.
 
   claude-opus-5-5:
     provider: anthropic
@@ -194,8 +200,13 @@ models:
     tier: S
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://platform.claude.com/docs/en/about-claude/pricing
+      input_per_million: 4
+      cached_input_per_million: 0.2
+      cache_write_per_million: 5
+      output_per_million: 20
 
   claude-sonnet-5-5:
     provider: anthropic
@@ -204,8 +215,13 @@ models:
     tier: A
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://platform.claude.com/docs/en/about-claude/pricing
+      input_per_million: 2
+      cached_input_per_million: 0.1
+      cache_write_per_million: 2.5
+      output_per_million: 10
 
   claude-sonnet-5:
     provider: anthropic
@@ -214,8 +230,13 @@ models:
     tier: A
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://platform.claude.com/docs/en/about-claude/pricing
+      input_per_million: 2
+      cached_input_per_million: 0.2
+      cache_write_per_million: 2.5
+      output_per_million: 10
 
   claude-haiku-5-5:
     provider: anthropic
@@ -225,7 +246,8 @@ models:
     pricing:
       currency: USD
       mode: unknown
-      verified_at: 2026-11-07
+      verified_at: 2026-11-12
+      source: https://platform.claude.com/docs/en/about-claude/pricing
 
   gpt-6.1-sol:
     provider: openai
@@ -233,8 +255,13 @@ models:
     aliases: [gpt-6.1, openai/gpt-6.1, gpt-6.1-sol, openai/gpt-6.1-sol]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://developers.openai.com/api/docs/pricing
+      input_per_million: 2
+      cached_input_per_million: 0.1
+      cache_write_per_million: 2.5
+      output_per_million: 10
 
   gpt-6.1-terra:
     provider: openai
@@ -242,8 +269,13 @@ models:
     aliases: [gpt-6.1-terra, openai/gpt-6.1-terra]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://developers.openai.com/api/docs/pricing
+      input_per_million: 1
+      cached_input_per_million: 0.05
+      cache_write_per_million: 1.25
+      output_per_million: 5
 
   gpt-6-luna:
     provider: openai
@@ -251,8 +283,13 @@ models:
     aliases: [gpt-6, openai/gpt-6, gpt-6-luna, openai/gpt-6-luna]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://developers.openai.com/api/docs/pricing
+      input_per_million: 0.1
+      cached_input_per_million: 0.01
+      cache_write_per_million: 0.125
+      output_per_million: 0.5
 
   gpt-6-sol:
     provider: openai
@@ -260,8 +297,13 @@ models:
     aliases: [gpt-6-sol, openai/gpt-6-sol]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://developers.openai.com/api/docs/pricing
+      input_per_million: 2
+      cached_input_per_million: 0.2
+      cache_write_per_million: 2.5
+      output_per_million: 10
 
   gpt-6-astra:
     provider: openai
@@ -269,8 +311,13 @@ models:
     aliases: [gpt-6-astra, openai/gpt-6-astra]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://developers.openai.com/api/docs/pricing
+      input_per_million: 10
+      cached_input_per_million: 1
+      cache_write_per_million: 12.5
+      output_per_million: 50
 
   codex-auto-review:
     provider: openai
@@ -287,8 +334,12 @@ models:
     aliases: [glm-5.3-flash, GLM-5.3-Flash, GLM-5.3, glm-5.3]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://docs.z.ai/guides/overview/pricing
+      input_per_million: 0.15
+      cached_input_per_million: 0.03
+      output_per_million: 0.5
 
   gemini-3-flash:
     provider: google
@@ -297,7 +348,8 @@ models:
     pricing:
       currency: USD
       mode: unknown
-      verified_at: 2026-11-07
+      verified_at: 2026-11-12
+      source: https://ai.google.dev/gemini-api/docs/pricing
 
   gemini-3.6-flash:
     provider: google
@@ -305,8 +357,12 @@ models:
     aliases: [gemini-3.6-flash]
     pricing:
       currency: USD
-      mode: unknown
-      verified_at: 2026-11-07
+      mode: standard
+      verified_at: 2026-11-12
+      source: https://ai.google.dev/gemini-api/docs/pricing
+      input_per_million: 0.75
+      cached_input_per_million: 0.075
+      output_per_million: 3.75
 
   gemini-3.7-flash:
     provider: google
@@ -315,7 +371,8 @@ models:
     pricing:
       currency: USD
       mode: unknown
-      verified_at: 2026-11-07
+      verified_at: 2026-11-12
+      source: https://ai.google.dev/gemini-api/docs/pricing
 
   nemotron-3.5-super-vl-120b-a12b:
     provider: nvidia
@@ -333,7 +390,8 @@ models:
     pricing:
       currency: USD
       mode: unknown
-      verified_at: 2026-11-07
+      verified_at: 2026-11-12
+      source: https://api-docs.deepseek.com/quick_start/pricing
 
   deepseek-v4-flash-free:
     provider: deepseek
@@ -351,7 +409,8 @@ models:
     pricing:
       currency: USD
       mode: unknown
-      verified_at: 2026-11-07
+      verified_at: 2026-11-12
+      source: https://api-docs.deepseek.com/quick_start/pricing
 
   qwen3.8-flash-next:
     provider: alibaba
