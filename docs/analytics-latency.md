@@ -129,13 +129,43 @@ invalidations produces one refresh, a reader inside the window is served the
 cached result, an entry older than the window still refreshes on the next
 read) and the ingest flow in `TestAnalyticsCacheServesAndInvalidates`.
 
+## Dashboard pre-render race
+
+The overview entry and the dashboard page rendered from it are now one cache
+entry: `overviewCacheEntry` carries the `html` built from its `result`, and the
+background refresh renders the page *before* it publishes the entry. A reader
+therefore cannot observe a fresh overview paired with the old page — the state
+that made `GET /` rebuild on the request path and run `DisplayAliases` plus a
+`Sessions` query.
+
+Before, `startOverviewRefreshLocked` installed the new entry, released
+`overviewMu`, and only then called `buildDashboardHTML` in the same goroutine. A
+`GET /` arriving in that window matched the new `fetched` time against the old
+page, missed, and paid the rebuild (756-934ms when the `Sessions` query queued
+behind the analytics refresh).
+
+After, the refresh computes the overview, renders the page, and publishes both
+under `overviewMu`. Readers keep the previous entry and its page for the
+render's duration — the same stale-while-revalidate bargain they already accept
+for the refresh itself — and the new entry is never visible without its bytes.
+A failed render publishes the entry without a page, so the next reader falls
+back to a request-path build (which is then attached to the entry) instead of
+serving stale bytes forever.
+
+Cost removed for a reader that used to land in the window, 20k-event synthetic
+database, 30 samples, median: 80.7ms for the request-path rebuild (aliases,
+sessions, template) versus 27.8µs for the pre-rendered page. On the live hub the
+same rebuild measured 756-934ms because its `Sessions` query queued behind the
+analytics refresh. Warm `GET /` is unchanged at 1-3ms.
+
+Regression tests: `internal/api/dashboard_prerender_test.go` (a reader after a
+background refresh is served the pre-rendered bytes with the store closed, a
+fresh entry is never visible without its page, and a missing pre-render falls
+back to a request-path build) plus the existing
+`TestDashboardServesCachedPageAndTracksRefresh`.
+
 ## Not fixed here (follow-ups)
 
-- **Dashboard pre-render race.** After a background overview refresh installs a
-  fresh entry, the pre-rendered HTML is rebuilt in that goroutine. A `GET /`
-  arriving in that window misses the HTML cache, rebuilds the page, and runs a
-  `Sessions` query that can queue behind the analytics refresh (756-934ms
-  observed). It is pre-existing and unrelated to the analytics cache.
 - **Quota panel.** With `TOKEMON_QUOTAS` configured, `QuotaStatus` still runs a
   per-request query and would queue behind a refresh the same way. The live hub
   has no quotas configured, so it was left alone.

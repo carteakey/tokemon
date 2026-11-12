@@ -56,8 +56,6 @@ type Server struct {
 	// process start. Tests assert on it to prove invalidation coalescing;
 	// production code never reads it.
 	analyticsRefreshes atomic.Int64
-	dashboardMu        sync.Mutex
-	dashboardHTML      *dashboardHTMLCache
 }
 
 type evolutionCacheEntry struct {
@@ -70,15 +68,11 @@ type overviewCacheEntry struct {
 	result  database.Overview
 	err     error
 	fetched time.Time
-}
-
-// dashboardHTMLCache holds the overview page rendered from one overview
-// entry. The overview entry's fetched time is the identity of the render: a
-// match means the bytes are exactly as fresh as the overview being served,
-// including the stale-served window right after an ingest.
-type dashboardHTMLCache struct {
-	overviewFetched time.Time
-	html            []byte
+	// html is the dashboard page rendered from result, or nil when the render
+	// has not run or failed. Keeping it on the entry means a reader served this
+	// overview is also served exactly the page built from it: the two can never
+	// be stitched from different entries.
+	html []byte
 }
 
 // analyticsCacheEntry caches one filter combination's full Analytics result.
@@ -2385,6 +2379,15 @@ func (s *Server) invalidateEvolutionCache() {
 const overviewCacheTTL = time.Minute
 
 func (s *Server) cachedOverview(ctx context.Context) (database.Overview, time.Time, error) {
+	entry := s.cachedOverviewEntry(ctx)
+	return entry.result, entry.fetched, entry.err
+}
+
+// cachedOverviewEntry returns the overview entry currently being served (or the
+// one computed for a cold cache) as a snapshot. The result and the page always
+// come from the same entry, so a reader cannot pair a fresh overview with a
+// stale page or the reverse.
+func (s *Server) cachedOverviewEntry(ctx context.Context) overviewCacheEntry {
 	for {
 		s.overviewMu.Lock()
 		if cached := s.overviewCache; cached != nil {
@@ -2394,9 +2397,9 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, time.Ti
 			if time.Since(cached.fetched) >= overviewCacheTTL && s.overviewReady == nil {
 				s.startOverviewRefreshLocked()
 			}
-			result, err, fetched := cached.result, cached.err, cached.fetched
+			entry := *cached
 			s.overviewMu.Unlock()
-			return result, fetched, err
+			return entry
 		}
 		if ready := s.overviewReady; ready != nil {
 			s.overviewMu.Unlock()
@@ -2404,7 +2407,7 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, time.Ti
 			case <-ready:
 				continue
 			case <-ctx.Done():
-				return database.Overview{}, time.Time{}, ctx.Err()
+				return overviewCacheEntry{err: ctx.Err()}
 			}
 		}
 		// No cache yet: the first render computes synchronously so it has data.
@@ -2428,13 +2431,23 @@ func (s *Server) cachedOverview(ctx context.Context) (database.Overview, time.Ti
 		}
 		s.overviewMu.Unlock()
 		close(ready)
-		return result, fetched, err
+		return overviewCacheEntry{result: result, err: err, fetched: fetched}
 	}
 }
 
 // startOverviewRefreshLocked starts one background overview refresh. The
 // caller holds overviewMu; readers keep serving the cached result while it
 // runs, and the generation guard drops a result that an ingest superseded.
+//
+// The page is rendered before the entry is published, so the fresh overview and
+// its pre-rendered HTML become visible together. Publishing first and rendering
+// after (the previous shape) left a window where a GET / saw the new entry,
+// missed the old page, and rebuilt it on the request path — including a
+// Sessions query that queued behind the analytics refresh (756-934ms observed,
+// docs/analytics-latency.md). Rendering first closes that window structurally:
+// there is no state in which a fresh entry exists without its page. The cost is
+// that readers keep the previous entry for the render's duration, which is the
+// same stale-while-revalidate bargain they already accept for the refresh.
 func (s *Server) startOverviewRefreshLocked() {
 	generation := s.overviewGeneration
 	ready := make(chan struct{})
@@ -2444,22 +2457,28 @@ func (s *Server) startOverviewRefreshLocked() {
 		defer cancel()
 		result, err := s.store.Overview(ctx)
 
+		var html []byte
+		if err == nil {
+			var buildErr error
+			if html, buildErr = s.renderDashboardHTML(ctx, result); buildErr != nil {
+				// Publish the entry without a page: the next reader falls back
+				// to a request-path build instead of serving stale bytes.
+				html = nil
+				if !clientGone(buildErr) {
+					s.logger.Warn("dashboard_prebuild_failed")
+				}
+			}
+		}
+
 		s.overviewMu.Lock()
 		var fetched time.Time
 		if s.overviewGeneration == generation && !clientGone(err) {
 			fetched = time.Now()
-			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: fetched}
+			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: fetched, html: html}
 		}
 		s.overviewReady = nil
 		s.overviewMu.Unlock()
 		close(ready)
-		// Pre-render the dashboard page for the fresh entry so the next
-		// request serves cached bytes instead of rebuilding the page.
-		if !fetched.IsZero() {
-			if _, buildErr := s.buildDashboardHTML(ctx, result, fetched); buildErr != nil && !clientGone(buildErr) {
-				s.logger.Warn("dashboard_prebuild_failed")
-			}
-		}
 	}()
 }
 
@@ -2493,17 +2512,11 @@ func (s *Server) invalidateOverviewCache() {
 	if s.overviewCache != nil {
 		// Keep the last good result so readers are served immediately; the
 		// zero fetched time marks it stale and the next request refreshes it.
+		// The rendered page rides along on the entry, so the stale overview and
+		// its page stay a pair until the refresh replaces both.
 		s.overviewCache.fetched = time.Time{}
 	}
 	s.overviewMu.Unlock()
-	// Shift the rendered page's identity onto the stale overview too, so the
-	// cached HTML keeps matching what readers are served until the background
-	// refresh installs a fresh entry (and its pre-rendered page).
-	s.dashboardMu.Lock()
-	if s.dashboardHTML != nil {
-		s.dashboardHTML.overviewFetched = time.Time{}
-	}
-	s.dashboardMu.Unlock()
 }
 
 // analyticsCacheTTL bounds how long a cached Analytics result may be served
@@ -2682,23 +2695,23 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, overviewFetched, err := s.cachedOverview(r.Context())
+	entry := s.cachedOverviewEntry(r.Context())
 	s.metrics.observeDB(started)
-	if err != nil {
-		if clientGone(err) {
+	if entry.err != nil {
+		if clientGone(entry.err) {
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, entry.err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// The rendered page is cached against the overview entry it was built
-	// from, so a warm request writes pre-rendered bytes instead of repeating
-	// the machine, session, and alias queries plus the full template render.
-	if html, ok := s.cachedDashboardHTML(overviewFetched); ok {
-		w.Write(html)
+	// The page is cached on the overview entry it was rendered from, so a warm
+	// request writes pre-rendered bytes instead of repeating the machine,
+	// session, and alias queries plus the full template render.
+	if len(entry.html) > 0 {
+		w.Write(entry.html)
 		return
 	}
-	html, err := s.buildDashboardHTML(r.Context(), result, overviewFetched)
+	html, err := s.buildDashboardHTML(r.Context(), entry.result, entry.fetched)
 	if err != nil {
 		if clientGone(err) {
 			return
@@ -2709,20 +2722,32 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Write(html)
 }
 
-// cachedDashboardHTML returns the rendered page when it was built from the
-// overview entry currently being served.
-func (s *Server) cachedDashboardHTML(overviewFetched time.Time) ([]byte, bool) {
-	s.dashboardMu.Lock()
-	defer s.dashboardMu.Unlock()
-	if s.dashboardHTML != nil && s.dashboardHTML.overviewFetched.Equal(overviewFetched) {
-		return s.dashboardHTML.html, true
+// buildDashboardHTML renders the dashboard page and attaches it to the overview
+// entry it was built from, so the next reader reuses the bytes. A page built
+// from an entry that a refresh has since replaced is served but not cached: the
+// replacement carries its own page.
+func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overview, overviewFetched time.Time) ([]byte, error) {
+	html, err := s.renderDashboardHTML(ctx, result)
+	if err != nil {
+		return nil, err
 	}
-	return nil, false
+	// A zero fetched time marks the stale entry that an ingest invalidated;
+	// attaching there would let one request's page outlive the refresh that is
+	// already replacing it, and the refresh pre-renders the successor anyway.
+	if !overviewFetched.IsZero() {
+		s.overviewMu.Lock()
+		if cached := s.overviewCache; cached != nil && cached.fetched.Equal(overviewFetched) && len(cached.html) == 0 {
+			cached.html = html
+		}
+		s.overviewMu.Unlock()
+	}
+	return html, nil
 }
 
-// buildDashboardHTML assembles the dashboard page from a computed overview
-// and caches the rendered bytes under the entry's fetched-time identity.
-func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overview, overviewFetched time.Time) ([]byte, error) {
+// renderDashboardHTML assembles the dashboard page from a computed overview. It
+// deliberately does not publish the bytes: the caller owns the entry they
+// belong to, which is what keeps the page and its overview from diverging.
+func (s *Server) renderDashboardHTML(ctx context.Context, result database.Overview) ([]byte, error) {
 	aliases, err := s.store.DisplayAliases(ctx)
 	if err != nil {
 		return nil, err
@@ -2744,9 +2769,6 @@ func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overvie
 	if err := s.template.ExecuteTemplate(&buffer, "dashboard", page); err != nil {
 		return nil, err
 	}
-	s.dashboardMu.Lock()
-	s.dashboardHTML = &dashboardHTMLCache{overviewFetched: overviewFetched, html: buffer.Bytes()}
-	s.dashboardMu.Unlock()
 	return buffer.Bytes(), nil
 }
 

@@ -51,7 +51,7 @@ func TestWarmCachesPopulatesCachesWithCanceledCaller(t *testing.T) {
 	if server.overviewCache != nil {
 		t.Fatal("overview cache populated before the warm")
 	}
-	if html, ok := server.cachedDashboardHTML(time.Time{}); ok {
+	if _, html := cachedDashboardEntry(server); len(html) > 0 {
 		t.Fatalf("dashboard pre-render present before the warm: %d bytes", len(html))
 	}
 
@@ -59,17 +59,11 @@ func TestWarmCachesPopulatesCachesWithCanceledCaller(t *testing.T) {
 	cancel()
 	server.WarmCaches(callerCtx)
 
-	server.overviewMu.Lock()
-	cached := server.overviewCache
-	fetched := time.Time{}
-	if cached != nil {
-		fetched = cached.fetched
-	}
-	server.overviewMu.Unlock()
-	if cached == nil || fetched.IsZero() {
+	fetched, html := cachedDashboardEntry(server)
+	if fetched.IsZero() {
 		t.Fatal("warm left no fresh overview cache entry")
 	}
-	if _, ok := server.cachedDashboardHTML(fetched); !ok {
+	if len(html) == 0 {
 		t.Fatal("warm did not build the pre-rendered dashboard HTML")
 	}
 	server.analyticsMu.Lock()

@@ -29,6 +29,18 @@ func dashboardEvent(eventID, machine string, tokens int64) usage.Event {
 	}
 }
 
+// cachedDashboardEntry snapshots the served overview entry's fetched time and
+// pre-rendered page. A zero fetched time means the entry is stale (an ingest
+// invalidated it) and the page, if any, is the stale one.
+func cachedDashboardEntry(server *Server) (time.Time, []byte) {
+	server.overviewMu.Lock()
+	defer server.overviewMu.Unlock()
+	if server.overviewCache == nil {
+		return time.Time{}, nil
+	}
+	return server.overviewCache.fetched, server.overviewCache.html
+}
+
 // The dashboard page is rendered once per overview entry and served as cached
 // bytes: repeat requests must be byte-identical, an ingest must not force a
 // rebuild (the stale page is served like the stale overview), and the next
@@ -80,13 +92,12 @@ func TestDashboardServesCachedPageAndTracksRefresh(t *testing.T) {
 	// The invalidated page is served immediately instead of rebuilding.
 	stale := fetch()
 
-	// The background refresh pre-renders the page for the fresh overview.
+	// The background refresh pre-renders the page for the fresh overview and
+	// publishes the entry and its page together.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		server.dashboardMu.Lock()
-		built := server.dashboardHTML != nil && !server.dashboardHTML.overviewFetched.IsZero()
-		server.dashboardMu.Unlock()
-		if built {
+		fetched, html := cachedDashboardEntry(server)
+		if !fetched.IsZero() && len(html) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
