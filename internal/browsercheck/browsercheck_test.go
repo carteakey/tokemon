@@ -60,6 +60,20 @@ var axeTags = []string{"wcag2a", "wcag21a", "wcag2aa", "wcag21aa"}
 // land an allowlist entry with a reason, never silently.
 var axeAllowlist = map[string]map[string]string{}
 
+// gateViewports are the widths every gated page renders at: the desktop hub
+// plus the tablet and phone widths where the responsive layout reflows. The
+// gate used to render only 1280x800 — the one width where the wide regions
+// fit — so it was blind to the layout it exists to protect.
+var gateViewports = []struct {
+	name   string
+	width  int64
+	height int64
+}{
+	{name: "1280x800", width: 1280, height: 800},
+	{name: "768x900", width: 768, height: 900},
+	{name: "390x844", width: 390, height: 844},
+}
+
 // The invariant scripts return a JSON array of problem strings; empty means
 // the page keeps its contract.
 
@@ -560,24 +574,29 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
+		{path: "/insights"},
 		{path: "/settings"},
 	}
 	for _, page := range pages {
 		t.Run(page.path, func(t *testing.T) {
-			if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+page.path)); err != nil {
-				t.Fatalf("navigation to %s failed: %v", page.path, err)
-			}
-			if _, err := chromedp.Run(ctx, chromedp.WaitReady("body")); err != nil {
-				t.Fatalf("%s never became ready: %v", page.path, err)
-			}
-			if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
-				t.Fatalf("could not settle animations on %s: %v", page.path, err)
-			}
-			for _, invariant := range append([]string{sharedInvariantJS}, page.invariants...) {
-				assertNoProblems(t, ctx, invariant)
-			}
-			assertAxeAllowlist(t, ctx, page.path)
+			assertPageAtViewports(t, ctx, baseURL, page.path, page.invariants)
 		})
+	}
+	// Leave the browser at the desktop viewport for the subtests below, which
+	// predate the viewport loop and still exercise the wide layout.
+	if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+		t.Fatalf("could not restore the desktop viewport: %v", err)
+	}
+
+	// The sign-in form is outside the authenticated page list: it only
+	// renders when a password account is configured, so it gets its own
+	// server, and it is held to the same three-viewport gate.
+	t.Run("/login", func(t *testing.T) {
+		passwordURL := startSeededPasswordServer(t)
+		assertPageAtViewports(t, ctx, passwordURL, "/login", nil)
+	})
+	if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+		t.Fatalf("could not restore the desktop viewport: %v", err)
 	}
 
 	// The per-source connector health panel (issue #26) in a real browser:
@@ -944,6 +963,34 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			t.Fatalf("signed-out navigation landed on %s with status %d, want /login with 200", signedOutNavResponse.URL, signedOutNavResponse.Status)
 		}
 	})
+}
+
+// assertPageAtViewports renders one page at every gated viewport, runs the
+// shared invariants plus the page's own at each, and scans axe at each. The
+// narrow widths are the point: a region that only fits at 1280x800 still has
+// to be keyboard reachable where it scrolls.
+func assertPageAtViewports(t *testing.T, ctx context.Context, baseURL, path string, invariants []string) {
+	t.Helper()
+	for _, viewport := range gateViewports {
+		t.Run(viewport.name, func(t *testing.T) {
+			if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(viewport.width, viewport.height)); err != nil {
+				t.Fatalf("could not emulate %s: %v", viewport.name, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+path)); err != nil {
+				t.Fatalf("navigation to %s at %s failed: %v", path, viewport.name, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.WaitReady("body")); err != nil {
+				t.Fatalf("%s never became ready at %s: %v", path, viewport.name, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+				t.Fatalf("could not settle animations on %s at %s: %v", path, viewport.name, err)
+			}
+			for _, invariant := range append([]string{sharedInvariantJS}, invariants...) {
+				assertNoProblems(t, ctx, invariant)
+			}
+			assertAxeAllowlist(t, ctx, path)
+		})
+	}
 }
 
 // assertNoProblems evaluates an invariant script and fails with the reported

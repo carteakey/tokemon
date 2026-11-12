@@ -14,6 +14,7 @@ import (
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/usage"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var (
@@ -49,10 +50,15 @@ func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/", "/settings", "/analytics", "/sessions"} {
+	for _, path := range []string{"/", "/settings", "/analytics", "/sessions", "/insights"} {
 		body := renderAccessiblePage(t, server, path)
 		assertAccessibleDocument(t, path, body)
 	}
+	// The sign-in form only renders when a password account is configured, so
+	// it comes from its own server; it still owes the same document contract,
+	// including the skip link and its main target.
+	loginBody := renderAccessiblePage(t, passwordAccountServer(t, store), "/login")
+	assertAccessibleDocument(t, "/login", loginBody)
 
 	invalid := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader("model_identity=a&model_alias=b"))
 	invalid.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -76,20 +82,46 @@ func renderAccessiblePage(t *testing.T, server *Server, path string) string {
 	return response.Body.String()
 }
 
+// passwordAccountServer serves the same store behind a dashboard password
+// account so the sign-in form renders; /login answers 404 without one.
+func passwordAccountServer(t *testing.T, store *database.Store) *Server {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte("accessibility-passphrase"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewWithConfig(store, Config{
+		IngestToken:           "secret",
+		DashboardToken:        testDashboardToken,
+		DashboardUsername:     "accessibility-operator",
+		DashboardPasswordHash: hash,
+		AllowLoopbackDev:      true,
+		EnableTokedex:         true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
 func assertAccessibleDocument(t *testing.T, path, body string) {
 	t.Helper()
-	for _, required := range []string{
+	required := []string{
 		`<html lang="en">`,
 		`<meta name="viewport"`,
 		`<a class="skip-link" href="#main-content">Skip to content</a>`,
 		`<h1`,
-		`<h2`,
-		`@media (max-width:`,
 		`:focus-visible`,
 		`prefers-reduced-motion`,
-	} {
-		if !strings.Contains(body, required) {
-			t.Errorf("%s missing accessibility contract %q", path, required)
+	}
+	// The sign-in form is a single card: it has no section headings and no
+	// responsive breakpoint of its own to assert.
+	if path != "/login" {
+		required = append(required, `<h2`, `@media (max-width:`)
+	}
+	for _, contract := range required {
+		if !strings.Contains(body, contract) {
+			t.Errorf("%s missing accessibility contract %q", path, contract)
 		}
 	}
 	if focusNoneRegex.MatchString(body) {
@@ -100,8 +132,11 @@ func assertAccessibleDocument(t *testing.T, path, body string) {
 	}
 	assertContrastPolicy(t, path, body)
 
+	// Pages built from cards, charts, and forms rather than tabular data have
+	// no data table to name; every other page must expose one.
+	tableless := map[string]bool{"/settings": true, "/insights": true, "/login": true}
 	tables := tablePattern.FindAllStringSubmatch(body, -1)
-	if len(tables) == 0 && path != "/settings" {
+	if len(tables) == 0 && !tableless[path] {
 		t.Errorf("%s has no semantic data table", path)
 	}
 	for index, table := range tables {
