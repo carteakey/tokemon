@@ -133,8 +133,10 @@ jobs:
       matrix:
         # macOS Intel and Apple Silicon are both hosted; Linux arm64 is
         # covered by the cross-build matrix in release.yml and the binary
-        # archive checksum gate above.
-        os: [ubuntu-latest, macos-15-intel, macos-14]
+        # archive checksum gate above. Do not use macos-14: GitHub retired
+        # that image on 2026-11-02 and a job targeting it is cancelled with
+        # no runner, which marks the whole run cancelled.
+        os: [ubuntu-latest, macos-15-intel, macos-15]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
