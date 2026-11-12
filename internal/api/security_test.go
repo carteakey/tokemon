@@ -472,3 +472,139 @@ func TestLoginLockoutEscalationIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardAuthValidSessionBeatsLoginThrottle pins the gate order behind
+// issue #40: the session cookie is validated before the login throttle, so a
+// locked-out IP with a live session is served; requests that present
+// credential material stay throttled, and an expired cookie from a locked-out
+// IP takes the anonymous path instead of a 429.
+func TestDashboardAuthValidSessionBeatsLoginThrottle(t *testing.T) {
+	const (
+		lockedRemote   = "192.0.2.7:4444"
+		unlockedRemote = "192.0.2.99:5555"
+	)
+	// Mint a cookie bound to the case server's own session key and
+	// credential fingerprint: live or expired.
+	liveSession := func(t *testing.T, server *Server) string {
+		t.Helper()
+		fingerprint := credentialFingerprint(server.config.DashboardUsername, server.config.DashboardPasswordHash)
+		value, err := mintSessionCookieValue(server.sessionSecret, time.Now(), time.Now().Add(sessionTTL), fingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	expiredSession := func(t *testing.T, server *Server) string {
+		t.Helper()
+		fingerprint := credentialFingerprint(server.config.DashboardUsername, server.config.DashboardPasswordHash)
+		value, err := mintSessionCookieValue(server.sessionSecret, time.Now().Add(-2*sessionTTL), time.Now().Add(-sessionTTL), fingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+
+	tests := []struct {
+		name       string
+		remote     string
+		session    func(t *testing.T, server *Server) string // nil = no cookie
+		basicUser  string
+		basicPass  string
+		wantStatus int
+		check      func(t *testing.T, response *httptest.ResponseRecorder)
+	}{
+		{
+			// The bug: this used to 429 because the throttle ran before the
+			// cookie check.
+			name:       "valid session from a locked-out IP is served, not throttled",
+			remote:     lockedRemote,
+			session:    liveSession,
+			wantStatus: http.StatusOK,
+			check: func(t *testing.T, response *httptest.ResponseRecorder) {
+				if response.Header().Get("Retry-After") != "" {
+					t.Error("session-authenticated response carries Retry-After")
+				}
+				if !strings.Contains(response.Body.String(), "Log out") {
+					t.Error("authenticated page missing the logout affordance")
+				}
+			},
+		},
+		{
+			name:       "rejected credentials from a locked-out IP stay throttled",
+			remote:     lockedRemote,
+			basicUser:  "ops",
+			basicPass:  "wrong",
+			wantStatus: http.StatusTooManyRequests,
+			check: func(t *testing.T, response *httptest.ResponseRecorder) {
+				if response.Header().Get("Retry-After") == "" {
+					t.Error("locked response missing Retry-After")
+				}
+			},
+		},
+		{
+			name:       "expired cookie from a locked-out IP is anonymous, not throttled",
+			remote:     lockedRemote,
+			session:    expiredSession,
+			wantStatus: http.StatusSeeOther,
+			check: func(t *testing.T, response *httptest.ResponseRecorder) {
+				if location := response.Header().Get("Location"); !strings.HasPrefix(location, "/login") {
+					t.Errorf("anonymous redirect = %q, want /login", location)
+				}
+				if response.Header().Get("Retry-After") != "" {
+					t.Error("anonymous path carries Retry-After")
+				}
+				if cleared := findCookie(response, sessionCookieName); cleared == nil || cleared.MaxAge > 0 {
+					t.Error("expired cookie was not cleared")
+				}
+			},
+		},
+		{
+			name:       "valid credentials from an unlocked IP still work",
+			remote:     unlockedRemote,
+			basicUser:  "ops",
+			basicPass:  "hunter2",
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// A fresh server per case: recordSuccess on one path must not
+			// unlock the remote another case relies on being locked out.
+			server, _, _ := newLoginTestServer(t)
+			clock := time.Unix(1700000000, 0)
+			server.loginThrottle.now = func() time.Time { return clock }
+			lockRemoteOut(t, server, lockedRemote)
+
+			request := httptest.NewRequest(http.MethodGet, "/analytics", nil)
+			request.RemoteAddr = test.remote
+			request.Header.Set("Accept", "text/html,application/xhtml+xml")
+			if test.session != nil {
+				request.AddCookie(sessionCookie(test.session(t, server), 0, false))
+			}
+			if test.basicUser != "" {
+				request.SetBasicAuth(test.basicUser, test.basicPass)
+			}
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.check != nil {
+				test.check(t, response)
+			}
+		})
+	}
+}
+
+// lockRemoteOut records enough rejected credential attempts through the real
+// handler path to engage the lockout for remote's address.
+func lockRemoteOut(t *testing.T, server *Server, remote string) {
+	t.Helper()
+	for attempt := 0; attempt < loginFailuresAllowed; attempt++ {
+		response := dashboardLoginRequest(t, server, remote, "/", func(r *http.Request) { r.SetBasicAuth("ops", "wrong") })
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("lockout failure %d status = %d, want %d", attempt+1, response.Code, http.StatusUnauthorized)
+		}
+	}
+}

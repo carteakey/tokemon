@@ -642,21 +642,11 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 		// cache (server-side caching is unaffected — response header only).
 		w.Header().Set("Cache-Control", "no-store")
 		remote := loginLimitKey(r)
-		// Throttle before any credential work so a locked-out client cannot
-		// burn bcrypt CPU.
-		if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
-			seconds := int(retryAfter / time.Second)
-			if retryAfter%time.Second != 0 {
-				seconds++
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			w.Header().Set("Cache-Control", "no-store")
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed dashboard login attempts; try again later"})
-			return
-		}
-		// A session cookie is handled exclusively: valid means authenticated,
-		// invalid or expired means clear + treat as anonymous — never a
-		// throttle failure.
+		// A session cookie is handled exclusively and validated before the
+		// throttle: the HMAC check is cheap, and a valid cookie authenticates
+		// outright so a locked-out IP (shared/NAT address, or a fat-fingered
+		// password earlier) is still served instead of 429'd. Invalid or
+		// expired means clear + treat as anonymous — never a throttle failure.
 		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
 			fingerprint := credentialFingerprint(s.config.DashboardUsername, s.config.DashboardPasswordHash)
 			if s.passwordAccountConfigured() &&
@@ -667,6 +657,22 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 				return
 			}
 			http.SetCookie(w, sessionCookie("", -1, s.cookieSecure(r)))
+		}
+		// Throttle only requests that still need credential authentication,
+		// before any bcrypt work: a locked-out client cannot burn bcrypt CPU,
+		// while a bare navigation keeps the redirect/challenge path and never
+		// touches the login budget.
+		if s.hasPresentedCredentials(r) {
+			if blocked, retryAfter := s.loginThrottle.check(remote); blocked {
+				seconds := int(retryAfter / time.Second)
+				if retryAfter%time.Second != 0 {
+					seconds++
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				w.Header().Set("Cache-Control", "no-store")
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed dashboard login attempts; try again later"})
+				return
+			}
 		}
 		if !s.dashboardAuthorized(r) {
 			// Only rejected credentials consume the login budget; a bare
