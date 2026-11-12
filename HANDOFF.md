@@ -1,17 +1,19 @@
 # Tokemon handoff — 2026-11-12
 
-Written by supervisor (opencode) after closing the v0.4.3 follow-up batch.
-Everything below is verified against the live hub and `origin/main` unless it
-says otherwise.
+Written by supervisor (opencode) after cutting v0.4.4. Everything below is
+verified against the live hub and `origin/main` unless it says otherwise.
 
 ## TL;DR
 
-- `origin/main = caf7b4d`, clean, CI **green** (first green run since
-  2026-11-07).
-- The live Mac hub runs **`0.4.4-dev` @ `caf7b4d`** (go1.26.11), with the
-  password login form enabled (`admin` / the password in
-  `~/.config/tokemon/server.env`). Tokedex is still **gated off**; quotas are
-  still **off**.
+- `origin/main = 2e1d8ba` (release: prepare v0.4.4), clean, CI **green**
+  (first green run since 2026-11-07).
+- **v0.4.4 is published**:
+  https://github.com/carteakey/tokemon/releases/tag/v0.4.4 (annotated tag on
+  `2e1d8ba`; release workflow `43290741126`).
+- The live Mac hub runs the **v0.4.4** binary (`version: 0.4.4`,
+  `commit: 2e1d8ba`) with the password login form enabled (`admin` / the
+  password in `~/.config/tokemon/server.env`). Tokedex is still **gated off**;
+  quotas are still **off**.
 - **Tokedex MVP is complete** (roadmap items 1–4). It stays opt-in until the
   user reviews it and agrees the page earns its nav slot.
 - **Warm `/analytics` is fixed**: 20 consecutive warm requests under live
@@ -57,7 +59,7 @@ Green run: `43258375794` (all four jobs).
 ## Live hub
 
 - Service: launchd `com.tokemon.server`, binary `~/.local/bin/tokemon`
-  (`0.4.4-dev`, `caf7b4d`, go1.26.11), config `~/.config/tokemon/server.env`,
+  (`0.4.4`, `2e1d8ba`, go1.26.11), config `~/.config/tokemon/server.env`,
   DB `~/repos/tokemon/data/tokemon.db` (~120k events), catalog
   `~/Library/Application Support/Tokemon/models.yaml`.
 - Listen: `0.0.0.0:18787`.
@@ -160,6 +162,29 @@ nav link.
 - Workers for this batch ran as opencode subagents, one worktree each, and
   were gated at their exact commit before landing.
 
+## Release v0.4.4 checklist — DONE
+
+1. `bash deploy/release-check.sh` on `2e1d8ba` (browser smoke + axe, image
+   identity assertion, trivy HIGH/CRITICAL, full `-race`) — **PASS**.
+   `deploy/release-guard.sh --tracked` and `--context .` both clean.
+   CI on the same commit: green (`43289682531`).
+2. `## Unreleased` promoted to `## 0.4.4` in `CHANGELOG.md`; the release
+   workflow's notes-extraction check finds the section.
+3. Tag `v0.4.4` (annotated) pushed with `main`; Release workflow
+   `43290741126` published signed assets.
+4. Verified independently: all four tarballs + `sbom.spdx.json` match
+   `checksums.txt`; `cosign verify-blob` OK for `checksums.txt`,
+   `image-digest.txt`, `sbom.spdx.json` and the linux/amd64 tarball against
+   identity
+   `https://github.com/carteakey/tokemon/.github/workflows/release.yml@refs/tags/v0.4.4`;
+   image `ghcr.io/carteakey/tokemon:0.4.4` resolves to
+   `sha256:96c33082…` (matching `image-digest.txt`) and reports
+   `version: 0.4.4`, `commit: 2e1d8ba`.
+5. Deployed the signed darwin/arm64 artifact to the hub and verified:
+   `/healthz` 200 after 14s, anonymous HTML `/` → `303 /login?next=%2F`,
+   `/login` 200, Bearer `/` and `/analytics` 200, `/tokedex` 404,
+   `/api/v1/quotas` 200, warm `/analytics` 17–22ms.
+
 ## How to operate
 
 - Read `docs/ship-loop.md` and `AGENTS.md`. Gate =
@@ -176,9 +201,9 @@ nav link.
 
 ## Open items / risks
 
-1. **No release tag since v0.4.3.** `main` carries the Tokedex MVP, the
-   analytics fix and the Go security bump. Cut `v0.4.4` with
-   `bash deploy/release-check.sh` on the candidate commit before tagging.
+1. **v0.4.4 is tagged and published.** Any further work on `main` needs the
+   next release cut with `bash deploy/release-check.sh` on the candidate
+   commit before tagging.
 2. **Tokedex is hidden** until the flag is flipped (see "Waiting on you").
 3. **Quotas are off** (`TOKEMON_QUOTAS` unset).
 4. **`mode: unknown` tail** is now small but real, and the three drifted
@@ -194,6 +219,6 @@ nav link.
 - Workflow feedback issue: `carteakey/herding#20`
 - Team-store hand-editing incident: `carteakey/herding#52`
 - zcode quota/health false-positive: `carteakey/herding#55`
-- Release: https://github.com/carteakey/tokemon/releases/tag/v0.4.3
+- Release: https://github.com/carteakey/tokemon/releases/tag/v0.4.4
 - Analytics findings: `docs/analytics-latency.md`
 - Tokedex roadmap: `docs/tokedex-roadmap.md`
