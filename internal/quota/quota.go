@@ -32,6 +32,9 @@ type Quota struct {
 	Provider string `yaml:"provider" json:"provider"`
 	Model    string `yaml:"model" json:"model"`
 	Label    string `yaml:"label" json:"label"`
+	// ResetDay is the day of month the period restarts, 1–31. Days beyond a
+	// month's length clamp to that month's last day (day 31 resets on Feb
+	// 28/29), the standard billing-cycle convention.
 	ResetDay int    `yaml:"reset_day" json:"reset_day"`
 	Budget   Budget `yaml:"budget" json:"budget"`
 }
@@ -71,8 +74,8 @@ func Load(path string) ([]Quota, error) {
 
 // Validate checks one quota definition.
 func Validate(quota Quota) error {
-	if quota.ResetDay < 1 || quota.ResetDay > 28 {
-		return fmt.Errorf("reset_day must be between 1 and 28, got %d", quota.ResetDay)
+	if quota.ResetDay < 1 || quota.ResetDay > 31 {
+		return fmt.Errorf("reset_day must be between 1 and 31, got %d", quota.ResetDay)
 	}
 	if quota.Budget.TokensPerMonth == nil && quota.Budget.CostPerMonth == nil {
 		return errors.New("budget requires tokens_per_month or cost_per_month")
@@ -86,13 +89,17 @@ func Validate(quota Quota) error {
 	return nil
 }
 
-// Specificity ranks quotas for match resolution: a provider+model quota is
-// more specific than a provider quota, which beats a catch-all.
+// Specificity ranks quotas for match resolution by their number of non-empty
+// match fields: a provider+model quota beats a single-field quota (provider
+// only or model only), which beats a catch-all. Ranking model-only quotas
+// above catch-alls keeps match resolution deterministic — without it, a
+// model-only quota and a catch-all would tie and configuration order would
+// decide which one claims the event.
 func Specificity(quota Quota) int {
 	switch {
 	case quota.Provider != "" && quota.Model != "":
 		return 0
-	case quota.Provider != "":
+	case quota.Provider != "" || quota.Model != "":
 		return 1
 	default:
 		return 2

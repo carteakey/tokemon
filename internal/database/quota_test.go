@@ -143,3 +143,209 @@ func TestQuotaStatusEmptyWithoutQuotas(t *testing.T) {
 		t.Fatalf("statuses = %+v, want nil without quotas", statuses)
 	}
 }
+
+// quotaUsageEvent builds one priced usage event at a fixed instant.
+func quotaUsageEvent(id string, when time.Time, provider, model string, tokens int64) usage.Event {
+	return usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: id, Timestamp: when,
+		MachineID: "machine", SessionID: "session-" + id, Provider: provider,
+		Model: model, Tool: "codex", InputTokens: usage.Int64(tokens / 2), OutputTokens: usage.Int64(tokens - tokens/2),
+		TotalTokens: usage.Int64(tokens), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+	}
+}
+
+// ingestQuotaEvents ingests events and fails the test on any rejection.
+func ingestQuotaEvents(t *testing.T, store *Store, events []usage.Event) {
+	t.Helper()
+	if result, err := store.Ingest(context.Background(), events); err != nil || result.Accepted != len(events) {
+		t.Fatalf("ingest = %+v, err %v", result, err)
+	}
+}
+
+// fixedNow anchors every attribution test to a deterministic period: with
+// reset_day 1 the current period is 2026-11-01 .. 2026-12-01 (UTC).
+func fixedNow() time.Time {
+	return time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+}
+
+func TestQuotaStatusAttributesEventsToMostSpecificQuota(t *testing.T) {
+	providerBudget := int64(100_000_000)
+	modelBudget := int64(40_000_000)
+	quotas := []quota.Quota{
+		{Provider: "openai", Label: "OpenAI cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &providerBudget}},
+		{Provider: "openai", Model: "gpt-6.1-sol", Label: "Sol cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &modelBudget}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("overlap-sol-1", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 30_000_000),
+		quotaUsageEvent("overlap-sol-2", time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 5_000_000),
+		quotaUsageEvent("overlap-other", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "openai", "gpt-6-luna", 10_000_000),
+	})
+
+	statuses := store.QuotaStatus(context.Background(), fixedNow())
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want 2", statuses)
+	}
+	// The provider+model quota is more specific and comes first; the model's
+	// events belong to it alone, so the provider quota measures only the
+	// remainder instead of the double count (issue #36).
+	sol, openai := statuses[0], statuses[1]
+	if sol.Label != "Sol cap" || openai.Label != "OpenAI cap" {
+		t.Fatalf("ordering = %q then %q, want the specific quota first", sol.Label, openai.Label)
+	}
+	if sol.TokensUsed != 35_000_000 {
+		t.Errorf("sol tokens = %d, want 35000000", sol.TokensUsed)
+	}
+	if openai.TokensUsed != 10_000_000 {
+		t.Errorf("openai tokens = %d, want 10000000 (remainder, not 45000000)", openai.TokensUsed)
+	}
+	if last := sol.Daily[len(sol.Daily)-1]; last.CumulativeTokens != 35_000_000 {
+		t.Errorf("sol final point = %+v, want 35000000", last)
+	}
+	if last := openai.Daily[len(openai.Daily)-1]; last.CumulativeTokens != 10_000_000 {
+		t.Errorf("openai final point = %+v, want 10000000", last)
+	}
+	if sol.State != "ok" || openai.State != "ok" {
+		t.Errorf("states = %q / %q, want ok / ok", sol.State, openai.State)
+	}
+}
+
+func TestQuotaStatusCatchAllGetsOnlyRemainder(t *testing.T) {
+	allBudget := int64(100_000_000)
+	providerBudget := int64(50_000_000)
+	quotas := []quota.Quota{
+		{Provider: "anthropic", Label: "Anthropic cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &providerBudget}},
+		{Label: "Everything cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &allBudget}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("catchall-anthropic", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "anthropic", "claude-opus-5-5", 20_000_000),
+		quotaUsageEvent("catchall-openai", time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 30_000_000),
+	})
+
+	statuses := store.QuotaStatus(context.Background(), fixedNow())
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want 2", statuses)
+	}
+	anthropic, everything := statuses[0], statuses[1]
+	if anthropic.Label != "Anthropic cap" || everything.Label != "Everything cap" {
+		t.Fatalf("ordering = %q then %q, want the provider quota first", anthropic.Label, everything.Label)
+	}
+	if anthropic.TokensUsed != 20_000_000 {
+		t.Errorf("anthropic tokens = %d, want 20000000", anthropic.TokensUsed)
+	}
+	if everything.TokensUsed != 30_000_000 {
+		t.Errorf("catch-all tokens = %d, want 30000000 (only the unclaimed remainder)", everything.TokensUsed)
+	}
+}
+
+func TestQuotaStatusModelOnlyQuotaBeatsCatchAll(t *testing.T) {
+	// A model-only quota (no provider) ranks above a catch-all, so its model's
+	// events belong to it from every provider. The catch-all is defined first
+	// on purpose: configuration order must not decide the match.
+	allBudget := int64(100_000_000)
+	modelBudget := int64(40_000_000)
+	quotas := []quota.Quota{
+		{Label: "Everything cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &allBudget}},
+		{Model: "gpt-6.1-sol", Label: "Sol cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &modelBudget}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("modelonly-openai", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 30_000_000),
+		quotaUsageEvent("modelonly-anthropic", time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC), "anthropic", "gpt-6.1-sol", 5_000_000),
+		quotaUsageEvent("modelonly-opus", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "anthropic", "claude-opus-5-5", 20_000_000),
+	})
+
+	statuses := store.QuotaStatus(context.Background(), fixedNow())
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want 2", statuses)
+	}
+	sol, everything := statuses[0], statuses[1]
+	if sol.Label != "Sol cap" || everything.Label != "Everything cap" {
+		t.Fatalf("ordering = %q then %q, want the model-only quota first", sol.Label, everything.Label)
+	}
+	if sol.TokensUsed != 35_000_000 {
+		t.Errorf("model-only tokens = %d, want 35000000 (the model's events from every provider)", sol.TokensUsed)
+	}
+	if everything.TokensUsed != 20_000_000 {
+		t.Errorf("catch-all tokens = %d, want 20000000 (only the unclaimed remainder)", everything.TokensUsed)
+	}
+}
+
+func TestQuotaStatusNonOverlappingQuotasUnchanged(t *testing.T) {
+	openaiBudget := int64(50_000_000)
+	anthropicBudget := int64(50_000_000)
+	quotas := []quota.Quota{
+		{Provider: "openai", Label: "OpenAI cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &openaiBudget}},
+		{Provider: "anthropic", Label: "Anthropic cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &anthropicBudget}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("split-openai", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 10_000_000),
+		quotaUsageEvent("split-anthropic", time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC), "anthropic", "claude-opus-5-5", 25_000_000),
+	})
+
+	statuses := store.QuotaStatus(context.Background(), fixedNow())
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v, want 2", statuses)
+	}
+	if statuses[0].Provider != "openai" || statuses[1].Provider != "anthropic" {
+		t.Fatalf("providers = %q / %q, want openai / anthropic", statuses[0].Provider, statuses[1].Provider)
+	}
+	if statuses[0].TokensUsed != 10_000_000 || statuses[1].TokensUsed != 25_000_000 {
+		t.Errorf("tokens = %d / %d, want 10000000 / 25000000", statuses[0].TokensUsed, statuses[1].TokensUsed)
+	}
+}
+
+func TestQuotaStatusClampsResetDay31Period(t *testing.T) {
+	// Day 31 now loads from config (issue #37) and the period clamps to the
+	// month's last day: running 2026-02-10, the period is Jan 31 .. Feb 28.
+	budget := int64(1_000_000)
+	quotas := []quota.Quota{
+		{Provider: "openai", Label: "OpenAI cap", ResetDay: 31, Budget: quota.Budget{TokensPerMonth: &budget}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC, quotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("clamp-inside", time.Date(2026, 2, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 100_000),
+		quotaUsageEvent("clamp-after-reset", time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC), "openai", "gpt-6.1-sol", 200_000),
+	})
+
+	statuses := store.QuotaStatus(context.Background(), time.Date(2026, 2, 10, 12, 0, 0, 0, time.UTC))
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want 1", statuses)
+	}
+	status := statuses[0]
+	if status.PeriodStart != "2026-01-31" || status.PeriodEnd != "2026-02-28" {
+		t.Errorf("period = %s .. %s, want 2026-01-31 .. 2026-02-28", status.PeriodStart, status.PeriodEnd)
+	}
+	if status.TokensUsed != 100_000 {
+		t.Errorf("tokens = %d, want 100000 (the post-reset event belongs to the next period)", status.TokensUsed)
+	}
+	if len(status.Daily) != 28 {
+		t.Errorf("daily points = %d, want 28 (Jan 31 through Feb 27)", len(status.Daily))
+	}
+	if last := status.Daily[len(status.Daily)-1]; last.Date != "2026-02-27" || last.CumulativeTokens != 100_000 {
+		t.Errorf("final point = %+v, want 100000 on 2026-02-27", last)
+	}
+}

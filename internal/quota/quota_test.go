@@ -43,7 +43,7 @@ quotas:
 		wantErr  string
 	}{
 		{"wrong schema", "schema_version: 2\nquotas: []\n", `quotas schema_version must be "1"`},
-		{"reset day out of range", "schema_version: 1\nquotas:\n  - provider: openai\n    reset_day: 29\n    budget:\n      tokens_per_month: 10\n", "reset_day must be between 1 and 28"},
+		{"reset day out of range", "schema_version: 1\nquotas:\n  - provider: openai\n    reset_day: 32\n    budget:\n      tokens_per_month: 10\n", "reset_day must be between 1 and 31"},
 		{"no budget", "schema_version: 1\nquotas:\n  - provider: openai\n    reset_day: 1\n    budget: {}\n", "budget requires tokens_per_month or cost_per_month"},
 		{"zero tokens", "schema_version: 1\nquotas:\n  - provider: openai\n    reset_day: 1\n    budget:\n      tokens_per_month: 0\n", "tokens_per_month must be positive"},
 		{"negative cost", "schema_version: 1\nquotas:\n  - provider: openai\n    reset_day: 1\n    budget:\n      cost_per_month: -5\n", "cost_per_month must be positive"},
@@ -59,11 +59,80 @@ quotas:
 	}
 }
 
+func TestLoadAcceptsResetDay31(t *testing.T) {
+	// Day 29+ clamps to each month's last day (issue #37): the documented
+	// billing-cycle convention must load from config, not just clamp in
+	// PeriodFor if it could ever be reached.
+	document := `schema_version: 1
+quotas:
+  - provider: openai
+    label: OpenAI monthly cap
+    reset_day: 31
+    budget:
+      tokens_per_month: 50000000
+`
+	path := filepath.Join(t.TempDir(), "quotas.yaml")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quotas, err := Load(path)
+	if err != nil {
+		t.Fatalf("reset_day 31 rejected: %v", err)
+	}
+	if len(quotas) != 1 || quotas[0].ResetDay != 31 {
+		t.Fatalf("quotas = %+v, want one day-31 quota", quotas)
+	}
+}
+
+func TestValidateResetDayRange(t *testing.T) {
+	tokens := int64(10)
+	for _, test := range []struct {
+		resetDay int
+		wantErr  bool
+	}{
+		{resetDay: 0, wantErr: true},
+		{resetDay: -1, wantErr: true},
+		{resetDay: 32, wantErr: true},
+		{resetDay: 1},
+		{resetDay: 28},
+		{resetDay: 29},
+		{resetDay: 31},
+	} {
+		candidate := Quota{ResetDay: test.resetDay, Budget: Budget{TokensPerMonth: &tokens}}
+		err := Validate(candidate)
+		if (err != nil) != test.wantErr {
+			t.Errorf("Validate(reset_day %d) err = %v, wantErr %v", test.resetDay, err, test.wantErr)
+		}
+	}
+}
+
 func TestSpecificityAndMatch(t *testing.T) {
 	global := Quota{ResetDay: 1}
 	providerQuota := Quota{Provider: "openai", ResetDay: 1}
+	modelOnlyQuota := Quota{Model: "gpt-6.1-sol", ResetDay: 1}
 	modelQuota := Quota{Provider: "openai", Model: "gpt-6.1-sol", ResetDay: 1}
-	if Specificity(modelQuota) >= Specificity(providerQuota) || Specificity(providerQuota) >= Specificity(global) {
+
+	// Rank by non-empty match fields: provider+model, then either field
+	// alone (provider-only and model-only are a genuine tie), then catch-all.
+	for _, test := range []struct {
+		name string
+		rank int
+		q    Quota
+	}{
+		{"provider+model", 0, modelQuota},
+		{"provider-only", 1, providerQuota},
+		{"model-only", 1, modelOnlyQuota},
+		{"catch-all", 2, global},
+	} {
+		if got := Specificity(test.q); got != test.rank {
+			t.Errorf("Specificity(%s) = %d, want %d", test.name, got, test.rank)
+		}
+	}
+	// The order match resolution relies on: a model-only quota deterministically
+	// beats a catch-all instead of tying into configuration order.
+	if !(Specificity(modelQuota) < Specificity(providerQuota) &&
+		Specificity(providerQuota) <= Specificity(modelOnlyQuota) &&
+		Specificity(modelOnlyQuota) < Specificity(global)) {
 		t.Fatal("specificity ordering is wrong")
 	}
 	if !Match(modelQuota, "openai", "gpt-6.1-sol") || Match(modelQuota, "openai", "gpt-6-luna") {
@@ -71,6 +140,9 @@ func TestSpecificityAndMatch(t *testing.T) {
 	}
 	if !Match(providerQuota, "openai", "anything") || Match(providerQuota, "anthropic", "anything") {
 		t.Fatal("provider match is wrong")
+	}
+	if !Match(modelOnlyQuota, "openai", "gpt-6.1-sol") || !Match(modelOnlyQuota, "anthropic", "gpt-6.1-sol") || Match(modelOnlyQuota, "openai", "gpt-6-luna") {
+		t.Fatal("model-only match is wrong")
 	}
 	if !Match(global, "", "") {
 		t.Fatal("global quota should match everything")
@@ -105,6 +177,30 @@ func TestPeriodForMonthBoundaries(t *testing.T) {
 	start, end = PeriodFor(time.Date(2026, 3, 5, 0, 0, 0, 0, utc), 31, utc)
 	if !start.Equal(time.Date(2026, 2, 28, 0, 0, 0, 0, utc)) || !end.Equal(time.Date(2026, 3, 31, 0, 0, 0, 0, utc)) {
 		t.Fatalf("post-February period = %s .. %s", start, end)
+	}
+}
+
+func TestPeriodForClampsDay31AcrossMonthLengths(t *testing.T) {
+	// Day 31 resets on each month's last day when the month is shorter
+	// (issue #37): February non-leap and leap, and a 30-day month.
+	utc := time.UTC
+	tests := []struct {
+		name string
+		now  time.Time
+		want time.Time // clamped end of the running period
+	}{
+		{"February non-leap", time.Date(2026, 2, 10, 0, 0, 0, 0, utc), time.Date(2026, 2, 28, 0, 0, 0, 0, utc)},
+		{"February leap", time.Date(2028, 2, 10, 0, 0, 0, 0, utc), time.Date(2028, 2, 29, 0, 0, 0, 0, utc)},
+		{"30-day month", time.Date(2026, 4, 15, 0, 0, 0, 0, utc), time.Date(2026, 4, 30, 0, 0, 0, 0, utc)},
+	}
+	for _, test := range tests {
+		start, end := PeriodFor(test.now, 31, utc)
+		if !end.Equal(test.want) {
+			t.Errorf("%s: end = %s, want %s", test.name, end, test.want)
+		}
+		if !start.Before(test.want) {
+			t.Errorf("%s: start %s not before end %s", test.name, start, test.want)
+		}
 	}
 }
 

@@ -110,10 +110,12 @@ quotas:
       cost_per_month: 250
 ```
 
-`reset_day` is the day of month the period restarts (1–28; day 29+ clamps to
+`reset_day` is the day of month the period restarts (1–31; day 29+ clamps to
 each month's last day, the standard billing-cycle convention) in the hub's
-configured analytics timezone. A `model` field narrows a quota to one model
-(most-specific quota wins); omitting `provider` makes a catch-all. Cost
+configured analytics timezone. A `model` field narrows a quota to one model;
+omitting `provider` makes a catch-all. Where quotas overlap, each event is
+counted by its most specific matching quota only, so a provider+model budget
+never shares events with the provider or catch-all budget. Cost
 budgets measure priced usage only — a cost quota with no priced rows reads
 Unknown, never zero. The same data is available at `/api/v1/quotas`.
 

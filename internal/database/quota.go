@@ -45,8 +45,10 @@ type QuotaStatus struct {
 }
 
 // QuotaStatus measures every configured quota over its current period in the
-// store's reporting timezone. With no quotas configured it returns nil — the
-// dashboard renders an explicit Unknown state for that case itself.
+// store's reporting timezone. Each usage event is attributed to exactly one
+// quota — the most specific match — so overlapping quotas never double-count
+// an event. With no quotas configured it returns nil — the dashboard renders
+// an explicit Unknown state for that case itself.
 func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 	if len(s.quotas) == 0 {
 		return nil
@@ -57,85 +59,110 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 		return quota.Specificity(ordered[left]) < quota.Specificity(ordered[right])
 	})
 
-	statuses := make([]QuotaStatus, 0, len(ordered))
+	loc := s.reportingLocation()
+	measurements := make([]quotaMeasurement, 0, len(ordered))
+	var windowStart, windowEnd time.Time
 	for _, configured := range ordered {
-		statuses = append(statuses, s.quotaStatus(ctx, configured, now))
+		start, end := quota.PeriodFor(now, configured.ResetDay, loc)
+		if windowStart.IsZero() || start.Before(windowStart) {
+			windowStart = start
+		}
+		if windowEnd.IsZero() || end.After(windowEnd) {
+			windowEnd = end
+		}
+		measurements = append(measurements, quotaMeasurement{
+			configured: configured,
+			start:      start,
+			end:        end,
+			perDay:     make(map[string]quotaDay),
+			status: QuotaStatus{
+				Provider:    configured.Provider,
+				Model:       configured.Model,
+				Label:       configured.Label,
+				ResetDay:    configured.ResetDay,
+				PeriodStart: start.In(loc).Format("2006-01-02"),
+				PeriodEnd:   end.In(loc).Format("2006-01-02"),
+				Daily:       []QuotaPoint{},
+			},
+		})
+	}
+
+	// One fetch covers the union of the periods; attribution happens in Go so
+	// each event is counted at most once. The measurement windows are
+	// candidates too: with mismatched reset days a specific quota's period can
+	// miss a day its broader quota covers, and the event then falls through to
+	// the broader quota instead of vanishing from every budget.
+	events, ok := s.quotaEvents(ctx, windowStart, windowEnd, loc)
+	if !ok {
+		for index := range measurements {
+			measurements[index].status.State = "unknown"
+		}
+	} else {
+		for _, event := range events {
+			if index := mostSpecificQuota(measurements, event); index >= 0 {
+				measurements[index].add(event)
+			}
+		}
+		for index := range measurements {
+			measurements[index].fillStatus(loc, now)
+		}
+	}
+
+	statuses := make([]QuotaStatus, 0, len(measurements))
+	for index := range measurements {
+		statuses = append(statuses, measurements[index].status)
 	}
 	return statuses
 }
 
-func (s *Store) quotaStatus(ctx context.Context, configured quota.Quota, now time.Time) QuotaStatus {
-	loc := s.reportingLocation()
-	start, end := quota.PeriodFor(now, configured.ResetDay, loc)
-	status := QuotaStatus{
-		Provider:    configured.Provider,
-		Model:       configured.Model,
-		Label:       configured.Label,
-		ResetDay:    configured.ResetDay,
-		PeriodStart: start.In(loc).Format("2006-01-02"),
-		PeriodEnd:   end.In(loc).Format("2006-01-02"),
-		Daily:       []QuotaPoint{},
-	}
+// quotaMeasurement accumulates one quota's attributed usage before the
+// status is filled in.
+type quotaMeasurement struct {
+	configured quota.Quota
+	start, end time.Time
+	perDay     map[string]quotaDay
+	status     QuotaStatus
+}
 
-	query := `SELECT timestamp, total_tokens, cost FROM usage_events
-WHERE timestamp >= ? AND timestamp < ?`
-	args := []any{start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339)}
-	if configured.Provider != "" {
-		query += ` AND provider = ?`
-		args = append(args, configured.Provider)
-	}
-	if configured.Model != "" {
-		query += ` AND (canonical_model = ? OR raw_model = ?)`
-		args = append(args, configured.Model, configured.Model)
-	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		status.State = "unknown"
-		return status
-	}
-	defer rows.Close()
+// matchesEvent reports whether the quota applies to an event with the given
+// provider and model in either stored form (canonical or raw).
+func (m *quotaMeasurement) matchesEvent(provider, canonical, raw string) bool {
+	return quota.Match(m.configured, provider, canonical) || quota.Match(m.configured, provider, raw)
+}
 
-	perDay := make(map[string]quotaDay)
-	for rows.Next() {
-		var timestamp string
-		var total sql.NullInt64
-		var cost sql.NullFloat64
-		if err := rows.Scan(&timestamp, &total, &cost); err != nil {
-			status.State = "unknown"
-			return status
-		}
-		parsed, err := timeParse(timestamp)
-		if err != nil {
-			status.State = "unknown"
-			return status
-		}
-		day := perDay[parsed.In(loc).Format("2006-01-02")]
-		day.events++
-		if !total.Valid {
-			day.unknownEvents++
-		} else {
-			day.tokens += total.Int64
-		}
-		if cost.Valid {
-			day.cost += cost.Float64
-			day.costKnown = true
-		}
-		perDay[parsed.In(loc).Format("2006-01-02")] = day
-	}
-	if err := rows.Err(); err != nil {
-		status.State = "unknown"
-		return status
-	}
+// containsDay reports whether the quota's current period covers a local day.
+func (m *quotaMeasurement) containsDay(day string) bool {
+	return day >= m.status.PeriodStart && day < m.status.PeriodEnd
+}
 
+// add folds one attributed event into the quota's per-day totals.
+func (m *quotaMeasurement) add(event quotaEvent) {
+	day := m.perDay[event.day]
+	day.events++
+	if !event.total.Valid {
+		day.unknownEvents++
+	} else {
+		day.tokens += event.total.Int64
+	}
+	if event.cost.Valid {
+		day.cost += event.cost.Float64
+		day.costKnown = true
+	}
+	m.perDay[event.day] = day
+}
+
+// fillStatus folds the per-day usage into the status: a continuous daily
+// cumulative line across the period, the totals, and the state + projection.
+func (m *quotaMeasurement) fillStatus(loc *time.Location, now time.Time) {
 	// Walk every local day of the period so the line is continuous even for
 	// quiet days.
 	var tokensUsed int64
 	var costUsed float64
 	var costKnown bool
 	var unknownEvents int64
-	for day := start; day.Before(end); day = day.AddDate(0, 0, 1) {
+	for day := m.start; day.Before(m.end); day = day.AddDate(0, 0, 1) {
 		key := day.Format("2006-01-02")
-		measured := perDay[key]
+		measured := m.perDay[key]
 		tokensUsed += measured.tokens
 		costUsed += measured.cost
 		costKnown = costKnown || measured.costKnown
@@ -145,23 +172,79 @@ WHERE timestamp >= ? AND timestamp < ?`
 			costCopy := costUsed
 			point.CumulativeCost = &costCopy
 		}
-		status.Daily = append(status.Daily, point)
+		m.status.Daily = append(m.status.Daily, point)
 	}
-	status.TokensUsed = tokensUsed
-	status.UnknownTotalEvents = unknownEvents
+	m.status.TokensUsed = tokensUsed
+	m.status.UnknownTotalEvents = unknownEvents
 	if costKnown {
-		status.CostUsed = &costUsed
+		m.status.CostUsed = &costUsed
 	}
-	status.TokensBudget = configured.Budget.TokensPerMonth
-	status.CostBudget = configured.Budget.CostPerMonth
+	m.status.TokensBudget = m.configured.Budget.TokensPerMonth
+	m.status.CostBudget = m.configured.Budget.CostPerMonth
 
-	status.State = quotaState(status)
-	if projected := quotaProjection(status, start, end, now, loc); projected != nil {
-		status.ProjectedTokens = projected.tokens
-		status.ProjectedCost = projected.cost
-		status.ProjectedOverageDate = projected.overageDate
+	m.status.State = quotaState(m.status)
+	if projected := quotaProjection(m.status, m.start, m.end, now, loc); projected != nil {
+		m.status.ProjectedTokens = projected.tokens
+		m.status.ProjectedCost = projected.cost
+		m.status.ProjectedOverageDate = projected.overageDate
 	}
-	return status
+}
+
+// mostSpecificQuota returns the index of the quota an event belongs to: the
+// most specific matching quota whose current period contains the event's day,
+// or -1 when no configured quota covers it. The measurements are ordered by
+// ascending specificity, so the first match wins; equal ranks fall back to
+// configuration order.
+func mostSpecificQuota(measurements []quotaMeasurement, event quotaEvent) int {
+	for index := range measurements {
+		if measurements[index].matchesEvent(event.provider, event.canonical, event.raw) &&
+			measurements[index].containsDay(event.day) {
+			return index
+		}
+	}
+	return -1
+}
+
+// quotaEvent is one usage row inside the union quota window, pre-parsed to
+// its reporting-timezone day for attribution.
+type quotaEvent struct {
+	day       string
+	provider  string
+	canonical string
+	raw       string
+	total     sql.NullInt64
+	cost      sql.NullFloat64
+}
+
+// quotaEvents loads the usage rows covering the union of the configured
+// periods. ok is false when the rows cannot be read or parsed: every quota
+// then reports unknown rather than a partial measurement.
+func (s *Store) quotaEvents(ctx context.Context, start, end time.Time, loc *time.Location) ([]quotaEvent, bool) {
+	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, provider, canonical_model, raw_model, total_tokens, cost FROM usage_events
+WHERE timestamp >= ? AND timestamp < ?`,
+		start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+	var events []quotaEvent
+	for rows.Next() {
+		var timestamp string
+		var event quotaEvent
+		if err := rows.Scan(&timestamp, &event.provider, &event.canonical, &event.raw, &event.total, &event.cost); err != nil {
+			return nil, false
+		}
+		parsed, err := timeParse(timestamp)
+		if err != nil {
+			return nil, false
+		}
+		event.day = parsed.In(loc).Format("2006-01-02")
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false
+	}
+	return events, true
 }
 
 // quotaDay is one local day's measured usage.
