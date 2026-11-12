@@ -1,4 +1,8 @@
-## Unreleased
+## 0.4.4
+
+A correctness-and-cost pass: the Tokedex MVP is complete behind its flag,
+the catalog finally prices most of what the hub actually uses, warm analytics
+renders stop queuing behind ingest, and CI runs again.
 
 ### Added
 
