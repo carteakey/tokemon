@@ -282,6 +282,116 @@ const sourceHealthInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// connectorHealthInvariantJS is the dedicated gate for the per-source
+// connector health panel (issue #26). It goes beyond the page-loop's
+// sourceHealthInvariantJS by pinning each seeded adapter to its expected
+// state label, asserting the state is announced as text rather than carried
+// by colour alone, and checking the no-source machine's explicit copy.
+const connectorHealthInvariantJS = `(() => {
+	const problems = [];
+	const table = document.querySelector('table.health-table');
+	if (!table) {
+		problems.push('machine health panel is missing');
+		return JSON.stringify(problems);
+	}
+	const rows = Array.from(table.querySelectorAll('tbody tr')).filter(row => !row.classList.contains('empty-row'));
+	const reporting = rows.find(row => row.textContent.includes('smoke-laptop'));
+	if (!reporting) {
+		problems.push('machine health panel lacks the reporting machine row');
+		return JSON.stringify(problems);
+	}
+	const lines = Array.from(reporting.querySelectorAll('.source-health-line'));
+	if (lines.length !== 4) {
+		problems.push('expected 4 per-source connector rows, found ' + lines.length);
+	}
+	// Each seeded source has a known shape: fresh sync, stale sync, never
+	// synced, and a stale source carrying an error class.
+	const expected = {'claude-code': 'Fresh', 'codex': 'Stale', 'zcode': 'Unknown', 'opencode': 'Stale'};
+	for (const adapter of Object.keys(expected)) {
+		const want = expected[adapter];
+		const line = lines.find(candidate => candidate.textContent.includes(adapter));
+		if (!line) {
+			problems.push('missing connector row for ' + adapter);
+			continue;
+		}
+		const pill = line.querySelector('.status-pill');
+		if (!pill) {
+			problems.push(adapter + ' row has no status pill');
+			continue;
+		}
+		// The state must reach assistive tech as text, not only as the colour
+		// class the stylesheet paints. Assert the announced label itself.
+		const announced = (pill.getAttribute('aria-label') || pill.textContent).trim();
+		if (announced !== want) {
+			problems.push(adapter + ' pill announces ' + JSON.stringify(announced) + ', want ' + want);
+		}
+		if (pill.getAttribute('aria-hidden') === 'true') {
+			problems.push(adapter + ' pill hides its state from assistive tech');
+		}
+	}
+	const freshLine = lines.find(line => line.textContent.includes('claude-code'));
+	const staleLine = lines.find(line => line.textContent.includes('codex'));
+	if (freshLine && staleLine) {
+		const freshPill = freshLine.querySelector('.status-pill');
+		const stalePill = staleLine.querySelector('.status-pill');
+		if (!freshPill || !stalePill) {
+			problems.push('fresh/stale rows lost their status pills');
+		} else {
+			if (freshPill.textContent.trim() === stalePill.textContent.trim()) {
+				problems.push('stale and healthy sources are not distinguished by their announced text');
+			}
+			if (!freshPill.classList.contains('connected') || !stalePill.classList.contains('stale')) {
+				problems.push('fresh/stale pills lost their state classes');
+			}
+		}
+	}
+	const unknownLine = lines.find(line => line.textContent.includes('zcode'));
+	if (!unknownLine || !unknownLine.textContent.includes('never synced')) {
+		problems.push('never-synced source does not say never synced');
+	}
+	const errorLine = lines.find(line => line.textContent.includes('opencode'));
+	if (!errorLine || !errorLine.querySelector('.sync-error') || !errorLine.querySelector('.sync-error').textContent.includes('upload_failed')) {
+		problems.push('erroring source does not show its error class inline');
+	}
+	// A machine that reported no sources must render explicit copy, never an
+	// empty sync-context cell.
+	const silent = rows.find(row => row.textContent.includes('smoke-silent'));
+	if (!silent) {
+		problems.push('machine health panel lacks the no-source machine row');
+	} else {
+		if (silent.querySelector('.source-health-line')) {
+			problems.push('no-source machine rendered per-source rows');
+		}
+		if (!silent.textContent.includes('Heartbeat metadata only')) {
+			problems.push('no-source machine lacks its explicit empty copy');
+		}
+	}
+	return JSON.stringify(problems);
+})()`
+
+// connectorHealthEmptyInvariantJS covers the panel's empty state: with no
+// heartbeat at all the table must say so explicitly instead of rendering an
+// empty box.
+const connectorHealthEmptyInvariantJS = `(() => {
+	const problems = [];
+	const table = document.querySelector('table.health-table');
+	if (!table) {
+		problems.push('machine health panel is missing');
+		return JSON.stringify(problems);
+	}
+	const rows = Array.from(table.querySelectorAll('tbody tr'));
+	if (rows.length !== 1 || !rows[0].classList.contains('empty-row')) {
+		problems.push('expected one empty machine-health row, found ' + rows.length);
+	}
+	if (!table.textContent.includes('No machine heartbeats yet.')) {
+		problems.push('empty machine health panel lacks its explicit copy');
+	}
+	if (table.querySelector('.source-health-line') || table.querySelector('.source-health')) {
+		problems.push('empty machine health panel rendered an empty source box');
+	}
+	return JSON.stringify(problems);
+})()`
+
 // quotaAbsentInvariantJS guards the no-quotas default: the analytics page
 // must not render the panel section at all.
 const quotaAbsentInvariantJS = `(() => {
@@ -469,6 +579,41 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			assertAxeAllowlist(t, ctx, page.path)
 		})
 	}
+
+	// The per-source connector health panel (issue #26) in a real browser:
+	// one row per seeded source with its state announced as text, a stale
+	// source visibly (not colour-only) distinguished from a healthy one, the
+	// no-source machine's explicit copy, and the empty panel's explicit copy.
+	t.Run("connector-health", func(t *testing.T) {
+		navigate := func(url string) {
+			t.Helper()
+			if _, err := chromedp.Run(ctx, chromedp.Navigate(url+"/")); err != nil {
+				t.Fatalf("navigation to %s failed: %v", url, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.WaitReady("table.health-table")); err != nil {
+				t.Fatalf("machine health panel never appeared on %s: %v", url, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+				t.Fatalf("could not settle animations on %s: %v", url, err)
+			}
+		}
+
+		// Seeded sources: fresh, stale, never synced, and stale-with-error,
+		// plus a machine that reported no sources at all.
+		navigate(baseURL)
+		for _, invariant := range []string{sharedInvariantJS, connectorHealthInvariantJS} {
+			assertNoProblems(t, ctx, invariant)
+		}
+		assertAxeAllowlist(t, ctx, "/")
+
+		// No heartbeat yet: the panel must say so instead of an empty box.
+		emptyURL := serveStore(t, seedEmptyStore(t), false)
+		navigate(emptyURL)
+		for _, invariant := range []string{sharedInvariantJS, connectorHealthEmptyInvariantJS} {
+			assertNoProblems(t, ctx, invariant)
+		}
+		assertAxeAllowlist(t, ctx, "/")
+	})
 
 	// With the default configuration the catalog UI is opt-in: the route
 	// answers 404 for an authenticated user and no page advertises it.
@@ -936,8 +1081,9 @@ func startSeededServer(t *testing.T, enableTokedex bool) string {
 }
 
 // seedSmokeStore opens a scratch database and seeds enough usage for every
-// dashboard page to render with data: two machines, four connector-health
-// shapes, and events fresh enough for the overview pill to read Fresh.
+// dashboard page to render with data: two usage-reporting machines, four
+// connector-health shapes, a no-source machine, and events fresh enough for
+// the overview pill to read Fresh.
 func seedSmokeStore(t *testing.T) *database.Store {
 	t.Helper()
 	store, err := database.Open(filepath.Join(t.TempDir(), "smoke.db"), smokeCatalog())
@@ -1022,6 +1168,33 @@ func seedSmokeStore(t *testing.T) *database.Store {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A second machine that reported no discovered sources: the panel must
+	// render its explicit "Heartbeat metadata only" copy instead of an empty
+	// source box. The non-nil empty slice is a health-aware agent with zero
+	// sources, which clears any previously reported rows.
+	if err := store.RecordHeartbeat(context.Background(), database.AgentHeartbeat{
+		MachineID:       "smoke-silent",
+		OperatingSystem: "linux",
+		Architecture:    "amd64",
+		SourceCount:     0,
+		Sources:         []database.AgentSourceHealth{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// seedEmptyStore opens a scratch database with the smoke catalog but no usage
+// events and no heartbeats, so the overview renders every empty state —
+// including the machine-health panel's explicit "No machine heartbeats yet."
+// row instead of an empty table body.
+func seedEmptyStore(t *testing.T) *database.Store {
+	t.Helper()
+	store, err := database.Open(filepath.Join(t.TempDir(), "empty.db"), smokeCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
 	return store
 }
 
