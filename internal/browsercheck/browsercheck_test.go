@@ -19,22 +19,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/tokemon/tokemon/internal/api"
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
+	"golang.org/x/crypto/bcrypt"
 )
 
 //go:embed testdata/axe.min.js
 var axeSource string
 
 const dashboardToken = "smoke-dashboard"
+
+// The dashboard password account the login-session-logout smoke signs in
+// with; startSeededPasswordServer configures the server to accept it.
+const (
+	smokeLoginUsername = "smoke-operator"
+	smokeLoginPassword = "smoke-passphrase"
+)
 
 // axeTags mirrors the WCAG 2.x A/AA success criteria the release promises;
 // best-practice rules outside those tags stay out of the gate.
@@ -562,6 +572,233 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		assertAxeAllowlist(t, ctx, "/analytics")
 	})
+
+	// The login/session/logout flow in a real browser against a
+	// password-enabled server: the form renders, wrong credentials fail with
+	// a visible alert, correct credentials mint a session cookie and land on
+	// the next target, logout demands its CSRF token, real logout clears the
+	// cookie, and a signed-out browser is sent back to the form. The v0.4.3
+	// anonymous-HTML redirect regression reached the gate because none of
+	// this was exercised.
+	t.Run("login-session-logout", func(t *testing.T) {
+		passwordURL := startSeededPasswordServer(t)
+		loginCtx, cancelLogin := chromedp.NewContext(allocatorCtx)
+		defer cancelLogin()
+		loginRunCtx, cancelLoginRun := context.WithTimeout(loginCtx, 90*time.Second)
+		defer cancelLoginRun()
+
+		// RunResponse only reports the final document of a redirect chain, so
+		// the 303 assertions read records taken off the CDP network events:
+		// one entry per rendered document plus one per intermediate redirect.
+		// Listeners run synchronously in arrival order, so every record a
+		// step produced is in the slice by the time its RunResponse returns.
+		var wireMu sync.Mutex
+		var wire []wireResponse
+		wireLen := func() int {
+			wireMu.Lock()
+			defer wireMu.Unlock()
+			return len(wire)
+		}
+		wireSince := func(mark int) []wireResponse {
+			wireMu.Lock()
+			defer wireMu.Unlock()
+			return append([]wireResponse(nil), wire[mark:]...)
+		}
+		wireFind := func(mark int, match func(wireResponse) bool) bool {
+			t.Helper()
+			for _, response := range wireSince(mark) {
+				if match(response) {
+					return true
+				}
+			}
+			t.Fatalf("no matching wire response after mark %d; recorded: %+v", mark, wireSince(mark))
+			return false
+		}
+		if err := chromedp.Listen(loginCtx, func(ev any) {
+			switch ev := ev.(type) {
+			case *network.EventResponseReceived:
+				if ev.Type == network.ResourceTypeDocument {
+					wireMu.Lock()
+					wire = append(wire, wireResponse{status: ev.Response.Status, url: ev.Response.URL})
+					wireMu.Unlock()
+				}
+			case *network.EventRequestWillBeSent:
+				if ev.RedirectResponse == nil || !strings.HasPrefix(ev.Request.URL, passwordURL) {
+					return
+				}
+				wireMu.Lock()
+				wire = append(wire, wireResponse{
+					status:   ev.RedirectResponse.Status,
+					url:      ev.RedirectResponse.URL,
+					location: wireHeader(ev.RedirectResponse.Headers, "Location"),
+				})
+				wireMu.Unlock()
+			}
+		}); err != nil {
+			t.Fatalf("could not subscribe to network events: %v", err)
+		}
+
+		// 1. GET /login renders the form: 200, a username field, a password
+		// field, and the hidden CSRF field.
+		formResponse, err := chromedp.RunResponse(loginRunCtx, chromedp.Navigate(passwordURL+"/login"))
+		if err != nil {
+			t.Fatalf("navigation to /login failed: %v", err)
+		}
+		if formResponse.Status != http.StatusOK {
+			t.Fatalf("GET /login status = %d, want %d", formResponse.Status, http.StatusOK)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.WaitReady("#login-password")); err != nil {
+			t.Fatalf("login form never became ready: %v", err)
+		}
+		fieldsJSON, err := chromedp.Run(loginRunCtx, chromedp.Evaluate[string](`(() => {
+			const form = document.querySelector('form[action="/login"]');
+			return JSON.stringify({
+				username: !!document.querySelector('#login-username[name="username"]'),
+				password: !!document.querySelector('#login-password[name="password"]'),
+				csrf: !!form && !!form.querySelector('input[type="hidden"][name="csrf_token"]'),
+			});
+		})()`))
+		if err != nil {
+			t.Fatalf("login form field check failed to run: %v", err)
+		}
+		var fields struct {
+			Username bool `json:"username"`
+			Password bool `json:"password"`
+			CSRF     bool `json:"csrf"`
+		}
+		if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
+			t.Fatalf("login form field check returned malformed JSON %q: %v", fieldsJSON, err)
+		}
+		if !fields.Username || !fields.Password || !fields.CSRF {
+			t.Fatalf("login form incomplete: username=%v password=%v hidden-csrf=%v", fields.Username, fields.Password, fields.CSRF)
+		}
+
+		// 2. Wrong password: 401 and a visible role=alert error.
+		if _, err := chromedp.Run(loginRunCtx, chromedp.SetValue("#login-username", smokeLoginUsername)); err != nil {
+			t.Fatalf("could not fill the username field: %v", err)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.SetValue("#login-password", "deliberately-wrong")); err != nil {
+			t.Fatalf("could not fill the password field: %v", err)
+		}
+		wrongResponse, err := chromedp.RunResponse(loginRunCtx, chromedp.Click(`form[action="/login"] button[type="submit"]`))
+		if err != nil {
+			t.Fatalf("wrong-password submit failed: %v", err)
+		}
+		if wrongResponse.Status != http.StatusUnauthorized {
+			t.Fatalf("wrong-password submit status = %d, want %d", wrongResponse.Status, http.StatusUnauthorized)
+		}
+		alertJSON, err := chromedp.Run(loginRunCtx, chromedp.Evaluate[string](`(() => {
+			const alert = document.querySelector('[role="alert"]');
+			if (!alert) return JSON.stringify({present: false});
+			const box = alert.getBoundingClientRect();
+			return JSON.stringify({present: true, visible: box.width > 0 && box.height > 0, text: alert.textContent.trim()});
+		})()`))
+		if err != nil {
+			t.Fatalf("login alert check failed to run: %v", err)
+		}
+		var alert struct {
+			Present bool   `json:"present"`
+			Visible bool   `json:"visible"`
+			Text    string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(alertJSON), &alert); err != nil {
+			t.Fatalf("login alert check returned malformed JSON %q: %v", alertJSON, err)
+		}
+		if !alert.Present || !alert.Visible || !strings.Contains(alert.Text, "Invalid username or password.") {
+			t.Fatalf("wrong-password error alert = (present=%v, visible=%v, text=%q), want a visible alert telling the credentials were rejected", alert.Present, alert.Visible, alert.Text)
+		}
+
+		// 3. Correct password: a 303 to the next target with a session
+		// cookie, and the authenticated page renders 200.
+		signInMark := wireLen()
+		if _, err := chromedp.Run(loginRunCtx, chromedp.Navigate(passwordURL+"/login?next=%2Fsessions")); err != nil {
+			t.Fatalf("navigation to the next-carrying login form failed: %v", err)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.WaitReady("#login-password")); err != nil {
+			t.Fatalf("next-carrying login form never became ready: %v", err)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.SetValue("#login-username", smokeLoginUsername)); err != nil {
+			t.Fatalf("could not fill the username field: %v", err)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.SetValue("#login-password", smokeLoginPassword)); err != nil {
+			t.Fatalf("could not fill the password field: %v", err)
+		}
+		signedInResponse, err := chromedp.RunResponse(loginRunCtx, chromedp.Click(`form[action="/login"] button[type="submit"]`))
+		if err != nil {
+			t.Fatalf("correct-password submit failed: %v", err)
+		}
+		wireFind(signInMark, func(response wireResponse) bool {
+			return response.status == http.StatusSeeOther &&
+				response.url == passwordURL+"/login" &&
+				response.location == "/sessions"
+		})
+		if signedInResponse.Status != http.StatusOK || !strings.HasPrefix(signedInResponse.URL, passwordURL+"/sessions") {
+			t.Fatalf("after sign-in the browser landed on %s with status %d, want /sessions with 200", signedInResponse.URL, signedInResponse.Status)
+		}
+		if held := sessionCookieCount(t, loginRunCtx); held != 1 {
+			t.Fatalf("after sign-in the browser holds %d session cookies, want exactly 1", held)
+		}
+
+		// 4. Logout without the CSRF token: 403. The request goes through the
+		// real topbar form with its CSRF field stripped, so the origin check
+		// still passes and the rejection is the token gate.
+		if _, err := chromedp.Run(loginRunCtx, chromedp.Evaluate[bool](`(() => {
+			const field = document.querySelector('form.logout-form input[name="csrf_token"]');
+			if (!field) return false;
+			field.remove();
+			return true;
+		})()`)); err != nil {
+			t.Fatalf("could not strip the logout CSRF field: %v", err)
+		}
+		rejectedResponse, err := chromedp.RunResponse(loginRunCtx, chromedp.Click("form.logout-form button"))
+		if err != nil {
+			t.Fatalf("csrf-less logout submit failed: %v", err)
+		}
+		if rejectedResponse.Status != http.StatusForbidden {
+			t.Fatalf("logout without the CSRF token status = %d, want %d", rejectedResponse.Status, http.StatusForbidden)
+		}
+
+		// 5. Logout with the CSRF token: 303 to /login and the session cookie
+		// cleared.
+		logoutMark := wireLen()
+		if _, err := chromedp.Run(loginRunCtx, chromedp.Navigate(passwordURL+"/")); err != nil {
+			t.Fatalf("navigation to the signed-in overview failed: %v", err)
+		}
+		if _, err := chromedp.Run(loginRunCtx, chromedp.WaitReady("form.logout-form")); err != nil {
+			t.Fatalf("signed-in overview never became ready: %v", err)
+		}
+		signedOutResponse, err := chromedp.RunResponse(loginRunCtx, chromedp.Click("form.logout-form button"))
+		if err != nil {
+			t.Fatalf("logout submit failed: %v", err)
+		}
+		wireFind(logoutMark, func(response wireResponse) bool {
+			return response.status == http.StatusSeeOther &&
+				response.url == passwordURL+"/logout" &&
+				response.location == "/login"
+		})
+		if signedOutResponse.Status != http.StatusOK || !strings.HasPrefix(signedOutResponse.URL, passwordURL+"/login") {
+			t.Fatalf("after logout the browser landed on %s with status %d, want /login with 200", signedOutResponse.URL, signedOutResponse.Status)
+		}
+		if remaining := sessionCookieCount(t, loginRunCtx); remaining != 0 {
+			t.Fatalf("after logout the browser still holds %d session cookies, want 0", remaining)
+		}
+
+		// 6. After logout, an authenticated page redirects browsers to the
+		// login form with the target preserved in next.
+		signedOutNavMark := wireLen()
+		signedOutNavResponse, err := chromedp.Run(loginRunCtx, chromedp.NavigateResponse(passwordURL+"/sessions"))
+		if err != nil {
+			t.Fatalf("navigation to the signed-out /sessions failed: %v", err)
+		}
+		wireFind(signedOutNavMark, func(response wireResponse) bool {
+			return response.status == http.StatusSeeOther &&
+				response.url == passwordURL+"/sessions" &&
+				response.location == "/login?next=%2Fsessions"
+		})
+		if signedOutNavResponse.Status != http.StatusOK || !strings.HasPrefix(signedOutNavResponse.URL, passwordURL+"/login") {
+			t.Fatalf("signed-out navigation landed on %s with status %d, want /login with 200", signedOutNavResponse.URL, signedOutNavResponse.Status)
+		}
+	})
 }
 
 // assertNoProblems evaluates an invariant script and fails with the reported
@@ -622,6 +859,47 @@ func assertAxeAllowlist(t *testing.T, ctx context.Context, path string) {
 	}
 }
 
+// wireResponse is one document-level HTTP exchange the login smoke observed
+// over CDP: either a rendered document or an intermediate redirect, whose
+// Location carries the hand-off target. RunResponse only ever reports the
+// final document of a chain, so redirect assertions read these records.
+type wireResponse struct {
+	status   int64
+	url      string
+	location string
+}
+
+// wireHeader reads one response header case-insensitively from the CDP
+// headers map.
+func wireHeader(headers network.Headers, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			text, _ := value.(string)
+			return text
+		}
+	}
+	return ""
+}
+
+// sessionCookieCount returns how many HttpOnly cookies holding a value the
+// browser currently has for the page's host. The smoke servers set exactly
+// one such cookie — the login session — so the count is 1 while signed in
+// and 0 once logout has cleared it.
+func sessionCookieCount(t *testing.T, ctx context.Context) int {
+	t.Helper()
+	cookies, err := chromedp.Call(ctx, network.GetCookies, network.GetCookiesParams{})
+	if err != nil {
+		t.Fatalf("could not read the browser cookies: %v", err)
+	}
+	count := 0
+	for _, cookie := range cookies.Cookies {
+		if cookie.HTTPOnly && cookie.Value != "" {
+			count++
+		}
+	}
+	return count
+}
+
 // smokeCatalog seeds the enabled Tokedex with the states the MVP must render:
 // a priced model with usage, an unpublished-rates model with usage, and a
 // priced model with no usage at all.
@@ -654,6 +932,13 @@ func smokeCatalog() *catalog.Catalog {
 // The browser signs in with Basic auth via URL credentials. enableTokedex
 // mirrors the TOKEMON_ENABLE_TOKEDEX default-off gate.
 func startSeededServer(t *testing.T, enableTokedex bool) string {
+	return serveStore(t, seedSmokeStore(t), enableTokedex)
+}
+
+// seedSmokeStore opens a scratch database and seeds enough usage for every
+// dashboard page to render with data: two machines, four connector-health
+// shapes, and events fresh enough for the overview pill to read Fresh.
+func seedSmokeStore(t *testing.T) *database.Store {
 	t.Helper()
 	store, err := database.Open(filepath.Join(t.TempDir(), "smoke.db"), smokeCatalog())
 	if err != nil {
@@ -737,7 +1022,7 @@ func startSeededServer(t *testing.T, enableTokedex bool) string {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return serveStore(t, store, enableTokedex)
+	return store
 }
 
 // serveStore wraps an already-seeded store in the real handler on a loopback
@@ -753,14 +1038,44 @@ func serveStore(t *testing.T, store *database.Store, enableTokedex bool) string 
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fmt.Sprintf("http://tokemon:%s@%s", dashboardToken, listenOnLoopback(t, server.Handler()))
+}
+
+// startSeededPasswordServer serves the seeded scratch store behind a
+// dashboard password account instead of URL-embedded Basic credentials, so
+// the browser must sign in through the real login form. The returned base URL
+// carries no credentials: anything authenticated must come from a session
+// cookie.
+func startSeededPasswordServer(t *testing.T) string {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(smokeLoginPassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := api.NewWithConfig(seedSmokeStore(t), api.Config{
+		IngestToken:           "smoke-ingest",
+		DashboardToken:        dashboardToken,
+		DashboardUsername:     smokeLoginUsername,
+		DashboardPasswordHash: hash,
+		Logger:                slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "http://" + listenOnLoopback(t, server.Handler())
+}
+
+// listenOnLoopback serves the handler on a loopback port and returns the
+// host:port; the listener closes when the test ends.
+func listenOnLoopback(t *testing.T, handler http.Handler) string {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { listener.Close() })
-	go http.Serve(listener, server.Handler())
-	host := listener.Addr().String()
-	return fmt.Sprintf("http://tokemon:%s@%s", dashboardToken, host)
+	go http.Serve(listener, handler)
+	return listener.Addr().String()
 }
 
 // startQuotaServer opens a scratch store with two configured quotas and
