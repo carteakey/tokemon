@@ -47,6 +47,12 @@
   the CSRF token (403), logout with it (303 + cookie cleared), and the
   signed-out redirect. This is the gap that let the v0.4.3 anonymous-HTML
   redirect regression reach the gate. Fixes #39.
+- **The browser smoke gates the per-source connector health panel.** A
+  dedicated subtest pins each seeded adapter to its expected state
+  (Fresh/Stale/Unknown), asserts the state is announced as text rather than
+  colour-only, covers the never-synced source and its inline error, and covers
+  both empty states (a machine that reported no sources, and an empty
+  database). Fixes #26.
 
 ## 0.4.4
 
