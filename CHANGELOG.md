@@ -1,3 +1,43 @@
+## Unreleased
+
+### Added
+
+- **Tokedex MVP is complete** (still opt-in: `/tokedex` answers 404 until
+  `TOKEMON_ENABLE_TOKEDEX` is set). The page now has a tier legend, honest
+  empty/unknown states, and client-side sort / filter / search over the model
+  cards — sort by tokens, events, or name within each tier, filter by tier,
+  provider, and priced-vs-unknown, and free-text search over display names and
+  aliases. No new endpoints; the controls are progressive enhancement over the
+  fully server-rendered grid, and the page stays axe-clean.
+- **Catalog pricing verification:** 24 of 35 models now carry `mode: standard`
+  rates with a source URL and `verified_at` date, covering 97.3% of observed
+  tokens on the live hub (up from 32.5%). Models whose providers publish only
+  tiered, time-of-day, or promotional rates stay `mode: unknown` rather than
+  guessing.
+
+### Fixed
+
+- **Warm `/analytics` no longer queues behind the ingest refresh.** The
+  stale-while-revalidate path was serving the cached result in under a
+  millisecond, but the handler's next store call (`DisplayAliases`) shared the
+  store's single SQLite connection with the background analytics refresh and
+  waited for its longest stage. Alias rows are now cached in the store and
+  dropped on write, so a warm render does no database work at all. Live
+  measurement under continuous ingest: 20 consecutive warm requests, median
+  23ms, max 29ms (previously spikes of 0.3–1.2s and outliers to 4s). See
+  `docs/analytics-latency.md`.
+- **Security: Go 1.26.11.** GO-2026-6859 (HTTP/1 server crash from a
+  `MaxBytesReader` header race in `net/http`) is reachable from the dashboard
+  handler and the server's own `MaxBytesReader` use. Bumped `go.mod`, the
+  container build image, and every workflow.
+- **CI runs were cancelled on every push.** GitHub retired the macOS 14 images
+  on 2026-11-02; a job targeting `macos-14` is cancelled one second in with no
+  runner, which marks the whole run cancelled even when every other job passes.
+  The installer matrix now uses `macos-15` for the Apple Silicon leg.
+- The site's local quick-start snippet runs the server in the background and
+  waits for `/healthz` before the agent's one-shot sync, so pasting it actually
+  reaches the server.
+
 ## 0.4.3
 
 A speed and account pass: pages stay fast across ingest cycles and cold
