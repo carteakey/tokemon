@@ -83,6 +83,25 @@
   viewport. It immediately found a pre-existing 41px overflow on `/analytics`
   at 768px (the non-wrapping heading/export row); the heading now wraps below
   860px, leaving the desktop layout unchanged.
+- **The heatmap is a real keyboard grid.** The overview's 53-week activity
+  grid rendered one tab stop per active day (179 on the live hub, growing with
+  the year) while its `role="grid"` promised arrow-key navigation. It now
+  loads with exactly one tab stop — the most recent active day, chosen
+  server-side so it holds without JS — and Left/Right move by day, Up/Down by
+  week, Home/End to the row ends, carrying the tab stop with focus. Tooltips,
+  labels, roles and geometry are unchanged.
+- **Analytics charts are one tab stop each.** Every bucket was a Tab stop
+  (60 at 30 days, ~180 at `period=all`). Each chart now renders one tab stop
+  (the trend chart's peak bucket, else the first) with arrow-key navigation
+  between buckets; the live readout, selection, tooltip and labels are
+  unchanged.
+- **Phone-width chrome and the 641px gap.** The gate gained a 641×900 viewport
+  (one pixel above the 640px column breakpoint), which exposed a 2px overflow
+  from the topbar gear on the pages where the Tokedex link makes four nav
+  items; those templates now wrap up to 700px like analytics already did. Below
+  500px the refresh and pause controls are icon-only with 32×32 touch targets
+  and their `aria-label`/`aria-pressed` state intact, so the topbar no longer
+  stacks to three rows.
 
 ### Tests
 
