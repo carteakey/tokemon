@@ -1518,16 +1518,18 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		return nil, err
 	}
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
-		"tokedexEnabled":  func() bool { return config.EnableTokedex },
-		"commas":          commas,
-		"commasPtr":       commasPtr,
-		"activityTooltip": activityTooltip,
-		"mul":             func(left, right float64) float64 { return left * right },
-		"percent":         func(value float64) float64 { return value * 100 },
-		"money":           money,
-		"compact":         compact,
-		"cacheUncached":   cacheUncached,
-		"compactPtr":      compactPtr,
+		"tokedexEnabled":     func() bool { return config.EnableTokedex },
+		"commas":             commas,
+		"commasPtr":          commasPtr,
+		"activityTooltip":    activityTooltip,
+		"activityInitialTab": activityInitialTab,
+		"activityTabStop":    activityTabStop,
+		"mul":                func(left, right float64) float64 { return left * right },
+		"percent":            func(value float64) float64 { return value * 100 },
+		"money":              money,
+		"compact":            compact,
+		"cacheUncached":      cacheUncached,
+		"compactPtr":         compactPtr,
 		"share": func(part, total int64) string {
 			if total == 0 {
 				return "0.0%"
@@ -3513,10 +3515,11 @@ const dashboardTemplate = `<!doctype html>
       <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
       <div class="activity-scroll" tabindex="0" role="region" aria-label="Daily token activity, scrollable">
         <div class="activity-grid" role="grid" aria-label="Daily token activity for the last 53 weeks">
+          {{$initialTab := activityInitialTab .Activity}}
           {{range .Activity.Weeks}}
           <div class="activity-week" role="row">
             <span class="activity-month" role="presentation">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}"{{if or .Level .UnknownTokens}} tabindex="0"{{end}}{{end}}></span>{{end}}
+            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="{{activityTabStop . $initialTab}}"{{end}}></span>{{end}}
           </div>
           {{end}}
         </div>
@@ -3964,9 +3967,108 @@ const dashboardTemplate = `<!doctype html>
   window.addEventListener('resize', positionTooltip, { passive: true });
   window.addEventListener('scroll', positionTooltip, { passive: true, capture: true });
 })();
+
+// Roving tabindex for the activity grid (role="grid" promises arrow-key cell
+// navigation): exactly one cell is in the tab order — the server renders the
+// most recent active day — and the arrow keys move focus by day and week,
+// carrying the tab stop with them. Future and aria-hidden cells are skipped.
+(() => {
+  const grid = document.querySelector('.activity-grid');
+  if (!grid) return;
+  const navigable = (cell) => !cell.classList.contains('future') && cell.getAttribute('aria-hidden') !== 'true';
+  const rows = () => Array.from(grid.querySelectorAll('.activity-week'));
+  // Focus moving into a cell — by tab, click, or the arrows below — makes it
+  // the one tab stop.
+  grid.addEventListener('focusin', (event) => {
+    const cell = event.target.closest('.activity-cell');
+    if (!cell || !navigable(cell)) return;
+    for (const other of grid.querySelectorAll('.activity-cell[tabindex="0"]')) {
+      if (other !== cell) other.tabIndex = -1;
+    }
+    cell.tabIndex = 0;
+  });
+  grid.addEventListener('keydown', (event) => {
+    const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
+    if (!cell || !navigable(cell)) return;
+    const row = cell.closest('.activity-week');
+    if (!row) return;
+    const allRows = rows();
+    const rowIndex = allRows.indexOf(row);
+    const rowCells = Array.from(row.querySelectorAll('.activity-cell'));
+    const column = rowCells.indexOf(cell);
+    const at = (candidateRow, index) => {
+      const cells = Array.from(candidateRow.querySelectorAll('.activity-cell'));
+      return index >= 0 && index < cells.length && navigable(cells[index]) ? cells[index] : null;
+    };
+    let target = null;
+    switch (event.key) {
+      case 'ArrowLeft':
+        for (let index = column - 1; index >= 0 && !target; index--) target = at(row, index);
+        break;
+      case 'ArrowRight':
+        for (let index = column + 1; index < rowCells.length && !target; index++) target = at(row, index);
+        break;
+      case 'ArrowUp':
+        for (let index = rowIndex - 1; index >= 0 && !target; index--) target = at(allRows[index], column);
+        break;
+      case 'ArrowDown':
+        for (let index = rowIndex + 1; index < allRows.length && !target; index++) target = at(allRows[index], column);
+        break;
+      case 'Home':
+        for (let index = 0; index < rowCells.length && !target; index++) target = at(row, index);
+        break;
+      case 'End':
+        for (let index = rowCells.length - 1; index >= 0 && !target; index--) target = at(row, index);
+        break;
+      default:
+        return;
+    }
+    if (!target || target === cell) return;
+    event.preventDefault();
+    target.focus();
+  });
+})();
 </script>
 </body>
 </html>`
+
+// activityInitialTab picks the date the heatmap's roving tabindex starts on:
+// the most recent active day, so keyboard users land at the newest end of the
+// year and arrow across or backwards from there instead of stepping through
+// one stop per active day. With no activity at all it falls back to the most
+// recent non-future day (today), so the grid always loads with exactly one
+// tab stop and stays keyboard reachable.
+func activityInitialTab(activity database.ActivityHeatmap) string {
+	if date := activityLastDay(activity, func(day database.ActivityDay) bool {
+		return day.Level > 0 || day.UnknownTokens > 0
+	}); date != "" {
+		return date
+	}
+	return activityLastDay(activity, func(database.ActivityDay) bool { return true })
+}
+
+// activityLastDay returns the newest non-future day matching match, or "".
+func activityLastDay(activity database.ActivityHeatmap, match func(database.ActivityDay) bool) string {
+	for week := len(activity.Weeks) - 1; week >= 0; week-- {
+		days := activity.Weeks[week].Days
+		for index := len(days) - 1; index >= 0; index-- {
+			if !days[index].Future && match(days[index]) {
+				return days[index].Date
+			}
+		}
+	}
+	return ""
+}
+
+// activityTabStop renders one heatmap cell's roving-tabindex value: the
+// initial tab stop is the only cell in the tab order, and every other
+// non-future day is reachable through the arrow keys (tabindex="-1").
+func activityTabStop(day database.ActivityDay, initial string) string {
+	if day.Date == initial {
+		return "0"
+	}
+	return "-1"
+}
 
 func activityTooltip(day database.ActivityDay) string {
 	if day.Future {
