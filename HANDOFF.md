@@ -1,224 +1,159 @@
-# Tokemon handoff — 2026-11-12
+# Tokemon handoff — 2026-11-13
 
-Written by supervisor (opencode) after cutting v0.4.4. Everything below is
-verified against the live hub and `origin/main` unless it says otherwise.
+Written by supervisor (`super`, opencode) after the post-v0.4.4 performance and
+accessibility batch. Everything below was verified against the live hub and
+`origin/main` unless it says otherwise.
 
 ## TL;DR
 
-- `origin/main = 2e1d8ba` (release: prepare v0.4.4), clean, CI **green**
-  (first green run since 2026-11-07).
-- **v0.4.4 is published**:
-  https://github.com/carteakey/tokemon/releases/tag/v0.4.4 (annotated tag on
-  `2e1d8ba`; release workflow `43290741126`).
-- The live Mac hub runs the **v0.4.4** binary (`version: 0.4.4`,
-  `commit: 2e1d8ba`) with the password login form enabled (`admin` / the
-  password in `~/.config/tokemon/server.env`). Tokedex is still **gated off**;
-  quotas are still **off**.
-- **Tokedex MVP is complete** (roadmap items 1–4). It stays opt-in until the
-  user reviews it and agrees the page earns its nav slot.
-- **Warm `/analytics` is fixed**: 20 consecutive warm requests under live
-  ingest, median 23ms, max 29ms (was 0.3–1.2s with 4s outliers).
-- **CI cancellation explained and fixed**, and the fix exposed a real
-  security gate failure (GO-2026-6859) which is also fixed.
-- No open board tasks. Two decisions are waiting on the user (see
-  "Waiting on you").
+- `origin/main = 6e3182f`, clean, CI **green**.
+- **v0.4.4 is still the latest tag.** This batch is unreleased; `CHANGELOG.md`
+  has an `## Unreleased` section with all of it.
+- The live Mac hub runs `0.4.5-dev` at `d534a6c` (one docs-only commit behind
+  main), launchd priority **31**, `/healthz` 200.
+- **15 commits landed** since the last handoff: interactive launchd priority,
+  analytics invalidation coalescing, the dashboard pre-render race, the login
+  throttle fix, quota attribution, and a large accessibility slice.
+- **16 GitHub issues closed** (#23–#33, #35–#37, #39, #40). Open: #38 and the
+  #19–#22 epics.
+- **Three worker branches are in flight** (heatmap roving tabindex, chart
+  roving tabindex, mobile chrome). All pushed at base `6e3182f`; none has code
+  yet.
+- The Herding control socket is still dead (`carteakey/herding#77`), so the
+  team CLI is unusable; the board was read from `team.sqlite3` directly.
 
 ## What shipped (this batch, on main)
 
 | Commit(s) | Area |
 | --- | --- |
-| `97f94d7` | CI: `macos-14` (retired 2026-11-02) → `macos-15`; runs stop being cancelled |
-| `92e5c4e` | Build: Go 1.26.11 for GO-2026-6859 (`net/http` MaxBytesReader race) |
-| `4854df0` | Catalog: pricing verification, 24/35 models, 97.3% of observed tokens |
-| `460091f` | Tokedex: client-side sort / filter / search over the card grid |
-| `caf7b4d` | Perf: warm analytics page does no database work (`docs/analytics-latency.md`) |
-| `b252074` | Site: local quick-start runs the server in the background, waits for `/healthz` |
+| `6a295d2` | Perf: launchd `ProcessType=Background` → `Interactive` (priority 4 → 31) |
+| `53b2562` | Perf: coalesce analytics cache invalidations behind a 2s window |
+| `eeb6da7` | Perf: publish the dashboard pre-render with its overview entry |
+| `d6fb1ca` | Fix: a valid session is no longer throttled (#40) |
+| `511f6dc` | Test: browser smoke covers login/session/logout (#39) |
+| `1da4b94` | Test: browser smoke gates the connector-health panel (#26) |
+| `aaeaa28` | Fix: quota most-specific attribution + `reset_day` 29–31 (#36, #37) |
+| `6902042` | A11y: keyboard-reachable overflow regions + 3-viewport gate |
+| `d534a6c` | A11y: `--control-border` 3.41:1, hero names, document-overflow gate |
+| `0aa00fd`, `d3b0e69`, `97bea08`, `33c1e7d`, `da8bedc`, `6e3182f` | CHANGELOG / docs |
 
-`55b7edd` (tier legend + empty/unknown states) and `c63f6d5` (staticcheck fix)
-landed just before this batch and were already on main.
+### Measured results
 
-## CI: why every run was cancelled
-
-GitHub retired the macOS 14 runner images on **2026-11-02**. A job targeting
-`macos-14` is cancelled one second in with `runner_name` empty and zero steps,
-and GitHub marks the **whole run** `cancelled` even when `test` and the other
-installer jobs pass. There was never a `concurrency` block involved.
-
-Evidence: runs `42949174186`, `42934364780`, `42678266857`, `42677820011`,
-`42426091687` all show the identical signature on `Installer smoke
-(macos-14)`.
-
-With that fixed, the `test` job failed honestly on **GO-2026-6859** — an
-HTTP/1 server crash from a `MaxBytesReader` header race, reachable from
-`api.responseStatusWriter` and the server's own `MaxBytesReader` use, fixed in
-go1.26.11. `go.mod`, the Dockerfile build image (digest re-resolved from the
-Docker Hub index) and `setup-go` in all three workflows are now on 1.26.11.
-
-Green run: `43258375794` (all four jobs).
+- **launchd priority** (live hub, 20 warm requests each): `/analytics` median
+  17ms → 8ms (max 2.5s → 18ms), `/sessions` median 450ms → 70ms (max 3.1s →
+  115ms), `/healthz` max 669ms → 1.2ms. Numbers recorded in
+  `docs/analytics-latency.md`.
+- **Invalidation coalescing** (scratch instance): a single ingest appeared in
+  131ms; a 10-event burst coalesced to one refresh and appeared after ~2.0s
+  with no events lost.
+- **Pre-render race**: 80.7ms median request-path rebuild vs 27.8µs for the
+  pre-rendered page (20k-event synthetic DB). Warm `/` on the live hub is
+  0.6–1.6ms.
+- **Accessibility**: 7 pages × 3 viewports (1280×800, 768×900, 390×844), axe
+  allowlist **empty**. The new document-overflow check immediately found a
+  pre-existing 41px overflow on `/analytics` at 768px, now fixed.
 
 ## Live hub
 
 - Service: launchd `com.tokemon.server`, binary `~/.local/bin/tokemon`
-  (`0.4.4`, `2e1d8ba`, go1.26.11), config `~/.config/tokemon/server.env`,
-  DB `~/repos/tokemon/data/tokemon.db` (~120k events), catalog
+  (`0.4.5-dev`, `d534a6c`), config `~/.config/tokemon/server.env`, DB
+  `~/repos/tokemon/data/tokemon.db`, catalog
   `~/Library/Application Support/Tokemon/models.yaml`.
-- Listen: `0.0.0.0:18787`.
-- **The hub runs at launchd `ProcessType=Background` (priority 4).** That is
-  why per-request latency on the hub is much worse than the same binary at
-  normal priority. Keep it in mind before trusting any local benchmark.
-- Verified after the deploy: `/healthz` 200 after 14s; anonymous HTML `/` →
-  `303 /login?next=%2F`; `/login` 200; Bearer `/` and `/analytics` 200;
-  `/tokedex` 404 (still gated); `/api/v1/quotas` 200; catalog 35 models, 24
-  priced, `priced_tokens` 22.05B / 22.66B observed.
-- Pricing is visible: session costs now render (`$0.04`, `$0.07`) instead of
-  `Unknown` for priced models.
-- **Restart gotcha (unchanged):** after replacing the binary, macOS kills the
-  unsigned copy (`rc=137`). Run
-  `xattr -d com.apple.provenance ~/.local/bin/tokemon` and
+- Listen: `0.0.0.0:18787`. **Priority 31** (`ProcessType=Interactive`).
+- Verified: `/healthz` 200, anonymous HTML `/` → `303 /login?next=%2F`,
+  `/login` 200, Bearer `/`, `/analytics`, `/sessions`, `/settings`,
+  `/insights` all 200, `/tokedex` 404 (still gated), `/api/v1/quotas` 200.
+- Warm latency right now: `/` 0.8–2.8ms, `/analytics` 5.5–11ms, `/sessions`
+  92–128ms (first request after a restart can be ~0.9s).
+- **Restart gotcha:** after replacing the binary, macOS kills the unsigned copy
+  (`rc=137`). Run `xattr -d com.apple.provenance ~/.local/bin/tokemon` and
   `codesign --force --sign - ~/.local/bin/tokemon`, then
-  `launchctl kickstart -k gui/$(id -u)/com.tokemon.server`. Startup takes
-  ~9–14s before `/healthz` answers.
+  `launchctl kickstart -k gui/$(id -u)/com.tokemon.server`. Startup now takes
+  ~3s before `/healthz` answers.
 - **Catalog deployment path:** the hub loads
   `~/Library/Application Support/Tokemon/models.yaml`, not the repo copy.
-  Copy the file and restart after catalog changes.
 
-## Analytics latency (task 039bbe0f) — fixed
+## In flight (worker branches, pushed at base `6e3182f`)
 
-The stale-while-revalidate path was working: `cachedAnalytics` served the last
-good result in under a millisecond and never joined the in-flight compute. The
-time went to the handler's *next* store call, `DisplayAliases`, which shares
-the store's single SQLite connection (`SetMaxOpenConns(1)`) with the background
-analytics refresh. The refresh's longest stage is the facets `DISTINCT` scan
-(~477ms of a ~500ms refresh), and ingest invalidates the facets cache on every
-write, so a reader arriving mid-refresh queued behind it. At priority 4 those
-stages stretch ~8–10x, which is where the 0.3–1.2s came from. The 2–4s
-outliers coincided with whole-process stalls during the release window
-(`/healthz` 1–6s, readiness 503, heartbeat 12.5s), not with analytics work.
+| Branch | Worker | Task |
+| --- | --- | --- |
+| `fix/heatmap-roving-tabindex` | zcode1 | One tab stop instead of 179 on the activity heatmap; arrow-key day/week nav |
+| `fix/chart-roving-tabindex` | zcode2 | One tab stop per analytics chart instead of 60–180; arrows move buckets |
+| `fix/mobile-chrome` | zcode3 | Sessions 641px overflow; icon-only refresh/pause at ≤500px with 32px targets |
 
-Fix: cache the alias rows in the store, dropped by `SetDisplayAlias` (the only
-writer in the process). A warm analytics render now does zero database work.
+All three are still in the investigation phase (no code committed). They were
+asked to commit and push at their first working increment and again at the end.
+Gate each at its exact commit, cherry-pick onto main, deploy, verify.
 
-Live measurement after the deploy, ingest running, 20 consecutive requests 1s
-apart: min 13ms, median 23ms, p90 28ms, **max 29ms**.
+## Team mechanics (read before spawning workers)
 
-Documented but **not** fixed (see `docs/analytics-latency.md`):
+- **Herding's control socket is dead while the app runs.** `herding team
+  status/task/bulletin` all return `not_running` / `Connection refused`. The app
+  process is alive and redrawing (~43% CPU); its listener never accepts. Filed
+  as **`carteakey/herding#77`**. Do **not** kill the app: it hosts every agent
+  pane, including the supervisor's.
+- Consequence: the board cannot be written. Read `team.sqlite3` directly
+  (read-only is safe; the app holds a ~4 MB WAL, so do not hand-edit). The one
+  open board task, `039bbe0f` (warm `/analytics`), is fixed but cannot be
+  closed.
+- **zcode workers are alive but flaky.** All three run
+  `account:zai-start-plan/GLM-5.3-Flash` with ~85% context left. Turns
+  intermittently fail with `Model request failed / Turn failed` (quota class),
+  then resume when woken. A retry prompt can fail in ~1s. Recorded on
+  `carteakey/herding#55`.
+- Workers were dispatched with `herdr pane run <pane> "Read /tmp/brief-*.md ..."`
+  because team wakes/bulletins are unavailable. Reports come back in the pane.
+- **Mistake to avoid:** opencode subagents were dispatched into the *same*
+  worktrees the zcode workers were using. Nothing broke, but give each agent
+  its own worktree.
+- Subagents (`general`) are a reliable fallback when zcode dies; they produced
+  the pre-render, connector-health, and both UI slices.
 
-1. The analytics refresh still runs on every ingest (~50% duty cycle at
-   priority 4). Coalescing invalidations or a per-day rollup is the next win.
-2. `deploy/macos/install-server.sh` pins the hub at `ProcessType=Background`.
-   Moving the server to `ProcessType=Interactive` would remove the ~8–10x
-   scheduling penalty for every request.
-3. The dashboard pre-render race (occasional 0.7–0.9s warm `/`).
-4. The quota-panel query path when `TOKEMON_QUOTAS` is configured.
+## Open issues / follow-ups
 
-## Tokedex MVP — complete, still gated
-
-Roadmap items 1–4 are all merged and gated (`docs/tokedex-roadmap.md`):
-
-1. **Pricing verification** — 24/35 models priced from fetched provider pages,
-   97.3% of observed tokens. Haiku 5.5 (tiered by prompt length), DeepSeek
-   (peak/off-peak), Gemini 3/3.7 Flash (different model IDs or unlisted),
-   Nemotron (no per-token rate), Qwen 3.8 Flash Next, Codex Auto Review and
-   the free-tier IDs stay `mode: unknown` on purpose.
-2. **Tier legend** — one row per populated tier plus the provenance line.
-3. **Sort / filter / search** — client-side, per-tier sorting, `role="status"`
-   result count, no-match state, `<noscript>` note, axe-clean.
-4. **Empty / unknown states** — "Rates not published yet", "No usage recorded
-   yet", nothing-uncataloged note, empty-catalog help.
-
-Known limitations: sorting is per tier (flattening would strip the tier
-headings); the controls are inert without JS (full grid still renders);
-uncataloged cards never match a provider filter because their provider is
-genuinely unknown.
-
-To flip the flag: `TOKEMON_ENABLE_TOKEDEX=true` in
-`~/.config/tokemon/server.env`, restart, and verify `/tokedex` 200 plus the
-nav link.
-
-## Waiting on you
-
-1. **Enable Tokedex?** The checklist's last box is the user reviewing the MVP
-   and agreeing the page earns its nav slot. A preview with the flag on was
-   left running at `http://127.0.0.1:18789/tokedex` (DB copy, safe to click;
-   log in as `admin`).
-2. **Pricing drift.** The verification pass left three pre-existing entries on
-   their old numbers because the new ones are promotional or freshly cut:
-   `gpt-5.6-luna` ($1/$6 catalog vs $0.20/$1.20 published), `gpt-5.6-terra`
-   ($2.50/$15 vs $2/$12), `gpt-5.6-sol` ($5/$30 vs $4/$20, promotional through
-   2026-11-30). Decide whether the catalog tracks current published rates.
-
-## Team mechanics (read this before trying to spawn workers)
-
-- **Herding is not running.** `herding team status` returns `not_running`
-  (control socket refused). The board was read directly from
-  `~/.local/state/herdr/gpui/team/team.sqlite3`; no task could be claimed or
-  completed through the CLI.
-- **zcode cannot run any model.** `zcode -p` fails with
-  `Select a model before sending a message`, and the provider registry reports
-  `providerCount: 0` with `entitled: false` on all ten providers
-  (`account:zai-individual-coding-plan`, `account:zai-start-plan`, …). This is
-  the same account/quota condition as `carteakey/herding#55`. It needs a
-  `zcode login` / plan refresh by the user; it cannot be fixed headlessly.
-- Workers for this batch ran as opencode subagents, one worktree each, and
-  were gated at their exact commit before landing.
-
-## Release v0.4.4 checklist — DONE
-
-1. `bash deploy/release-check.sh` on `2e1d8ba` (browser smoke + axe, image
-   identity assertion, trivy HIGH/CRITICAL, full `-race`) — **PASS**.
-   `deploy/release-guard.sh --tracked` and `--context .` both clean.
-   CI on the same commit: green (`43289682531`).
-2. `## Unreleased` promoted to `## 0.4.4` in `CHANGELOG.md`; the release
-   workflow's notes-extraction check finds the section.
-3. Tag `v0.4.4` (annotated) pushed with `main`; Release workflow
-   `43290741126` published signed assets.
-4. Verified independently: all four tarballs + `sbom.spdx.json` match
-   `checksums.txt`; `cosign verify-blob` OK for `checksums.txt`,
-   `image-digest.txt`, `sbom.spdx.json` and the linux/amd64 tarball against
-   identity
-   `https://github.com/carteakey/tokemon/.github/workflows/release.yml@refs/tags/v0.4.4`;
-   image `ghcr.io/carteakey/tokemon:0.4.4` resolves to
-   `sha256:96c33082…` (matching `image-digest.txt`) and reports
-   `version: 0.4.4`, `commit: 2e1d8ba`.
-5. Deployed the signed darwin/arm64 artifact to the hub and verified:
-   `/healthz` 200 after 14s, anonymous HTML `/` → `303 /login?next=%2F`,
-   `/login` 200, Bearer `/` and `/analytics` 200, `/tokedex` 404,
-   `/api/v1/quotas` 200, warm `/analytics` 17–22ms.
+1. **#38 — `Store.QuotaStatus` is uncached** (~139ms per quota per render).
+   Quotas are off on the hub, so this is not live-impacting.
+2. **#22 — dashboard visual hierarchy / responsive controls** (epic). The
+   remaining UI work: analytics IA (collapse the filter panel, drop the
+   duplicate dimension `<select>`), and CSS extraction. The shared blocks
+   (`:root`, `.topbar`, `.nav`, `.footer`, `.skip-link`) are duplicated across
+   all seven templates — the root cause of most drift. That should be its own
+   slice with the browser gate run at every viewport.
+3. **Sessions latency** is 92–128ms warm (was 70ms earlier in the batch); it is
+   an uncached query. Worth a look if it grows.
+4. **CI runner flake:** on 2026-11-12 the `macos-15` arm64 installer job sat
+   queued 15 minutes with `runnerName: null` and was cancelled, failing a
+   docs-only run. A re-run was green. Two macOS legs per push is the cost
+   centre; if it recurs, consider gating the macOS legs to PRs/tags.
+5. **CAR-205:** `/insights` stays reachable behind dashboard auth but is
+   deliberately **not** linked from primary navigation. Do not "fix" this.
+6. **Tokedex** is still gated off (`TOKEMON_ENABLE_TOKEDEX` unset) pending the
+   user's review.
+7. **Pricing drift:** `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` remain on
+   old catalog numbers by choice; decide whether the catalog tracks current
+   published/promotional rates.
 
 ## How to operate
 
-- Read `docs/ship-loop.md` and `AGENTS.md`. Gate =
-  `gofmt -l .` clean + `go build ./...` + `go vet ./...` +
-  `go test ./... -count=1` in a throwaway worktree at the exact commit; add
-  `-race`, catalog validate, browser smoke, or `deploy/release-check.sh` for
-  the affected surface.
-- Workers never push; the supervisor gates and pushes. One worktree per
-  worker. Nudge once, then reassign.
-- Deploy: build `./cmd/tokemon`, install to `~/.local/bin/tokemon`, sign,
-  restart launchd, verify `/healthz` + auth + the changed page.
-- Worktrees and landed feature branches were cleaned up in this batch; only
-  `main` remains locally.
-
-## Open items / risks
-
-1. **v0.4.4 is tagged and published.** Any further work on `main` needs the
-   next release cut with `bash deploy/release-check.sh` on the candidate
-   commit before tagging.
-2. **Tokedex is hidden** until the flag is flipped (see "Waiting on you").
-3. **Quotas are off** (`TOKEMON_QUOTAS` unset).
-4. **`mode: unknown` tail** is now small but real, and the three drifted
-   OpenAI entries above are stale by choice.
-5. **Session revocation** is still TTL/credential-rotation only.
-6. **CI minutes:** the installer matrix now runs `ubuntu-latest`,
-   `macos-15-intel` and `macos-15`; two macOS runners per push is the bulk of
-   the cost if that ever matters.
+- Gate = `gofmt -l .` clean + `go build ./...` + `go vet ./...` +
+  `go test ./... -count=1` at the exact commit, plus
+  `go test ./internal/api -race -count=1` for auth/cache changes and
+  `TOKEMON_BROWSER_SMOKE=1 go test ./internal/browsercheck -count=1` for
+  template/JS/CSS changes. The browser smoke is now 7 pages × 3 viewports.
+- Land by cherry-picking onto current `main` in a throwaway worktree, gating
+  there, then `git merge --ff-only` and push. Deploy only when the server
+  changed.
+- Deploy: build `./cmd/tokemon` with
+  `-X internal/version.Version=0.4.5-dev -X ...Commit=<sha>`, install to
+  `~/.local/bin/tokemon`, sign, restart launchd, verify `/healthz` + auth + the
+  changed page.
+- Release: tag only after `bash deploy/release-check.sh` on the candidate
+  commit (browser smoke, image identity, trivy, full `-race`).
 
 ## Reference artifacts
 
-- Ship-loop playbook PR: `carteakey/herding#19`
-- Workflow feedback issue: `carteakey/herding#20`
-- Team-store hand-editing incident: `carteakey/herding#52`
-- zcode quota/health false-positive: `carteakey/herding#55`
-- Release: https://github.com/carteakey/tokemon/releases/tag/v0.4.4
+- Herding control-socket bug: `carteakey/herding#77`
+- zcode quota/health recurrence: `carteakey/herding#55`
 - Analytics findings: `docs/analytics-latency.md`
 - Tokedex roadmap: `docs/tokedex-roadmap.md`
+- Last release: https://github.com/carteakey/tokemon/releases/tag/v0.4.4
