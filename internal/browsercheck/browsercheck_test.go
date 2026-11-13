@@ -447,6 +447,85 @@ const quotaAbsentInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// chartRovingInvariantJS guards the analytics charts' roving tabindex: each
+// chart exposes exactly one Tab stop (the data lives in the sr-only table, so
+// one stop per chart is the whole tab cost), ArrowRight moves focus to the
+// next bucket with the stop following, the trend readout still announces the
+// focused bucket, and the share chart roves independently of the trend chart.
+// It must run after the other /analytics invariants: it drives focus and
+// mutates the roving stops.
+const chartRovingInvariantJS = `(() => {
+	const problems = [];
+	const trendColumns = Array.from(document.querySelectorAll('.trend-column'));
+	const sharePoints = Array.from(document.querySelectorAll('.share-point'));
+	const stops = (buckets) => buckets.filter((bucket) => bucket.getAttribute('tabindex') === '0');
+	const roving = (selector, buckets) => {
+		if (!buckets.length) {
+			problems.push('no ' + selector + ' buckets rendered');
+			return null;
+		}
+		const offPattern = buckets.filter((bucket) => bucket.getAttribute('tabindex') !== '0' && bucket.getAttribute('tabindex') !== '-1');
+		if (offPattern.length) {
+			problems.push(selector + ' buckets carry tabindex values outside the roving pattern');
+		}
+		const stopCount = stops(buckets).length;
+		if (stopCount !== 1) {
+			problems.push('expected exactly 1 ' + selector + '[tabindex="0"], found ' + stopCount);
+		}
+		return stops(buckets)[0] || buckets[0];
+	};
+
+	// ArrowRight moves focus to the next bucket, the roving stop follows, and
+	// the live readout announces the focused bucket.
+	if (trendColumns.length >= 2) {
+		const first = trendColumns[0];
+		const next = trendColumns[1];
+		const readout = document.getElementById('trend-readout-value');
+		first.focus();
+		const readoutBefore = readout ? readout.textContent : '';
+		first.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true, cancelable: true}));
+		if (document.activeElement !== next) {
+			problems.push('ArrowRight did not move trend focus to the next bucket (activeElement: ' + (document.activeElement.className || document.activeElement.tagName) + ')');
+		} else {
+			const stopsNow = stops(trendColumns);
+			if (stopsNow.length !== 1 || stopsNow[0] !== next) {
+				problems.push('trend roving tab stop did not follow focus after ArrowRight');
+			}
+			if (readout && readout.textContent === readoutBefore) {
+				problems.push('trend readout did not update after arrowing to ' + next.dataset.label);
+			}
+		}
+	}
+	const trendStopBeforeShare = stops(trendColumns)[0] || null;
+
+	// The share chart roves independently: its stop follows focus and the
+	// trend chart's stop is untouched.
+	if (sharePoints.length >= 2) {
+		const first = sharePoints[0];
+		const next = sharePoints[1];
+		first.focus();
+		first.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true, cancelable: true}));
+		if (document.activeElement !== next) {
+			problems.push('ArrowRight did not move share focus to the next bucket (activeElement: ' + (document.activeElement.className || document.activeElement.tagName) + ')');
+		} else {
+			const stopsNow = stops(sharePoints);
+			if (stopsNow.length !== 1 || stopsNow[0] !== next) {
+				problems.push('share roving tab stop did not follow focus after ArrowRight');
+			}
+		}
+		if ((stops(trendColumns)[0] || null) !== trendStopBeforeShare) {
+			problems.push('share chart navigation disturbed the trend chart roving stop');
+		}
+	}
+
+	// Leave the page as found: focus in the share chart would otherwise keep
+	// the tooltip open for the axe scan.
+	if (document.activeElement && document.activeElement !== document.body) {
+		document.activeElement.blur();
+	}
+	return JSON.stringify(problems);
+})()`
+
 // quotaConfiguredInvariantJS asserts the analytics quota panel with two
 // configured budgets: an over-budget row (over styling, 120 percent track,
 // pace detail) and an under-budget row (plain fill, 20 percent track).
@@ -602,7 +681,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		invariants []string
 	}{
 		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
-		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
+		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS, chartRovingInvariantJS}},
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
 		{path: "/insights"},

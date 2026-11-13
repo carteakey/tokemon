@@ -4800,9 +4800,13 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
         <div class="trend-y-axis" aria-label="Token scale"><span class="trend-axis-unit">TOKENS</span>{{range .AxisTicks}}<span class="trend-y-tick" style="bottom: {{.Position}}%">{{compact .Value}}</span>{{end}}</div>
         <div class="trend-plot">
           <div class="trend-grid" aria-hidden="true">{{range .AxisTicks}}<i style="bottom: {{.Position}}%"></i>{{end}}</div>
+          {{/* Roving tabindex: the buckets are data-duplicated in the sr-only table, so only one is a Tab stop — the first peak bucket (or the first bucket when there is no peak); the rest join via arrow keys. */}}
+          {{$trendStop := -1}}
+          {{range $index, $point := .Points}}{{if and (lt $trendStop 0) (gt $.PeakPoint.Tokens 0) (eq $point.Tokens $.PeakPoint.Tokens)}}{{$trendStop = $index}}{{end}}{{end}}
+          {{if lt $trendStop 0}}{{$trendStop = 0}}{{end}}
           <div class="trend-chart period-{{.Filter.Period}}" tabindex="0" role="region" aria-label="Token volume over the selected window">
             {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
               <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
               <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
@@ -4858,8 +4862,9 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
             <div class="share-tooltip-series" data-share-tooltip-series role="list"></div>
           </div>
           <div class="share-hit-grid">
+            {{/* Same roving tabindex as the trend chart, tracked independently: the first bucket is the Tab stop, the rest join via arrow keys. */}}
             {{range $index, $point := .SharePoints}}
-            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
               <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
             </button>
@@ -4920,10 +4925,27 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       value.textContent = column.dataset.label + ' · ' + number.format(Number(column.dataset.tokens)) + ' tokens';
       mix.textContent = 'Input ' + number.format(Number(column.dataset.input)) + ' · Cached ' + number.format(Number(column.dataset.cached)) + ' · Output ' + number.format(Number(column.dataset.output));
     };
-    document.querySelectorAll('.trend-column').forEach((column) => {
+    document.querySelectorAll('.trend-column').forEach((column, index, columns) => {
       column.addEventListener('mouseenter', () => showPoint(column));
-      column.addEventListener('focus', () => showPoint(column));
+      column.addEventListener('focus', () => {
+        showPoint(column);
+        // Roving tabindex: focus — via Tab, click, or the arrow keys below —
+        // makes the focused bucket the chart's single Tab stop.
+        columns.forEach((button) => button.setAttribute('tabindex', button === column ? '0' : '-1'));
+      });
       column.addEventListener('click', () => showPoint(column));
+      column.addEventListener('keydown', (event) => {
+        let target = null;
+        if (event.key === 'ArrowRight') target = columns[index + 1] || columns[columns.length - 1];
+        else if (event.key === 'ArrowLeft') target = columns[index - 1] || columns[0];
+        else if (event.key === 'Home') target = columns[0];
+        else if (event.key === 'End') target = columns[columns.length - 1];
+        if (target) {
+          // The focus listener moves the roving stop and updates the readout.
+          event.preventDefault();
+          target.focus();
+        }
+      });
     });
 
     const shareTooltip = document.getElementById('share-tooltip');
@@ -4976,15 +4998,31 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       shareTooltip.hidden = false;
       positionShareTooltip(point);
     };
-    document.querySelectorAll('.share-point').forEach((point) => {
+    document.querySelectorAll('.share-point').forEach((point, index, points) => {
       point.addEventListener('pointerenter', () => showSharePoint(point));
-      point.addEventListener('focus', () => showSharePoint(point));
+      point.addEventListener('focus', () => {
+        showSharePoint(point);
+        // Roving tabindex, tracked independently of the trend chart.
+        points.forEach((button) => button.setAttribute('tabindex', button === point ? '0' : '-1'));
+      });
       point.addEventListener('click', () => showSharePoint(point));
       point.addEventListener('pointerleave', (event) => {
         if (event.pointerType === 'mouse' && !point.matches(':focus')) hideShareTooltip();
       });
       point.addEventListener('blur', () => {
         if (!point.matches(':hover')) hideShareTooltip();
+      });
+      point.addEventListener('keydown', (event) => {
+        let target = null;
+        if (event.key === 'ArrowRight') target = points[index + 1] || points[points.length - 1];
+        else if (event.key === 'ArrowLeft') target = points[index - 1] || points[0];
+        else if (event.key === 'Home') target = points[0];
+        else if (event.key === 'End') target = points[points.length - 1];
+        if (target) {
+          // The focus listener moves the roving stop and shows the tooltip.
+          event.preventDefault();
+          target.focus();
+        }
       });
     });
     window.addEventListener('resize', () => {
