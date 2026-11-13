@@ -3203,6 +3203,7 @@ const dashboardTemplate = `<!doctype html>
     .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
     .topbar-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 12px; }
     .refresh-control { display: inline-flex; gap: 6px; }
+    .refresh-glyph { display: none; }
     .refresh-btn { padding: 6px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
     .refresh-btn:hover, .refresh-btn:focus-visible { border-color: var(--accent); color: var(--accent); }
     .refresh-btn[aria-pressed="true"] { border-color: var(--warm); color: var(--warm); }
@@ -3413,6 +3414,14 @@ const dashboardTemplate = `<!doctype html>
     @media (max-width: 500px) {
       main { width: min(100% - 12px, 420px); margin: 6px auto; padding: 6px; border-radius: 8px; }
       .nav-link { padding: 6px 7px; font-size: 10px; }
+      /* The topbar cannot fit two uppercase text buttons beside the brand,
+         gear, and logout: the refresh controls become icon-only. The visible
+         glyph takes over from the text label; the announced name stays on
+         aria-label, which tracks the pause state. Touch targets keep their
+         32x32 minimum. */
+      .refresh-btn { width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 0; display: inline-grid; place-items: center; }
+      .refresh-glyph { display: inline; font-size: 16px; line-height: 1; }
+      .refresh-label { display: none; }
       .hero { padding-top: 14px; }
       .creature-panel { padding: 16px; }
       .power-panel, .data-panel { padding: 18px; }
@@ -3449,8 +3458,8 @@ const dashboardTemplate = `<!doctype html>
     </nav>
     <div class="topbar-actions">
       <div class="refresh-control">
-        <button type="button" id="refresh-now" class="refresh-btn">Refresh now</button>
-        <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false">Pause auto-refresh</button>
+        <button type="button" id="refresh-now" class="refresh-btn" aria-label="Refresh now"><span class="refresh-glyph" aria-hidden="true">&#8635;</span><span class="refresh-label">Refresh now</span></button>
+        <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false"><span class="refresh-glyph" aria-hidden="true">&#9208;</span><span class="refresh-label">Pause auto-refresh</span></button>
       </div>
       <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
     </div>
@@ -3810,8 +3819,13 @@ const dashboardTemplate = `<!doctype html>
   const autoToggle = document.getElementById('auto-refresh-toggle');
   const renderAutoToggle = () => {
     const paused = autoPaused();
+    const label = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
     autoToggle.setAttribute('aria-pressed', String(paused));
-    autoToggle.textContent = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
+    // The announced name and the glyphs track the state so the phone layout
+    // can show an icon-only control without losing the accessible name.
+    autoToggle.setAttribute('aria-label', label);
+    autoToggle.querySelector('.refresh-glyph').textContent = paused ? '\u25B6' : '\u23F8';
+    autoToggle.querySelector('.refresh-label').textContent = label;
   };
   renderAutoToggle();
   autoToggle.addEventListener('click', () => {

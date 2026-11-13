@@ -502,8 +502,9 @@ const quotaConfiguredInvariantJS = `(() => {
 // exposing its state via aria-pressed.
 const refreshControlInvariantJS = `(() => {
 	const problems = [];
+	const announcedName = (control) => (control.getAttribute('aria-label') || control.textContent).trim();
 	const refresh = document.getElementById('refresh-now');
-	if (!refresh || refresh.textContent.trim() !== 'Refresh now') {
+	if (!refresh || announcedName(refresh) !== 'Refresh now') {
 		problems.push('overview lacks the labeled Refresh now button');
 	}
 	const toggle = document.getElementById('auto-refresh-toggle');
@@ -513,8 +514,40 @@ const refreshControlInvariantJS = `(() => {
 		if (toggle.getAttribute('aria-pressed') === null) {
 			problems.push('auto-refresh toggle lacks aria-pressed');
 		}
-		if (!['Pause auto-refresh', 'Resume auto-refresh'].includes(toggle.textContent.trim())) {
-			problems.push('auto-refresh toggle has an unexpected label: ' + toggle.textContent.trim());
+		if (!['Pause auto-refresh', 'Resume auto-refresh'].includes(announcedName(toggle))) {
+			problems.push('auto-refresh toggle has an unexpected label: ' + announcedName(toggle));
+		}
+	}
+	// Phone width renders both controls icon-only: the visible glyph replaces
+	// the text label, the announced name stays on aria-label, and the touch
+	// target grows to at least 32x32. The rules are scoped to the widths where
+	// the phone layout is active so the same invariant gates every viewport.
+	if (window.innerWidth <= 500) {
+		for (const control of [refresh, toggle]) {
+			if (!control) continue;
+			const box = control.getBoundingClientRect();
+			if (box.width < 32 || box.height < 32) {
+				problems.push(control.id + ' touch target is ' + Math.round(box.width) + 'x' + Math.round(box.height) + ', want at least 32x32');
+			}
+			const glyph = control.querySelector('.refresh-glyph');
+			const label = control.querySelector('.refresh-label');
+			if (!glyph || getComputedStyle(glyph).display === 'none') {
+				problems.push(control.id + ' has no visible icon glyph at phone width');
+			}
+			if (!label || getComputedStyle(label).display !== 'none') {
+				problems.push(control.id + ' still renders its text label at phone width; expected icon-only');
+			}
+			if (!announcedName(control)) {
+				problems.push(control.id + ' has no accessible name at phone width');
+			}
+		}
+		if (toggle) {
+			const pressed = toggle.getAttribute('aria-pressed');
+			const want = pressed === 'true' ? '\u25B6' : '\u23F8';
+			const glyph = toggle.querySelector('.refresh-glyph');
+			if (!glyph || glyph.textContent !== want) {
+				problems.push('pause glyph at aria-pressed=' + pressed + ' is ' + (glyph ? glyph.textContent : 'none') + ', want ' + want);
+			}
 		}
 	}
 	return JSON.stringify(problems);
@@ -704,7 +737,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	// The pause toggle keeps its state across the reloads it controls, and
 	// unpausing restores the default auto-refresh.
 	t.Run("overview-refresh-pause", func(t *testing.T) {
-		stateJS := `(() => { const toggle = document.getElementById('auto-refresh-toggle'); return JSON.stringify({ pressed: toggle.getAttribute('aria-pressed'), label: toggle.textContent.trim() }); })()`
+		stateJS := `(() => { const toggle = document.getElementById('auto-refresh-toggle'); return JSON.stringify({ pressed: toggle.getAttribute('aria-pressed'), label: (toggle.getAttribute('aria-label') || toggle.textContent).trim() }); })()`
 		navigate := func() {
 			t.Helper()
 			if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/")); err != nil {
