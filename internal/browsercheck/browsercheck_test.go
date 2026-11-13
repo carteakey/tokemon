@@ -477,6 +477,17 @@ const chartRovingInvariantJS = `(() => {
 
 	// ArrowRight moves focus to the next bucket, the roving stop follows, and
 	// the live readout announces the focused bucket.
+	const trendStop = roving('.trend-column', trendColumns);
+	const shareStop = roving('.share-point', sharePoints);
+	// Initial placement: the trend stop is the first peak-selected bucket when
+	// there is one (else the first bucket); the share chart has no
+	// server-rendered selection, so its stop is the first bucket.
+	if (trendStop && trendStop !== trendColumns[0] && !(trendStop.classList.contains('peak') && trendStop.classList.contains('selected'))) {
+		problems.push('trend tab stop is neither the first bucket nor a peak-selected bucket');
+	}
+	if (shareStop && shareStop !== sharePoints[0]) {
+		problems.push('share tab stop is not the first bucket');
+	}
 	if (trendColumns.length >= 2) {
 		const first = trendColumns[0];
 		const next = trendColumns[1];
@@ -671,6 +682,13 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		Features: []*emulation.MediaFeature{{Name: "prefers-reduced-motion", Value: "reduce"}},
 	}); err != nil {
 		t.Fatalf("could not emulate reduced motion: %v", err)
+	}
+	// The headless tab is never OS-focused, so Chrome delivers no focus events
+	// (element.focus() moves activeElement silently) and keyboard-driven
+	// roving tabindex would be untestable. Focus emulation makes the page
+	// behave like a focused tab for the session.
+	if _, err := chromedp.Call(ctx, emulation.SetFocusEmulationEnabled, emulation.SetFocusEmulationEnabledParams{Enabled: true}); err != nil {
+		t.Fatalf("could not enable focus emulation: %v", err)
 	}
 	if reduced, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`window.matchMedia('(prefers-reduced-motion: reduce)').matches`)); err != nil || !reduced {
 		t.Fatalf("reduced-motion emulation did not apply (matches=%v, err=%v)", reduced, err)
