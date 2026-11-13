@@ -61,9 +61,12 @@ var axeTags = []string{"wcag2a", "wcag21a", "wcag2aa", "wcag21aa"}
 var axeAllowlist = map[string]map[string]string{}
 
 // gateViewports are the widths every gated page renders at: the desktop hub
-// plus the tablet and phone widths where the responsive layout reflows. The
-// gate used to render only 1280x800 — the one width where the wide regions
-// fit — so it was blind to the layout it exists to protect.
+// plus the tablet and phone widths where the responsive layout reflows. 641
+// is one pixel above the 640px column breakpoint — the width where the
+// sessions heading once overflowed by 2px — so the gap between a breakpoint
+// and its neighbour stays gated. The gate used to render only 1280x800 — the
+// one width where the wide regions fit — so it was blind to the layout it
+// exists to protect.
 var gateViewports = []struct {
 	name   string
 	width  int64
@@ -71,6 +74,7 @@ var gateViewports = []struct {
 }{
 	{name: "1280x800", width: 1280, height: 800},
 	{name: "768x900", width: 768, height: 900},
+	{name: "641x900", width: 641, height: 900},
 	{name: "390x844", width: 390, height: 844},
 }
 
@@ -799,7 +803,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 
 	// The sign-in form is outside the authenticated page list: it only
 	// renders when a password account is configured, so it gets its own
-	// server, and it is held to the same three-viewport gate.
+	// server, and it is held to the same viewport gate.
 	t.Run("/login", func(t *testing.T) {
 		passwordURL := startSeededPasswordServer(t)
 		assertPageAtViewports(t, ctx, passwordURL, "/login", nil)
