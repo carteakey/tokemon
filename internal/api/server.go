@@ -3977,15 +3977,21 @@ const dashboardTemplate = `<!doctype html>
   if (!grid) return;
   const navigable = (cell) => !cell.classList.contains('future') && cell.getAttribute('aria-hidden') !== 'true';
   const rows = () => Array.from(grid.querySelectorAll('.activity-week'));
-  // Focus moving into a cell — by tab, click, or the arrows below — makes it
-  // the one tab stop.
-  grid.addEventListener('focusin', (event) => {
-    const cell = event.target.closest('.activity-cell');
-    if (!cell || !navigable(cell)) return;
+  // makeTabStop moves the single tab stop to cell. The arrows call it
+  // directly: an unfocused window (headless scans, background tabs) fires no
+  // focus events, so the tab stop must not depend on receiving them.
+  const makeTabStop = (cell) => {
     for (const other of grid.querySelectorAll('.activity-cell[tabindex="0"]')) {
       if (other !== cell) other.tabIndex = -1;
     }
     cell.tabIndex = 0;
+  };
+  // Focus moving into a cell — by tab, click, or the arrows below — makes it
+  // the one tab stop.
+  grid.addEventListener('focusin', (event) => {
+    const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
+    if (!cell || !navigable(cell)) return;
+    makeTabStop(cell);
   });
   grid.addEventListener('keydown', (event) => {
     const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
@@ -4025,6 +4031,7 @@ const dashboardTemplate = `<!doctype html>
     }
     if (!target || target === cell) return;
     event.preventDefault();
+    makeTabStop(target);
     target.focus();
   });
 })();

@@ -516,6 +516,87 @@ const refreshControlInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// activityGridInvariantJS asserts the overview heatmap's roving tabindex: the
+// role="grid" contract is arrow-key cell navigation, so the grid must load
+// with exactly one tabbable cell (the most recent active day), future and
+// aria-hidden cells must stay non-focusable, and Left/Right plus Up/Down must
+// move focus a day and a week with the tab stop following the focus.
+const activityGridInvariantJS = `(() => {
+	const problems = [];
+	const grid = document.querySelector('.activity-grid');
+	if (!grid) {
+		return JSON.stringify(['overview lacks the .activity-grid']);
+	}
+	const navigable = (cell) => !cell.classList.contains('future') && cell.getAttribute('aria-hidden') !== 'true';
+	const cells = Array.from(grid.querySelectorAll('.activity-cell'));
+	for (const cell of cells) {
+		if (!navigable(cell) && cell.getAttribute('tabindex') !== null) {
+			problems.push('future or aria-hidden cell is focusable: ' + cell.className);
+		}
+	}
+	const dayCells = cells.filter(navigable);
+	const stops = dayCells.filter((cell) => cell.getAttribute('tabindex') === '0');
+	if (stops.length !== 1) {
+		problems.push('activity grid has ' + stops.length + ' tabindex="0" cells, want exactly 1');
+		return JSON.stringify(problems);
+	}
+	const usage = dayCells.filter((cell) => /level-[1-4]/.test(cell.className) || cell.classList.contains('unknown'));
+	if (usage.length > 0 && stops[0] !== usage[usage.length - 1]) {
+		problems.push('the initial tab stop is not the most recent active day');
+	}
+	const rows = Array.from(grid.querySelectorAll('.activity-week'));
+	if (rows.length < 3) {
+		problems.push('activity grid has ' + rows.length + ' week rows, want at least 3');
+		return JSON.stringify(problems);
+	}
+	const columnOf = (cell) => Array.from(cell.closest('.activity-week').querySelectorAll('.activity-cell')).indexOf(cell);
+	const press = (cell, key) => cell.dispatchEvent(new KeyboardEvent('keydown', { key: key, bubbles: true, cancelable: true }));
+	// Drive the arrows from a cell with room in every direction: the first day
+	// of the third-to-last week. The rows below it are fully past, so ArrowDown
+	// lands on the same weekday regardless of which weekday today is.
+	const startRow = rows[rows.length - 3];
+	const start = Array.from(startRow.querySelectorAll('.activity-cell')).filter(navigable)[0];
+	if (!start) {
+		problems.push('the third-to-last week has no navigable day cell');
+		return JSON.stringify(problems);
+	}
+	// Position the origin of the keyboard events. This headless page has no
+	// window focus, so focus() moves activeElement but fires no focus events
+	// and :focus does not match; the arrows carry the roving tab stop
+	// themselves, which is exactly what the assertions below check.
+	start.focus();
+	if (document.activeElement !== start) {
+		problems.push('could not focus an activity cell');
+		return JSON.stringify(problems);
+	}
+	press(start, 'ArrowRight');
+	const afterRight = document.activeElement;
+	if (afterRight === start) {
+		problems.push('ArrowRight did not move focus');
+		return JSON.stringify(problems);
+	}
+	if (afterRight.closest('.activity-week') !== startRow || columnOf(afterRight) !== columnOf(start) + 1) {
+		problems.push('ArrowRight did not land on the next day cell of the same week');
+	}
+	if (afterRight.getAttribute('tabindex') !== '0' || start.getAttribute('tabindex') !== '-1') {
+		problems.push('the roving tab stop did not follow ArrowRight');
+	}
+	press(afterRight, 'ArrowDown');
+	const afterDown = document.activeElement;
+	const downRow = rows[rows.length - 2];
+	if (afterDown === afterRight) {
+		problems.push('ArrowDown did not move focus');
+	} else {
+		if (afterDown.closest('.activity-week') !== downRow || columnOf(afterDown) !== columnOf(afterRight)) {
+			problems.push('ArrowDown did not land on the same weekday in the next week');
+		}
+		if (afterDown.getAttribute('tabindex') !== '0' || afterRight.getAttribute('tabindex') !== '-1') {
+			problems.push('the roving tab stop did not follow ArrowDown');
+		}
+	}
+	return JSON.stringify(problems);
+})()`
+
 const freshnessInvariantJS = `(() => {
 	const problems = [];
 	const pill = document.querySelector('.status-pill.connected');
@@ -601,7 +682,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		path       string
 		invariants []string
 	}{
-		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS}},
+		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS, activityGridInvariantJS}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS}},
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
