@@ -67,6 +67,22 @@
 - **Small consistency fixes:** the sessions export links are grouped instead of
   pushed to opposite ends of the header, and sortable session headers finally
   have a hover/focus/active style (`.session-sort` had no CSS rule at all).
+- **Form controls meet the 3:1 non-text contrast floor.** Control borders used
+  `--line-bright` (2.11:1 against the panel), below WCAG 1.4.11's requirement
+  for UI component boundaries — and axe's A/AA tag set does not test it. A
+  separate `--control-border` token (`#66705f`, 3.41:1) now applies to form
+  fields and interactive buttons only; panels, cards, tables and pills keep the
+  deliberate heavier border. `assertContrastPolicy` guards the token at ≥3:1.
+- **Hero controls have real accessible names.** The lifetime counter announces
+  "Lifetime tokens: N" instead of a bare number, and the evolution progressbar
+  is named "Evolution progress" instead of reading as "42%". The settings form
+  is named "Display name aliases" rather than borrowing the "Models" heading,
+  and the active analytics dimension tab now carries `aria-current` plus an
+  underline so it is not conveyed by colour alone.
+- **The gate now catches document-level horizontal overflow** at every
+  viewport. It immediately found a pre-existing 41px overflow on `/analytics`
+  at 768px (the non-wrapping heading/export row); the heading now wraps below
+  860px, leaving the desktop layout unchanged.
 
 ### Tests
 
