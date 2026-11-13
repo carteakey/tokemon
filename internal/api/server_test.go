@@ -1496,6 +1496,9 @@ func TestDashboardOmitsDuplicateAndTechnicalCopy(t *testing.T) {
 			t.Fatalf("dashboard still contains unnecessary copy %q", omitted)
 		}
 	}
+	// CAR-205: Insights stays reachable at /insights behind dashboard auth but
+	// is deliberately not linked from primary navigation. Do not "fix" this by
+	// adding a nav link; the page still renders and is still accessibility-gated.
 	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(body) {
 		t.Fatal("dashboard still exposes Insights in primary navigation")
 	}
@@ -1612,6 +1615,7 @@ func TestAnalyticsPageAndJSONExport(t *testing.T) {
 	if bytes.Contains(pageResponse.Body.Bytes(), []byte(`/api/v1/analytics/overview">Data</a>`)) {
 		t.Fatal("analytics navigation still points directly at the overview JSON")
 	}
+	// CAR-205: Insights is unlinked from primary navigation by design.
 	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).Match(pageResponse.Body.Bytes()) {
 		t.Fatal("analytics page still exposes Insights in primary navigation")
 	}
@@ -2540,6 +2544,7 @@ func TestInsightsPageAndAPIRespectAnalyticsFilters(t *testing.T) {
 	if regexp.MustCompile(`(?i)\bknown\b`).MatchString(body) {
 		t.Fatalf("insights page still renders known qualifier: %s", body)
 	}
+	// CAR-205: the Insights page is reachable but unlinked from primary navigation.
 	if regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`).MatchString(body) {
 		t.Fatal("insights page still exposes Insights in primary navigation")
 	}

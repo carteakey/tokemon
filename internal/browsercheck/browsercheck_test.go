@@ -78,8 +78,11 @@ var gateViewports = []struct {
 // the page keeps its contract.
 
 // sharedInvariantJS checks what every page promises: a skip link to a real
-// main target, and horizontally scrolling regions that keyboard users can
-// actually reach.
+// main target, horizontally scrolling regions that keyboard users can
+// actually reach, and a document that never scrolls sideways. The gate used
+// to miss document-level overflow because it only inspected elements whose
+// own overflow was auto/scroll, so the root check below is deliberate: a wide
+// table belongs inside its scroll wrapper, not on the document.
 const sharedInvariantJS = `(() => {
 	const problems = [];
 	if (!document.querySelector('a.skip-link[href="#main-content"]')) {
@@ -97,10 +100,38 @@ const sharedInvariantJS = `(() => {
 			}
 		}
 	}
+	const root = document.documentElement;
+	if (root.scrollWidth > root.clientWidth + 1) {
+		problems.push('document overflows horizontally by ' + (root.scrollWidth - root.clientWidth) + 'px (scrollWidth ' + root.scrollWidth + ' > clientWidth ' + root.clientWidth + '); offenders: ' + documentOverflowOffenders());
+	}
 	if (document.querySelector('meta[http-equiv="refresh"]')) {
 		problems.push('meta refresh is back; the overview must use the pause/refresh control instead');
 	}
 	return JSON.stringify(problems);
+
+	// documentOverflowOffenders names the elements that actually push the
+	// document wider. Elements clipped by an auto/scroll/hidden ancestor are
+	// skipped: they overflow their own wrapper, not the page.
+	function documentOverflowOffenders() {
+		const limit = document.documentElement.clientWidth;
+		const offenders = [];
+		for (const el of document.querySelectorAll('body *')) {
+			const rect = el.getBoundingClientRect();
+			if (rect.width === 0 || rect.right <= limit + 1) continue;
+			let clipped = false;
+			for (let node = el.parentElement; node && node !== document.body; node = node.parentElement) {
+				const overflow = getComputedStyle(node).overflowX;
+				if (overflow === 'auto' || overflow === 'scroll' || overflow === 'hidden') {
+					clipped = true;
+					break;
+				}
+			}
+			if (clipped) continue;
+			const classes = typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\s+/).join('.') : '';
+			offenders.push(el.tagName.toLowerCase() + classes + (el.id ? '#' + el.id : '') + ' right=' + Math.round(rect.right) + 'px');
+		}
+		return offenders.length ? offenders.slice(0, 5).join(', ') : 'none found outside clipped regions';
+	}
 })()`
 
 // tokedexInvariantJS asserts the Tokedex MVP states on the enabled page: the

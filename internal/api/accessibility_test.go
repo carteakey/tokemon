@@ -159,7 +159,7 @@ func assertAccessibleDocument(t *testing.T, path, body string) {
 		}
 	}
 	if path == "/settings" {
-		for _, required := range []string{`aria-label="Alias for`, `aria-labelledby="settings-form-title"`, `type="submit"`} {
+		for _, required := range []string{`aria-label="Alias for`, `aria-label="Display name aliases"`, `type="submit"`} {
 			if !strings.Contains(body, required) {
 				t.Errorf("settings missing %q", required)
 			}
@@ -196,6 +196,22 @@ func assertContrastPolicy(t *testing.T, path, body string) {
 		if ratio := contrastRatio(foreground, background); ratio < 4.5 {
 			t.Errorf("%s %s contrast = %.2f, want at least 4.5", path, name, ratio)
 		}
+	}
+	// Form-control boundaries are UI components, not text: WCAG 1.4.11 asks
+	// for 3:1 against the surface they sit on. axe's A/AA tag set does not
+	// test this, so the policy is asserted here instead.
+	controlBorder, ok := colors["control-border"]
+	if !ok {
+		t.Errorf("%s has no control-border color token", path)
+		return
+	}
+	surface, ok := colors["surface"]
+	if !ok {
+		t.Errorf("%s has no surface color token", path)
+		return
+	}
+	if ratio := contrastRatio(controlBorder, surface); ratio < 3 {
+		t.Errorf("%s control-border contrast = %.2f, want at least 3", path, ratio)
 	}
 }
 
