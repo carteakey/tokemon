@@ -1842,6 +1842,12 @@ type heartbeatRequest struct {
 // batch limits live beside the shared body decoder in security.go.
 const maxHeartbeatBodyBytes = 1 << 20
 
+// maxHeartbeatSources bounds the per-source health list. A machine's source
+// list is one row per transcript/database, so it grows with session history;
+// the old 256 cap rejected busy machines outright (macOS with 297 sources),
+// starving the machine view and its connector health.
+const maxHeartbeatSources = 4096
+
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ingestRequests.Add(1)
 	if !s.ingestAuthorized(r) {
@@ -1934,7 +1940,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many adapters"})
 		return
 	}
-	if len(request.Sources) > 256 {
+	if len(request.Sources) > maxHeartbeatSources {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "too many sources"})
 		return
 	}

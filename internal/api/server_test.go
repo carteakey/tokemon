@@ -2882,3 +2882,27 @@ func TestCSVExportNeutralizesFormulaInjection(t *testing.T) {
 		t.Errorf("analytics csv missing neutralized project cell:\n%s", body)
 	}
 }
+
+func TestHeartbeatAcceptsManySources(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := make([]string, 0, 300)
+	for i := 0; i < 300; i++ {
+		sources = append(sources, fmt.Sprintf(`{"adapter":"codex","identity_hash":"sha256:%064x"}`, i))
+	}
+	payload := fmt.Sprintf(`{"machine_id":"busy-box","agent_version":"0.4.5","source_count":300,"source_error_count":0,"sources":[%s]}`, strings.Join(sources, ","))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("heartbeat with 300 sources = %d: %s", response.Code, response.Body.String())
+	}
+}
