@@ -345,3 +345,79 @@ func encodeVarint(value uint64) []byte {
 	}
 	return append(result, byte(value))
 }
+
+func TestParseGenerationStepsAfterMetadataMigration(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "migrated.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// New-format generation records no longer carry a timestamp; the counters
+	// and timestamps live in steps.metadata. The transcript stays in a separate
+	// field and must never be read.
+	generation := message(bytesField(3, message(bytesField(28, []byte("gemini-3.8-flash")))))
+	stepOne := message(
+		bytesField(1, message(varintField(1, 1793760236), varintField(2, 0))),
+		bytesField(9, message(varintField(1, 8192), varintField(2, 1200), varintField(3, 345))),
+	)
+	stepTwo := message(
+		bytesField(1, message(varintField(1, 1793761390), varintField(2, 0))),
+		bytesField(9, message(varintField(1, 8192), varintField(2, 1300), varintField(3, 100))),
+	)
+	if _, err := db.Exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, metadata BLOB);
+CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, 0), (1, ?, 0)`, generation, generation); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?), (2, 15, ?), (3, 132, 'tool')`, stepOne, stepTwo); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)`, fixtureTrajectoryMetadata()); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	result, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 2 {
+		t.Fatalf("events = %d, want 2", len(result.Events))
+	}
+	first := result.Events[0]
+	if first.InputTokens == nil || *first.InputTokens != 1200 || first.OutputTokens == nil || *first.OutputTokens != 345 || first.TotalTokens == nil || *first.TotalTokens != 1545 {
+		t.Fatalf("unexpected step tokens: %+v", first)
+	}
+	if first.Model != "gemini-3.8-flash" || first.Provider != "google" || first.Project != "carteakey.dev" {
+		t.Fatalf("unexpected step model or project: %+v", first)
+	}
+	if first.Timestamp != time.Unix(1793760236, 0).UTC() || first.Tool != "antigravity" {
+		t.Fatalf("unexpected step timestamp or tool: %+v", first)
+	}
+	if err := usage.ValidateOutboundBatch(result.Events); err != nil {
+		t.Fatalf("step batch failed outbound validation: %v", err)
+	}
+	repeated, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: result.Cursor})
+	if err != nil || len(repeated.Events) != 0 || repeated.Cursor != result.Cursor {
+		t.Fatalf("unchanged step source was reparsed: %+v, error: %v", repeated, err)
+	}
+}

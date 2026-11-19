@@ -227,6 +227,32 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
 	}
 	sessionID := usage.HashSessionID(source.Path)
+	// Antigravity moved generation counters out of gen_metadata's record value
+	// into the steps table. When the newest generation record no longer carries
+	// its own timestamp, read the per-generation steps instead. Conversations
+	// that still decode with the original layout keep the original path so
+	// already-ingested history is not re-read or double-counted.
+	stepsStart, useSteps, err := generationStepsStart(ctx, db, start)
+	if err != nil {
+		return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+	}
+	if useSteps {
+		events, nextOffset, err := a.parseGenerationSteps(ctx, db, request, eventIdentity, sessionID, project, stepsStart)
+		if err != nil {
+			return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+		}
+		result := adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}
+		if err := db.Close(); err != nil {
+			return a.rememberParse(source.Path, signature, identity, request.Cursor, adapters.ParseResult{}, err)
+		}
+		if current, err := sourceSignatureForPath(source.Path); err == nil {
+			signature = current
+		}
+		a.mu.Lock()
+		a.parsed[source.Path] = parseEntry{signature: signature, identity: identity, resultCursor: result.Cursor}
+		a.mu.Unlock()
+		return result, nil
+	}
 	rows, err := db.QueryContext(ctx, `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND idx >= ? ORDER BY idx`, start)
 	if err != nil {
 		err = fmt.Errorf("read Antigravity generation metadata: %w", err)
@@ -287,6 +313,163 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 
 func cursorIdentity(path string) string {
 	return adapters.HashIdentity(adapterID + "\x00" + adapterVersion + "\x00" + path)
+}
+
+// generationStepsStart decides whether a database needs the steps-based
+// parser. Antigravity's older gen_metadata values carry their own timestamp
+// and counters; newer values are a compact generation record without one, and
+// the per-generation counters now live in steps.metadata. Only the databases
+// whose newest record no longer decodes switch layouts.
+//
+// cursorOffset is the number of generation records already processed by the
+// original parser. A conversation that began on the old layout reuses it as
+// the number of steps already covered so upgrading does not re-emit history;
+// a conversation that was always on the new layout has no ingested history
+// and starts from zero.
+func generationStepsStart(ctx context.Context, db *sql.DB, cursorOffset int64) (int64, bool, error) {
+	hasSteps, err := adapters.HasTable(ctx, db, "steps")
+	if err != nil {
+		return 0, false, err
+	}
+	if !hasSteps {
+		return 0, false, nil
+	}
+	hasStepType, err := adapters.HasColumn(ctx, db, "steps", "step_type")
+	if err != nil {
+		return 0, false, err
+	}
+	hasMetadata, err := adapters.HasColumn(ctx, db, "steps", "metadata")
+	if err != nil {
+		return 0, false, err
+	}
+	if !hasStepType || !hasMetadata {
+		return 0, false, nil
+	}
+	var first, last []byte
+	err = db.QueryRowContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC LIMIT 1`).Scan(&first)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 1`).Scan(&last); err != nil {
+		return 0, false, err
+	}
+	if _, ok := decodeGenerationMetadata(last); ok {
+		return 0, false, nil
+	}
+	start := int64(0)
+	if _, ok := decodeGenerationMetadata(first); ok {
+		start = cursorOffset
+	}
+	var steps int64
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE step_type = 15 AND metadata IS NOT NULL`).Scan(&steps); err != nil {
+		return 0, false, err
+	}
+	if start > steps {
+		start = steps
+	}
+	return start, true, nil
+}
+
+// decodeStepMetadata reads the timestamp and usage counters Antigravity stores
+// on an assistant step. Only these scalar fields are touched; step_payload and
+// the transcript tables are never queried.
+func decodeStepMetadata(data []byte) (generationMetadata, bool) {
+	timestampMessage, ok := protobufBytesField(data, 1)
+	if !ok {
+		return generationMetadata{}, false
+	}
+	seconds, ok := protobufVarintField(timestampMessage, 1)
+	if !ok || seconds == 0 {
+		return generationMetadata{}, false
+	}
+	nanos, _ := protobufVarintField(timestampMessage, 2)
+	usageMessage, ok := protobufBytesField(data, 9)
+	if !ok {
+		return generationMetadata{}, false
+	}
+	input, ok := protobufVarintField(usageMessage, 2)
+	if !ok {
+		return generationMetadata{}, false
+	}
+	// Field 1 is the model's configured output ceiling and is constant for a
+	// conversation; field 3 is the generated output for this step.
+	output, ok := protobufVarintField(usageMessage, 3)
+	if !ok {
+		return generationMetadata{}, false
+	}
+	return generationMetadata{
+		InputTokens: int64(input), OutputTokens: int64(output),
+		Timestamp: time.Unix(int64(seconds), int64(nanos)).UTC(),
+	}, true
+}
+
+// conversationModel returns the model recorded on the generation records. A
+// conversation uses one model in practice, so the newest record wins.
+func conversationModel(ctx context.Context, db *sql.DB) string {
+	rows, err := db.QueryContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 32`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return ""
+		}
+		for _, path := range [][]uint64{{3, 28}, {19}, {1, 19}, {1, 3, 28}} {
+			if model, ok := protobufBytesField(data, path...); ok && len(model) > 0 {
+				return string(model)
+			}
+		}
+	}
+	return ""
+}
+
+func (a *Adapter) parseGenerationSteps(ctx context.Context, db *sql.DB, request adapters.ParseRequest, eventIdentity, sessionID, project string, start int64) ([]usage.Event, int64, error) {
+	model := conversationModel(ctx, db)
+	rows, err := db.QueryContext(ctx, `SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL ORDER BY idx`)
+	if err != nil {
+		return nil, start, fmt.Errorf("read Antigravity generation steps: %w", err)
+	}
+	defer rows.Close()
+	var events []usage.Event
+	rank := int64(0)
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return nil, rank, err
+		}
+		current := rank
+		rank++
+		if current < start {
+			continue
+		}
+		metadata, ok := decodeStepMetadata(data)
+		if !ok || metadata.InputTokens+metadata.OutputTokens <= 0 {
+			continue
+		}
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       usage.DeterministicID(request.MachineID, adapterID, eventIdentity, current, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
+			Timestamp:     metadata.Timestamp,
+			MachineID:     request.MachineID,
+			SessionID:     sessionID,
+			Project:       project,
+			Provider:      providerForModel(model),
+			Model:         a.NormalizeModel(model),
+			Tool:          "antigravity",
+			InputTokens:   usage.Int64(metadata.InputTokens),
+			OutputTokens:  usage.Int64(metadata.OutputTokens),
+			TotalTokens:   usage.Int64(metadata.InputTokens + metadata.OutputTokens),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: current},
+		})
+	}
+	return events, rank, rows.Err()
 }
 
 func projectFromDatabase(ctx context.Context, db *sql.DB) (string, error) {
