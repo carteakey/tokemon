@@ -3,6 +3,7 @@ package opencode
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -90,24 +91,50 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	return result, err
 }
 
+// sessionsTable picks the canonical session table. OpenCode renamed the
+// aggregate table to session_v2 as part of its storage migration and left the
+// old session table frozen at the migration point, so reading that table alone
+// silently misses every session created afterwards. The v2 table is a superset
+// of the legacy rows; fall back to session only when v2 is absent or empty.
+func sessionsTable(ctx context.Context, db *sql.DB) (string, bool, error) {
+	hasV2, err := adapters.HasTable(ctx, db, "session_v2")
+	if err != nil {
+		return "", false, err
+	}
+	hasLegacy, err := adapters.HasTable(ctx, db, "session")
+	if err != nil {
+		return "", false, err
+	}
+	if hasV2 {
+		var populated bool
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM session_v2)`).Scan(&populated); err != nil {
+			return "", false, err
+		}
+		if populated || !hasLegacy {
+			return "session_v2", true, nil
+		}
+	}
+	return "session", hasLegacy, nil
+}
+
 func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, request adapters.ParseRequest, machineID, sourceIdentity string) (adapters.ParseResult, error) {
 	db, err := adapters.OpenReadOnly(ctx, source.Path)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
 	defer db.Close()
-	hasSession, err := adapters.HasTable(ctx, db, "session")
+	table, ok, err := sessionsTable(ctx, db)
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	if !hasSession {
+	if !ok {
 		return adapters.ParseResult{Cursor: adapters.Cursor{Identity: sourceIdentity}}, nil
 	}
 	for _, column := range []string{
 		"id", "time_created", "time_updated", "tokens_input", "tokens_output",
 		"tokens_reasoning", "tokens_cache_read", "tokens_cache_write", "cost",
 	} {
-		hasColumn, err := adapters.HasColumn(ctx, db, "session", column)
+		hasColumn, err := adapters.HasColumn(ctx, db, table, column)
 		if err != nil {
 			return adapters.ParseResult{}, err
 		}
@@ -119,13 +146,13 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 		}
 	}
 	modelExpression := "''"
-	if hasModel, err := adapters.HasColumn(ctx, db, "session", "model"); err != nil {
+	if hasModel, err := adapters.HasColumn(ctx, db, table, "model"); err != nil {
 		return adapters.ParseResult{}, err
 	} else if hasModel {
 		modelExpression = "model"
 	}
 	projectExpression := `''`
-	if hasDirectory, err := adapters.HasColumn(ctx, db, "session", "directory"); err != nil {
+	if hasDirectory, err := adapters.HasColumn(ctx, db, table, "directory"); err != nil {
 		return adapters.ParseResult{}, err
 	} else if hasDirectory {
 		projectExpression = "directory"
@@ -134,7 +161,7 @@ func (a *Adapter) parseUncached(ctx context.Context, source adapters.Source, req
 	SELECT id, time_created, time_updated, `+modelExpression+`,
        tokens_input, tokens_output, tokens_reasoning,
        tokens_cache_read, tokens_cache_write, cost, `+projectExpression+`
-FROM session
+FROM `+table+`
 WHERE tokens_input + tokens_output + tokens_reasoning + tokens_cache_read + tokens_cache_write > 0
 ORDER BY time_created, id`)
 	if err != nil {
