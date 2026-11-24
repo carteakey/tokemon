@@ -1,4 +1,12 @@
-## Unreleased
+## 0.5.0
+
+A major speed, UI/UX, and utility release: split SQLite read/write pools with
+single-pass analytics and gzip/immutable asset delivery, shared dashboard chrome
+with clickable drill-downs and live in-place updates, upgraded sessions and
+Tokedex detail views, SQLite-backed editable quotas, Codex `.jsonl.zst` and
+Antigravity `cache_read_tokens` / `reasoning_tokens` accuracy fixes, `tokemon
+status` CLI, automated daily WAL-safe backups, and an authenticated
+`/api/v1/card.svg` share card.
 
 ### Added
 

@@ -4,9 +4,8 @@ Updated after landing Slices 1–4, E2E and adversarial hardening, live Mac hub 
 
 ## TL;DR
 
-- **Local `main` is ahead of `origin/main`** (unpushed by request; push when ready). Working tree clean once docs are committed.
-- **v0.4.4 is still the latest tag.** Slices 1–4 + Antigravity `0.3.0` live under `## Unreleased` in `CHANGELOG.md`.
-- **Live Mac hub:** `~/.local/bin/tokemon` (`0.4.5-dev`, commit `498f82e`, adhoc-signed), `com.tokemon.server` healthy (`GET /healthz` `200`, ~1s boot), `com.tokemon.agent` active, SQLite schema `user_version = 5`, `TOKEMON_ENABLE_TOKEDEX=true` enabled in `~/.config/tokemon/server.env`.
+- **`v0.5.0` tagged and pushed to `origin/main`.** Full release notes live under `## 0.5.0` in `CHANGELOG.md`.
+- **Live Mac hub:** `~/.local/bin/tokemon` (`0.5.0`, adhoc-signed), `com.tokemon.server` healthy (`GET /healthz` `200`, ~1s boot), `com.tokemon.agent` active, SQLite schema `user_version = 5`, `TOKEMON_ENABLE_TOKEDEX=true` enabled in `~/.config/tokemon/server.env`.
 - **Antigravity backfill complete on this Mac (`Kartikeys-MacBook-Air`):** `v0.3.0` recovered **1.72B** `cache_read_tokens` and **5.19M** `reasoning_tokens` across 327 local conversations (hub lifetime total `30.24B` → `31.96B`, zero duplicates).
 - **Automated gates verified:** `gofmt`, `go build`, `go vet`, `go test ./... -count=1` (`25/25`), `go test ./internal/api -race -count=1`, `TOKEMON_BROWSER_SMOKE=1 go test ./internal/browsercheck -v -count=1` (`73` checks, empty axe allowlist), and `TOKEMON_E2E=1 go test -tags e2e ./internal/e2e -v -count=1` (`386` checks).
 
@@ -32,10 +31,8 @@ See `docs/improvement-plan-2026-11-23.md` and `docs/delivery-report-2026-11-24.m
 
 ## Open Follow-Ups
 
-1. **Push local `main` to `origin`** when ready (kept local-only by request).
-2. **Upgrade remote agents (`kpc-cachy`, `Kartikeys-MacBook-Air-2`, `fx505`, and `raspberrypi` when online)** to `498f82e+` so they pick up Codex `.jsonl.zst`, `claude-desktop` separation, and automatic Antigravity `0.3.0` `cache_read_tokens` / `reasoning_tokens` backfill.
-3. **Cut next release (`v0.4.5` / `v0.5.0`)** after running `bash deploy/release-check.sh` on the pushed candidate commit.
-4. **Pricing drift:** `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` remain on old catalog numbers by choice; Gemini 4.x models stay `mode: unknown` until published API rates exist.
+1. **Upgrade remote agents (`kpc-cachy`, `Kartikeys-MacBook-Air-2`, `fx505`, and `raspberrypi` when online)** to `v0.5.0` so they pick up Codex `.jsonl.zst`, `claude-desktop` separation, and automatic Antigravity `0.3.0` `cache_read_tokens` / `reasoning_tokens` backfill.
+2. **Pricing drift:** `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol` remain on old catalog numbers by choice; Gemini 4.x models stay `mode: unknown` until published API rates exist.
 
 ## Reference Artifacts
 
@@ -44,4 +41,4 @@ See `docs/improvement-plan-2026-11-23.md` and `docs/delivery-report-2026-11-24.m
 - Analytics findings: `docs/analytics-latency.md`
 - Data audit: `docs/data-audit-2026-11-19.md`
 - Tokedex roadmap: `docs/tokedex-roadmap.md`
-- Last release: <https://github.com/carteakey/tokemon/releases/tag/v0.4.4>
+- Latest release: <https://github.com/carteakey/tokemon/releases/tag/v0.5.0>
