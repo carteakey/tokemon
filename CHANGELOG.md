@@ -2,6 +2,13 @@
 
 ### Changed
 
+- **Codex thread totals now carry a residual.** Detailed rollout totals
+  (`total_token_usage.total_tokens` deltas) remain the primary count. When a
+  thread's `tokens_used` counter exceeds the detailed total, the gap is stored
+  as an aggregate residual in the new `codex_thread_totals` table (schema v6),
+  and lifetime per thread is `max(detailed, tokens_used)`. Archived or deleted
+  rollouts no longer drop usage, and a stale counter no longer hides detailed
+  data. See `docs/codex-token-accounting.md`.
 - **Evolution forms naming and sprite cleanup pass.** Eliminated repeated
   prefixes and late-game sci-fi drift across 9 sealed evolution forms (`03
   Prompt Imp`, `04 Cache Cub`, `05 Vector Lynx`, `07 Agent Hound`, `11 Attention

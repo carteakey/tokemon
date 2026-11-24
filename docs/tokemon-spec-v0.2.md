@@ -809,6 +809,16 @@ Built-in and extension adapters:
 8. ZCode
 9. Generic JSONL
 
+Codex usage is read from `~/.codex/sessions/**/*.jsonl`,
+`~/.codex/archived_sessions/**/*.jsonl.zst`, and the `threads` table in
+`~/.codex/state_*.sqlite`. Rollout records provide the per-call
+`total_token_usage.total_tokens` deltas; the thread table provides Codex's
+cumulative `tokens_used` summary. Lifetime usage is the per-thread maximum of
+the two, with the shortfall stored as a residual aggregate event, so a deleted
+or archived rollout does not silently drop usage and a stale thread counter
+does not overwrite detailed data. See
+[docs/codex-token-accounting.md](codex-token-accounting.md).
+
 GitHub Copilot CLI usage is read from `~/.copilot/session-state/*/events.jsonl`. The adapter consumes only durable `session.shutdown.modelMetrics.usage` aggregates and the final directory name from session context. Prompts, responses, tool arguments, titles, repository paths, and modified-file lists are never included in normalized events. One stable snapshot is emitted per model and session; active sessions become visible after Copilot writes their shutdown aggregate.
 
 OpenClaw usage is read from `~/.openclaw/agents/*/sessions/*.jsonl`. The adapter consumes only assistant message usage metadata, provider, model, timestamps, and the session header's normalized project basename. Transcript content, tool calls, tool arguments, trajectory mirrors, and full working-directory paths are never included in normalized events. Zero-token delivery and error records are ignored, and incomplete final records remain eligible for the next poll.
