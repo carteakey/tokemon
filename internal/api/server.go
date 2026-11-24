@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/csv"
@@ -133,6 +134,7 @@ type overviewCacheEntry struct {
 	// overview is also served exactly the page built from it: the two can never
 	// be stitched from different entries.
 	html []byte
+	etag string
 }
 
 // analyticsCacheEntry caches one filter combination's full Analytics result.
@@ -222,16 +224,18 @@ func dataFreshnessFor(newest *time.Time, now time.Time) dataFreshness {
 type analyticsPageData struct {
 	PageChrome
 	database.Analytics
-	ModelAliases   map[string]string
-	MachineAliases map[string]string
-	ExportURL      string
-	CSVURL         string
-	PeakPoint      database.AnalyticsPoint
-	AverageThread  int64
-	AxisMax        int64
-	AxisTicks      []analyticsAxisTick
-	Insights       []analyticsInsight
-	Quotas         []quotaView
+	ModelAliases      map[string]string
+	MachineAliases    map[string]string
+	ExportURL         string
+	CSVURL            string
+	PeakPoint         database.AnalyticsPoint
+	AverageThread     int64
+	AxisMax           int64
+	AxisTicks         []analyticsAxisTick
+	Insights          []analyticsInsight
+	Quotas            []quotaView
+	ActiveFilters     []activeFilterPill
+	ActiveFilterCount int
 }
 
 type analyticsAxisTick struct {
@@ -319,9 +323,15 @@ type insightsPageData struct {
 }
 
 type aliasRow struct {
-	Identity string
-	Alias    string
-	Default  string
+	Identity      string
+	Alias         string
+	Default       string
+	Tokens        int64
+	Events        int64
+	UnknownEvents int64
+	HasUsage      bool
+	AnalyticsURL  string
+	TokedexURL    string
 }
 
 type settingsPage struct {
@@ -1862,6 +1872,90 @@ func analyticsPeriodURL(query database.AnalyticsQuery, period string) string {
 	return analyticsViewURL(query, query.Dimension)
 }
 
+func analyticsActiveFilters(query database.AnalyticsQuery, modelAliases, machineAliases map[string]string) []activeFilterPill {
+	var pills []activeFilterPill
+	addPill := func(label string, mutate func(*database.AnalyticsQuery)) {
+		next := query
+		mutate(&next)
+		pills = append(pills, activeFilterPill{
+			Label:     label,
+			RemoveURL: analyticsViewURL(next, query.Dimension),
+		})
+	}
+	if query.From != "" {
+		addPill("From: "+query.From, func(q *database.AnalyticsQuery) { q.From = "" })
+	}
+	if query.To != "" {
+		addPill("To: "+query.To, func(q *database.AnalyticsQuery) { q.To = "" })
+	}
+	if query.Project != "" {
+		label := query.Project
+		if label == database.UnknownProjectFilter {
+			label = "Unknown project"
+		}
+		addPill("Project: "+label, func(q *database.AnalyticsQuery) { q.Project = "" })
+	}
+	if query.Machine != "" {
+		addPill("Machine: "+machineDisplayName(machineAliases, query.Machine), func(q *database.AnalyticsQuery) { q.Machine = "" })
+	}
+	if query.Provider != "" {
+		addPill("Provider: "+query.Provider, func(q *database.AnalyticsQuery) { q.Provider = "" })
+	}
+	if query.Model != "" {
+		addPill("Model: "+modelDisplayName(modelAliases, query.Model), func(q *database.AnalyticsQuery) { q.Model = "" })
+	}
+	if query.Tool != "" {
+		addPill("Harness: "+harnessName(query.Tool), func(q *database.AnalyticsQuery) { q.Tool = "" })
+	}
+	return pills
+}
+
+func analyticsClearFiltersURL(query database.AnalyticsQuery) string {
+	return analyticsViewURL(database.AnalyticsQuery{Period: query.Period, Dimension: query.Dimension}, query.Dimension)
+}
+
+func analyticsDateRangeLabel(filter database.AnalyticsQuery, startDate, endDate string) string {
+	if !validDateRange(filter) || startDate == "" || endDate == "" {
+		return "Invalid date range"
+	}
+	if startDate == endDate {
+		return startDate
+	}
+	return startDate + " → " + endDate
+}
+
+func dashboardETag(html []byte) string {
+	if len(html) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(html)
+	return fmt.Sprintf(`"%x"`, sum[:16])
+}
+
+func etagMatches(ifNoneMatch, etag string) bool {
+	if etag == "" || strings.TrimSpace(ifNoneMatch) == "" {
+		return false
+	}
+	normalizeTag := func(tag string) string {
+		tag = strings.TrimSpace(tag)
+		if strings.HasPrefix(tag, "W/") || strings.HasPrefix(tag, "w/") {
+			tag = strings.TrimSpace(tag[2:])
+		}
+		return tag
+	}
+	target := normalizeTag(etag)
+	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+		part := strings.TrimSpace(candidate)
+		if part == "*" {
+			return true
+		}
+		if normalizeTag(part) == target {
+			return true
+		}
+	}
+	return false
+}
+
 func insightsViewURL(query database.AnalyticsQuery, dimension string) string {
 	query.Dimension = dimension
 	return "/insights?" + analyticsQueryValues(query).Encode()
@@ -1931,19 +2025,62 @@ func aliasMaps(values []database.DisplayAlias) (map[string]string, map[string]st
 	return models, machines
 }
 
-func modelAliasRows(values []database.ModelTotal, aliases map[string]string) []aliasRow {
+func compareAliasRows(left, right aliasRow) bool {
+	if left.HasUsage != right.HasUsage {
+		return left.HasUsage
+	}
+	if left.Tokens != right.Tokens {
+		return left.Tokens > right.Tokens
+	}
+	if left.Events != right.Events {
+		return left.Events > right.Events
+	}
+	return left.Identity < right.Identity
+}
+
+func modelAliasRows(values []database.ModelTotal, aliases map[string]string, tokedex bool) []aliasRow {
 	rows := make([]aliasRow, 0, len(values))
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
 		seen[value.Model] = struct{}{}
-		rows = append(rows, aliasRow{Identity: value.Model, Alias: aliases[value.Model], Default: compactModelName(value.Model)})
+		var analyticsURL, tokedexURL string
+		if isDrillableBucket(value.Model) {
+			analyticsURL = "/analytics?dimension=models&model=" + url.QueryEscape(value.Model)
+			if tokedex {
+				tokedexURL = "/tokedex?q=" + url.QueryEscape(value.Model)
+			}
+		}
+		rows = append(rows, aliasRow{
+			Identity:      value.Model,
+			Alias:         aliases[value.Model],
+			Default:       compactModelName(value.Model),
+			Tokens:        value.Tokens,
+			Events:        value.Events,
+			UnknownEvents: value.UnknownEvents,
+			HasUsage:      value.Events > 0,
+			AnalyticsURL:  analyticsURL,
+			TokedexURL:    tokedexURL,
+		})
 	}
 	for identity, alias := range aliases {
 		if _, ok := seen[identity]; !ok {
-			rows = append(rows, aliasRow{Identity: identity, Alias: alias, Default: compactModelName(identity)})
+			var analyticsURL, tokedexURL string
+			if isDrillableBucket(identity) {
+				analyticsURL = "/analytics?dimension=models&model=" + url.QueryEscape(identity)
+				if tokedex {
+					tokedexURL = "/tokedex?q=" + url.QueryEscape(identity)
+				}
+			}
+			rows = append(rows, aliasRow{
+				Identity:     identity,
+				Alias:        alias,
+				Default:      compactModelName(identity),
+				AnalyticsURL: analyticsURL,
+				TokedexURL:   tokedexURL,
+			})
 		}
 	}
-	sort.SliceStable(rows, func(left, right int) bool { return rows[left].Identity < rows[right].Identity })
+	sort.SliceStable(rows, func(left, right int) bool { return compareAliasRows(rows[left], rows[right]) })
 	return rows
 }
 
@@ -1952,14 +2089,36 @@ func machineAliasRows(values []database.MachineTotal, aliases map[string]string)
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
 		seen[value.Machine] = struct{}{}
-		rows = append(rows, aliasRow{Identity: value.Machine, Alias: aliases[value.Machine], Default: compactMachineName(value.Machine)})
+		var analyticsURL string
+		if isDrillableBucket(value.Machine) {
+			analyticsURL = "/analytics?dimension=machines&machine=" + url.QueryEscape(value.Machine)
+		}
+		rows = append(rows, aliasRow{
+			Identity:      value.Machine,
+			Alias:         aliases[value.Machine],
+			Default:       compactMachineName(value.Machine),
+			Tokens:        value.Tokens,
+			Events:        value.Events,
+			UnknownEvents: value.UnknownEvents,
+			HasUsage:      value.Events > 0,
+			AnalyticsURL:  analyticsURL,
+		})
 	}
 	for identity, alias := range aliases {
 		if _, ok := seen[identity]; !ok {
-			rows = append(rows, aliasRow{Identity: identity, Alias: alias, Default: compactMachineName(identity)})
+			var analyticsURL string
+			if isDrillableBucket(identity) {
+				analyticsURL = "/analytics?dimension=machines&machine=" + url.QueryEscape(identity)
+			}
+			rows = append(rows, aliasRow{
+				Identity:     identity,
+				Alias:        alias,
+				Default:      compactMachineName(identity),
+				AnalyticsURL: analyticsURL,
+			})
 		}
 	}
-	sort.SliceStable(rows, func(left, right int) bool { return rows[left].Identity < rows[right].Identity })
+	sort.SliceStable(rows, func(left, right int) bool { return compareAliasRows(rows[left], rows[right]) })
 	return rows
 }
 
@@ -2082,16 +2241,18 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"compositionTooltip": func(label string, value int64) string {
 			return label + "\n" + commas(value) + " tokens"
 		},
-		"analyticsURL":         analyticsViewURL,
-		"analyticsPeriodURL":   analyticsPeriodURL,
-		"sessionsExportURL":    sessionsExportURL,
-		"sessionsPageURL":      sessionsPageURL,
-		"sessionDetailURL":     sessionDetailURL,
-		"validDateInput":       parseQueryDate,
-		"validDateRange":       validDateRange,
-		"overviewDrillURL":     overviewDrillURL,
-		"breakdownDrillURL":    analyticsBreakdownDrillURL,
-		"unknownProjectFilter": func() string { return database.UnknownProjectFilter },
+		"analyticsURL":             analyticsViewURL,
+		"analyticsPeriodURL":       analyticsPeriodURL,
+		"analyticsClearFiltersURL": analyticsClearFiltersURL,
+		"analyticsDateRangeLabel":  analyticsDateRangeLabel,
+		"sessionsExportURL":        sessionsExportURL,
+		"sessionsPageURL":          sessionsPageURL,
+		"sessionDetailURL":         sessionDetailURL,
+		"validDateInput":           parseQueryDate,
+		"validDateRange":           validDateRange,
+		"overviewDrillURL":         overviewDrillURL,
+		"breakdownDrillURL":        analyticsBreakdownDrillURL,
+		"unknownProjectFilter":     func() string { return database.UnknownProjectFilter },
 		"trendPointDate": func(point database.AnalyticsPoint, bucket string) string {
 			date, _, _ := analyticsPointDateRange(point, bucket, store.Location())
 			return date
@@ -2607,6 +2768,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.observeDB(started)
+	s.invalidateOverviewCache()
 	s.logger.Info("heartbeat_recorded", "source_errors", request.SourceErrorCount)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -2926,6 +3088,19 @@ func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	etag := fmt.Sprintf(`"ev-%d-%d-%d-%d-%d-%d"`,
+		result.LifetimeTokens,
+		result.Composition.InputTokens,
+		result.Composition.UncachedInputTokens,
+		result.Composition.CachedInputTokens,
+		result.Composition.OutputTokens,
+		result.Composition.UnclassifiedTokens,
+	)
+	w.Header().Set("ETag", etag)
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -3126,6 +3301,7 @@ func (s *Server) startOverviewRefreshLocked() {
 		result, err := s.store.Overview(ctx)
 
 		var html []byte
+		var etag string
 		if err == nil {
 			var buildErr error
 			if html, buildErr = s.renderDashboardHTML(ctx, result); buildErr != nil {
@@ -3135,6 +3311,8 @@ func (s *Server) startOverviewRefreshLocked() {
 				if !clientGone(buildErr) {
 					s.logger.Warn("dashboard_prebuild_failed")
 				}
+			} else {
+				etag = dashboardETag(html)
 			}
 		}
 
@@ -3142,7 +3320,7 @@ func (s *Server) startOverviewRefreshLocked() {
 		var fetched time.Time
 		if s.overviewGeneration == generation && !clientGone(err) {
 			fetched = time.Now()
-			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: fetched, html: html}
+			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: fetched, html: html, etag: etag}
 		}
 		s.overviewReady = nil
 		s.overviewMu.Unlock()
@@ -3197,6 +3375,7 @@ func (s *Server) dropOverviewHTMLCache() {
 	s.overviewGeneration++
 	if s.overviewCache != nil {
 		s.overviewCache.html = nil
+		s.overviewCache.etag = ""
 		s.overviewCache.fetched = time.Time{}
 	}
 	s.overviewMu.Unlock()
@@ -3393,20 +3572,32 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, entry.err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if entry.fetched.IsZero() || time.Since(entry.fetched) >= overviewCacheTTL {
+		w.Header().Set("X-Tokemon-Refreshing", "1")
+	}
 	// The page is cached on the overview entry it was rendered from, so a warm
 	// request writes pre-rendered bytes instead of repeating the machine,
 	// session, and alias queries plus the full template render.
-	if len(entry.html) > 0 {
-		w.Write(entry.html)
-		return
-	}
-	html, err := s.buildDashboardHTML(r.Context(), entry.result, entry.fetched)
-	if err != nil {
-		if clientGone(err) {
+	html := entry.html
+	etag := entry.etag
+	if len(html) == 0 {
+		var err error
+		html, err = s.buildDashboardHTML(r.Context(), entry.result, entry.fetched)
+		if err != nil {
+			if clientGone(err) {
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		etag = dashboardETag(html)
+	}
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+		if etagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 	w.Write(html)
 }
@@ -3420,6 +3611,7 @@ func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overvie
 	if err != nil {
 		return nil, err
 	}
+	etag := dashboardETag(html)
 	// A zero fetched time marks the stale entry that an ingest invalidated;
 	// attaching there would let one request's page outlive the refresh that is
 	// already replacing it, and the refresh pre-renders the successor anyway.
@@ -3427,6 +3619,7 @@ func (s *Server) buildDashboardHTML(ctx context.Context, result database.Overvie
 		s.overviewMu.Lock()
 		if cached := s.overviewCache; cached != nil && cached.fetched.Equal(overviewFetched) && len(cached.html) == 0 {
 			cached.html = html
+			cached.etag = etag
 		}
 		s.overviewMu.Unlock()
 	}
@@ -3652,19 +3845,22 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
 	axisMax := analyticsNiceMax(result.MaxTokens)
+	activeFilters := analyticsActiveFilters(result.Filter, modelAliases, machineAliases)
 	page := analyticsPageData{
-		PageChrome:     s.pageChrome("Tokemon · Analytics", "analytics", false),
-		Analytics:      result,
-		ModelAliases:   modelAliases,
-		MachineAliases: machineAliases,
-		ExportURL:      analyticsExportURL(result.Filter, "json"),
-		CSVURL:         analyticsExportURL(result.Filter, "csv"),
-		PeakPoint:      analyticsPeakPoint(result.Points),
-		AverageThread:  analyticsAverageThread(result.Summary),
-		AxisMax:        axisMax,
-		AxisTicks:      analyticsAxisTicks(axisMax),
-		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
-		Quotas:         quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
+		PageChrome:        s.pageChrome("Tokemon · Analytics", "analytics", false),
+		Analytics:         result,
+		ModelAliases:      modelAliases,
+		MachineAliases:    machineAliases,
+		ExportURL:         analyticsExportURL(result.Filter, "json"),
+		CSVURL:            analyticsExportURL(result.Filter, "csv"),
+		PeakPoint:         analyticsPeakPoint(result.Points),
+		AverageThread:     analyticsAverageThread(result.Summary),
+		AxisMax:           axisMax,
+		AxisTicks:         analyticsAxisTicks(axisMax),
+		Insights:          analyticsInsights(result, time.Now(), modelAliases, machineAliases),
+		Quotas:            quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
+		ActiveFilters:     activeFilters,
+		ActiveFilterCount: len(activeFilters),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -4202,7 +4398,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	authMode, tokenSource := s.authSummary()
 	page := settingsPage{
 		PageChrome:  s.pageChrome("Tokemon · Settings", "settings", false),
-		Models:      modelAliasRows(result.ByModel, modelAliases),
+		Models:      modelAliasRows(result.ByModel, modelAliases, s.config.EnableTokedex),
 		Machines:    machineAliasRows(result.ByMachine, machineAliases),
 		Saved:       r.URL.Query().Get("saved") == "1",
 		AuthMode:    authMode,

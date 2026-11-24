@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -897,6 +898,218 @@ var axeViolationsJS = `axe.run(document, {runOnly: {type: 'tag', values: ['` + s
 	})))
 )`
 
+// analyticsToolbarInvariantJS checks the decluttered /analytics toolbar:
+// duplicate #dimension-filter is gone (replaced by hidden dimension input),
+// secondary filters and export links start collapsed inside <details>, and
+// every filter select has an explicit label[for].
+const analyticsToolbarInvariantJS = `(() => {
+	const problems = [];
+	if (document.getElementById('dimension-filter')) {
+		problems.push('duplicate #dimension-filter select must be removed');
+	}
+	if (!document.querySelector('input[type="hidden"][name="dimension"]')) {
+		problems.push('missing hidden dimension input in filter form');
+	}
+	if (!document.querySelector('input[type="hidden"][name="period"]')) {
+		problems.push('missing hidden period input in filter form');
+	}
+	const filterDetails = document.querySelector('details.filter-details');
+	if (!filterDetails) {
+		problems.push('missing details.filter-details');
+	} else if (filterDetails.open) {
+		problems.push('details.filter-details should be collapsed by default');
+	}
+	const exportMenu = document.querySelector('details.export-menu');
+	if (!exportMenu) {
+		problems.push('missing details.export-menu');
+	} else if (exportMenu.open) {
+		problems.push('details.export-menu should be collapsed by default');
+	}
+	for (const id of ['project-filter', 'machine-filter', 'provider-filter', 'model-filter', 'harness-filter']) {
+		if (!document.getElementById(id)) {
+			problems.push('missing filter select #' + id);
+		}
+		if (!document.querySelector('label[for="' + id + '"]')) {
+			problems.push('missing label[for="' + id + '"]');
+		}
+	}
+	if (!document.querySelector('.filter-form button[type="submit"]')) {
+		problems.push('missing Apply filters submit button');
+	}
+	return JSON.stringify(problems);
+})()`
+
+// insightsRovingInvariantJS checks /insights 24-hour rhythm roving tabindex,
+// live readout, and sr-only semantic table.
+const insightsRovingInvariantJS = `(() => {
+	const problems = [];
+	const hist = document.querySelector('.histogram');
+	if (!hist) {
+		problems.push('missing .histogram');
+		return JSON.stringify(problems);
+	}
+	if (hist.getAttribute('role') !== 'region') {
+		problems.push('.histogram role = ' + hist.getAttribute('role') + ', want region');
+	}
+	const hours = Array.from(hist.querySelectorAll('button.hour[type="button"]'));
+	if (hours.length !== 24) {
+		problems.push('expected 24 button.hour[type="button"] elements, got ' + hours.length);
+	}
+	const stops = hours.filter((h) => h.getAttribute('tabindex') === '0');
+	if (stops.length !== 1) {
+		problems.push('expected exactly 1 .hour[tabindex="0"], got ' + stops.length);
+	}
+	const offPattern = hours.filter((h) => h.getAttribute('tabindex') !== '0' && h.getAttribute('tabindex') !== '-1');
+	if (offPattern.length) {
+		problems.push('.hour buttons carry tabindex outside roving pattern');
+	}
+	const peak = hist.querySelector('.hour.peak');
+	if (peak && stops[0] !== peak) {
+		problems.push('initial roving stop is not the peak hour');
+	}
+	const readout = document.getElementById('rhythm-readout-value');
+	if (!readout || !document.querySelector('.rhythm-readout[aria-live="polite"]')) {
+		problems.push('missing .rhythm-readout[aria-live="polite"] or #rhythm-readout-value');
+	}
+	if (hours.length >= 24) {
+		hours[0].focus();
+		const before = readout ? readout.textContent : '';
+		hours[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+		if (document.activeElement !== hours[1]) {
+			problems.push('ArrowRight did not move focus from hour 0 to hour 1');
+		}
+		if (hours[1].getAttribute('tabindex') !== '0' || hours[0].getAttribute('tabindex') !== '-1') {
+			problems.push('roving tabindex did not follow ArrowRight');
+		}
+		if (readout && readout.textContent === before) {
+			problems.push('rhythm readout did not update on ArrowRight');
+		}
+		hours[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+		if (document.activeElement !== hours[23]) {
+			problems.push('End did not move focus to hour 23');
+		}
+		hours[23].dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true }));
+		if (document.activeElement !== hours[0]) {
+			problems.push('Home did not move focus to hour 0');
+		}
+	}
+	const tableRows = document.querySelectorAll('#rhythm-data-table table[aria-label="24-hour rhythm data table"] tbody tr');
+	if (tableRows.length !== 24) {
+		problems.push('expected 24 rows in #rhythm-data-table, got ' + tableRows.length);
+	}
+	if (document.activeElement && document.activeElement !== document.body) {
+		document.activeElement.blur();
+	}
+	return JSON.stringify(problems);
+})()`
+
+// settingsAliasInvariantJS checks /settings usage-sorted aliases, live filter,
+// per-row Reset focus restoration, and Analytics/Tokedex cross-links.
+const settingsAliasInvariantJS = `(() => {
+	const problems = [];
+	const filter = document.getElementById('alias-filter');
+	if (!filter) {
+		problems.push('missing #alias-filter');
+		return JSON.stringify(problems);
+	}
+	if (!document.querySelector('label[for="alias-filter"]')) {
+		problems.push('missing label[for="alias-filter"]');
+	}
+	if (filter.closest('form[action="/settings/aliases"]')) {
+		problems.push('#alias-filter must sit outside the alias POST form');
+	}
+	const status = document.getElementById('alias-filter-status');
+	if (!status) {
+		problems.push('missing #alias-filter-status');
+	}
+	const modelRows = Array.from(document.querySelectorAll('[data-alias-row][data-kind="model"]'));
+	if (modelRows.length < 2) {
+		problems.push('expected at least 2 seeded model alias rows');
+	} else {
+		if (modelRows[0].dataset.identity !== 'claude-sonnet-4' || modelRows[1].dataset.identity !== 'gpt-5') {
+			problems.push('model rows not sorted by usage tokens DESC: ' + modelRows.map((r) => r.dataset.identity).join(','));
+		}
+		if (!modelRows[0].querySelector('a[href^="/analytics?dimension=models&model="]')) {
+			problems.push('model row missing Analytics cross-link');
+		}
+		if (!modelRows[0].querySelector('a[href^="/tokedex?q="]')) {
+			problems.push('model row missing Tokedex cross-link when enabled');
+		}
+		const usage = modelRows[0].querySelector('.alias-usage');
+		if (!usage || !usage.textContent.includes('tokens')) {
+			problems.push('model row missing usage summary');
+		}
+	}
+	filter.value = 'gpt-5';
+	filter.dispatchEvent(new Event('input', { bubbles: true }));
+	const hiddenCount = modelRows.filter((r) => r.hidden).length;
+	if (hiddenCount === 0) {
+		problems.push('#alias-filter did not hide non-matching model rows');
+	}
+	filter.value = '';
+	filter.dispatchEvent(new Event('input', { bubbles: true }));
+	if (modelRows.some((r) => r.hidden)) {
+		problems.push('clearing #alias-filter left rows hidden');
+	}
+	if (modelRows.length > 0) {
+		const input = modelRows[0].querySelector('[data-alias-input]');
+		const reset = modelRows[0].querySelector('[data-reset-alias]');
+		if (!input || !reset) {
+			problems.push('missing input or reset button on first model row');
+		} else {
+			const original = input.value;
+			input.value = 'Temp Alias';
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+			if (reset.disabled) {
+				problems.push('reset button remained disabled after typing alias');
+			}
+			reset.click();
+			if (input.value !== '' || !reset.disabled || document.activeElement !== input) {
+				problems.push('reset button did not clear input, disable itself, and restore focus');
+			}
+
+			// Regression: editing or resetting a row while #alias-filter matches
+			// only that row's custom alias must keep the row visible and keep
+			// focus on the row's input (never dropping to document.body).
+			input.value = 'UniqueSmokeAlias';
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+			filter.value = 'UniqueSmokeAlias';
+			filter.dispatchEvent(new Event('input', { bubbles: true }));
+			if (modelRows[0].hidden) {
+				problems.push('row hidden when #alias-filter matches its custom alias');
+			}
+			input.focus();
+			input.value = 'EditedSmokeAlias';
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+			if (modelRows[0].hidden || document.activeElement !== input) {
+				problems.push('editing row while filtered by old alias hid row or dropped focus');
+			}
+			filter.value = 'EditedSmokeAlias';
+			filter.dispatchEvent(new Event('input', { bubbles: true }));
+			reset.click();
+			if (input.value !== '' || !reset.disabled || modelRows[0].hidden || document.activeElement !== input) {
+				problems.push('reset while filtered by own alias hid row or dropped focus to ' + (document.activeElement ? document.activeElement.tagName : 'none'));
+			}
+			if (status && !status.textContent.includes('Showing 1 of')) {
+				problems.push('status count inaccurate while focused reset row stayed visible: ' + status.textContent);
+			}
+			const emptyModels = document.querySelector('[data-filter-empty="models"]');
+			if (emptyModels && !emptyModels.hidden) {
+				problems.push('empty-models notice shown while focused reset row is still visible');
+			}
+
+			filter.value = '';
+			filter.dispatchEvent(new Event('input', { bubbles: true }));
+			input.value = original;
+			input.dispatchEvent(new Event('input', { bubbles: true }));
+		}
+	}
+	if (document.activeElement && document.activeElement !== document.body) {
+		document.activeElement.blur();
+	}
+	return JSON.stringify(problems);
+})()`
+
 func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	if os.Getenv("TOKEMON_BROWSER_SMOKE") != "1" {
 		t.Skip("set TOKEMON_BROWSER_SMOKE=1 with a local Chrome to run the browser smoke")
@@ -910,7 +1123,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	defer cancelAllocator()
 	browserCtx, cancelBrowser := chromedp.NewContext(allocatorCtx)
 	defer cancelBrowser()
-	ctx, cancel := context.WithTimeout(browserCtx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(browserCtx, 120*time.Second)
 	defer cancel()
 	if _, err := chromedp.Run(ctx, chromedp.Evaluate[int](`1`)); err != nil {
 		t.Fatalf("could not start headless Chrome: %v", err)
@@ -948,6 +1161,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{
 			exportInvariantJS,
+			analyticsToolbarInvariantJS,
 			quotaAbsentInvariantJS,
 			belowFoldReachabilityJS(".share-panel", ".sessions-panel"),
 			chartRovingInvariantJS,
@@ -955,8 +1169,8 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS, sessionsFilterInvariantJS}},
 		{path: "/sessions/smoke-sess-alpha", invariants: []string{sessionDetailInvariantJS}},
-		{path: "/insights"},
-		{path: "/settings"},
+		{path: "/insights", invariants: []string{insightsRovingInvariantJS}},
+		{path: "/settings", invariants: []string{settingsAliasInvariantJS}},
 	}
 	for _, page := range pages {
 		t.Run(page.path, func(t *testing.T) {
@@ -1164,6 +1378,16 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		if linkCount != 0 {
 			t.Fatalf("disabled deployment still renders %d Tokedex nav links", linkCount)
+		}
+		if _, err := chromedp.Run(disabledRunCtx, chromedp.Navigate(disabledURL+"/settings")); err != nil {
+			t.Fatalf("navigation to disabled /settings failed: %v", err)
+		}
+		settingsTokedexCount, err := chromedp.Run(disabledRunCtx, chromedp.Evaluate[int](`document.querySelectorAll('a[href^="/tokedex"]').length`))
+		if err != nil {
+			t.Fatalf("settings tokedex link check failed: %v", err)
+		}
+		if settingsTokedexCount != 0 {
+			t.Fatalf("disabled /settings still renders %d Tokedex links", settingsTokedexCount)
 		}
 	})
 
@@ -1617,6 +1841,381 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		if trendResp.Status != http.StatusOK || !strings.Contains(trendResp.URL, "/sessions?from=") {
 			t.Fatalf("trend click landed on %s status=%d", trendResp.URL, trendResp.Status)
+		}
+	})
+
+	// Decluttered /analytics toolbar: collapsed Filters (N), auto-submit,
+	// removable active pills, and Export menu across desktop and phone widths.
+	t.Run("analytics-filter-toolbar", func(t *testing.T) {
+		if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+			t.Fatalf("emulate desktop: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/analytics?period=7d&dimension=models")); err != nil {
+			t.Fatalf("navigate /analytics: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("details.filter-details")); err != nil {
+			t.Fatalf("filter-details missing: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+			t.Fatalf("settle animations: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("summary.filter-summary")); err != nil {
+			t.Fatalf("click filter-summary: %v", err)
+		}
+		assertNoProblems(t, ctx, sharedInvariantJS)
+		assertAxeAllowlist(t, ctx, "/analytics")
+
+		// Auto-submit on machine select change preserves period=7d and dimension=models.
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+			const sel = document.getElementById('machine-filter');
+			sel.value = 'smoke-laptop';
+			sel.dispatchEvent(new Event('change', { bubbles: true }));
+			return true;
+		})()`)); err != nil {
+			t.Fatalf("trigger machine-filter change: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			curURL, err := chromedp.Run(ctx, chromedp.Evaluate[string](`window.location.href`))
+			if err == nil && strings.Contains(curURL, "machine=smoke-laptop") {
+				if !strings.Contains(curURL, "period=7d") || !strings.Contains(curURL, "dimension=models") {
+					t.Fatalf("auto-submit URL lost period or dimension: %s", curURL)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("auto-submit did not navigate to filtered URL (last=%q err=%v)", curURL, err)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(".filter-pill")); err != nil {
+			t.Fatalf("filter-pill missing after auto-submit: %v", err)
+		}
+		assertNoProblems(t, ctx, `(() => {
+			const problems = [];
+			const count = document.querySelector('.filter-count');
+			if (!count || !count.textContent.includes('(1)')) problems.push('expected Filters (1)');
+			const pill = document.querySelector('.filter-pill');
+			if (!pill || !pill.textContent.includes('Machine:')) problems.push('missing Machine filter pill');
+			const exp = document.querySelector('.export-menu a.action[href*="export"]');
+			if (!exp || !exp.getAttribute('href').includes('machine=smoke-laptop')) problems.push('export href missing active filter');
+			return JSON.stringify(problems);
+		})()`)
+
+		// Export menu open at desktop & phone widths must not overflow or fail axe.
+		for _, vp := range []struct {
+			name string
+			w, h int64
+		}{
+			{"desktop", 1280, 800},
+			{"phone", 390, 844},
+		} {
+			if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(vp.w, vp.h)); err != nil {
+				t.Fatalf("emulate %s: %v", vp.name, err)
+			}
+			if _, err := chromedp.Run(ctx, chromedp.Click("summary.export-summary")); err != nil {
+				t.Fatalf("click export-summary at %s: %v", vp.name, err)
+			}
+			assertNoProblems(t, ctx, sharedInvariantJS)
+			assertAxeAllowlist(t, ctx, "/analytics")
+			if _, err := chromedp.Run(ctx, chromedp.Click("summary.export-summary")); err != nil {
+				t.Fatalf("close export-summary at %s: %v", vp.name, err)
+			}
+		}
+		if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+			t.Fatalf("restore desktop viewport: %v", err)
+		}
+
+		// One-click pill removal clears machine while keeping period=7d and dimension=models.
+		pillResp, err := chromedp.RunResponse(ctx, chromedp.Click(".filter-pill"))
+		if err != nil {
+			t.Fatalf("click filter-pill: %v", err)
+		}
+		if pillResp.Status != http.StatusOK || strings.Contains(pillResp.URL, "machine=") || !strings.Contains(pillResp.URL, "period=7d") || !strings.Contains(pillResp.URL, "dimension=models") {
+			t.Fatalf("pill removal landed on unexpected URL %s status=%d", pillResp.URL, pillResp.Status)
+		}
+	})
+
+	// In-place / live updates: paused auto-refresh stays quiet, #refresh-now
+	// patches without reload, and active polling updates stage + counter +
+	// sessions while keeping open <details> and .activity-cell focus intact.
+	t.Run("overview-live-in-place-update", func(t *testing.T) {
+		liveStore, err := database.Open(filepath.Join(t.TempDir(), "live.db"), smokeCatalog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { liveStore.Close() })
+		now := time.Now().UTC()
+		freshSync := now.Add(-time.Minute)
+		staleSync := now.Add(-2 * time.Hour)
+		if _, err := liveStore.Ingest(context.Background(), []usage.Event{{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "live-seed-1",
+			Timestamp:     now.Add(-2 * time.Minute),
+			MachineID:     "smoke-live",
+			Project:       "live-proj",
+			Provider:      "anthropic",
+			Model:         "claude-sonnet-4",
+			Tool:          "claude-code",
+			SessionID:     "live-sess-1",
+			InputTokens:   usage.Int64(70),
+			OutputTokens:  usage.Int64(30),
+			TotalTokens:   usage.Int64(100),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "smoke"},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := liveStore.RecordHeartbeat(context.Background(), database.AgentHeartbeat{
+			MachineID:        "smoke-live",
+			OperatingSystem:  "darwin",
+			Architecture:     "arm64",
+			SourceCount:      2,
+			SourceErrorCount: 1,
+			Sources: []database.AgentSourceHealth{
+				{Adapter: "codex", SourceHash: "live-src-1", LastSuccessfulSync: &freshSync},
+				{Adapter: "codex", SourceHash: "live-src-2", LastSuccessfulSync: &staleSync, LastErrorClass: "timeout"},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		liveURL := serveStore(t, liveStore, false)
+		parsedURL, err := url.Parse(liveURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ingestBatch := func(eventID, sessionID string, input, output, total int64) {
+			t.Helper()
+			payload, err := json.Marshal(map[string]any{
+				"events": []usage.Event{{
+					SchemaVersion: usage.SchemaVersion,
+					EventID:       eventID,
+					Timestamp:     time.Now().UTC(),
+					MachineID:     "smoke-live",
+					Project:       "live-proj",
+					Provider:      "anthropic",
+					Model:         "claude-sonnet-4",
+					Tool:          "claude-code",
+					SessionID:     sessionID,
+					InputTokens:   usage.Int64(input),
+					OutputTokens:  usage.Int64(output),
+					TotalTokens:   usage.Int64(total),
+					Currency:      "USD",
+					TokenAccuracy: usage.AccuracyReported,
+					Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "smoke"},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, "http://"+parsedURL.Host+"/api/v1/events/batch", strings.NewReader(string(payload)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer smoke-ingest")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("ingest batch status = %d", resp.StatusCode)
+			}
+		}
+
+		if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+			t.Fatalf("emulate desktop: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(liveURL+"/")); err != nil {
+			t.Fatalf("navigate live /: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("details.source-details")); err != nil {
+			t.Fatalf("details.source-details missing: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => { window.__tokemonNoReloadSentinel = 'alive'; return true; })()`)); err != nil {
+			t.Fatalf("set sentinel: %v", err)
+		}
+		// Expand details.source-details.
+		if _, err := chromedp.Run(ctx, chromedp.ScrollIntoView("summary.source-details-summary")); err != nil {
+			t.Fatalf("scroll source-details: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))`, chromedp.EvalAwaitPromise)); err != nil {
+			t.Fatalf("await frame: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("summary.source-details-summary")); err != nil {
+			t.Fatalf("expand source-details: %v", err)
+		}
+
+		// Paused state: ingest +500 tokens, wait >2.2s, confirm counter stays 100.
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("pause auto-refresh: %v", err)
+		}
+		ingestBatch("live-paused-1", "live-sess-2", 350, 150, 500)
+		time.Sleep(2400 * time.Millisecond)
+		if pausedVal, err := chromedp.Run(ctx, chromedp.Evaluate[string](`document.getElementById('lifetime-counter').dataset.display`)); err != nil || pausedVal != "100" {
+			t.Fatalf("paused counter = %q (err=%v), want 100", pausedVal, err)
+		}
+
+		// Manual #refresh-now while paused updates counter to 600 + new session without reload.
+		if _, err := chromedp.Run(ctx, chromedp.Click("#refresh-now")); err != nil {
+			t.Fatalf("click #refresh-now: %v", err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			done, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+				const c = document.getElementById('lifetime-counter');
+				const s = document.querySelector('.sessions-panel');
+				return Boolean(c && c.dataset.display === '600' && s && s.textContent.includes('live-sess-2'));
+			})()`))
+			if err == nil && done {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("#refresh-now did not update counter to 600 and show live-sess-2 in time")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		assertNoProblems(t, ctx, `(() => {
+			const problems = [];
+			if (window.__tokemonNoReloadSentinel !== 'alive') problems.push('page reloaded on #refresh-now');
+			const details = document.querySelector('details.source-details');
+			if (!details || !details.open) problems.push('details.source-details did not stay open after #refresh-now');
+			return JSON.stringify(problems);
+		})()`)
+
+		// Resume auto-refresh, focus active .activity-cell, ingest +400 -> 1,000 (Stage 3 Promptling).
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("resume auto-refresh: %v", err)
+		}
+		focusedDate, err := chromedp.Run(ctx, chromedp.Evaluate[string](`(() => {
+			const cell = document.querySelector('.activity-cell[tabindex="0"]');
+			if (!cell) return '';
+			cell.focus();
+			return cell.dataset.date || '';
+		})()`))
+		if err != nil || focusedDate == "" {
+			t.Fatalf("failed to focus .activity-cell[tabindex=0]: date=%q err=%v", focusedDate, err)
+		}
+		ingestBatch("live-auto-1", "live-sess-3", 280, 120, 400)
+		deadline = time.Now().Add(15 * time.Second)
+		for {
+			evolved, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+				const c = document.getElementById('lifetime-counter');
+				const p = document.querySelector('.creature-panel');
+				const f = document.querySelector('.form-name');
+				const s = document.querySelector('.sessions-panel');
+				return Boolean(c && c.dataset.display === '1,000' && p && p.dataset.stage === '3' && f && f.textContent === 'Promptling' && s && s.textContent.includes('live-sess-3'));
+			})()`))
+			if err == nil && evolved {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("auto-update did not evolve creature to Stage 3 Promptling at 1,000 tokens in time")
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		assertNoProblems(t, ctx, fmt.Sprintf(`(() => {
+			const problems = [];
+			if (window.__tokemonNoReloadSentinel !== 'alive') problems.push('page reloaded during stage evolution');
+			const img = document.querySelector('img.creature-art');
+			if (!img || !img.getAttribute('src').includes('stage-03.png')) problems.push('creature-art src did not update to stage-03.png');
+			const details = document.querySelector('details.source-details');
+			if (!details || !details.open) problems.push('details.source-details lost open state on live update');
+			const active = document.activeElement;
+			if (!active || !active.classList.contains('activity-cell') || active.dataset.date !== %q) {
+				problems.push('activity-cell focus lost on live update');
+			}
+			return JSON.stringify(problems);
+		})()`, focusedDate))
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); return true; })()`)); err != nil {
+			t.Fatalf("blur active element: %v", err)
+		}
+		assertNoProblems(t, ctx, sharedInvariantJS)
+		assertNoProblems(t, ctx, creatureArtInvariantJS)
+		assertAxeAllowlist(t, ctx, "/")
+
+		// Regression: pausing auto-refresh cancels a pending 400ms force:true
+		// retry and prevents an in-flight force:true refresh from scheduling one.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(liveURL+"/")); err != nil {
+			t.Fatalf("navigate live / for pause-retry check: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("#refresh-now")); err != nil {
+			t.Fatalf("#refresh-now never became ready: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+			window.__pauseRetryCalls = 0;
+			window.__pauseRetryDeferred = null;
+			const origFetch = window.fetch.bind(window);
+			window.fetch = (input, init) => {
+				const url = typeof input === 'string' ? input : (input && input.url) || '';
+				let pathname = url;
+				try { pathname = new URL(url, window.location.origin).pathname; } catch (_) {}
+				if (pathname === '/') {
+					window.__pauseRetryCalls += 1;
+					if (window.__pauseRetryHold) {
+						return new Promise((resolve) => {
+							window.__pauseRetryDeferred = () => resolve(new Response(null, { status: 304, headers: { 'X-Tokemon-Refreshing': '1' } }));
+						});
+					}
+					return Promise.resolve(new Response(null, { status: 304, headers: { 'X-Tokemon-Refreshing': '1' } }));
+				}
+				return origFetch(input, init);
+			};
+			return true;
+		})()`)); err != nil {
+			t.Fatalf("install fetch interceptor: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#refresh-now")); err != nil {
+			t.Fatalf("click #refresh-now for pending retry test: %v", err)
+		}
+		// Wait for the initial fetch to resolve and schedule its 400ms timer, then pause immediately.
+		retryDeadline := time.Now().Add(2 * time.Second)
+		for {
+			calls, err := chromedp.Run(ctx, chromedp.Evaluate[int](`window.__pauseRetryCalls`))
+			if err == nil && calls >= 1 {
+				break
+			}
+			if time.Now().After(retryDeadline) {
+				t.Fatalf("intercepted fetch never fired (calls=%d err=%v)", calls, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("click #auto-refresh-toggle to pause pending retry: %v", err)
+		}
+		time.Sleep(550 * time.Millisecond)
+		if calls, err := chromedp.Run(ctx, chromedp.Evaluate[int](`window.__pauseRetryCalls`)); err != nil || calls != 1 {
+			t.Fatalf("pause did not cancel pending 400ms force:true retry: fetch calls = %d (err=%v), want 1", calls, err)
+		}
+		// Unpause, then test an in-flight force:true refresh that resolves after Pause is clicked.
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("unpause before in-flight check: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => { window.__pauseRetryHold = true; return true; })()`)); err != nil {
+			t.Fatalf("arm deferred fetch: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#refresh-now")); err != nil {
+			t.Fatalf("click #refresh-now for in-flight test: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("click #auto-refresh-toggle while force fetch in flight: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`(() => {
+			window.__pauseRetryHold = false;
+			if (window.__pauseRetryDeferred) window.__pauseRetryDeferred();
+			return true;
+		})()`)); err != nil {
+			t.Fatalf("resolve deferred fetch: %v", err)
+		}
+		time.Sleep(550 * time.Millisecond)
+		if calls, err := chromedp.Run(ctx, chromedp.Evaluate[int](`window.__pauseRetryCalls`)); err != nil || calls != 2 {
+			t.Fatalf("in-flight force:true refresh scheduled 400ms retry after Pause: fetch calls = %d (err=%v), want 2", calls, err)
+		}
+		// Restore unpaused state so sessionStorage stays clean.
+		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
+			t.Fatalf("restore unpaused state: %v", err)
 		}
 	})
 }

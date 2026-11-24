@@ -10,16 +10,32 @@
     h2 { margin-top: 24px; padding-bottom: 8px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
     .intro { margin: 14px 0 0; color: var(--muted); }
     .notice { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-data); font-size: 12px; }
+    .filter-panel { margin-top: 18px; padding: 12px 14px; }
+    .filter-panel label { display: block; color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .filter-panel input[type="search"] { margin-top: 7px; }
+    .filter-panel input::placeholder { color: var(--faint); opacity: 1; }
+    .filter-status { margin: 8px 0 0; color: var(--faint); font: 11px/1.3 var(--font-data); }
     .alias-list { display: grid; gap: 8px; margin-top: 10px; }
-    .alias-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, .7fr); align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .alias-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, .85fr); align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .alias-meta { min-width: 0; }
     .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
     .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .settings-body input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
+    .alias-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 6px; font: 10px/1.25 var(--font-data); }
+    .alias-usage { color: var(--muted); }
+    .alias-usage.unknown-value { color: var(--warm); }
+    .alias-links { display: inline-flex; align-items: center; gap: 10px; }
+    .alias-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .alias-link:hover, .alias-link:focus-visible { color: var(--text); }
+    .alias-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .settings-body input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
     .settings-body input:focus { border-color: var(--accent); }
     .settings-body input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .reset-alias { flex: none; min-height: 34px; padding: 7px 10px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .reset-alias:hover:not(:disabled), .reset-alias:focus-visible { border-color: var(--accent); color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
+    .reset-alias:disabled { border-color: var(--line); color: var(--faint); opacity: .55; cursor: default; }
     .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
-    .settings-body button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .settings-body button:hover, .settings-body button:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .save-aliases { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .save-aliases:hover, .save-aliases:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
     .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
     @media (max-width: 620px) {
@@ -37,35 +53,131 @@
   <p class="intro">Auth mode: <strong>{{.AuthMode}}</strong> · Dashboard token: <strong>{{.TokenSource}}</strong>.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
   {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
+  <section class="panel filter-panel" role="search" aria-label="Filter aliases">
+    <label for="alias-filter">Filter models and machines</label>
+    <input id="alias-filter" type="search" placeholder="Filter by ID, default, or alias" autocomplete="off" spellcheck="false">
+    <p class="filter-status" role="status" aria-live="polite" id="alias-filter-status">Showing {{len .Models}} model{{if ne (len .Models) 1}}s{{end}} and {{len .Machines}} machine{{if ne (len .Machines) 1}}s{{end}}.</p>
+  </section>
   <form action="/settings/aliases" method="post" aria-label="Display name aliases">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <h2 id="settings-form-title">Models</h2>
     {{if .Models}}
     <div class="alias-list">
       {{range $index, $row := .Models}}
-      <div class="alias-row">
-        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
-        <input id="model-alias-{{$index}}" name="model_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
-        <input type="hidden" name="model_identity" value="{{$row.Identity}}">
+      <div class="alias-row" data-alias-row data-kind="model" data-identity="{{$row.Identity}}" data-default="{{$row.Default}}" data-search="{{$row.Identity}} {{$row.Default}} {{$row.Alias}}">
+        <div class="alias-meta">
+          <div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div>
+          <span class="default-name">Default: {{$row.Default}}</span>
+          <div class="alias-sub">
+            {{if not $row.HasUsage}}<span class="alias-usage">No usage recorded yet</span>{{else if eq $row.UnknownEvents $row.Events}}<span class="alias-usage unknown-value" title="Token totals unavailable · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}" aria-label="Unknown tokens, {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}">Unknown tokens · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}</span>{{else}}<span class="alias-usage" title="{{commas $row.Tokens}} tokens{{if $row.UnknownEvents}} ({{commas $row.UnknownEvents}} unavailable){{end}} · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}" aria-label="{{commas $row.Tokens}} tokens, {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}">{{compact $row.Tokens}} tokens · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}</span>{{end}}
+            {{if or $row.AnalyticsURL (and tokedexEnabled $row.TokedexURL)}}<span class="alias-links">{{if $row.AnalyticsURL}}<a class="alias-link" href="{{$row.AnalyticsURL}}">Analytics</a>{{end}}{{if and tokedexEnabled $row.TokedexURL}}<a class="alias-link" href="{{$row.TokedexURL}}">Tokedex</a>{{end}}</span>{{end}}
+          </div>
+        </div>
+        <div class="alias-control">
+          <input id="model-alias-{{$index}}" name="model_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}" data-alias-input>
+          <button type="button" class="reset-alias" data-reset-alias aria-label="Reset alias for {{$row.Identity}}"{{if not $row.Alias}} disabled{{end}}>Reset</button>
+          <input type="hidden" name="model_identity" value="{{$row.Identity}}">
+        </div>
       </div>
       {{end}}
     </div>
+    <p class="empty" data-filter-empty="models" hidden>No models match this filter.</p>
     {{else}}<p class="empty">No models recorded yet.</p>{{end}}
     <h2 id="machines-title">Machines</h2>
     {{if .Machines}}
     <div class="alias-list">
       {{range $index, $row := .Machines}}
-      <div class="alias-row">
-        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
-        <input id="machine-alias-{{$index}}" name="machine_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
-        <input type="hidden" name="machine_identity" value="{{$row.Identity}}">
+      <div class="alias-row" data-alias-row data-kind="machine" data-identity="{{$row.Identity}}" data-default="{{$row.Default}}" data-search="{{$row.Identity}} {{$row.Default}} {{$row.Alias}}">
+        <div class="alias-meta">
+          <div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div>
+          <span class="default-name">Default: {{$row.Default}}</span>
+          <div class="alias-sub">
+            {{if not $row.HasUsage}}<span class="alias-usage">No usage recorded yet</span>{{else if eq $row.UnknownEvents $row.Events}}<span class="alias-usage unknown-value" title="Token totals unavailable · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}" aria-label="Unknown tokens, {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}">Unknown tokens · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}</span>{{else}}<span class="alias-usage" title="{{commas $row.Tokens}} tokens{{if $row.UnknownEvents}} ({{commas $row.UnknownEvents}} unavailable){{end}} · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}" aria-label="{{commas $row.Tokens}} tokens, {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}">{{compact $row.Tokens}} tokens · {{commas $row.Events}} event{{if ne $row.Events 1}}s{{end}}</span>{{end}}
+            {{if $row.AnalyticsURL}}<span class="alias-links"><a class="alias-link" href="{{$row.AnalyticsURL}}">Analytics</a></span>{{end}}
+          </div>
+        </div>
+        <div class="alias-control">
+          <input id="machine-alias-{{$index}}" name="machine_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}" data-alias-input>
+          <button type="button" class="reset-alias" data-reset-alias aria-label="Reset alias for {{$row.Identity}}"{{if not $row.Alias}} disabled{{end}}>Reset</button>
+          <input type="hidden" name="machine_identity" value="{{$row.Identity}}">
+        </div>
       </div>
       {{end}}
     </div>
+    <p class="empty" data-filter-empty="machines" hidden>No machines match this filter.</p>
     {{else}}<p class="empty">No machines recorded yet.</p>{{end}}
-    <div class="actions"><button type="submit">Save aliases</button></div>
+    <div class="actions"><button class="save-aliases" type="submit">Save aliases</button></div>
   </form>
   </div>
   {{template "footer" .}}
+<script>
+  (() => {
+    const filter = document.getElementById('alias-filter');
+    const status = document.getElementById('alias-filter-status');
+    const rows = Array.from(document.querySelectorAll('[data-alias-row]'));
+    const emptyModels = document.querySelector('[data-filter-empty="models"]');
+    const emptyMachines = document.querySelector('[data-filter-empty="machines"]');
+    if (!filter) return;
+
+    const normalize = (value) => (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const applyFilter = () => {
+      const terms = normalize(filter.value).split(' ').filter(Boolean);
+      const active = document.activeElement;
+      let shownModels = 0;
+      let shownMachines = 0;
+      let totalModels = 0;
+      let totalMachines = 0;
+      for (const row of rows) {
+        const kind = row.dataset.kind;
+        if (kind === 'model') totalModels += 1;
+        else if (kind === 'machine') totalMachines += 1;
+        const haystack = normalize(row.dataset.search);
+        const keepFocused = Boolean(active && row.contains(active));
+        const match = keepFocused || terms.length === 0 || terms.every((term) => haystack.includes(term));
+        row.hidden = !match;
+        if (match) {
+          if (kind === 'model') shownModels += 1;
+          else if (kind === 'machine') shownMachines += 1;
+        }
+      }
+      if (emptyModels) emptyModels.hidden = totalModels === 0 || shownModels > 0;
+      if (emptyMachines) emptyMachines.hidden = totalMachines === 0 || shownMachines > 0;
+      if (status) {
+        status.textContent = terms.length === 0
+          ? 'Showing ' + totalModels + ' model' + (totalModels === 1 ? '' : 's') + ' and ' + totalMachines + ' machine' + (totalMachines === 1 ? '' : 's') + '.'
+          : 'Showing ' + shownModels + ' of ' + totalModels + ' model' + (totalModels === 1 ? '' : 's') + ' and ' + shownMachines + ' of ' + totalMachines + ' machine' + (totalMachines === 1 ? '' : 's') + '.';
+      }
+    };
+
+    const syncRow = (row) => {
+      const input = row.querySelector('[data-alias-input]');
+      const resetBtn = row.querySelector('[data-reset-alias]');
+      if (!input) return;
+      row.dataset.search = (row.dataset.identity || '') + ' ' + (row.dataset.default || '') + ' ' + input.value;
+      if (resetBtn) resetBtn.disabled = input.value.trim() === '';
+    };
+
+    for (const row of rows) {
+      const input = row.querySelector('[data-alias-input]');
+      const resetBtn = row.querySelector('[data-reset-alias]');
+      if (input) {
+        input.addEventListener('input', () => {
+          syncRow(row);
+          if (filter.value.trim()) applyFilter();
+        });
+      }
+      if (resetBtn && input) {
+        resetBtn.addEventListener('click', () => {
+          input.value = '';
+          input.focus();
+          syncRow(row);
+          applyFilter();
+        });
+      }
+    }
+
+    filter.addEventListener('input', applyFilter);
+  })();
+</script>
 </body>
 </html>{{end}}

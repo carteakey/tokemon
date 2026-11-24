@@ -67,15 +67,19 @@ type IngestResult struct {
 }
 
 type ModelTotal struct {
-	Model    string  `json:"model"`
-	Tokens   int64   `json:"tokens"`
-	Sessions int64   `json:"sessions"`
-	Cost     float64 `json:"cost"`
+	Model         string  `json:"model"`
+	Tokens        int64   `json:"tokens"`
+	Events        int64   `json:"events,omitempty"`
+	UnknownEvents int64   `json:"unknown_events,omitempty"`
+	Sessions      int64   `json:"sessions"`
+	Cost          float64 `json:"cost"`
 }
 
 type MachineTotal struct {
-	Machine string `json:"machine"`
-	Tokens  int64  `json:"tokens"`
+	Machine       string `json:"machine"`
+	Tokens        int64  `json:"tokens"`
+	Events        int64  `json:"events,omitempty"`
+	UnknownEvents int64  `json:"unknown_events,omitempty"`
 }
 
 // AgentHeartbeat contains deployment metadata only. It deliberately excludes
@@ -1583,14 +1587,15 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	}
 	rows, err := s.readHandle().QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
-COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0)
+COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0),
+COUNT(*), COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
 FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	if err != nil {
 		return result, err
 	}
 	for rows.Next() {
 		var item ModelTotal
-		if err := rows.Scan(&item.Model, &item.Sessions, &item.Tokens, &item.Cost); err != nil {
+		if err := rows.Scan(&item.Model, &item.Sessions, &item.Tokens, &item.Cost, &item.Events, &item.UnknownEvents); err != nil {
 			rows.Close()
 			return result, err
 		}

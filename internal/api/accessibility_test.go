@@ -174,7 +174,7 @@ func assertAccessibleDocument(t *testing.T, path, body, css string) {
 
 	// Pages built from cards, charts, and forms rather than tabular data have
 	// no data table to name; every other page must expose one.
-	tableless := map[string]bool{"/settings": true, "/insights": true, "/tokedex": true, "/login": true}
+	tableless := map[string]bool{"/settings": true, "/tokedex": true, "/login": true}
 	tables := tablePattern.FindAllStringSubmatch(body, -1)
 	if len(tables) == 0 && !tableless[path] {
 		t.Errorf("%s has no semantic data table", path)
@@ -199,14 +199,21 @@ func assertAccessibleDocument(t *testing.T, path, body, css string) {
 		}
 	}
 	if path == "/settings" {
-		for _, required := range []string{`aria-label="Alias for`, `aria-label="Display name aliases"`, `type="submit"`} {
+		for _, required := range []string{`for="alias-filter"`, `aria-label="Alias for`, `aria-label="Display name aliases"`, `type="submit"`} {
 			if !strings.Contains(body, required) {
 				t.Errorf("settings missing %q", required)
 			}
 		}
 	}
+	if path == "/insights" {
+		for _, required := range []string{`aria-label="24-hour rhythm data table"`, `aria-live="polite"`, `role="region"`, `type="button"`} {
+			if !strings.Contains(body, required) {
+				t.Errorf("insights missing %q", required)
+			}
+		}
+	}
 	if path == "/analytics" {
-		for _, required := range []string{`for="dimension-filter"`, `for="machine-filter"`, `aria-label="Usage share data table"`, `aria-describedby="share-tooltip"`, `type="button"`} {
+		for _, required := range []string{`name="dimension"`, `for="project-filter"`, `for="machine-filter"`, `for="provider-filter"`, `for="model-filter"`, `for="harness-filter"`, `aria-label="Usage share data table"`, `aria-describedby="share-tooltip"`, `type="button"`} {
 			if !strings.Contains(body, required) {
 				t.Errorf("analytics missing %q", required)
 			}

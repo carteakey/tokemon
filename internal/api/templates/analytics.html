@@ -9,8 +9,22 @@
     h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
     .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
     .heading-actions { display: flex; align-items: center; gap: 10px; }
+    .export-menu { position: relative; }
+    .export-summary { list-style: none; gap: 6px; }
+    .export-summary::-webkit-details-marker { display: none; }
+    .export-menu-list { display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; gap: 6px; min-width: 220px; padding: 6px; border: 1px solid var(--line-bright); border-radius: 6px; background: var(--surface-raised); }
+    .export-menu[open] .export-menu-list { display: grid; }
+    .export-item { width: 100%; justify-content: flex-start; }
     .filter-panel { padding: 14px 16px; }
+    .filter-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+    .filter-details { width: 100%; }
+    .filter-summary { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 8px 11px; border: 1px solid var(--control-border); border-radius: 4px; background: var(--surface-raised); color: var(--text); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; list-style: none; }
+    .filter-summary::-webkit-details-marker { display: none; }
+    .filter-summary:hover, .filter-summary:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .filter-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .filter-count { color: var(--warm); }
     .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
+    .filter-details[open] .filter-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
     label { display: grid; gap: 7px; color: var(--faint); }
     select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
     select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -173,18 +187,19 @@
       .analytics-grid { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 860px) {
-      /* The export buttons never shrink (white-space: nowrap), so below this
-         width the heading row could not fit and pushed the document 41px wide
-         at 768. Wrapping keeps the actions on their own line instead of
-         overflowing; the desktop row at 1280 is untouched. */
+      /* The export controls should never push the document wide on narrow viewports. */
       .analytics-heading { flex-wrap: wrap; }
       .heading-actions { flex-wrap: wrap; }
+      .export-menu-list { max-width: calc(100vw - 40px); }
     }
     @media (max-width: 700px) {
       .analytics-heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; }
       .heading-actions { width: 100%; align-items: stretch; flex-direction: column; }
       .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); }
       .action { width: 100%; }
+      .export-menu { width: 100%; }
+      .export-summary { width: 100%; }
+      .export-menu-list { position: static; width: 100%; min-width: 0; max-width: none; margin-top: 6px; }
       .filter-panel { padding: 13px 12px; }
       .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .filter-actions { grid-column: span 2; }
@@ -221,59 +236,74 @@
         <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
         <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
       </nav>
-      <a class="action" download href="{{.ExportURL}}">Export analytics JSON</a><a class="action" download href="{{.CSVURL}}">Export analytics CSV</a>
+      <details class="export-menu">
+        <summary class="action export-summary">Export <span aria-hidden="true">&#9662;</span></summary>
+        <div class="export-menu-list">
+          <a class="action export-item" download href="{{.ExportURL}}">Export analytics JSON</a>
+          <a class="action export-item" download href="{{.CSVURL}}">Export analytics CSV</a>
+        </div>
+      </details>
     </div>
   </section>
 
   <section class="panel filter-panel" aria-label="Analytics filters">
-    <form class="filter-form" method="get" action="/analytics">
-      <input type="hidden" name="period" value="{{.Filter.Period}}">
-      {{if .Filter.Project}}<input type="hidden" name="project" value="{{.Filter.Project}}">{{end}}
-      {{if .Filter.From}}<input type="hidden" name="from" value="{{.Filter.From}}">{{end}}
-      {{if .Filter.To}}<input type="hidden" name="to" value="{{.Filter.To}}">{{end}}
-      <label for="dimension-filter">Breakdown
-        <select id="dimension-filter" name="dimension">
-          <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
-          <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
-          <option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option>
-          <option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option>
-          <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
-        </select>
-      </label>
-      <label for="machine-filter">Machine
-        <select id="machine-filter" name="machine">
-          <option value="">All machines</option>
-          {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
-        </select>
-      </label>
-      <label for="provider-filter">Provider
-        <select id="provider-filter" name="provider">
-          <option value="">All providers</option>
-          {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
-        </select>
-      </label>
-      <label for="model-filter">Model
-        <select id="model-filter" name="model">
-          <option value="">All models</option>
-          {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
-        </select>
-      </label>
-      <label for="harness-filter">Harness
-        <select id="harness-filter" name="tool">
-          <option value="">All harnesses</option>
-          {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
-        </select>
-      </label>
-      <div class="filter-actions">
-        <button class="action apply" type="submit">Apply filters</button>
-        <a class="action" href="/analytics">Reset</a>
-      </div>
-    </form>
+    <div class="filter-toolbar">
+      <details class="filter-details">
+        <summary class="filter-summary">Filters{{if .ActiveFilterCount}} <span class="filter-count" aria-label="{{.ActiveFilterCount}} active">({{.ActiveFilterCount}})</span>{{end}}</summary>
+        <form class="filter-form" method="get" action="/analytics">
+          <input type="hidden" name="period" value="{{.Filter.Period}}">
+          <input type="hidden" name="dimension" value="{{.Filter.Dimension}}">
+          {{if .Filter.From}}<input type="hidden" name="from" value="{{.Filter.From}}">{{end}}
+          {{if .Filter.To}}<input type="hidden" name="to" value="{{.Filter.To}}">{{end}}
+          <label for="project-filter">Project
+            <select id="project-filter" name="project">
+              <option value="">All projects</option>
+              {{if and .Filter.Project (not (hasString .Facets.Projects .Filter.Project))}}<option value="{{.Filter.Project}}" selected>{{if eq .Filter.Project unknownProjectFilter}}Unknown project{{else}}{{.Filter.Project}}{{end}}</option>{{end}}
+              {{range .Facets.Projects}}<option value="{{.}}"{{if eq $.Filter.Project .}} selected{{end}}>{{.}}</option>{{end}}
+            </select>
+          </label>
+          <label for="machine-filter">Machine
+            <select id="machine-filter" name="machine">
+              <option value="">All machines</option>
+              {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
+            </select>
+          </label>
+          <label for="provider-filter">Provider
+            <select id="provider-filter" name="provider">
+              <option value="">All providers</option>
+              {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
+            </select>
+          </label>
+          <label for="model-filter">Model
+            <select id="model-filter" name="model">
+              <option value="">All models</option>
+              {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
+            </select>
+          </label>
+          <label for="harness-filter">Harness
+            <select id="harness-filter" name="tool">
+              <option value="">All harnesses</option>
+              {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
+            </select>
+          </label>
+          <div class="filter-actions">
+            <button class="action apply" type="submit">Apply filters</button>
+            <a class="action" href="/analytics">Reset</a>
+          </div>
+        </form>
+      </details>
+    </div>
+    {{if .ActiveFilters}}
+    <div class="active-filters" aria-label="Active filters">
+      {{range .ActiveFilters}}<a class="filter-pill" href="{{.RemoveURL}}" aria-label="Remove filter {{.Label}}"><span>{{.Label}}</span><span class="filter-pill-x" aria-hidden="true">&times;</span></a>{{end}}
+      <a class="clear-filters" href="{{analyticsClearFiltersURL .Filter}}">Clear all</a>
+    </div>
+    {{end}}
   </section>
 
   <section class="stats" aria-label="Period summary">
-    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value" data-count="{{.Summary.Tokens}}">{{commas .Summary.Tokens}}</div>{{if .Comparison}}{{if .Comparison.TokenChangePercent}}<div class="stat-meta comparison {{analyticsChangeClass .Comparison.TokenChangePercent}}"><strong>{{analyticsChange .Comparison.TokenChangePercent}}</strong><span>vs previous window</span></div>{{else}}<div class="stat-meta">No earlier baseline</div>{{end}}{{else}}<div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div>{{end}}</article>
-    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value" data-count="{{.Summary.ActiveDays}}">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div></article>
+    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value" data-count="{{.Summary.Tokens}}">{{commas .Summary.Tokens}}</div>{{if .Comparison}}{{if .Comparison.TokenChangePercent}}<div class="stat-meta comparison {{analyticsChangeClass .Comparison.TokenChangePercent}}"><strong>{{analyticsChange .Comparison.TokenChangePercent}}</strong><span>vs previous window</span></div>{{else}}<div class="stat-meta">No earlier baseline</div>{{end}}{{else}}<div class="stat-meta">{{analyticsDateRangeLabel .Filter .StartDate .EndDate}}</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value" data-count="{{.Summary.ActiveDays}}">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">{{analyticsDateRangeLabel .Filter .StartDate .EndDate}}</div></article>
     <article class="stat"><div class="stat-label">Average thread</div><div class="stat-value" data-count="{{.AverageThread}}">{{commas .AverageThread}}</div><div class="stat-meta">Across {{commas .Summary.Threads}} thread{{if ne .Summary.Threads 1}}s{{end}}</div></article>
     <article class="stat"><div class="stat-label">Cache hit</div>{{if .Summary.Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (percent .Summary.Cache.HitRate)}}</div><div class="stat-meta">{{commas .Summary.Cache.CachedTokens}} cached tokens</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No eligible input tokens</div>{{end}}</article>
     <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}{{if .Summary.EstimatedCost.UnpricedTokens}} · unpriced: {{commas .Summary.EstimatedCost.UnpricedTokens}}{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens{{if .Summary.EstimatedCost.UnpricedTokens}} · {{commas .Summary.EstimatedCost.UnpricedTokens}} unpriced{{end}}</div>{{end}}</article>
@@ -554,6 +584,32 @@
       const active = document.querySelector('.share-point.active');
       if (active && shareTooltip && !shareTooltip.hidden) positionShareTooltip(active);
     });
+
+    const filterForm = document.querySelector('.filter-form');
+    if (filterForm) {
+      filterForm.querySelectorAll('select').forEach((select) => {
+        select.addEventListener('change', () => {
+          if (filterForm.requestSubmit) filterForm.requestSubmit();
+          else filterForm.submit();
+        });
+      });
+    }
+
+    const exportMenu = document.querySelector('details.export-menu');
+    if (exportMenu) {
+      const exportSummary = exportMenu.querySelector('.export-summary');
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && exportMenu.open) {
+          exportMenu.open = false;
+          if (exportSummary) exportSummary.focus();
+        }
+      });
+      document.addEventListener('click', (event) => {
+        if (exportMenu.open && !exportMenu.contains(event.target)) {
+          exportMenu.open = false;
+        }
+      });
+    }
   })();
 </script>
 </body>

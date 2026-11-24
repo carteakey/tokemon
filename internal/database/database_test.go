@@ -2658,3 +2658,76 @@ func TestAnalytics24hFallBackDSTAndFractionalOffsetBuckets(t *testing.T) {
 		t.Fatalf("IST half-hour bucket 2026-11-01T00:30:00Z missing from %+v", istRes.Points)
 	}
 }
+
+func TestOverviewModelAndMachineEventAndUnknownCounts(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "counts.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "cnt-1",
+			Timestamp:     now.Add(-2 * time.Minute),
+			MachineID:     "mac-known",
+			Provider:      "anthropic",
+			Model:         "claude-sonnet-4",
+			Tool:          "claude-code",
+			TotalTokens:   usage.Int64(500),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "cnt-2",
+			Timestamp:     now.Add(-time.Minute),
+			MachineID:     "mac-known",
+			Provider:      "anthropic",
+			Model:         "claude-sonnet-4",
+			Tool:          "claude-code",
+			TokenAccuracy: usage.AccuracyUnknown,
+			Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "cnt-3",
+			Timestamp:     now.Add(-30 * time.Second),
+			MachineID:     "mac-unknown-only",
+			Provider:      "openai",
+			Model:         "gpt-unknown-only",
+			Tool:          "codex",
+			TokenAccuracy: usage.AccuracyUnknown,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := map[string]ModelTotal{}
+	for _, m := range overview.ByModel {
+		models[m.Model] = m
+	}
+	if got := models["claude-sonnet-4"]; got.Tokens != 500 || got.Events != 2 || got.UnknownEvents != 1 {
+		t.Fatalf("claude-sonnet-4 = %+v, want tokens=500 events=2 unknown=1", got)
+	}
+	if got := models["gpt-unknown-only"]; got.Tokens != 0 || got.Events != 1 || got.UnknownEvents != 1 {
+		t.Fatalf("gpt-unknown-only = %+v, want tokens=0 events=1 unknown=1", got)
+	}
+	machines := map[string]MachineTotal{}
+	for _, m := range overview.ByMachine {
+		machines[m.Machine] = m
+	}
+	if got := machines["mac-known"]; got.Tokens != 500 || got.Events != 2 || got.UnknownEvents != 1 {
+		t.Fatalf("mac-known = %+v, want tokens=500 events=2 unknown=1", got)
+	}
+	if got := machines["mac-unknown-only"]; got.Tokens != 0 || got.Events != 1 || got.UnknownEvents != 1 {
+		t.Fatalf("mac-unknown-only = %+v, want tokens=0 events=1 unknown=1", got)
+	}
+}

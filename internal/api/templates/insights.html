@@ -51,11 +51,20 @@
     .empty-cards span { display: block; margin-top: 7px; color: var(--faint); font-size: 12px; }
     .distribution-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 10px; margin-top: 10px; }
     .distribution { min-width: 0; }
-    .histogram { display: grid; grid-template-columns: repeat(24, minmax(8px, 1fr)); align-items: end; gap: 3px; min-height: 148px; padding: 18px 13px 8px; }
-    .hour { display: grid; min-width: 0; grid-template-rows: 112px 14px; align-items: end; gap: 5px; }
-    .hour-track { display: flex; height: 112px; align-items: end; justify-content: center; }
+    .rhythm-readout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 46px; margin: 12px 14px 0; padding: 8px 11px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); }
+    .readout-kicker { color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .09em; text-transform: uppercase; }
+    .readout-value { overflow: hidden; color: var(--text); font: 700 14px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .readout-mix { overflow: hidden; color: var(--muted); font: 10px/1.2 var(--font-data); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+    .histogram { display: grid; grid-template-columns: repeat(24, minmax(8px, 1fr)); align-items: end; gap: 3px; min-height: 148px; padding: 14px 13px 8px; }
+    .hour { display: grid; width: 100%; min-width: 0; grid-template-rows: 112px 14px; align-items: end; gap: 5px; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: center; }
+    .hour-track { display: flex; width: 100%; min-width: 0; height: 112px; align-items: end; justify-content: center; }
     .hour-bar { display: block; width: min(100%, 18px); min-height: 2px; border: 1px solid var(--accent-dim); border-bottom-color: var(--accent); border-radius: 2px 2px 0 0; background: var(--accent-dim); }
-    .hour-label { overflow: hidden; color: var(--faint); font: 8px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .hour-label { width: 100%; min-width: 0; overflow: hidden; color: var(--faint); font: 8px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+    .hour:hover .hour-bar { border-color: var(--accent); background: var(--accent); }
+    .hour.peak .hour-bar { border-color: var(--warm); background: rgba(210, 164, 119, .45); }
+    .hour.selected .hour-bar { border-color: var(--text); box-shadow: 0 0 0 1px rgba(240, 237, 229, .2); }
+    .hour:hover .hour-label, .hour.selected .hour-label { color: var(--text); }
+    .hour:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 2px; }
     .weekday-list { display: grid; gap: 7px; padding: 14px; }
     .weekday-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) 44px; align-items: center; gap: 8px; color: var(--muted); font: 10px var(--font-data); }
     .weekday-track { height: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; background: #11130f; }
@@ -70,7 +79,7 @@
     .ai-status.generated { color: var(--accent); }
     .ai-status.unavailable { color: var(--warm); }
     @media (max-width: 900px) { .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); } .filter-actions { grid-column: span 3; } .distribution-grid { grid-template-columns: 1fr; } }
-    @media (max-width: 700px) { .heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; } .heading-actions { width: 100%; align-items: stretch; } .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); } .window-link { text-align: center; } .filter-panel { padding: 12px; } .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .filter-actions { grid-column: span 2; } .filter-actions .action { flex: 1; } .insight-cards { grid-template-columns: 1fr; } .insight-card:last-child:nth-child(odd) { grid-column: auto; } .quality { align-items: start; flex-direction: column; gap: 5px; } }
+    @media (max-width: 700px) { .heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; } .heading-actions { width: 100%; align-items: stretch; } .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); } .window-link { text-align: center; } .filter-panel { padding: 12px; } .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .filter-actions { grid-column: span 2; } .filter-actions .action { flex: 1; } .insight-cards { grid-template-columns: 1fr; } .insight-card:last-child:nth-child(odd) { grid-column: auto; } .quality { align-items: start; flex-direction: column; gap: 5px; } .rhythm-readout { grid-template-columns: 1fr; gap: 5px; } .readout-mix { text-align: left; white-space: normal; } }
     @media (max-width: 430px) { .filter-form { grid-template-columns: 1fr; } .filter-actions { grid-column: auto; } .histogram { padding-inline: 7px; gap: 2px; } .hour-label { font-size: 7px; } }
   </style>
 </head>
@@ -121,12 +130,51 @@
   {{end}}
 
   <section class="distribution-grid" aria-label="Usage rhythm">
-    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
+    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}{{$hourStop := -1}}{{range $index, $bucket := .Hourly}}{{if and (lt $hourStop 0) (ne $.PeakHour "") (eq $bucket.Label $.PeakHour)}}{{$hourStop = $index}}{{end}}{{end}}{{if lt $hourStop 0}}{{$hourStop = 0}}{{end}}{{$initialHour := index .Hourly $hourStop}}<div class="rhythm-readout" aria-live="polite"><span class="readout-kicker" id="rhythm-readout-kicker">{{if $.PeakHour}}Peak hour{{else}}Selected hour{{end}}</span><strong class="readout-value" id="rhythm-readout-value">{{$initialHour.Label}} · {{commas $initialHour.Tokens}} tokens</strong><span class="readout-mix" id="rhythm-readout-mix">{{commas $initialHour.Events}} event{{if ne $initialHour.Events 1}}s{{end}} · {{printf "%.1f%%" (mul $initialHour.Share 100)}} of window</span></div><div class="histogram" role="region" aria-label="24-hour token rhythm">{{range $index, $bucket := .Hourly}}<button type="button" class="hour{{if and (ne $.PeakHour "") (eq .Label $.PeakHour)}} peak{{end}}{{if eq $index $hourStop}} selected{{end}}" tabindex="{{if eq $index $hourStop}}0{{else}}-1{{end}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-events="{{.Events}}" data-share="{{printf "%.1f" (mul .Share 100)}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></button>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div><div class="sr-only" id="rhythm-data-table"><table aria-label="24-hour rhythm data table"><caption>Tokens and events by local hour</caption><thead><tr><th scope="col">Hour</th><th scope="col">Tokens</th><th scope="col">Events</th><th scope="col">Share</th></tr></thead><tbody>{{range .Hourly}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td><td>{{commas .Events}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
     <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
   </section>
 
   <section class="panel ai-recap" aria-labelledby="ai-recap-title" data-ai-status="{{.Recap.Status}}"><div class="section-head"><h2 class="section-title" id="ai-recap-title">AI recap</h2><span class="ai-status {{.Recap.Status}}">{{insightRecapLabel .Recap.Status}}</span></div><div class="ai-recap-body">{{if eq .Recap.Status "generated"}}<p class="ai-status generated">Optional AI interpretation of aggregate evidence</p><p>{{.Recap.Text}}</p>{{else if eq .Recap.Status "unavailable"}}<p>The recap service is temporarily unavailable. Deterministic Insights remain available.</p>{{else}}<p>AI recap is disabled or unconfigured. This page uses deterministic aggregate signals only.</p>{{end}}</div></section>
 
   {{template "footer" .}}
+<script>
+  (() => {
+    const number = new Intl.NumberFormat('en-US');
+    const kicker = document.getElementById('rhythm-readout-kicker');
+    const value = document.getElementById('rhythm-readout-value');
+    const mix = document.getElementById('rhythm-readout-mix');
+    const hours = Array.from(document.querySelectorAll('.histogram .hour'));
+    if (hours.length === 0) return;
+
+    const showHour = (button) => {
+      hours.forEach((item) => item.classList.toggle('selected', item === button));
+      if (kicker) kicker.textContent = button.classList.contains('peak') ? 'Peak hour' : 'Selected hour';
+      const tokens = Number(button.dataset.tokens || 0);
+      const events = Number(button.dataset.events || 0);
+      if (value) value.textContent = (button.dataset.label || '') + ' · ' + number.format(tokens) + ' tokens';
+      if (mix) mix.textContent = number.format(events) + ' event' + (events === 1 ? '' : 's') + ' · ' + (button.dataset.share || '0.0') + '% of window';
+    };
+
+    hours.forEach((button, index) => {
+      button.addEventListener('mouseenter', () => showHour(button));
+      button.addEventListener('click', () => showHour(button));
+      button.addEventListener('focus', () => {
+        showHour(button);
+        hours.forEach((item) => item.setAttribute('tabindex', item === button ? '0' : '-1'));
+      });
+      button.addEventListener('keydown', (event) => {
+        let target = null;
+        if (event.key === 'ArrowRight') target = hours[index + 1] || hours[hours.length - 1];
+        else if (event.key === 'ArrowLeft') target = hours[index - 1] || hours[0];
+        else if (event.key === 'Home') target = hours[0];
+        else if (event.key === 'End') target = hours[hours.length - 1];
+        if (target) {
+          event.preventDefault();
+          target.focus();
+        }
+      });
+    });
+  })();
+</script>
 </body>
 </html>{{end}}

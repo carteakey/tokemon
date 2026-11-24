@@ -24,16 +24,21 @@ func TestAnalyticsDesktopBrowserRegression(t *testing.T) {
 	combined := append(append([]byte(nil), body...), css...)
 	for _, want := range []string{
 		`<meta name="viewport" content="width=device-width, initial-scale=1">`,
-		`<input type="hidden" name="period"`, `<select id="dimension-filter" name="dimension">`, `<select id="machine-filter" name="machine">`, `<select id="provider-filter" name="provider">`, `<select id="model-filter" name="model">`, `<select id="harness-filter" name="tool">`,
+		`<details class="export-menu">`, `<details class="filter-details">`,
+		`<input type="hidden" name="period"`, `<input type="hidden" name="dimension"`, `<select id="project-filter" name="project">`, `<select id="machine-filter" name="machine">`, `<select id="provider-filter" name="provider">`, `<select id="model-filter" name="model">`, `<select id="harness-filter" name="tool">`,
 		"Apply filters", "Reset", "Token trend", "Usage share", "Recent sessions",
 		`<table aria-label="Analytics breakdown">`, `class="trend-column`, `class="share-point`, `type="button"`,
 		`aria-describedby="share-tooltip"`, `role="tooltip"`,
 		`point.addEventListener('focus'`, `column.addEventListener('focus'`,
+		`filterForm.requestSubmit`,
 		`window.matchMedia('(prefers-reduced-motion: reduce)')`,
 	} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("desktop analytics output missing %q", want)
 		}
+	}
+	if bytes.Contains(body, []byte(`id="dimension-filter"`)) {
+		t.Fatal("desktop analytics output still contains duplicate dimension-filter select")
 	}
 	for _, want := range []string{
 		`.trend-chart { position: relative; z-index: 1; display: flex;`, `.table-scroll { overflow-x: auto;`,

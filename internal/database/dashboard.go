@@ -405,19 +405,21 @@ func (s *Store) machinesAndTotalsAt(ctx context.Context, now time.Time) ([]Machi
 	usageRows, err := s.readHandle().QueryContext(ctx, `SELECT machine_id,
 COALESCE(SUM(total_tokens), 0),
 COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0),
-COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0)
+COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0),
+COUNT(*),
+COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
 FROM usage_events GROUP BY machine_id`,
 		today.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339),
 		weekStart.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, nil, err
 	}
-	type usageTotals struct{ lifetime, today, week int64 }
+	type usageTotals struct{ lifetime, today, week, events, unknownEvents int64 }
 	byMachine := make(map[string]usageTotals)
 	for usageRows.Next() {
 		var id string
 		var totals usageTotals
-		if err := usageRows.Scan(&id, &totals.lifetime, &totals.today, &totals.week); err != nil {
+		if err := usageRows.Scan(&id, &totals.lifetime, &totals.today, &totals.week, &totals.events, &totals.unknownEvents); err != nil {
 			usageRows.Close()
 			return nil, nil, err
 		}
@@ -431,7 +433,12 @@ FROM usage_events GROUP BY machine_id`,
 	if len(byMachine) > 0 {
 		machineTotals = make([]MachineTotal, 0, len(byMachine))
 		for machineID, totals := range byMachine {
-			machineTotals = append(machineTotals, MachineTotal{Machine: machineID, Tokens: totals.lifetime})
+			machineTotals = append(machineTotals, MachineTotal{
+				Machine:       machineID,
+				Tokens:        totals.lifetime,
+				Events:        totals.events,
+				UnknownEvents: totals.unknownEvents,
+			})
 		}
 		sort.Slice(machineTotals, func(left, right int) bool {
 			if machineTotals[left].Tokens == machineTotals[right].Tokens {

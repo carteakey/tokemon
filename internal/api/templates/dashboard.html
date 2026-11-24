@@ -327,7 +327,7 @@
 
   <section class="panel health-panel" aria-labelledby="health-title">
     <div class="section-head"><h2 class="section-title" id="health-title">Machine health</h2><a class="section-link" href="/api/v1/machines">Read API</a></div>
-    <div class="health-scroll" tabindex="0" role="region" aria-label="Machine health table, scrollable"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}{{$summary := machineSourceGroups .Sources}}<span class="source-health">{{range $summary.Groups}}{{if eq .Count 1}}<span class="source-health-line" title="{{.SingleSourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}} · {{.SingleAge}}</span>{{else}}<span class="source-health-line"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}} · {{.Summary}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}}</span>{{end}}{{end}}{{if $summary.HasDetails}}<details class="source-details"><summary class="source-details-summary">{{if $summary.ProblemCount}}{{$summary.ProblemCount}} stale or errored ({{$summary.TotalSources}} total){{else}}{{$summary.TotalSources}} sources across {{len $summary.Groups}} adapter{{if ne (len $summary.Groups) 1}}s{{end}}{{end}}</summary><div class="source-details-list">{{if $summary.ProblemSources}}{{range $summary.ProblemSources}}<span class="source-detail-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}{{if $summary.OmittedProblems}}<span class="source-detail-line">+ {{$summary.OmittedProblems}} more stale or errored sources</span>{{end}}{{else}}{{range $summary.Groups}}<span class="source-detail-line">{{.Adapter}}: {{.Summary}}</span>{{end}}{{end}}</div></details>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
+    <div class="health-scroll" tabindex="0" role="region" aria-label="Machine health table, scrollable"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr data-machine="{{.Name}}"><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}{{$summary := machineSourceGroups .Sources}}<span class="source-health">{{range $summary.Groups}}{{if eq .Count 1}}<span class="source-health-line" title="{{.SingleSourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}} · {{.SingleAge}}</span>{{else}}<span class="source-health-line"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}} · {{.Summary}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}}</span>{{end}}{{end}}{{if $summary.HasDetails}}<details class="source-details"><summary class="source-details-summary">{{if $summary.ProblemCount}}{{$summary.ProblemCount}} stale or errored ({{$summary.TotalSources}} total){{else}}{{$summary.TotalSources}} sources across {{len $summary.Groups}} adapter{{if ne (len $summary.Groups) 1}}s{{end}}{{end}}</summary><div class="source-details-list">{{if $summary.ProblemSources}}{{range $summary.ProblemSources}}<span class="source-detail-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}{{if $summary.OmittedProblems}}<span class="source-detail-line">+ {{$summary.OmittedProblems}} more stale or errored sources</span>{{end}}{{else}}{{range $summary.Groups}}<span class="source-detail-line">{{.Adapter}}: {{.Summary}}</span>{{end}}{{end}}</div></details>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
@@ -502,6 +502,15 @@
   let lifetimeTokens = Number((counter.dataset.display || '0').replaceAll(',', ''));
   let currentStage = Number(document.querySelector('.creature-panel').dataset.stage);
   let polling = false;
+  let dashboardETag = '';
+  let evolutionETag = '';
+  let dashboardRefreshing = false;
+  let pendingForceRefresh = false;
+  let dashboardRetryTimer = 0;
+  let pauseEpoch = 0;
+  let authExpired = false;
+  let lastCompositionKey = null;
+  let syncOpenTooltip = () => {};
 
   const updateComposition = (composition) => {
     const input = Math.max(0, Number(composition.input_tokens) || 0);
@@ -533,48 +542,467 @@
     document.getElementById('live-output-share').textContent = percent(output);
     setTooltip('live-input', 'Input', input, []);
     setTooltip('live-output', 'Output', output, []);
+    syncOpenTooltip();
   };
 
-  // Auto-refresh replaces the old 60s meta refresh: a client timer drives a
-  // server re-render, pausable from the topbar, never firing while a copy or
-  // selection is in progress, and restoring keyboard focus across the reload.
+  // Auto-refresh polls lightweight ETag-backed endpoints and patches changed
+  // sections in place without dropping focus, open disclosures, or animations.
   const AUTO_REFRESH_MS = 60000;
   const AUTO_REFRESH_KEY = 'tokemon-auto-refresh';
-  const FOCUS_KEY = 'tokemon-restore-focus';
   const autoPaused = () => { try { return sessionStorage.getItem(AUTO_REFRESH_KEY) === 'paused'; } catch (_) { return false; } };
   const setAutoPaused = (paused) => { try { sessionStorage.setItem(AUTO_REFRESH_KEY, paused ? 'paused' : 'on'); } catch (_) {} };
+  const hasTextSelection = () => String(window.getSelection ? window.getSelection() : '').length > 0;
+  const originPrefix = (window.location.origin && window.location.origin !== 'null') ? window.location.origin : '';
+
+  const replaceChildrenFrom = (target, source) => {
+    if (!target || !source) return;
+    target.replaceChildren(...Array.from(source.children, (node) => document.importNode(node, true)));
+  };
+
+  const patchActivityPanel = (doc) => {
+    const curPanel = document.querySelector('.activity-panel');
+    const nxtPanel = doc.querySelector('.activity-panel');
+    if (!curPanel || !nxtPanel) return;
+
+    const curHead = curPanel.querySelector('.section-head');
+    const nxtHead = nxtPanel.querySelector('.section-head');
+    if (curHead && nxtHead && curHead.innerHTML !== nxtHead.innerHTML) {
+      replaceChildrenFrom(curHead, nxtHead);
+    }
+
+    const curEmpty = curPanel.querySelector('.activity-empty');
+    const nxtEmpty = nxtPanel.querySelector('.activity-empty');
+    if (curEmpty && !nxtEmpty) {
+      curEmpty.remove();
+    } else if (!curEmpty && nxtEmpty) {
+      curPanel.append(document.importNode(nxtEmpty, true));
+    } else if (curEmpty && nxtEmpty && curEmpty.textContent !== nxtEmpty.textContent) {
+      curEmpty.textContent = nxtEmpty.textContent;
+    }
+
+    const curGrid = curPanel.querySelector('.activity-grid');
+    const nxtGrid = nxtPanel.querySelector('.activity-grid');
+    if (!curGrid || !nxtGrid) return;
+
+    const curScroll = curPanel.querySelector('.activity-scroll');
+    const prevScrollLeft = curScroll ? curScroll.scrollLeft : 0;
+    const focusedCell = document.activeElement && curGrid.contains(document.activeElement) && document.activeElement.classList.contains('activity-cell')
+      ? document.activeElement
+      : null;
+    const focusedDate = focusedCell && focusedCell.dataset ? focusedCell.dataset.date || '' : '';
+    const tabStopCell = curGrid.querySelector('.activity-cell[tabindex="0"]');
+    const tabStopDate = tabStopCell && tabStopCell.dataset ? tabStopCell.dataset.date || '' : '';
+
+    const curWeeks = Array.from(curGrid.querySelectorAll('.activity-week'));
+    const nxtWeeks = Array.from(nxtGrid.querySelectorAll('.activity-week'));
+    let sameShape = curWeeks.length === nxtWeeks.length;
+    if (sameShape) {
+      for (let w = 0; w < curWeeks.length; w += 1) {
+        const curCells = curWeeks[w].querySelectorAll('.activity-cell');
+        const nxtCells = nxtWeeks[w].querySelectorAll('.activity-cell');
+        if (curCells.length !== nxtCells.length) {
+          sameShape = false;
+          break;
+        }
+        for (let d = 0; d < curCells.length; d += 1) {
+          if ((curCells[d].dataset.date || '') !== (nxtCells[d].dataset.date || '')) {
+            sameShape = false;
+            break;
+          }
+        }
+        if (!sameShape) break;
+      }
+    }
+
+    if (sameShape) {
+      for (let w = 0; w < curWeeks.length; w += 1) {
+        const curMonth = curWeeks[w].querySelector('.activity-month');
+        const nxtMonth = nxtWeeks[w].querySelector('.activity-month');
+        if (curMonth && nxtMonth && curMonth.textContent !== nxtMonth.textContent) {
+          curMonth.textContent = nxtMonth.textContent;
+        }
+        const curCells = curWeeks[w].querySelectorAll('.activity-cell');
+        const nxtCells = nxtWeeks[w].querySelectorAll('.activity-cell');
+        for (let d = 0; d < curCells.length; d += 1) {
+          const curCell = curCells[d];
+          const nxtCell = nxtCells[d];
+          if (curCell.className !== nxtCell.className) {
+            curCell.className = nxtCell.className;
+          }
+          const nxtTooltip = nxtCell.getAttribute('data-tooltip');
+          if (nxtTooltip === null) {
+            curCell.removeAttribute('data-tooltip');
+          } else if (curCell.getAttribute('data-tooltip') !== nxtTooltip) {
+            curCell.setAttribute('data-tooltip', nxtTooltip);
+          }
+          const nxtLabel = nxtCell.getAttribute('aria-label');
+          if (nxtLabel === null) {
+            curCell.removeAttribute('aria-label');
+          } else if (curCell.getAttribute('aria-label') !== nxtLabel) {
+            curCell.setAttribute('aria-label', nxtLabel);
+          }
+        }
+      }
+      return;
+    }
+
+    replaceChildrenFrom(curGrid, nxtGrid);
+    if (curScroll) curScroll.scrollLeft = prevScrollLeft;
+    if (tabStopDate) {
+      const match = Array.from(curGrid.querySelectorAll('.activity-cell')).find(
+        (cell) => cell.dataset.date === tabStopDate && !cell.classList.contains('future')
+      );
+      if (match) {
+        for (const existing of curGrid.querySelectorAll('.activity-cell[tabindex="0"]')) {
+          if (existing !== match) existing.tabIndex = -1;
+        }
+        match.tabIndex = 0;
+      }
+    }
+    if (focusedDate) {
+      const target = Array.from(curGrid.querySelectorAll('.activity-cell')).find(
+        (cell) => cell.dataset.date === focusedDate && !cell.classList.contains('future')
+      );
+      if (target) target.focus({ preventScroll: true });
+    }
+  };
+
+  const applyDashboardDocument = (doc, { force = false } = {}) => {
+    const curCreature = document.querySelector('.creature-panel');
+    const nxtCreature = doc.querySelector('.creature-panel');
+    if (curCreature && nxtCreature) {
+      if (nxtCreature.dataset.stage) {
+        curCreature.dataset.stage = nxtCreature.dataset.stage;
+        currentStage = Number(nxtCreature.dataset.stage) || currentStage;
+      }
+      const curForm = curCreature.querySelector('.form-name');
+      const nxtForm = nxtCreature.querySelector('.form-name');
+      if (curForm && nxtForm) curForm.textContent = nxtForm.textContent;
+      const curChip = curCreature.querySelector('.stage-chip');
+      const nxtChip = nxtCreature.querySelector('.stage-chip');
+      if (curChip && nxtChip) curChip.textContent = nxtChip.textContent;
+      const curFallback = curCreature.querySelector('.creature-fallback');
+      const nxtFallback = nxtCreature.querySelector('.creature-fallback');
+      if (curFallback && nxtFallback) curFallback.textContent = nxtFallback.textContent;
+      const curImg = curCreature.querySelector('img.creature-art');
+      const nxtImg = nxtCreature.querySelector('img.creature-art');
+      if (curImg && nxtImg) {
+        const nxtSrc = nxtImg.getAttribute('src') || '';
+        if (nxtSrc && curImg.getAttribute('src') !== nxtSrc) {
+          curImg.setAttribute('src', nxtSrc);
+          curImg.hidden = false;
+          if (curFallback) curFallback.hidden = true;
+        }
+        if (nxtImg.hasAttribute('alt')) curImg.setAttribute('alt', nxtImg.getAttribute('alt'));
+        if (nxtImg.hasAttribute('width')) curImg.setAttribute('width', nxtImg.getAttribute('width'));
+        if (nxtImg.hasAttribute('height')) curImg.setAttribute('height', nxtImg.getAttribute('height'));
+      }
+    }
+
+    const nxtCounter = doc.getElementById('lifetime-counter');
+    if (nxtCounter) {
+      const nextDisplay = nxtCounter.dataset.display || '0';
+      const nextLifetime = Number(nextDisplay.replaceAll(',', '')) || 0;
+      if (force || nextLifetime >= lifetimeTokens) {
+        if ((counter.dataset.display || '') !== nextDisplay) {
+          updateOdometer(counter, nextDisplay);
+        }
+        lifetimeTokens = nextLifetime;
+
+        for (const id of ['live-uncached-segment', 'live-cached-segment', 'live-output-segment']) {
+          const curSeg = document.getElementById(id);
+          const nxtSeg = doc.getElementById(id);
+          if (curSeg && nxtSeg) {
+            curSeg.hidden = nxtSeg.hidden;
+            curSeg.style.width = nxtSeg.style.width;
+          }
+        }
+        for (const id of ['live-input', 'live-output']) {
+          const curItem = document.getElementById(id);
+          const nxtItem = doc.getElementById(id);
+          if (curItem && nxtItem) {
+            if (nxtItem.dataset.tooltip !== undefined) curItem.dataset.tooltip = nxtItem.dataset.tooltip;
+            if (nxtItem.hasAttribute('aria-label')) curItem.setAttribute('aria-label', nxtItem.getAttribute('aria-label'));
+          }
+        }
+        for (const id of ['live-input-share', 'live-output-share']) {
+          const curShare = document.getElementById(id);
+          const nxtShare = doc.getElementById(id);
+          if (curShare && nxtShare && curShare.textContent !== nxtShare.textContent) {
+            curShare.textContent = nxtShare.textContent;
+          }
+        }
+        for (const id of ['live-input-tokens', 'live-output-tokens']) {
+          const curMini = document.getElementById(id);
+          const nxtMini = doc.getElementById(id);
+          if (curMini && nxtMini) {
+            const nxtMiniDisplay = nxtMini.dataset.display || '0';
+            if ((curMini.dataset.display || '') !== nxtMiniDisplay) {
+              updateOdometer(curMini, nxtMiniDisplay);
+            }
+          }
+        }
+
+        const curProgressRow = document.querySelector('.progress-row');
+        const nxtProgressRow = doc.querySelector('.progress-row');
+        if (curProgressRow && nxtProgressRow && curProgressRow.innerHTML !== nxtProgressRow.innerHTML) {
+          replaceChildrenFrom(curProgressRow, nxtProgressRow);
+        }
+        const curRemaining = document.getElementById('live-remaining-copy');
+        const nxtRemaining = doc.getElementById('live-remaining-copy');
+        if (curRemaining && nxtRemaining && curRemaining.innerHTML !== nxtRemaining.innerHTML) {
+          curRemaining.innerHTML = nxtRemaining.innerHTML;
+        }
+        const curProgLabel = document.getElementById('live-progress-label');
+        const nxtProgLabel = doc.getElementById('live-progress-label');
+        if (curProgLabel && nxtProgLabel && curProgLabel.textContent !== nxtProgLabel.textContent) {
+          curProgLabel.textContent = nxtProgLabel.textContent;
+        }
+        const curProg = document.getElementById('live-progress');
+        const nxtProg = doc.getElementById('live-progress');
+        if (curProg && nxtProg) {
+          const nextNow = nxtProg.getAttribute('aria-valuenow') || '0';
+          curProg.setAttribute('aria-valuenow', nextNow);
+          if (curProg.firstElementChild) {
+            curProg.firstElementChild.style.width = nextNow + '%';
+          }
+        }
+      }
+    }
+
+    for (const selector of ['.stat-grid', '.context-grid']) {
+      const cur = document.querySelector(selector);
+      const nxt = doc.querySelector(selector);
+      if (cur && nxt && cur.innerHTML !== nxt.innerHTML) {
+        replaceChildrenFrom(cur, nxt);
+      }
+    }
+
+    patchActivityPanel(doc);
+
+    const curContent = document.querySelector('.content-grid');
+    const nxtContent = doc.querySelector('.content-grid');
+    if (curContent && nxtContent && curContent.innerHTML !== nxtContent.innerHTML) {
+      const activeRowLink = document.activeElement && curContent.contains(document.activeElement) && document.activeElement.matches('.content-grid a[href]')
+        ? document.activeElement.getAttribute('href')
+        : null;
+      replaceChildrenFrom(curContent, nxtContent);
+      if (activeRowLink) {
+        const match = Array.from(curContent.querySelectorAll('.content-grid a[href]')).find(
+          (link) => link.getAttribute('href') === activeRowLink
+        );
+        if (match) match.focus({ preventScroll: true });
+      }
+    }
+
+    const curHealthPanel = document.querySelector('.health-panel');
+    const nxtHealthPanel = doc.querySelector('.health-panel');
+    if (curHealthPanel && nxtHealthPanel) {
+      const curScroll = curHealthPanel.querySelector('.health-scroll');
+      const curTbody = curHealthPanel.querySelector('tbody');
+      const nxtTbody = nxtHealthPanel.querySelector('tbody');
+      if (curTbody && nxtTbody) {
+        const prevScrollLeft = curScroll ? curScroll.scrollLeft : 0;
+        const openMachines = new Set();
+        for (const row of curTbody.querySelectorAll('tr[data-machine]')) {
+          const details = row.querySelector('.source-details');
+          if (details && details.open) {
+            openMachines.add(row.dataset.machine);
+          }
+        }
+        let healthFocusKind = '';
+        let healthFocusMachine = '';
+        if (document.activeElement === curScroll) {
+          healthFocusKind = 'scroll';
+        } else if (document.activeElement && curTbody.contains(document.activeElement)) {
+          const summary = document.activeElement.closest ? document.activeElement.closest('.source-details > summary') : null;
+          const row = summary && summary.closest ? summary.closest('tr[data-machine]') : null;
+          if (row) {
+            healthFocusKind = 'summary';
+            healthFocusMachine = row.dataset.machine || '';
+          }
+        }
+        for (const row of nxtTbody.querySelectorAll('tr[data-machine]')) {
+          if (openMachines.has(row.dataset.machine)) {
+            const details = row.querySelector('.source-details');
+            if (details) details.open = true;
+          }
+        }
+        if (curTbody.innerHTML !== nxtTbody.innerHTML) {
+          replaceChildrenFrom(curTbody, nxtTbody);
+          if (curScroll) curScroll.scrollLeft = prevScrollLeft;
+          if (healthFocusKind === 'scroll' && curScroll) {
+            curScroll.focus({ preventScroll: true });
+          } else if (healthFocusKind === 'summary' && healthFocusMachine) {
+            const row = Array.from(curTbody.querySelectorAll('tr[data-machine]')).find(
+              (candidate) => candidate.dataset.machine === healthFocusMachine
+            );
+            const summary = row ? row.querySelector('.source-details > summary') : null;
+            if (summary) summary.focus({ preventScroll: true });
+          }
+        }
+      }
+    }
+
+    const curSessionsPanel = document.querySelector('.sessions-panel');
+    const nxtSessionsPanel = doc.querySelector('.sessions-panel');
+    if (curSessionsPanel && nxtSessionsPanel) {
+      const curScroll = curSessionsPanel.querySelector('.sessions-scroll');
+      const curTbody = curSessionsPanel.querySelector('tbody');
+      const nxtTbody = nxtSessionsPanel.querySelector('tbody');
+      if (curTbody && nxtTbody && curTbody.innerHTML !== nxtTbody.innerHTML) {
+        const prevScrollLeft = curScroll ? curScroll.scrollLeft : 0;
+        let focusKind = '';
+        let focusAttr = '';
+        if (document.activeElement === curScroll) {
+          focusKind = 'scroll';
+        } else if (document.activeElement && curTbody.contains(document.activeElement)) {
+          if (document.activeElement.matches('.sessions-table td a[href]')) {
+            focusKind = 'session';
+            focusAttr = document.activeElement.getAttribute('href') || '';
+          } else if (document.activeElement.matches('.copy-id[data-copy-value]')) {
+            focusKind = 'copy';
+            focusAttr = document.activeElement.getAttribute('data-copy-value') || '';
+          }
+        }
+        replaceChildrenFrom(curTbody, nxtTbody);
+        if (curScroll) curScroll.scrollLeft = prevScrollLeft;
+        if (focusKind === 'scroll' && curScroll) {
+          curScroll.focus({ preventScroll: true });
+        } else if (focusKind === 'session' && focusAttr) {
+          const link = Array.from(curTbody.querySelectorAll('.sessions-table td a[href]')).find(
+            (candidate) => candidate.getAttribute('href') === focusAttr
+          );
+          if (link) link.focus({ preventScroll: true });
+        } else if (focusKind === 'copy' && focusAttr) {
+          const btn = Array.from(curTbody.querySelectorAll('.copy-id[data-copy-value]')).find(
+            (candidate) => candidate.getAttribute('data-copy-value') === focusAttr
+          );
+          if (btn) btn.focus({ preventScroll: true });
+        }
+      }
+    }
+
+    const curFirstRun = document.querySelector('.first-run');
+    const nxtFirstRun = doc.querySelector('.first-run');
+    if (curFirstRun && !nxtFirstRun) {
+      curFirstRun.remove();
+    } else if (!curFirstRun && nxtFirstRun) {
+      const footer = document.querySelector('main > footer');
+      if (footer) footer.before(document.importNode(nxtFirstRun, true));
+    }
+
+    syncOpenTooltip();
+  };
+
+  const refreshDashboard = async ({ force = false, retryCount = 0 } = {}) => {
+    if (authExpired) return;
+    if (!force && (document.hidden || autoPaused() || hasTextSelection())) return;
+    if (dashboardRefreshing) {
+      if (force) pendingForceRefresh = true;
+      return;
+    }
+    if (dashboardRetryTimer) {
+      window.clearTimeout(dashboardRetryTimer);
+      dashboardRetryTimer = 0;
+    }
+    const startPauseEpoch = pauseEpoch;
+    dashboardRefreshing = true;
+    try {
+      const headers = { Accept: 'text/html' };
+      if (dashboardETag) headers['If-None-Match'] = dashboardETag;
+      const response = await fetch(originPrefix + '/', { cache: 'no-store', redirect: 'manual', headers });
+      if (response.type === 'opaqueredirect') {
+        authExpired = true;
+        window.location.assign('/login?next=%2F');
+        return;
+      }
+      if (response.status === 401) {
+        authExpired = true;
+        return;
+      }
+      const nextETag = response.headers.get('ETag');
+      if (nextETag) dashboardETag = nextETag;
+      const serverRefreshing = response.headers.get('X-Tokemon-Refreshing') === '1';
+      if (response.status === 304) {
+        if (serverRefreshing && retryCount < 5 && pauseEpoch === startPauseEpoch && !authExpired) {
+          dashboardRetryTimer = window.setTimeout(() => refreshDashboard({ force, retryCount: retryCount + 1 }), 400);
+        }
+        return;
+      }
+      if (!response.ok) return;
+      const htmlText = await response.text();
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+      if (!doc.querySelector('#lifetime-counter')) return;
+      applyDashboardDocument(doc, { force });
+      if (serverRefreshing && retryCount < 5 && pauseEpoch === startPauseEpoch && !authExpired) {
+        dashboardRetryTimer = window.setTimeout(() => refreshDashboard({ force, retryCount: retryCount + 1 }), 400);
+      }
+    } catch (_) {
+    } finally {
+      dashboardRefreshing = false;
+      if (pendingForceRefresh && !authExpired) {
+        pendingForceRefresh = false;
+        refreshDashboard({ force: true, retryCount: 0 });
+      }
+    }
+  };
 
   const pollLifetime = async () => {
     if (polling || document.hidden || autoPaused()) return;
+    if (authExpired) return;
     polling = true;
     try {
-      const response = await fetch('/api/v1/evolution', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      const headers = { Accept: 'application/json' };
+      if (evolutionETag) headers['If-None-Match'] = evolutionETag;
+      const response = await fetch('/api/v1/evolution'.replace('', originPrefix), { cache: 'no-store', headers });
+      if (response.status === 401) {
+        refreshDashboard({ force: true });
+        return;
+      }
+      if (response.status === 304) return;
+      const nextEvolutionETag = response.headers.get('ETag');
+      if (nextEvolutionETag) evolutionETag = nextEvolutionETag;
       if (!response.ok) throw new Error('live counter unavailable');
       const snapshot = await response.json();
       const composition = snapshot.composition || {};
+      const compositionKey = [
+        Math.max(0, Number(composition.input_tokens) || 0),
+        Math.max(0, Number(composition.uncached_input_tokens) || 0),
+        Math.max(0, Number(composition.cached_input_tokens) || 0),
+        Math.max(0, Number(composition.output_tokens) || 0),
+      ].join(':');
+      const compositionChanged = lastCompositionKey !== null && compositionKey !== lastCompositionKey;
+      lastCompositionKey = compositionKey;
       updateComposition(composition);
       if (snapshot.stage !== currentStage) {
-        location.reload();
+        refreshDashboard();
         return;
       }
-      if (snapshot.lifetime_tokens === lifetimeTokens) return;
-      lifetimeTokens = snapshot.lifetime_tokens;
-      const display = number.format(lifetimeTokens);
-      updateOdometer(counter, display);
-      const remaining = document.getElementById('live-remaining-copy');
-      remaining.replaceChildren();
-      if (snapshot.tokens_remaining == null) {
-        remaining.textContent = 'Final form';
-      } else {
-        remaining.append(new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(snapshot.tokens_remaining) + ' ');
-        const suffix = document.createElement('small');
-        suffix.textContent = 'to go';
-        remaining.append(suffix);
+      if (snapshot.lifetime_tokens !== lifetimeTokens) {
+        lifetimeTokens = snapshot.lifetime_tokens;
+        const display = number.format(lifetimeTokens);
+        updateOdometer(counter, display);
+        const remaining = document.getElementById('live-remaining-copy');
+        remaining.replaceChildren();
+        if (snapshot.tokens_remaining == null) {
+          remaining.textContent = 'Final form';
+        } else {
+          remaining.append(new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(snapshot.tokens_remaining) + ' ');
+          const suffix = document.createElement('small');
+          suffix.textContent = 'to go';
+          remaining.append(suffix);
+        }
+        document.getElementById('live-progress-label').textContent = Math.round(snapshot.progress * 100) + '%';
+        const progress = document.getElementById('live-progress');
+        progress.setAttribute('aria-valuenow', String(snapshot.progress * 100));
+        progress.firstElementChild.style.width = (snapshot.progress * 100) + '%';
+        refreshDashboard();
+        return;
       }
-      document.getElementById('live-progress-label').textContent = Math.round(snapshot.progress * 100) + '%';
-      const progress = document.getElementById('live-progress');
-      progress.setAttribute('aria-valuenow', String(snapshot.progress * 100));
-      progress.firstElementChild.style.width = (snapshot.progress * 100) + '%';
+      if (compositionChanged) {
+        refreshDashboard();
+      }
     } catch (_) {
     } finally {
       polling = false;
@@ -601,40 +1029,22 @@
     setAutoPaused(paused);
     renderAutoToggle();
     autoToggle.focus();
+    if (paused) {
+      pauseEpoch += 1;
+      if (dashboardRetryTimer) {
+        window.clearTimeout(dashboardRetryTimer);
+        dashboardRetryTimer = 0;
+      }
+      pendingForceRefresh = false;
+    }
     if (!paused) pollLifetime();
   });
-  document.getElementById('refresh-now').addEventListener('click', () => location.reload());
-
-  const focusSelector = (el) => {
-    if (el.id) return '#' + CSS.escape(el.id);
-    if (el.matches('a[href]')) return 'a[href="' + el.getAttribute('href') + '"]';
-    const label = el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || el.getAttribute('title');
-    if (label) return el.tagName.toLowerCase() + '[aria-label="' + label.replace(/"/g, '\\"') + '"]';
-    return null;
-  };
-  const stashFocus = () => {
-    const el = document.activeElement;
-    if (!el || el === document.body) return;
-    const selector = focusSelector(el);
-    if (!selector) return;
-    try { sessionStorage.setItem(FOCUS_KEY, JSON.stringify({ selector: selector, at: Date.now() })); } catch (_) {}
-  };
-  const restoreFocus = () => {
-    let stashed = null;
-    try { stashed = JSON.parse(sessionStorage.getItem(FOCUS_KEY) || 'null'); } catch (_) {}
-    if (!stashed) return;
-    try { sessionStorage.removeItem(FOCUS_KEY); } catch (_) {}
-    if (Date.now() - stashed.at > 5000) return;
-    const el = document.querySelector(stashed.selector);
-    if (el) el.focus({ preventScroll: true });
-  };
-  restoreFocus();
+  document.getElementById('refresh-now').addEventListener('click', () => refreshDashboard({ force: true }));
 
   const autoRefreshTick = () => {
     if (autoPaused() || document.hidden) return;
-    if (String(window.getSelection ? window.getSelection() : '').length > 0) return;
-    stashFocus();
-    location.reload();
+    if (hasTextSelection()) return;
+    refreshDashboard();
   };
   window.setInterval(autoRefreshTick, AUTO_REFRESH_MS);
 
@@ -739,11 +1149,36 @@
     tooltip.hidden = true;
   };
 
-  document.querySelectorAll('.activity-cell[data-tooltip], .composition-item[data-tooltip-kind]').forEach((cell) => {
-    cell.addEventListener('pointerenter', () => showTooltip(cell));
-    cell.addEventListener('pointerleave', hideTooltip);
-    cell.addEventListener('focus', () => showTooltip(cell));
-    cell.addEventListener('blur', hideTooltip);
+  syncOpenTooltip = () => {
+    if (!activeCell || tooltip.hidden) return;
+    if (!activeCell.isConnected || !activeCell.dataset.tooltip) {
+      hideTooltip();
+      return;
+    }
+    renderTooltip(activeCell);
+    positionTooltip();
+  };
+
+  const tooltipTarget = (node) => (node && node.closest ? node.closest('.activity-cell[data-tooltip], .composition-item[data-tooltip-kind]') : null);
+  document.addEventListener('pointerover', (event) => {
+    const cell = tooltipTarget(event.target);
+    if (!cell || (event.relatedTarget && cell.contains(event.relatedTarget))) return;
+    showTooltip(cell);
+  });
+  document.addEventListener('pointerout', (event) => {
+    if (!activeCell) return;
+    const cell = tooltipTarget(event.target);
+    if (cell !== activeCell || (event.relatedTarget && activeCell.contains(event.relatedTarget))) return;
+    hideTooltip();
+  });
+  document.addEventListener('focusin', (event) => {
+    const cell = tooltipTarget(event.target);
+    if (cell) showTooltip(cell);
+  });
+  document.addEventListener('focusout', (event) => {
+    if (!activeCell) return;
+    if (event.relatedTarget && activeCell.contains(event.relatedTarget)) return;
+    hideTooltip();
   });
   window.addEventListener('resize', positionTooltip, { passive: true });
   window.addEventListener('scroll', positionTooltip, { passive: true, capture: true });

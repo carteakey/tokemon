@@ -101,6 +101,13 @@ main:not(.login-card) {
 .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
 .window-link.active, .window-link.active:hover, .window-link.active:focus-visible { background: var(--accent); color: var(--bg); }
 
+.active-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.filter-pill { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 4px 9px; border: 1px solid var(--line-bright); border-radius: 999px; background: var(--surface-raised); color: var(--text); font: 11px/1.2 var(--font-data); }
+.filter-pill:hover, .filter-pill:focus-visible { border-color: var(--accent); color: var(--accent); }
+.filter-pill-x { color: var(--warm); font-weight: 700; }
+.clear-filters { color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; text-decoration: underline; text-underline-offset: 2px; }
+.clear-filters:hover, .clear-filters:focus-visible { color: var(--accent); }
+
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { border-bottom: 1px solid var(--line); text-align: left; }
@@ -110,7 +117,7 @@ footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px
 @media (max-width: 820px) {
   main:not(.login-card) { width: min(100% - 20px, 620px); margin: 10px auto; padding: 10px; }
   .topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-  .nav { order: 3; width: 100%; justify-content: center; gap: 4px; }
+  .nav { order: 3; width: 100%; flex-wrap: wrap; justify-content: center; gap: 4px; }
   .topbar-actions { margin-left: auto; }
 }
 
