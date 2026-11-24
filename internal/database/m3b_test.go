@@ -269,10 +269,10 @@ func TestSessionDetailMetadataSwitchesUnknownsAndTimelineBound(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	// Schema version remains 4 and idx_usage_events_session_id exists.
+	// Schema version matches databaseSchemaVersion and idx_usage_events_session_id exists.
 	ver, err := schemaVersion(ctx, store.db)
-	if err != nil || ver != 4 {
-		t.Fatalf("schemaVersion = %d, err=%v, want 4", ver, err)
+	if err != nil || ver != databaseSchemaVersion {
+		t.Fatalf("schemaVersion = %d, err=%v, want %d", ver, err, databaseSchemaVersion)
 	}
 	var idxCount int
 	if err := store.readHandle().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_session_id'`).Scan(&idxCount); err != nil || idxCount != 1 {

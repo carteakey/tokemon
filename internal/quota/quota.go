@@ -8,10 +8,19 @@ package quota
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	maxProviderRunes = 128
+	maxModelRunes    = 256
+	maxLabelRunes    = 128
 )
 
 // SchemaVersion is the quotas.yaml document version.
@@ -44,6 +53,21 @@ type file struct {
 	Quotas        []Quota `yaml:"quotas"`
 }
 
+// Normalize trims surrounding whitespace from text fields and lowercases
+// Provider to canonical form.
+func Normalize(q Quota) Quota {
+	q.Provider = strings.ToLower(strings.TrimSpace(q.Provider))
+	q.Model = strings.TrimSpace(q.Model)
+	q.Label = strings.TrimSpace(q.Label)
+	return q
+}
+
+// Key returns the canonical case-insensitive deduplication key for a
+// (provider, model) pair.
+func Key(provider, model string) string {
+	return strings.ToLower(strings.TrimSpace(provider)) + "\x00" + strings.ToLower(strings.TrimSpace(model))
+}
+
 // Load reads and validates a quotas.yaml document. An empty quotas list is
 // valid and means the dashboard runs without quota tracking.
 func Load(path string) ([]Quota, error) {
@@ -60,10 +84,12 @@ func Load(path string) ([]Quota, error) {
 	}
 	seen := make(map[string]int, len(document.Quotas))
 	for index, quota := range document.Quotas {
+		quota = Normalize(quota)
+		document.Quotas[index] = quota
 		if err := Validate(quota); err != nil {
 			return nil, fmt.Errorf("quota %d: %w", index+1, err)
 		}
-		key := quota.Provider + "\x00" + quota.Model
+		key := Key(quota.Provider, quota.Model)
 		if previous, ok := seen[key]; ok {
 			return nil, fmt.Errorf("quota %d duplicates quota %d (provider %q, model %q)", index+1, previous, quota.Provider, quota.Model)
 		}
@@ -72,8 +98,30 @@ func Load(path string) ([]Quota, error) {
 	return document.Quotas, nil
 }
 
+func validateTextField(name, value string, maxRunes int) error {
+	trimmed := strings.TrimSpace(value)
+	if utf8.RuneCountInString(trimmed) > maxRunes {
+		return fmt.Errorf("%s must be at most %d characters", name, maxRunes)
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s must not contain control characters", name)
+		}
+	}
+	return nil
+}
+
 // Validate checks one quota definition.
 func Validate(quota Quota) error {
+	if err := validateTextField("provider", quota.Provider, maxProviderRunes); err != nil {
+		return err
+	}
+	if err := validateTextField("model", quota.Model, maxModelRunes); err != nil {
+		return err
+	}
+	if err := validateTextField("label", quota.Label, maxLabelRunes); err != nil {
+		return err
+	}
 	if quota.ResetDay < 1 || quota.ResetDay > 31 {
 		return fmt.Errorf("reset_day must be between 1 and 31, got %d", quota.ResetDay)
 	}
@@ -83,8 +131,11 @@ func Validate(quota Quota) error {
 	if quota.Budget.TokensPerMonth != nil && *quota.Budget.TokensPerMonth <= 0 {
 		return errors.New("tokens_per_month must be positive")
 	}
-	if quota.Budget.CostPerMonth != nil && *quota.Budget.CostPerMonth <= 0 {
-		return errors.New("cost_per_month must be positive")
+	if quota.Budget.CostPerMonth != nil {
+		v := *quota.Budget.CostPerMonth
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			return errors.New("cost_per_month must be positive")
+		}
 	}
 	return nil
 }
@@ -96,10 +147,12 @@ func Validate(quota Quota) error {
 // model-only quota and a catch-all would tie and configuration order would
 // decide which one claims the event.
 func Specificity(quota Quota) int {
+	provider := strings.TrimSpace(quota.Provider)
+	model := strings.TrimSpace(quota.Model)
 	switch {
-	case quota.Provider != "" && quota.Model != "":
+	case provider != "" && model != "":
 		return 0
-	case quota.Provider != "" || quota.Model != "":
+	case provider != "" || model != "":
 		return 1
 	default:
 		return 2
@@ -109,10 +162,12 @@ func Specificity(quota Quota) int {
 // Match reports whether the quota applies to an event with the given
 // provider and model (model matches either the canonical or raw form).
 func Match(quota Quota, provider, model string) bool {
-	if quota.Provider != "" && quota.Provider != provider {
+	qp := strings.TrimSpace(quota.Provider)
+	qm := strings.TrimSpace(quota.Model)
+	if qp != "" && !strings.EqualFold(qp, strings.TrimSpace(provider)) {
 		return false
 	}
-	if quota.Model != "" && quota.Model != model {
+	if qm != "" && !strings.EqualFold(qm, strings.TrimSpace(model)) {
 		return false
 	}
 	return true

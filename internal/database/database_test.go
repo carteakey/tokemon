@@ -35,7 +35,7 @@ func TestOpenBacksUpExistingDatabaseBeforeMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Close()
-	backups, err := filepath.Glob(filepath.Join(directory, "backups", "tokemon-v0-before-v4-*.db"))
+	backups, err := filepath.Glob(filepath.Join(directory, "backups", fmt.Sprintf("tokemon-v0-before-v%d-*.db", databaseSchemaVersion)))
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("backups = %v, err = %v", backups, err)
 	}
@@ -1926,7 +1926,7 @@ func TestOverviewPopulatesCompositionAndEmptyZeroes(t *testing.T) {
 }
 
 func TestMigrateDeduplicatesCodexUsageWhenBelowSchemaVersion(t *testing.T) {
-	for _, fromVersion := range []int{0, 3} {
+	for _, fromVersion := range []int{0, 3, 4} {
 		t.Run(fmt.Sprintf("from-v%d", fromVersion), func(t *testing.T) {
 			directory := t.TempDir()
 			path := filepath.Join(directory, "tokemon.db")

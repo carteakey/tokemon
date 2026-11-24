@@ -90,7 +90,8 @@ type CatalogSnapshot struct {
 	// UncatalogedModels counts identifiers missing from the catalog that are
 	// real models. The documented non-model sentinels stay disclosed in
 	// Uncataloged verbatim but are not counted here.
-	UncatalogedModels int `json:"uncataloged_models,omitempty"`
+	UncatalogedModels int                  `json:"uncataloged_models,omitempty"`
+	Recent30d         ComponentUsageTotals `json:"recent_30d"`
 }
 
 // nonModelSentinelIDs are observed identifiers that are not real models, kept
@@ -544,10 +545,19 @@ func pluralSuffix(value int) string {
 }
 
 func (s *Store) CatalogSnapshot(ctx context.Context) (CatalogSnapshot, error) {
+	return s.catalogSnapshotAt(ctx, time.Now())
+}
+
+func (s *Store) catalogSnapshotAt(ctx context.Context, now time.Time) (CatalogSnapshot, error) {
 	result := CatalogSnapshot{SchemaVersion: catalog.SchemaVersion, Tiers: []string{"S", "A", "B", "C", "D", "Unranked"}}
 	if s.catalog == nil {
 		return result, nil
 	}
+	recent30d, err := s.componentUsageTotals30dAt(ctx, now)
+	if err != nil {
+		return CatalogSnapshot{}, err
+	}
+	result.Recent30d = recent30d
 	usageRows, err := s.readHandle().QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
 COALESCE(SUM(total_tokens), 0), COUNT(*), COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
 FROM usage_events GROUP BY 1`)

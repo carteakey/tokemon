@@ -2,6 +2,9 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -725,4 +728,348 @@ func TestQuotaStatusNonZLegacyBoundary(t *testing.T) {
 			t.Fatalf("sub-second non-Z TokensUsed = %+v, want 333", st)
 		}
 	})
+}
+
+func TestSchemaV4ToV5MigrationCreatesQuotasTableWithBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokemon.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4DDL := `
+CREATE TABLE machines (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  operating_system TEXT NOT NULL DEFAULT '',
+  architecture TEXT NOT NULL DEFAULT '',
+  agent_version TEXT NOT NULL DEFAULT '',
+  detected_adapters TEXT NOT NULL DEFAULT '',
+  source_count INTEGER NOT NULL DEFAULT 0,
+  source_error_count INTEGER NOT NULL DEFAULT 0,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+CREATE TABLE machine_source_health (
+  machine_id TEXT NOT NULL,
+  adapter TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  last_successful_sync TEXT NOT NULL DEFAULT '',
+  last_error_class TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (machine_id, adapter, source_hash)
+);
+CREATE TABLE usage_events (
+  event_id TEXT PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  machine_id TEXT NOT NULL,
+  project TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL,
+  raw_model TEXT NOT NULL,
+  canonical_model TEXT NOT NULL DEFAULT '',
+  tool TEXT NOT NULL,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_write_tokens INTEGER,
+  reasoning_tokens INTEGER,
+  total_tokens INTEGER,
+  cost REAL,
+  cost_estimated INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  session_id TEXT,
+  duration_ms INTEGER,
+  token_accuracy TEXT NOT NULL,
+  adapter TEXT NOT NULL,
+  adapter_version TEXT NOT NULL
+);
+CREATE TABLE display_aliases (
+  kind TEXT NOT NULL CHECK (kind IN ('model', 'machine')),
+  identity TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (kind, identity)
+);
+INSERT INTO usage_events (event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool, total_tokens, token_accuracy, adapter, adapter_version)
+VALUES ('v4-ev-1', '2026-11-15T10:00:00Z', 'm1', 'proj', 'openai', 'gpt-5', 'gpt-5', 'codex', 420, 'reported', 'codex', '1');
+PRAGMA user_version = 4;`
+	if _, err := raw.Exec(v4DDL); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	ver, err := schemaVersion(ctx, store.db)
+	if err != nil || ver != 5 {
+		t.Fatalf("schemaVersion = %d, err = %v, want 5", ver, err)
+	}
+	var tableName string
+	if err := store.readHandle().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='quotas'`).Scan(&tableName); err != nil || tableName != "quotas" {
+		t.Fatalf("quotas table missing after v4->v5 migration: name=%q err=%v", tableName, err)
+	}
+	backups, err := filepath.Glob(filepath.Join(dir, "backups", fmt.Sprintf("tokemon-v4-before-v%d-*.db", databaseSchemaVersion)))
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("migration backups = %v, err = %v", backups, err)
+	}
+	events, err := store.Events(ctx)
+	if err != nil || len(events) != 1 || events[0].EventID != "v4-ev-1" {
+		t.Fatalf("events after v4->v5 migration = %+v, err=%v", events, err)
+	}
+}
+
+func TestSQLiteQuotaCRUDAndValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quotas.db")
+	store, err := OpenWithLocation(path, catalog.Empty(), time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Validation rejects invalid budgets/fields.
+	zero := int64(0)
+	neg := -5.0
+	nan := math.NaN()
+	inf := math.Inf(1)
+	for _, invalid := range []quota.Quota{
+		{ResetDay: 0, Budget: quota.Budget{TokensPerMonth: usage.Int64(10)}},
+		{ResetDay: 1},
+		{ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &zero}},
+		{ResetDay: 1, Budget: quota.Budget{CostPerMonth: &neg}},
+		{ResetDay: 1, Budget: quota.Budget{CostPerMonth: &nan}},
+		{ResetDay: 1, Budget: quota.Budget{CostPerMonth: &inf}},
+		{Provider: "bad\nprovider", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: usage.Int64(10)}},
+	} {
+		if err := store.UpsertQuota(ctx, invalid); err == nil {
+			t.Fatalf("expected validation error for %+v", invalid)
+		}
+	}
+
+	// Insert and update (case-insensitive conflict on provider+model).
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "OpenAI",
+		Model:    "GPT-5.4",
+		Label:    "Initial Cap",
+		ResetDay: 1,
+		Budget:   quota.Budget{TokensPerMonth: usage.Int64(1_000_000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "openai",
+		Model:    "gpt-5.4",
+		Label:    "Updated Cap",
+		ResetDay: 15,
+		Budget:   quota.Budget{CostPerMonth: usage.Float64(75.5)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	quotas, err := store.Quotas(ctx)
+	if err != nil || len(quotas) != 1 {
+		t.Fatalf("Quotas = %+v, err=%v", quotas, err)
+	}
+	if quotas[0].Provider != "openai" || quotas[0].Model != "gpt-5.4" || quotas[0].Label != "Updated Cap" ||
+		quotas[0].ResetDay != 15 || quotas[0].Budget.TokensPerMonth != nil || quotas[0].Budget.CostPerMonth == nil || *quotas[0].Budget.CostPerMonth != 75.5 {
+		t.Fatalf("unexpected updated quota: %+v", quotas[0])
+	}
+	if quotas[0].Source != QuotaSourceSQLite || quotas[0].OverridesYAML || quotas[0].UpdatedAt == "" {
+		t.Fatalf("unexpected source metadata: %+v", quotas[0])
+	}
+
+	// Persistence across Close + Open.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithLocation(path, catalog.Empty(), time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	persisted, err := reopened.Quotas(ctx)
+	if err != nil || len(persisted) != 1 || persisted[0].Label != "Updated Cap" {
+		t.Fatalf("persisted Quotas = %+v, err=%v", persisted, err)
+	}
+
+	// Idempotent delete of missing key succeeds; case-insensitive delete removes row.
+	if err := reopened.DeleteQuota(ctx, "anthropic", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteQuota(ctx, "OPENAI", "GPT-5.4"); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := reopened.Quotas(ctx)
+	if err != nil || len(afterDelete) != 0 {
+		t.Fatalf("Quotas after delete = %+v, err=%v", afterDelete, err)
+	}
+	if statuses := reopened.QuotaStatus(ctx, fixedNow()); statuses != nil {
+		t.Fatalf("QuotaStatus after deleting last quota = %+v, want nil", statuses)
+	}
+}
+
+func TestSQLiteAndYAMLQuotaMergePrecedence(t *testing.T) {
+	yamlQuotas := []quota.Quota{
+		{Provider: "openai", Label: "YAML OpenAI", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: usage.Int64(100_000)}},
+		{Provider: "anthropic", Label: "YAML Anthropic", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: usage.Int64(200_000)}},
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "merge.db"), catalog.Empty(), time.UTC, yamlQuotas...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("m-oai", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5.4", 40_000),
+		quotaUsageEvent("m-ant", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "anthropic", "claude-sonnet-4", 50_000),
+	})
+
+	initial, err := store.Quotas(ctx)
+	if err != nil || len(initial) != 2 {
+		t.Fatalf("initial Quotas = %+v, err=%v", initial, err)
+	}
+	if initial[0].Source != QuotaSourceYAML || initial[0].OverridesYAML || initial[1].Source != QuotaSourceYAML {
+		t.Fatalf("unexpected initial sources: %+v", initial)
+	}
+
+	// Override YAML openai quota in SQLite: replaces in-place preserving configuration order.
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "OpenAI",
+		Label:    "SQLite OpenAI",
+		ResetDay: 1,
+		Budget:   quota.Budget{TokensPerMonth: usage.Int64(20_000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Add a more specific SQLite-only provider+model quota.
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "openai",
+		Model:    "gpt-5.4",
+		Label:    "SQLite GPT-5.4",
+		ResetDay: 1,
+		Budget:   quota.Budget{TokensPerMonth: usage.Int64(50_000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	merged, err := store.Quotas(ctx)
+	if err != nil || len(merged) != 3 {
+		t.Fatalf("merged Quotas = %+v, err=%v", merged, err)
+	}
+	if merged[0].Label != "SQLite GPT-5.4" || merged[0].Source != QuotaSourceSQLite || merged[0].OverridesYAML {
+		t.Fatalf("merged[0] = %+v", merged[0])
+	}
+	if merged[1].Label != "SQLite OpenAI" || merged[1].Source != QuotaSourceSQLite || !merged[1].OverridesYAML {
+		t.Fatalf("merged[1] = %+v", merged[1])
+	}
+	if merged[2].Label != "YAML Anthropic" || merged[2].Source != QuotaSourceYAML || merged[2].OverridesYAML {
+		t.Fatalf("merged[2] = %+v", merged[2])
+	}
+
+	// Deleting SQLite override restores underlying YAML openai quota.
+	if err := store.DeleteQuota(ctx, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := store.Quotas(ctx)
+	if err != nil || len(restored) != 3 {
+		t.Fatalf("restored Quotas = %+v, err=%v", restored, err)
+	}
+	if restored[1].Label != "YAML OpenAI" || restored[1].Source != QuotaSourceYAML || restored[1].OverridesYAML {
+		t.Fatalf("restored[1] = %+v, want YAML OpenAI restored", restored[1])
+	}
+}
+
+func TestQuotaCRUDImmediateCacheInvalidationAndRace(t *testing.T) {
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "race.db"), catalog.Empty(), time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := fixedNow()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("r-1", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5.4", 50_000),
+	})
+
+	if st := store.QuotaStatus(ctx, now); st != nil {
+		t.Fatalf("initial QuotaStatus = %+v, want nil", st)
+	}
+
+	// Upsert immediately populates QuotaStatus (bypasses 2s SWR delay).
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "openai",
+		Label:    "Cap 1",
+		ResetDay: 1,
+		Budget:   quota.Budget{TokensPerMonth: usage.Int64(100_000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st1 := store.QuotaStatus(ctx, now)
+	if len(st1) != 1 || st1[0].TokensUsed != 50_000 || *st1[0].TokensBudget != 100_000 || st1[0].State != "ok" {
+		t.Fatalf("QuotaStatus immediately after upsert = %+v", st1)
+	}
+
+	// Updating budget immediately flips state to "over".
+	if err := store.UpsertQuota(ctx, quota.Quota{
+		Provider: "openai",
+		Label:    "Cap 1 Tight",
+		ResetDay: 1,
+		Budget:   quota.Budget{TokensPerMonth: usage.Int64(25_000)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st2 := store.QuotaStatus(ctx, now)
+	if len(st2) != 1 || st2[0].Label != "Cap 1 Tight" || *st2[0].TokensBudget != 25_000 || st2[0].State != "over" {
+		t.Fatalf("QuotaStatus immediately after budget tighten = %+v", st2)
+	}
+
+	// Concurrent readers/writers under -race.
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				_ = store.UpsertQuota(ctx, quota.Quota{
+					Provider: "openai",
+					Label:    fmt.Sprintf("Concurrent %d-%d", id, j),
+					ResetDay: 1,
+					Budget:   quota.Budget{TokensPerMonth: usage.Int64(10_000 + int64(j))},
+				})
+				_, _ = store.Quotas(ctx)
+				_ = store.QuotaStatus(ctx, now)
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				_, _ = store.Ingest(ctx, []usage.Event{
+					quotaUsageEvent(fmt.Sprintf("race-ev-%d-%d", id, j), time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC), "openai", "gpt-5.4", 100),
+				})
+				_ = store.QuotaStatus(ctx, now)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Deleting last quota immediately clears QuotaStatus back to nil.
+	if err := store.DeleteQuota(ctx, "openai", ""); err != nil {
+		t.Fatal(err)
+	}
+	if st3 := store.QuotaStatus(ctx, now); st3 != nil {
+		t.Fatalf("QuotaStatus after final delete = %+v, want nil", st3)
+	}
 }

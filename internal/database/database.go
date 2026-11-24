@@ -38,12 +38,14 @@ type Store struct {
 	aliasesCache  []DisplayAlias
 	aliasesCached bool
 
-	quotaMu         sync.Mutex
-	quotaCache      *quotaCacheEntry
-	quotaReady      chan struct{}
-	quotaReadyDay   string
-	quotaGeneration uint64
-	quotaRefreshes  atomic.Int64
+	quotaMu           sync.Mutex
+	quotaConfigLoaded bool
+	mergedConfigCache []ConfiguredQuota
+	quotaCache        *quotaCacheEntry
+	quotaReady        chan struct{}
+	quotaReadyDay     string
+	quotaGeneration   uint64
+	quotaRefreshes    atomic.Int64
 
 	bgMu      sync.Mutex
 	bgClosed  bool
@@ -164,7 +166,7 @@ type TokenComposition struct {
 const activityWeeks = 53
 
 const (
-	databaseSchemaVersion = 4
+	databaseSchemaVersion = 5
 	backupRetention       = 10
 )
 
@@ -200,13 +202,22 @@ type ActivityWeek struct {
 	Days       []ActivityDay `json:"days"`
 }
 
+type ActivityPeakDay struct {
+	Date   string `json:"date"`
+	Label  string `json:"label"`
+	Tokens int64  `json:"tokens"`
+}
+
 type ActivityHeatmap struct {
-	StartDate      string         `json:"start_date"`
-	EndDate        string         `json:"end_date"`
-	TotalTokens    int64          `json:"total_tokens"`
-	ActiveDays     int64          `json:"active_days"`
-	MaxDailyTokens int64          `json:"max_daily_tokens"`
-	Weeks          []ActivityWeek `json:"weeks"`
+	StartDate      string           `json:"start_date"`
+	EndDate        string           `json:"end_date"`
+	TotalTokens    int64            `json:"total_tokens"`
+	ActiveDays     int64            `json:"active_days"`
+	MaxDailyTokens int64            `json:"max_daily_tokens"`
+	CurrentStreak  int64            `json:"current_streak"`
+	LongestStreak  int64            `json:"longest_streak"`
+	PeakDay        *ActivityPeakDay `json:"peak_day,omitempty"`
+	Weeks          []ActivityWeek   `json:"weeks"`
 }
 
 type Overview struct {
@@ -252,15 +263,29 @@ type AnalyticsQuery struct {
 const UnknownProjectFilter = "__unknown__"
 
 type AnalyticsSummary struct {
-	Tokens           int64        `json:"tokens"`
-	Events           int64        `json:"events"`
-	ActiveDays       int64        `json:"active_days"`
-	AverageActiveDay float64      `json:"average_active_day"`
-	UnknownEvents    int64        `json:"unknown_events"`
-	EstimatedCost    CostSummary  `json:"estimated_cost"`
-	Cache            CacheSummary `json:"cache"`
-	SessionTokens    int64        `json:"session_tokens"`
-	Threads          int64        `json:"threads"`
+	Tokens                   int64        `json:"tokens"`
+	Events                   int64        `json:"events"`
+	ActiveDays               int64        `json:"active_days"`
+	AverageActiveDay         float64      `json:"average_active_day"`
+	UnknownEvents            int64        `json:"unknown_events"`
+	EstimatedCost            CostSummary  `json:"estimated_cost"`
+	Cache                    CacheSummary `json:"cache"`
+	CacheSavings             float64      `json:"cache_savings,omitempty"`
+	HasCacheSavings          bool         `json:"has_cache_savings,omitempty"`
+	CacheSavingsPricedTokens int64        `json:"cache_savings_priced_tokens,omitempty"`
+	EffectiveCostPerMillion  float64      `json:"effective_cost_per_million,omitempty"`
+	HasEffectiveCost         bool         `json:"has_effective_cost,omitempty"`
+	SessionTokens            int64        `json:"session_tokens"`
+	Threads                  int64        `json:"threads"`
+}
+
+// EffectiveRatePerMillion returns the estimated API cost per 1M priced tokens
+// and whether any priced tokens exist in the summary.
+func (s AnalyticsSummary) EffectiveRatePerMillion() (float64, bool) {
+	if s.EstimatedCost.PricedTokens <= 0 {
+		return 0, false
+	}
+	return s.EstimatedCost.Amount * 1_000_000 / float64(s.EstimatedCost.PricedTokens), true
 }
 
 type AnalyticsComparison struct {
@@ -286,11 +311,31 @@ type AnalyticsPoint struct {
 }
 
 type AnalyticsBreakdown struct {
-	Name     string  `json:"name"`
-	Tokens   int64   `json:"tokens"`
-	Events   int64   `json:"events"`
-	Sessions int64   `json:"sessions"`
-	Share    float64 `json:"share"`
+	Name                    string  `json:"name"`
+	Tokens                  int64   `json:"tokens"`
+	Events                  int64   `json:"events"`
+	Sessions                int64   `json:"sessions"`
+	Share                   float64 `json:"share"`
+	CachedTokens            int64   `json:"cached_tokens,omitempty"`
+	EligibleCacheTokens     int64   `json:"eligible_cache_tokens,omitempty"`
+	CacheHitRate            float64 `json:"cache_hit_rate,omitempty"`
+	HasCacheRate            bool    `json:"has_cache_rate,omitempty"`
+	Cost                    float64 `json:"cost,omitempty"`
+	PricedTokens            int64   `json:"priced_tokens,omitempty"`
+	HasCost                 bool    `json:"has_cost,omitempty"`
+	CacheSavings            float64 `json:"cache_savings,omitempty"`
+	HasCacheSavings         bool    `json:"has_cache_savings,omitempty"`
+	EffectiveCostPerMillion float64 `json:"effective_cost_per_million,omitempty"`
+	HasEffectiveCost        bool    `json:"has_effective_cost,omitempty"`
+}
+
+// EffectiveRatePerMillion returns the breakdown row's estimated API cost per
+// 1M priced tokens and whether any priced tokens exist in the row.
+func (b AnalyticsBreakdown) EffectiveRatePerMillion() (float64, bool) {
+	if !b.HasCost || b.PricedTokens <= 0 {
+		return 0, false
+	}
+	return b.Cost * 1_000_000 / float64(b.PricedTokens), true
 }
 
 type AnalyticsShareSeries struct {
@@ -509,7 +554,7 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 		catalog:  modelCatalog,
 		location: location,
 		lock:     lock,
-		quotas:   quotas,
+		quotas:   normalizeYAMLQuotas(quotas),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
 	}
@@ -715,6 +760,17 @@ CREATE TABLE IF NOT EXISTS display_aliases (
   alias TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (kind, identity)
+);
+CREATE TABLE IF NOT EXISTS quotas (
+  provider TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+  model TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+  label TEXT NOT NULL DEFAULT '',
+  reset_day INTEGER NOT NULL CHECK (reset_day >= 1 AND reset_day <= 31),
+  tokens_per_month INTEGER CHECK (tokens_per_month IS NULL OR tokens_per_month > 0),
+  cost_per_month REAL CHECK (cost_per_month IS NULL OR cost_per_month > 0),
+  updated_at TEXT NOT NULL,
+  CHECK (tokens_per_month IS NOT NULL OR cost_per_month IS NOT NULL),
+  PRIMARY KEY (provider, model)
 );
 `)
 	if err != nil {
@@ -1476,7 +1532,48 @@ func (s *Store) Activity(ctx context.Context, now time.Time) (ActivityHeatmap, e
 		}
 		result.Weeks = append(result.Weeks, week)
 	}
+	result.CurrentStreak, result.LongestStreak, result.PeakDay = computeActivityStreaks(result.Weeks)
 	return result, nil
+}
+
+func computeActivityStreaks(weeks []ActivityWeek) (currentStreak, longestStreak int64, peakDay *ActivityPeakDay) {
+	var runningStreak int64
+	nonFutureActive := make([]bool, 0, activityWeeks*7)
+	for _, week := range weeks {
+		for _, day := range week.Days {
+			if day.Future {
+				continue
+			}
+			active := day.Events > 0
+			nonFutureActive = append(nonFutureActive, active)
+			if active {
+				runningStreak++
+				if runningStreak > longestStreak {
+					longestStreak = runningStreak
+				}
+			} else {
+				runningStreak = 0
+			}
+			if day.Tokens > 0 && (peakDay == nil || day.Tokens > peakDay.Tokens) {
+				peakDay = &ActivityPeakDay{
+					Date:   day.Date,
+					Label:  day.Label,
+					Tokens: day.Tokens,
+				}
+			}
+		}
+	}
+	if n := len(nonFutureActive); n > 0 {
+		idx := n - 1
+		if !nonFutureActive[idx] && idx > 0 && nonFutureActive[idx-1] {
+			idx--
+		}
+		for idx >= 0 && nonFutureActive[idx] {
+			currentStreak++
+			idx--
+		}
+	}
+	return currentStreak, longestStreak, peakDay
 }
 
 func (s *Store) dateOnly(value time.Time) time.Time {
@@ -2478,12 +2575,45 @@ FROM usage_events WHERE `+where, args...)
 	pointsByBucket := make(map[string]AnalyticsPoint)
 
 	type breakdownAccum struct {
-		tokens   int64
-		events   int64
-		sessions map[string]struct{}
+		tokens              int64
+		events              int64
+		sessions            map[string]struct{}
+		cachedTokens        int64
+		eligibleCacheTokens int64
+		cost                float64
+		pricedTokens        int64
+		hasCost             bool
+		cacheSavings        float64
+		hasCacheSavings     bool
 	}
 	breakdownByName := make(map[string]*breakdownAccum)
 	bucketDimTokens := make(map[string]map[string]int64)
+
+	type modelSavingsInfo struct {
+		eligible          bool
+		savingsPerMillion float64
+	}
+	modelSavingsCache := make(map[string]modelSavingsInfo)
+	lookupSavings := func(modelID string) modelSavingsInfo {
+		if info, ok := modelSavingsCache[modelID]; ok {
+			return info
+		}
+		var info modelSavingsInfo
+		if s.catalog != nil && modelID != "" {
+			if _, model, ok := s.catalog.Resolve(modelID); ok {
+				p := model.Pricing
+				if p.Mode == "standard" && p.InputPricePerMillion != nil && p.CacheReadPricePerMillion != nil {
+					diff := *p.InputPricePerMillion - *p.CacheReadPricePerMillion
+					if diff < 0 {
+						diff = 0
+					}
+					info = modelSavingsInfo{eligible: true, savingsPerMillion: diff}
+				}
+			}
+		}
+		modelSavingsCache[modelID] = info
+		return info
+	}
 
 	for rows.Next() {
 		var timestamp, machine, provider, tool, project, effectiveModel string
@@ -2572,6 +2702,25 @@ FROM usage_events WHERE `+where, args...)
 		if hasSessionNonEmpty {
 			bd.sessions[threadKey] = struct{}{}
 		}
+		if input.Valid && cacheRead.Valid {
+			bd.cachedTokens += cacheRead.Int64
+			bd.eligibleCacheTokens += input.Int64 + cacheRead.Int64
+		}
+		if cost.Valid {
+			bd.cost += cost.Float64
+			bd.hasCost = true
+			if total.Valid {
+				bd.pricedTokens += total.Int64
+			}
+		}
+		if info := lookupSavings(effectiveModel); info.eligible && cacheRead.Valid && cost.Valid && total.Valid {
+			saving := float64(cacheRead.Int64) * info.savingsPerMillion / 1_000_000
+			summary.CacheSavings += saving
+			summary.HasCacheSavings = true
+			summary.CacheSavingsPricedTokens += total.Int64
+			bd.cacheSavings += saving
+			bd.hasCacheSavings = true
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return AnalyticsSummary{}, nil, nil, nil, nil, err
@@ -2584,6 +2733,15 @@ FROM usage_events WHERE `+where, args...)
 	}
 	if summary.Cache.EligibleTokens > 0 {
 		summary.Cache.HitRate = float64(summary.Cache.CachedTokens) / float64(summary.Cache.EligibleTokens)
+	}
+	if rate, ok := summary.EffectiveRatePerMillion(); ok {
+		summary.EffectiveCostPerMillion = rate
+		summary.HasEffectiveCost = true
+	}
+	if summary.EstimatedCost.PricedTokens <= 0 {
+		summary.CacheSavings = 0
+		summary.HasCacheSavings = false
+		summary.CacheSavingsPricedTokens = 0
 	}
 
 	rawPoints := make([]AnalyticsPoint, 0, len(pointsByBucket))
@@ -2599,13 +2757,32 @@ FROM usage_events WHERE `+where, args...)
 		breakdown = make([]AnalyticsBreakdown, 0, len(breakdownByName))
 		for name, bd := range breakdownByName {
 			item := AnalyticsBreakdown{
-				Name:     name,
-				Tokens:   bd.tokens,
-				Events:   bd.events,
-				Sessions: int64(len(bd.sessions)),
+				Name:                name,
+				Tokens:              bd.tokens,
+				Events:              bd.events,
+				Sessions:            int64(len(bd.sessions)),
+				CachedTokens:        bd.cachedTokens,
+				EligibleCacheTokens: bd.eligibleCacheTokens,
+				PricedTokens:        bd.pricedTokens,
 			}
 			if summary.Tokens > 0 {
 				item.Share = float64(item.Tokens) / float64(summary.Tokens)
+			}
+			if bd.eligibleCacheTokens > 0 {
+				item.CacheHitRate = float64(bd.cachedTokens) / float64(bd.eligibleCacheTokens)
+				item.HasCacheRate = true
+			}
+			if bd.hasCost {
+				item.Cost = bd.cost
+				item.HasCost = true
+			}
+			if rate, ok := item.EffectiveRatePerMillion(); ok {
+				item.EffectiveCostPerMillion = rate
+				item.HasEffectiveCost = true
+			}
+			if bd.hasCacheSavings && bd.pricedTokens > 0 {
+				item.CacheSavings = bd.cacheSavings
+				item.HasCacheSavings = true
 			}
 			breakdown = append(breakdown, item)
 		}

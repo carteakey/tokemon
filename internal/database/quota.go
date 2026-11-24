@@ -11,6 +11,237 @@ import (
 )
 
 const (
+	QuotaSourceYAML   = "yaml"
+	QuotaSourceSQLite = "sqlite"
+)
+
+// ConfiguredQuota is one effective quota definition together with its origin
+// (YAML config vs SQLite UI store) and override metadata.
+type ConfiguredQuota struct {
+	quota.Quota
+	Source        string `json:"source"`
+	OverridesYAML bool   `json:"overrides_yaml,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+}
+
+func normalizeYAMLQuotas(quotas []quota.Quota) []quota.Quota {
+	if len(quotas) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(quotas))
+	out := make([]quota.Quota, 0, len(quotas))
+	for _, q := range quotas {
+		norm := quota.Normalize(q)
+		key := quota.Key(norm.Provider, norm.Model)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, cloneQuota(norm))
+	}
+	return out
+}
+
+func cloneQuota(q quota.Quota) quota.Quota {
+	if q.Budget.TokensPerMonth != nil {
+		v := *q.Budget.TokensPerMonth
+		q.Budget.TokensPerMonth = &v
+	}
+	if q.Budget.CostPerMonth != nil {
+		v := *q.Budget.CostPerMonth
+		q.Budget.CostPerMonth = &v
+	}
+	return q
+}
+
+func cloneConfiguredQuotas(items []ConfiguredQuota) []ConfiguredQuota {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]ConfiguredQuota, len(items))
+	for i, item := range items {
+		item.Quota = cloneQuota(item.Quota)
+		out[i] = item
+	}
+	return out
+}
+
+func orderedQuotaList(quotas []quota.Quota) []quota.Quota {
+	ordered := make([]quota.Quota, len(quotas))
+	for i, q := range quotas {
+		ordered[i] = cloneQuota(q)
+	}
+	sort.SliceStable(ordered, func(left, right int) bool {
+		return quota.Specificity(ordered[left]) < quota.Specificity(ordered[right])
+	})
+	return ordered
+}
+
+func orderedQuotaListFromConfigured(configured []ConfiguredQuota) []quota.Quota {
+	ordered := make([]quota.Quota, len(configured))
+	for i, item := range configured {
+		ordered[i] = cloneQuota(item.Quota)
+	}
+	return ordered
+}
+
+func mergeQuotas(yamlQuotas []quota.Quota, sqliteRows []ConfiguredQuota) []ConfiguredQuota {
+	sqliteByKey := make(map[string]ConfiguredQuota, len(sqliteRows))
+	for _, row := range sqliteRows {
+		sqliteByKey[quota.Key(row.Provider, row.Model)] = row
+	}
+	consumed := make(map[string]struct{}, len(sqliteRows))
+	merged := make([]ConfiguredQuota, 0, len(yamlQuotas)+len(sqliteRows))
+	for _, yq := range yamlQuotas {
+		key := quota.Key(yq.Provider, yq.Model)
+		if override, ok := sqliteByKey[key]; ok {
+			override.Source = QuotaSourceSQLite
+			override.OverridesYAML = true
+			merged = append(merged, override)
+			consumed[key] = struct{}{}
+			continue
+		}
+		merged = append(merged, ConfiguredQuota{
+			Quota:  cloneQuota(yq),
+			Source: QuotaSourceYAML,
+		})
+	}
+	for _, row := range sqliteRows {
+		key := quota.Key(row.Provider, row.Model)
+		if _, ok := consumed[key]; ok {
+			continue
+		}
+		row.Source = QuotaSourceSQLite
+		row.OverridesYAML = false
+		merged = append(merged, row)
+	}
+	sort.SliceStable(merged, func(left, right int) bool {
+		return quota.Specificity(merged[left].Quota) < quota.Specificity(merged[right].Quota)
+	})
+	return merged
+}
+
+func (s *Store) resetQuotaConfigAndCache() {
+	s.quotaMu.Lock()
+	s.quotaGeneration++
+	s.quotaConfigLoaded = false
+	s.mergedConfigCache = nil
+	s.quotaCache = nil
+	s.quotaMu.Unlock()
+}
+
+func (s *Store) effectiveQuotas(ctx context.Context) ([]ConfiguredQuota, error) {
+	for {
+		s.quotaMu.Lock()
+		if s.quotaConfigLoaded {
+			cloned := cloneConfiguredQuotas(s.mergedConfigCache)
+			s.quotaMu.Unlock()
+			return cloned, nil
+		}
+		gen := s.quotaGeneration
+		s.quotaMu.Unlock()
+
+		rows, err := s.readHandle().QueryContext(ctx, `SELECT provider, model, label, reset_day, tokens_per_month, cost_per_month, updated_at
+FROM quotas
+ORDER BY LOWER(provider), LOWER(model)`)
+		if err != nil {
+			return nil, err
+		}
+		var sqliteRows []ConfiguredQuota
+		for rows.Next() {
+			var item ConfiguredQuota
+			var tokens sql.NullInt64
+			var cost sql.NullFloat64
+			if err := rows.Scan(&item.Provider, &item.Model, &item.Label, &item.ResetDay, &tokens, &cost, &item.UpdatedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			item.Quota = quota.Normalize(item.Quota)
+			item.Budget.TokensPerMonth = nullInt64(tokens)
+			item.Budget.CostPerMonth = nullFloat64(cost)
+			item.Source = QuotaSourceSQLite
+			sqliteRows = append(sqliteRows, item)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+
+		merged := mergeQuotas(s.quotas, sqliteRows)
+
+		s.quotaMu.Lock()
+		if s.quotaGeneration == gen {
+			s.mergedConfigCache = cloneConfiguredQuotas(merged)
+			s.quotaConfigLoaded = true
+			s.quotaMu.Unlock()
+			return merged, nil
+		}
+		s.quotaMu.Unlock()
+
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// Quotas returns the effective merged quota configuration (SQLite overrides
+// YAML on matching normalized (provider, model) keys) sorted stably by
+// specificity.
+func (s *Store) Quotas(ctx context.Context) ([]ConfiguredQuota, error) {
+	return s.effectiveQuotas(ctx)
+}
+
+// UpsertQuota validates, normalizes, and stores a quota in SQLite, overriding
+// any matching YAML quota, and immediately invalidates Store quota caches.
+func (s *Store) UpsertQuota(ctx context.Context, candidate quota.Quota) error {
+	candidate = quota.Normalize(candidate)
+	if err := quota.Validate(candidate); err != nil {
+		return err
+	}
+	var costArg any
+	if candidate.Budget.CostPerMonth != nil {
+		costArg = *candidate.Budget.CostPerMonth
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO quotas (
+  provider, model, label, reset_day, tokens_per_month, cost_per_month, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(provider, model) DO UPDATE SET
+  provider = excluded.provider,
+  model = excluded.model,
+  label = excluded.label,
+  reset_day = excluded.reset_day,
+  tokens_per_month = excluded.tokens_per_month,
+  cost_per_month = excluded.cost_per_month,
+  updated_at = excluded.updated_at`,
+		candidate.Provider, candidate.Model, candidate.Label, candidate.ResetDay,
+		ptrValue(candidate.Budget.TokensPerMonth), costArg, updatedAt,
+	); err != nil {
+		return err
+	}
+	s.resetQuotaConfigAndCache()
+	return nil
+}
+
+// DeleteQuota removes a SQLite-stored quota matching (provider, model) case-
+// insensitively and immediately invalidates Store quota caches if a row was
+// removed. Deleting an override restores any underlying YAML quota.
+func (s *Store) DeleteQuota(ctx context.Context, provider, model string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM quotas WHERE provider = ? AND model = ?`, provider, model)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows > 0 {
+		s.resetQuotaConfigAndCache()
+	}
+	return nil
+}
+
+const (
 	quotaCacheTTL           = time.Minute
 	quotaMinRefreshInterval = 2 * time.Second
 )
@@ -66,25 +297,23 @@ type QuotaStatus struct {
 	State string `json:"state"`
 }
 
-func (s *Store) orderedQuotas() []quota.Quota {
-	ordered := make([]quota.Quota, len(s.quotas))
-	copy(ordered, s.quotas)
-	sort.SliceStable(ordered, func(left, right int) bool {
-		return quota.Specificity(ordered[left]) < quota.Specificity(ordered[right])
-	})
-	return ordered
-}
-
 // QuotaStatus measures every configured quota over its current period in the
 // store's reporting timezone. Each usage event is attributed to exactly one
 // quota — the most specific match — so overlapping quotas never double-count
 // an event. With no quotas configured it returns nil — the dashboard renders
 // an explicit Unknown state for that case itself.
 func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
-	if len(s.quotas) == 0 {
+	loc := s.reportingLocation()
+	configured, err := s.effectiveQuotas(ctx)
+	if err != nil {
+		if len(s.quotas) == 0 {
+			return nil
+		}
+		return unknownQuotaStatuses(orderedQuotaList(s.quotas), loc, now)
+	}
+	if len(configured) == 0 {
 		return nil
 	}
-	loc := s.reportingLocation()
 	localDay := now.In(loc).Format("2006-01-02")
 
 	for {
@@ -103,9 +332,19 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 			s.quotaMu.Unlock()
 			select {
 			case <-ready:
+				configured, err = s.effectiveQuotas(ctx)
+				if err != nil {
+					if len(s.quotas) == 0 {
+						return nil
+					}
+					return unknownQuotaStatuses(orderedQuotaList(s.quotas), loc, now)
+				}
+				if len(configured) == 0 {
+					return nil
+				}
 				continue
 			case <-ctx.Done():
-				return unknownQuotaStatuses(s.orderedQuotas(), loc, now)
+				return unknownQuotaStatuses(orderedQuotaListFromConfigured(configured), loc, now)
 			}
 		}
 		generation := s.quotaGeneration
@@ -126,7 +365,7 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 		close(ready)
 
 		if !ok {
-			return unknownQuotaStatuses(s.orderedQuotas(), loc, now)
+			return unknownQuotaStatuses(orderedQuotaListFromConfigured(configured), loc, now)
 		}
 		return buildQuotaStatuses(entry, loc, now)
 	}
@@ -174,7 +413,11 @@ func (s *Store) invalidateQuotaCache() {
 }
 
 func (s *Store) computeQuotaCacheEntry(ctx context.Context, localDay string, now time.Time) (*quotaCacheEntry, bool) {
-	ordered := s.orderedQuotas()
+	configuredQuotas, err := s.effectiveQuotas(ctx)
+	if err != nil {
+		return nil, false
+	}
+	ordered := orderedQuotaListFromConfigured(configuredQuotas)
 	loc := s.reportingLocation()
 	measurements := make([]quotaMeasurement, 0, len(ordered))
 	var windowStart, windowEnd time.Time

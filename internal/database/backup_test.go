@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,7 +98,7 @@ func TestScheduledBackupRetentionUsesUTCAndPreservesMigrationSnapshots(t *testin
 			t.Fatal(err)
 		}
 	}
-	files, err := filepath.Glob(filepath.Join(destination, "tokemon-backup-v4-*.db"))
+	files, err := filepath.Glob(filepath.Join(destination, fmt.Sprintf("tokemon-backup-v%d-*.db", databaseSchemaVersion)))
 	if err != nil || len(files) != 2 {
 		t.Fatalf("scheduled backups = %v, err = %v", files, err)
 	}
@@ -276,7 +277,7 @@ PRAGMA user_version = 3;`
 		t.Fatal(err)
 	}
 	// Opening the old-schema restore runs the existing CAR-79 migration backup
-	// before mutating it, then preserves the event through schema v4.
+	// before mutating it, then preserves the event through the current schema version.
 	store, err := Open(destinationPath, catalog.Empty())
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +287,7 @@ PRAGMA user_version = 3;`
 	if err != nil || len(events) != 1 || events[0].EventID != "legacy-event" {
 		t.Fatalf("migrated events=%+v err=%v", events, err)
 	}
-	migrationBackups, err := filepath.Glob(filepath.Join(filepath.Dir(destinationPath), "backups", "tokemon-v3-before-v4-*.db"))
+	migrationBackups, err := filepath.Glob(filepath.Join(filepath.Dir(destinationPath), "backups", fmt.Sprintf("tokemon-v3-before-v%d-*.db", databaseSchemaVersion)))
 	if err != nil || len(migrationBackups) != 1 {
 		t.Fatalf("migration backups=%v err=%v", migrationBackups, err)
 	}

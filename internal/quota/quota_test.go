@@ -1,6 +1,7 @@
 package quota
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,3 +229,78 @@ func TestPeriodForDSTTransitions(t *testing.T) {
 		t.Fatalf("DST fall end = %s (%s)", end, end.UTC())
 	}
 }
+
+func TestValidateRejectsNonFiniteCostAndUnsafeText(t *testing.T) {
+	tokens := int64(100)
+	for _, tc := range []struct {
+		name  string
+		quota Quota
+	}{
+		{"NaN cost", Quota{ResetDay: 1, Budget: Budget{CostPerMonth: ptrFloat(math.NaN())}}},
+		{"+Inf cost", Quota{ResetDay: 1, Budget: Budget{CostPerMonth: ptrFloat(math.Inf(1))}}},
+		{"-Inf cost", Quota{ResetDay: 1, Budget: Budget{CostPerMonth: ptrFloat(math.Inf(-1))}}},
+		{"provider NUL", Quota{Provider: "openai\x00", ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+		{"model newline", Quota{Model: "gpt-5\n", ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+		{"label CR", Quota{Label: "bad\rlabel", ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+		{"provider too long", Quota{Provider: strings.Repeat("a", maxProviderRunes+1), ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+		{"model too long", Quota{Model: strings.Repeat("m", maxModelRunes+1), ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+		{"label too long", Quota{Label: strings.Repeat("l", maxLabelRunes+1), ResetDay: 1, Budget: Budget{TokensPerMonth: &tokens}}},
+	} {
+		if err := Validate(tc.quota); err == nil {
+			t.Errorf("%s: expected validation error, got nil", tc.name)
+		}
+	}
+}
+
+func TestNormalizeKeySpecificityAndCaseInsensitiveMatch(t *testing.T) {
+	tokens := int64(1000)
+	raw := Quota{
+		Provider: "  OpenAI ",
+		Model:    " GPT-5.4 ",
+		Label:    "  OpenAI Sol ",
+		ResetDay: 1,
+		Budget:   Budget{TokensPerMonth: &tokens},
+	}
+	norm := Normalize(raw)
+	if norm.Provider != "openai" || norm.Model != "GPT-5.4" || norm.Label != "OpenAI Sol" {
+		t.Fatalf("Normalize = %+v", norm)
+	}
+	if Key("OpenAI", "GPT-5.4") != Key("  openai ", " gpt-5.4") {
+		t.Fatalf("Key mismatch: %q vs %q", Key("OpenAI", "GPT-5.4"), Key("  openai ", " gpt-5.4"))
+	}
+	if got := Specificity(Quota{Provider: "   ", Model: "\t"}); got != 2 {
+		t.Fatalf("whitespace-only Specificity = %d, want 2", got)
+	}
+	if !Match(raw, "openai", "gpt-5.4") || !Match(raw, "OPENAI", "  GPT-5.4 ") {
+		t.Fatal("expected case-insensitive trimmed Match to succeed")
+	}
+	if Match(raw, "anthropic", "gpt-5.4") {
+		t.Fatal("unexpected provider match")
+	}
+}
+
+func TestLoadRejectsCaseAndWhitespaceDuplicates(t *testing.T) {
+	document := `schema_version: 1
+quotas:
+  - provider: " OpenAI "
+    model: "gpt-5.4"
+    label: " First "
+    reset_day: 1
+    budget:
+      tokens_per_month: 100
+  - provider: "openai"
+    model: " GPT-5.4 "
+    reset_day: 2
+    budget:
+      tokens_per_month: 200
+`
+	path := filepath.Join(t.TempDir(), "quotas.yaml")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "duplicates quota 1") {
+		t.Fatalf("Load duplicate err = %v, want duplicate error", err)
+	}
+}
+
+func ptrFloat(v float64) *float64 { return &v }
