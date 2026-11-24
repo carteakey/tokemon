@@ -57,11 +57,10 @@ func BenchmarkAnalyticsStages(b *testing.B) {
 	query := AnalyticsQuery{Period: "30d", Dimension: "providers", Now: time.Now().UTC()}
 	normalized, start, end := store.normalizeAnalyticsQuery(query)
 	where, args := analyticsWhere(normalized, start, end)
-	db := store.db
-	b.Run("summary", func(b *testing.B) {
-		var summary AnalyticsSummary
+	db := store.readHandle()
+	b.Run("aggregate", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			if err := store.analyticsSummary(ctx, where, args, &summary); err != nil {
+			if _, _, _, _, _, err := store.analyticsAggregate(ctx, normalized, where, args, start, end); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -75,32 +74,6 @@ func BenchmarkAnalyticsStages(b *testing.B) {
 			if err := db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens),0), COUNT(*),
 COUNT(*) FILTER (WHERE total_tokens IS NULL) FROM usage_events WHERE `+where, args...).
 				Scan(&tokens, &events, &unknown); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-	b.Run("points", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			if _, err := store.analyticsPoints(ctx, normalized, where, args); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-	b.Run("breakdown", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			if _, err := store.analyticsBreakdown(ctx, normalized, where, args, 1); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-	b.Run("share-timeline", func(b *testing.B) {
-		breakdown, err := store.analyticsBreakdown(ctx, normalized, where, args, 1)
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			if _, _, err := store.analyticsShareTimeline(ctx, normalized, where, args, start, end, breakdown, 1); err != nil {
 				b.Fatal(err)
 			}
 		}

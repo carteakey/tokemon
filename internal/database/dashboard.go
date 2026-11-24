@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,7 +124,7 @@ func (s *Store) PeriodSummary(ctx context.Context, start, end time.Time) (Period
 	if !end.After(start) {
 		return result, nil
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT
+	row := s.readHandle().QueryRowContext(ctx, `SELECT
 COUNT(*),
 COALESCE(SUM(CASE WHEN total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0),
@@ -155,10 +156,14 @@ func NormalizeSessionSort(sort, dir string) (string, string) {
 	return sort, dir
 }
 
-// sessionOrderBy builds the session-table ORDER BY from a validated sort key.
-// Only whitelisted literals reach the query; rows with an unknown sort value
-// (NULL aggregate) sort last regardless of direction, and timestamp breaks ties.
-func sessionOrderBy(sort, dir string) string {
+// sessionOrderBy builds the session-table ORDER BY and LIMIT from a validated
+// sort key. Only whitelisted literals reach the query; rows with an unknown
+// sort value (NULL aggregate) sort last regardless of direction, and timestamp
+// breaks ties.
+func sessionOrderBy(sort, dir string, limit int) string {
+	if limit <= 0 {
+		limit = 100
+	}
 	expressions := map[string]string{
 		"when":     "MAX(timestamp)",
 		"tokens":   "CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END",
@@ -166,20 +171,30 @@ func sessionOrderBy(sort, dir string) string {
 		"duration": "CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END",
 	}
 	column := expressions[sort]
-	return "ORDER BY " + column + " IS NULL ASC, " + column + " " + strings.ToUpper(dir) + ", MAX(timestamp) DESC LIMIT 100"
+	return "ORDER BY " + column + " IS NULL ASC, " + column + " " + strings.ToUpper(dir) + ", MAX(timestamp) DESC LIMIT " + strconv.Itoa(limit)
 }
 
 func (s *Store) Sessions(ctx context.Context, query AnalyticsQuery) ([]SessionRecord, error) {
-	return s.SessionsWithSort(ctx, query, "when", "desc")
+	return s.SessionsWithLimit(ctx, query, "when", "desc", 100)
 }
 
 // SessionsWithSort returns the session table ordered by the validated sort key
 // (when, tokens, cost, or duration) in the requested direction.
 func (s *Store) SessionsWithSort(ctx context.Context, query AnalyticsQuery, sort, dir string) ([]SessionRecord, error) {
+	return s.SessionsWithLimit(ctx, query, sort, dir, 100)
+}
+
+// SessionsWithLimit returns up to limit sessions ordered by the validated sort
+// key (when, tokens, cost, or duration) in the requested direction. A limit
+// <= 0 defaults to 100.
+func (s *Store) SessionsWithLimit(ctx context.Context, query AnalyticsQuery, sort, dir string, limit int) ([]SessionRecord, error) {
 	sort, dir = NormalizeSessionSort(sort, dir)
+	if limit <= 0 {
+		limit = 100
+	}
 	query, start, end := s.normalizeAnalyticsQuery(query)
 	where, args := analyticsWhere(query, start, end)
-	rows, err := s.db.QueryContext(ctx, `SELECT
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT
 MAX(timestamp),
 MAX(NULLIF(session_id, '')),
 machine_id,
@@ -197,7 +212,7 @@ CASE WHEN COUNT(DISTINCT token_accuracy) = 1 THEN MAX(token_accuracy) ELSE 'unkn
 COUNT(*)
 FROM usage_events WHERE `+where+` AND NULLIF(session_id, '') IS NOT NULL
 GROUP BY session_id, machine_id, provider, tool
-`+sessionOrderBy(sort, dir), args...)
+`+sessionOrderBy(sort, dir, limit), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -273,10 +288,15 @@ func syncAgeLabel(elapsed time.Duration) string {
 }
 
 func (s *Store) MachinesAt(ctx context.Context, now time.Time) ([]MachineInfo, error) {
+	machines, _, err := s.machinesAndTotalsAt(ctx, now)
+	return machines, err
+}
+
+func (s *Store) machinesAndTotalsAt(ctx context.Context, now time.Time) ([]MachineInfo, []MachineTotal, error) {
 	now = now.In(s.reportingLocation())
 	today := s.dateOnly(now)
 	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
-	usageRows, err := s.db.QueryContext(ctx, `SELECT machine_id,
+	usageRows, err := s.readHandle().QueryContext(ctx, `SELECT machine_id,
 COALESCE(SUM(total_tokens), 0),
 COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0)
@@ -284,7 +304,7 @@ FROM usage_events GROUP BY machine_id`,
 		today.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339),
 		weekStart.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	type usageTotals struct{ lifetime, today, week int64 }
 	byMachine := make(map[string]usageTotals)
@@ -293,19 +313,33 @@ FROM usage_events GROUP BY machine_id`,
 		var totals usageTotals
 		if err := usageRows.Scan(&id, &totals.lifetime, &totals.today, &totals.week); err != nil {
 			usageRows.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		byMachine[id] = totals
 	}
 	if err := usageRows.Close(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, operating_system, architecture, agent_version,
+	var machineTotals []MachineTotal
+	if len(byMachine) > 0 {
+		machineTotals = make([]MachineTotal, 0, len(byMachine))
+		for machineID, totals := range byMachine {
+			machineTotals = append(machineTotals, MachineTotal{Machine: machineID, Tokens: totals.lifetime})
+		}
+		sort.Slice(machineTotals, func(left, right int) bool {
+			if machineTotals[left].Tokens == machineTotals[right].Tokens {
+				return machineTotals[left].Machine < machineTotals[right].Machine
+			}
+			return machineTotals[left].Tokens > machineTotals[right].Tokens
+		})
+	}
+
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT id, name, operating_system, architecture, agent_version,
 detected_adapters, source_count, source_error_count, first_seen_at, last_seen_at
 FROM machines ORDER BY last_seen_at DESC, id`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	var result []MachineInfo
@@ -315,7 +349,7 @@ FROM machines ORDER BY last_seen_at DESC, id`)
 		if err := rows.Scan(&machine.ID, &machine.Name, &machine.OperatingSystem, &machine.Architecture,
 			&machine.AgentVersion, &adapterList, &machine.SourceCount, &machine.SourceErrorCount,
 			&machine.FirstSeenAt, &machine.LastSeenAt); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		machine.DetectedAdapters = splitAdapterIDs(adapterList)
 		totals := byMachine[machine.ID]
@@ -333,24 +367,24 @@ FROM machines ORDER BY last_seen_at DESC, id`)
 		result = append(result, machine)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	health, err := s.machineSourceHealth(ctx, now)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for index := range result {
 		result[index].Sources = health[result[index].ID]
 	}
-	return result, nil
+	return result, machineTotals, nil
 }
 
 // machineSourceHealth loads every machine's per-source connector health and
 // derives the display state and age. Machines whose agents predate the field
 // have no rows and keep their machine-level sync context only.
 func (s *Store) machineSourceHealth(ctx context.Context, now time.Time) (map[string][]MachineSourceHealth, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT machine_id, adapter, source_hash, last_successful_sync, last_error_class
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT machine_id, adapter, source_hash, last_successful_sync, last_error_class
 FROM machine_source_health ORDER BY machine_id, adapter, source_hash`)
 	if err != nil {
 		return nil, err
@@ -401,7 +435,7 @@ func (s *Store) CatalogSnapshot(ctx context.Context) (CatalogSnapshot, error) {
 	if s.catalog == nil {
 		return result, nil
 	}
-	usageRows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
+	usageRows, err := s.readHandle().QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
 COALESCE(SUM(total_tokens), 0), COUNT(*), COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
 FROM usage_events GROUP BY 1`)
 	if err != nil {

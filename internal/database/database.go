@@ -8,9 +8,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/catalog"
@@ -22,12 +24,13 @@ import (
 
 type Store struct {
 	db       *sql.DB
+	readDB   *sql.DB
 	catalog  *catalog.Catalog
 	location *time.Location
 	lock     *databaseLock
 	quotas   []quota.Quota
 
-	facetsMu      sync.Mutex
+	facetsMu      sync.RWMutex
 	facetsCache   *AnalyticsFacets
 	facetsFetched time.Time
 
@@ -35,6 +38,18 @@ type Store struct {
 	aliasesCache  []DisplayAlias
 	aliasesCached bool
 
+	quotaMu         sync.Mutex
+	quotaCache      *quotaCacheEntry
+	quotaReady      chan struct{}
+	quotaReadyDay   string
+	quotaGeneration uint64
+	quotaRefreshes  atomic.Int64
+
+	bgMu      sync.Mutex
+	bgClosed  bool
+	bgCtx     context.Context
+	bgCancel  context.CancelFunc
+	bgWG      sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -426,7 +441,13 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	var dsn string
+	if fileBacked {
+		dsn = sqliteFileDSN(path, false)
+	} else {
+		dsn = path
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		if lock != nil {
 			_ = lock.Close()
@@ -434,12 +455,22 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-		db.Close()
-		if lock != nil {
-			_ = lock.Close()
+	if !fileBacked {
+		for _, pragma := range []string{
+			"PRAGMA busy_timeout = 5000",
+			"PRAGMA synchronous = NORMAL",
+			"PRAGMA cache_size = -64000",
+			"PRAGMA temp_store = MEMORY",
+			"PRAGMA mmap_size = 268435456",
+		} {
+			if _, err := db.Exec(pragma); err != nil {
+				db.Close()
+				if lock != nil {
+					_ = lock.Close()
+				}
+				return nil, fmt.Errorf("configure database pragma (%s): %w", pragma, err)
+			}
 		}
-		return nil, fmt.Errorf("configure database busy timeout: %w", err)
 	}
 	if fileBacked {
 		var journalMode string
@@ -458,7 +489,16 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 			return nil, fmt.Errorf("enable database WAL mode: got %q", journalMode)
 		}
 	}
-	store := &Store{db: db, catalog: modelCatalog, location: location, lock: lock, quotas: quotas}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	store := &Store{
+		db:       db,
+		catalog:  modelCatalog,
+		location: location,
+		lock:     lock,
+		quotas:   quotas,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
+	}
 	if existing {
 		version, err := schemaVersion(context.Background(), db)
 		if err != nil {
@@ -476,7 +516,66 @@ func OpenWithLocation(path string, modelCatalog *catalog.Catalog, location *time
 		_ = store.Close()
 		return nil, err
 	}
+	if fileBacked {
+		readDB, err := sql.Open("sqlite", sqliteFileDSN(path, true))
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("open read-only database pool: %w", err)
+		}
+		readDB.SetMaxOpenConns(4)
+		readDB.SetMaxIdleConns(4)
+		store.readDB = readDB
+		if err := readDB.PingContext(context.Background()); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("open read-only database pool: %w", err)
+		}
+	} else {
+		store.readDB = db
+	}
 	return store, nil
+}
+
+func sqliteFileDSN(absPath string, readOnly bool) string {
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	q.Add("_pragma", "cache_size(-64000)")
+	q.Add("_pragma", "temp_store(MEMORY)")
+	q.Add("_pragma", "mmap_size(268435456)")
+	if readOnly {
+		q.Set("mode", "ro")
+		q.Add("_pragma", "query_only(1)")
+	}
+	u := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absPath),
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+func (s *Store) readHandle() *sql.DB {
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db
+}
+
+func (s *Store) backgroundContext() context.Context {
+	if s.bgCtx != nil {
+		return s.bgCtx
+	}
+	return context.Background()
+}
+
+func (s *Store) tryStartBackground() bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgClosed || s.bgCtx == nil {
+		return false
+	}
+	s.bgWG.Add(1)
+	return true
 }
 
 func (s *Store) Close() error {
@@ -484,7 +583,24 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closeOnce.Do(func() {
-		s.closeErr = s.db.Close()
+		s.bgMu.Lock()
+		s.bgClosed = true
+		cancel := s.bgCancel
+		s.bgMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		s.bgWG.Wait()
+
+		var readErr error
+		if s.readDB != nil && s.readDB != s.db {
+			readErr = s.readDB.Close()
+		}
+		var writeErr error
+		if s.db != nil {
+			writeErr = s.db.Close()
+		}
+		s.closeErr = errors.Join(readErr, writeErr)
 		if s.lock != nil {
 			s.closeErr = errors.Join(s.closeErr, s.lock.Close())
 		}
@@ -497,7 +613,7 @@ func (s *Store) Close() error {
 // the process is alive while the database is unavailable.
 func (s *Store) Ready(ctx context.Context) error {
 	var result int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&result); err != nil {
+	if err := s.readHandle().QueryRowContext(ctx, `SELECT 1`).Scan(&result); err != nil {
 		return err
 	}
 	if result != 1 {
@@ -669,6 +785,9 @@ WHERE adapter = 'codex'
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_project_sessions ON usage_events(project, machine_id, provider, tool, session_id, total_tokens)`); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_sessions_timestamp ON usage_events(timestamp DESC, session_id, machine_id, provider, tool)`); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, databaseSchemaVersion))
 	return err
 }
@@ -757,6 +876,23 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 	}
 	defer tx.Rollback()
 
+	var (
+		facetsNeedInvalidate bool
+		addedMachines        map[string]struct{}
+		addedProviders       map[string]struct{}
+		addedModels          map[string]struct{}
+		addedTools           map[string]struct{}
+	)
+	addFacet := func(dst *map[string]struct{}, val string) {
+		if val == "" {
+			return
+		}
+		if *dst == nil {
+			*dst = make(map[string]struct{})
+		}
+		(*dst)[val] = struct{}{}
+	}
+
 	for index, event := range events {
 		// Normalize project labels before validation and persistence so local
 		// ingestion never stores a filesystem path. The API rejects paths before
@@ -793,10 +929,14 @@ AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens 
 			// (TotalTokens nil, components preserved) must keep the aggregate
 			// counting until a corrected event with a real total arrives,
 			// otherwise the session's contribution collapses to zero.
-			if _, err := tx.ExecContext(ctx, `DELETE FROM usage_events
+			res, err := tx.ExecContext(ctx, `DELETE FROM usage_events
 WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
-AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, event.MachineID, event.SessionID); err != nil {
+AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, event.MachineID, event.SessionID)
+			if err != nil {
 				return result, err
+			}
+			if deleted, err := res.RowsAffected(); err == nil && deleted > 0 {
+				facetsNeedInvalidate = true
 			}
 		}
 		canonicalModel := event.CanonicalModel
@@ -808,6 +948,10 @@ AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL
 					estimatedCost, _ = catalog.Estimate(event, model)
 				}
 			}
+		}
+		effectiveModel := canonicalModel
+		if effectiveModel == "" {
+			effectiveModel = event.Model
 		}
 		cost := event.Cost
 		costEstimated := 0
@@ -842,25 +986,35 @@ adapter, adapter_version
 			// Some local providers expose a mutable aggregate per session rather
 			// than append-only records. Keep the deterministic event ID stable and
 			// refresh the snapshot so periodic scans do not double-count it.
-			updated, err := refreshUsageEvent(ctx, tx, event, args)
+			updated, facetsChanged, err := refreshUsageEvent(ctx, tx, event, effectiveModel, args)
 			if err != nil {
 				return result, err
 			}
 			if !updated {
 				return result, fmt.Errorf("usage event %q was ignored without a matching stored row", event.EventID)
 			}
+			if facetsChanged {
+				facetsNeedInvalidate = true
+			}
 			result.Duplicates++
 		} else {
 			result.Accepted++
+			addFacet(&addedMachines, event.MachineID)
+			addFacet(&addedProviders, event.Provider)
+			addFacet(&addedModels, effectiveModel)
+			addFacet(&addedTools, event.Tool)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return result, err
 	}
-	if result.Accepted > 0 || result.Duplicates > 0 {
-		// A refresh can change canonical_model without a new accepted row, so
-		// any successful write invalidates the cached facets.
+	if facetsNeedInvalidate {
 		s.invalidateFacetsCache()
+	} else if result.Accepted > 0 {
+		s.mergeFacetsCache(addedMachines, addedProviders, addedModels, addedTools)
+	}
+	if result.Accepted > 0 || result.Duplicates > 0 || facetsNeedInvalidate {
+		s.invalidateQuotaCache()
 	}
 	after, err := s.LifetimeTokens(ctx)
 	if err != nil {
@@ -882,7 +1036,15 @@ func usageEventArgs(event usage.Event, canonicalModel string, cost *float64, cos
 	}
 }
 
-func refreshUsageEvent(ctx context.Context, tx *sql.Tx, event usage.Event, args []any) (bool, error) {
+func refreshUsageEvent(ctx context.Context, tx *sql.Tx, event usage.Event, effectiveModel string, args []any) (bool, bool, error) {
+	var oldMachine, oldProvider, oldModel, oldTool string
+	err := tx.QueryRowContext(ctx, `SELECT machine_id, provider, COALESCE(NULLIF(canonical_model, ''), raw_model), tool FROM usage_events WHERE event_id = ?`, event.EventID).
+		Scan(&oldMachine, &oldProvider, &oldModel, &oldTool)
+	haveOld := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, false, err
+	}
+
 	updateArgs := append([]any{args[0]}, args[1:]...)
 	updateArgs = append(updateArgs, event.EventID)
 	res, err := tx.ExecContext(ctx, `UPDATE OR IGNORE usage_events SET
@@ -892,44 +1054,45 @@ total_tokens=?, cost=?, cost_estimated=?, currency=?, session_id=?, duration_ms=
 adapter=?, adapter_version=?
 WHERE event_id=?`, updateArgs...)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if rows > 0 {
-		return true, nil
+		facetsChanged := !haveOld || oldMachine != event.MachineID || oldProvider != event.Provider || oldModel != effectiveModel || oldTool != event.Tool
+		return true, facetsChanged, nil
 	}
 
 	if !isDetailedCodexEvent(event) {
 		var exists bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM usage_events WHERE event_id = ?)`, event.EventID).Scan(&exists); err != nil {
-			return false, err
+			return false, false, err
 		}
-		return exists, nil
+		return exists, false, nil
 	}
 
 	duplicateID, found, err := findDetailedCodexDuplicate(ctx, tx, event)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !found {
 		var exists bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM usage_events WHERE event_id = ?)`, event.EventID).Scan(&exists); err != nil {
-			return false, err
+			return false, false, err
 		}
-		return exists, nil
+		return exists, false, nil
 	}
 	if duplicateID == event.EventID {
-		return true, nil
+		return true, false, nil
 	}
 
 	// A corrected event may have the same dedup dimensions as another row while
 	// its old event ID still occupies the row being refreshed. Keep one canonical
 	// row and migrate the dedup winner to the incoming event ID.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_events WHERE event_id = ?`, event.EventID); err != nil {
-		return false, err
+		return false, false, err
 	}
 	updateArgs = append([]any{args[0]}, args[1:]...)
 	updateArgs = append(updateArgs, duplicateID)
@@ -940,10 +1103,10 @@ total_tokens=?, cost=?, cost_estimated=?, currency=?, session_id=?, duration_ms=
 adapter=?, adapter_version=?
 WHERE event_id=?`, updateArgs...)
 	if err != nil {
-		return false, err
+		return false, true, err
 	}
 	rows, err = res.RowsAffected()
-	return rows > 0, err
+	return rows > 0, true, err
 }
 
 func isDetailedCodexEvent(event usage.Event) bool {
@@ -1067,7 +1230,7 @@ func (s *Store) Machines(ctx context.Context) ([]MachineInfo, error) {
 // process restarts and does not require a second state store.
 func (s *Store) StaleAgents(ctx context.Context, cutoff time.Time) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM machines WHERE last_seen_at < ?`, cutoff.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&count)
+	err := s.readHandle().QueryRowContext(ctx, `SELECT COUNT(*) FROM machines WHERE last_seen_at < ?`, cutoff.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&count)
 	return count, err
 }
 
@@ -1123,7 +1286,7 @@ const lifetimeTokensQuery = `SELECT COALESCE(SUM(total_tokens), 0) FROM usage_ev
 
 func (s *Store) LifetimeTokens(ctx context.Context) (int64, error) {
 	var total sql.NullInt64
-	err := s.db.QueryRowContext(ctx, lifetimeTokensQuery).Scan(&total)
+	err := s.readHandle().QueryRowContext(ctx, lifetimeTokensQuery).Scan(&total)
 	return total.Int64, err
 }
 
@@ -1136,7 +1299,7 @@ COALESCE(SUM(MAX(COALESCE(total_tokens, 0) - COALESCE(input_tokens, 0) - COALESC
 
 func (s *Store) TokenComposition(ctx context.Context) (TokenComposition, error) {
 	var result TokenComposition
-	err := s.db.QueryRowContext(ctx, `SELECT`+tokenCompositionColumns+`
+	err := s.readHandle().QueryRowContext(ctx, `SELECT`+tokenCompositionColumns+`
 FROM usage_events`).Scan(
 		&result.InputTokens,
 		&result.UncachedInputTokens,
@@ -1161,7 +1324,7 @@ func (s *Store) DailyUsage(ctx context.Context, start, end time.Time) ([]DailyUs
 	if !end.After(start) {
 		return []DailyUsage{}, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp,
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT timestamp,
 COALESCE(NULLIF(canonical_model, ''), raw_model), provider, total_tokens
 FROM usage_events
 WHERE timestamp >= ? AND timestamp < ?
@@ -1350,7 +1513,7 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	var total, eligibleTokens int64
 	var newestEvent sql.NullString
 	result := Overview{Timezone: s.Timezone(), Accuracy: make(map[usage.Accuracy]int64)}
-	if err := s.db.QueryRowContext(ctx, overviewTotalsQuery).Scan(
+	if err := s.readHandle().QueryRowContext(ctx, overviewTotalsQuery).Scan(
 		&total,
 		&result.EstimatedCost.Amount,
 		&result.EstimatedCost.PricedTokens,
@@ -1397,14 +1560,13 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	if err != nil {
 		return Overview{}, err
 	}
-	// The machine cards ride along with the overview so callers that cache the
-	// overview (SWR) also cache the per-machine lifetime/today/week aggregates
-	// instead of repeating their full-table scan on every render.
-	result.Machines, err = s.MachinesAt(ctx, time.Now())
+	// The machine cards and ByMachine totals come from the same machine_id
+	// GROUP BY pass so callers that cache the overview pay one scan instead of two.
+	result.Machines, result.ByMachine, err = s.machinesAndTotalsAt(ctx, time.Now())
 	if err != nil {
 		return Overview{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT COALESCE(NULLIF(canonical_model, ''), raw_model),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
 COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost), 0)
 FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
@@ -1422,7 +1584,7 @@ FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	if err := rows.Close(); err != nil {
 		return result, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT tool, COALESCE(SUM(total_tokens), 0) FROM usage_events GROUP BY tool ORDER BY 2 DESC`)
+	rows, err = s.readHandle().QueryContext(ctx, `SELECT tool, COALESCE(SUM(total_tokens), 0) FROM usage_events GROUP BY tool ORDER BY 2 DESC`)
 	if err != nil {
 		return result, err
 	}
@@ -1437,22 +1599,7 @@ FROM usage_events GROUP BY 1 ORDER BY 3 DESC`)
 	if err := rows.Close(); err != nil {
 		return result, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT machine_id, COALESCE(SUM(total_tokens), 0) FROM usage_events GROUP BY machine_id ORDER BY 2 DESC`)
-	if err != nil {
-		return result, err
-	}
-	for rows.Next() {
-		var item MachineTotal
-		if err := rows.Scan(&item.Machine, &item.Tokens); err != nil {
-			rows.Close()
-			return result, err
-		}
-		result.ByMachine = append(result.ByMachine, item)
-	}
-	if err := rows.Close(); err != nil {
-		return result, err
-	}
-	rows, err = s.db.QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0),
+	rows, err = s.readHandle().QueryContext(ctx, `SELECT project, COALESCE(SUM(total_tokens), 0),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
 COUNT(DISTINCT machine_id)
 FROM usage_events GROUP BY project ORDER BY 2 DESC`)
@@ -1470,7 +1617,7 @@ FROM usage_events GROUP BY project ORDER BY 2 DESC`)
 	if err := rows.Close(); err != nil {
 		return result, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT token_accuracy, COUNT(*) FROM usage_events GROUP BY token_accuracy`)
+	rows, err = s.readHandle().QueryContext(ctx, `SELECT token_accuracy, COUNT(*) FROM usage_events GROUP BY token_accuracy`)
 	if err != nil {
 		return result, err
 	}
@@ -1503,7 +1650,9 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 	}
 
 	where, args := analyticsWhere(query, start, end)
-	if err := s.analyticsSummary(ctx, where, args, &result.Summary); err != nil {
+	var err error
+	result.Summary, result.Points, result.Breakdown, result.ShareSeries, result.SharePoints, err = s.analyticsAggregate(ctx, query, where, args, start, end)
+	if err != nil {
 		return Analytics{}, err
 	}
 	if !start.IsZero() {
@@ -1514,7 +1663,7 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 		// window aggregates in SQL instead of repeating the row-by-row summary
 		// scan.
 		var previousTokens, previousEvents, previousCached, previousEligible int64
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0), COUNT(*),
+		if err := s.readHandle().QueryRowContext(ctx, `SELECT COALESCE(SUM(total_tokens), 0), COUNT(*),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0)
 FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, &previousEvents, &previousCached, &previousEligible); err != nil {
@@ -1531,27 +1680,13 @@ FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, 
 		}
 		result.Comparison = comparison
 	}
-	points, err := s.analyticsPoints(ctx, query, where, args)
-	if err != nil {
-		return Analytics{}, err
-	}
-	points = s.fillAnalyticsPoints(points, query, start, end)
-	result.Points = points
-	for _, point := range points {
+	for _, point := range result.Points {
 		if point.Tokens > result.MaxTokens {
 			result.MaxTokens = point.Tokens
 		}
 	}
-	if query.Period == "all" && len(points) > 0 {
-		result.StartDate = points[0].Date
-	}
-	result.Breakdown, err = s.analyticsBreakdown(ctx, query, where, args, result.Summary.Tokens)
-	if err != nil {
-		return Analytics{}, err
-	}
-	result.ShareSeries, result.SharePoints, err = s.analyticsShareTimeline(ctx, query, where, args, start, end, result.Breakdown, result.Summary.Tokens)
-	if err != nil {
-		return Analytics{}, err
+	if query.Period == "all" && len(result.Points) > 0 {
+		result.StartDate = result.Points[0].Date
 	}
 	result.Sessions, err = s.analyticsSessions(ctx, where, args)
 	if err != nil {
@@ -1661,7 +1796,7 @@ func (s *Store) Insights(ctx context.Context, query AnalyticsQuery) (Insights, e
 
 func (s *Store) insightsAggregate(ctx context.Context, where string, args []any) (insightAggregate, error) {
 	result := insightAggregate{accuracy: make(map[usage.Accuracy]int64)}
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens,
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT timestamp, total_tokens,
 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, token_accuracy
 FROM usage_events WHERE `+where, args...)
 	if err != nil {
@@ -2136,29 +2271,91 @@ func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) 
 	return strings.Join(conditions, " AND "), args
 }
 
-func (s *Store) analyticsSummary(ctx context.Context, where string, args []any, summary *AnalyticsSummary) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens, cost,
-input_tokens, cache_read_tokens, session_id, machine_id, provider, tool
+func analyticsDimensionValue(dimension, machine, provider, effectiveModel, tool, project string) string {
+	var val string
+	switch dimension {
+	case "harnesses":
+		val = tool
+	case "providers":
+		val = provider
+	case "models":
+		val = effectiveModel
+	case "machines":
+		val = machine
+	default:
+		val = project
+	}
+	if val == "" {
+		return "Unknown"
+	}
+	return val
+}
+
+func (s *Store) analyticsBuckets(timestamp, period string, loc *time.Location) (dayKey, bucketKey string, err error) {
+	if loc == time.UTC && isCanonicalUTCTimestamp(timestamp) {
+		dayKey = timestamp[:10]
+		switch period {
+		case "24h":
+			bucketKey = timestamp[:13] + ":00:00Z"
+		case "all":
+			bucketKey = timestamp[:7] + "-01"
+		default:
+			bucketKey = dayKey
+		}
+		return dayKey, bucketKey, nil
+	}
+	parsed, err := timeParse(timestamp)
+	if err != nil {
+		return "", "", err
+	}
+	local := parsed.In(loc)
+	dayKey = local.Format("2006-01-02")
+	bucketKey = analyticsBucketKey(local, period)
+	return dayKey, bucketKey, nil
+}
+
+// analyticsAggregate computes Summary, Points, Breakdown, ShareSeries, and
+// SharePoints in a single streaming pass over usage_events so filtered
+// analytics views read the matching rows once instead of four times.
+func (s *Store) analyticsAggregate(ctx context.Context, query AnalyticsQuery, where string, args []any, start, end time.Time) (AnalyticsSummary, []AnalyticsPoint, []AnalyticsBreakdown, []AnalyticsShareSeries, []AnalyticsSharePoint, error) {
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT timestamp, total_tokens, cost,
+input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+session_id, machine_id, provider, tool, project, COALESCE(NULLIF(canonical_model, ''), raw_model)
 FROM usage_events WHERE `+where, args...)
 	if err != nil {
-		return err
+		return AnalyticsSummary{}, nil, nil, nil, nil, err
 	}
 	defer rows.Close()
+
+	loc := s.reportingLocation()
+	var summary AnalyticsSummary
 	days := make(map[string]struct{})
 	threads := make(map[string]struct{})
+	pointsByBucket := make(map[string]AnalyticsPoint)
+
+	type breakdownAccum struct {
+		tokens   int64
+		events   int64
+		sessions map[string]struct{}
+	}
+	breakdownByName := make(map[string]*breakdownAccum)
+	bucketDimTokens := make(map[string]map[string]int64)
+
 	for rows.Next() {
-		var timestamp, machine, provider, tool string
-		var total, input, cached sql.NullInt64
+		var timestamp, machine, provider, tool, project, effectiveModel string
+		var total, input, cacheRead, cacheWrite, output sql.NullInt64
 		var cost sql.NullFloat64
 		var session sql.NullString
-		if err := rows.Scan(&timestamp, &total, &cost, &input, &cached, &session, &machine, &provider, &tool); err != nil {
-			return err
+		if err := rows.Scan(&timestamp, &total, &cost, &input, &cacheRead, &cacheWrite, &output,
+			&session, &machine, &provider, &tool, &project, &effectiveModel); err != nil {
+			return AnalyticsSummary{}, nil, nil, nil, nil, err
 		}
-		parsed, err := timeParse(timestamp)
+		dayKey, bucketKey, err := s.analyticsBuckets(timestamp, query.Period, loc)
 		if err != nil {
-			return err
+			return AnalyticsSummary{}, nil, nil, nil, nil, err
 		}
-		days[parsed.In(s.reportingLocation()).Format("2006-01-02")] = struct{}{}
+
+		days[dayKey] = struct{}{}
 		summary.Events++
 		if !total.Valid {
 			summary.UnknownEvents++
@@ -2173,63 +2370,25 @@ FROM usage_events WHERE `+where, args...)
 		if cost.Valid {
 			summary.EstimatedCost.Amount += cost.Float64
 		}
-		if input.Valid && cached.Valid {
-			summary.Cache.CachedTokens += cached.Int64
-			summary.Cache.EligibleTokens += input.Int64 + cached.Int64
+		if input.Valid && cacheRead.Valid {
+			summary.Cache.CachedTokens += cacheRead.Int64
+			summary.Cache.EligibleTokens += input.Int64 + cacheRead.Int64
 		}
-		if session.Valid && strings.TrimSpace(session.String) != "" {
+		var threadKey string
+		hasSessionNonEmpty := session.Valid && session.String != ""
+		hasSessionTrimmed := hasSessionNonEmpty && strings.TrimSpace(session.String) != ""
+		if hasSessionNonEmpty {
+			threadKey = machine + "\x1f" + provider + "\x1f" + tool + "\x1f" + session.String
+		}
+		if hasSessionTrimmed {
 			if total.Valid {
 				summary.SessionTokens += total.Int64
 			}
-			threads[machine+"\x1f"+provider+"\x1f"+tool+"\x1f"+session.String] = struct{}{}
+			threads[threadKey] = struct{}{}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	summary.ActiveDays = int64(len(days))
-	summary.Threads = int64(len(threads))
-	if summary.ActiveDays > 0 {
-		summary.AverageActiveDay = float64(summary.Tokens) / float64(summary.ActiveDays)
-	}
-	if summary.Cache.EligibleTokens > 0 {
-		summary.Cache.HitRate = float64(summary.Cache.CachedTokens) / float64(summary.Cache.EligibleTokens)
-	}
-	return nil
-}
 
-func (s *Store) analyticsPoints(ctx context.Context, query AnalyticsQuery, where string, args []any) ([]AnalyticsPoint, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens, input_tokens,
-cache_read_tokens, cache_write_tokens, output_tokens
-FROM usage_events WHERE `+where, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	byDate := make(map[string]AnalyticsPoint)
-	for rows.Next() {
-		var timestamp string
-		var total, input, cached, cacheWrite, output sql.NullInt64
-		if err := rows.Scan(&timestamp, &total, &input, &cached, &cacheWrite, &output); err != nil {
-			return nil, err
-		}
-		parsed, err := timeParse(timestamp)
-		if err != nil {
-			return nil, err
-		}
-		local := parsed.In(s.reportingLocation())
-		bucket := ""
-		switch query.Period {
-		case "24h":
-			hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, s.reportingLocation())
-			bucket = hour.UTC().Format(time.RFC3339)
-		case "all":
-			bucket = local.Format("2006-01") + "-01"
-		default:
-			bucket = local.Format("2006-01-02")
-		}
-		point := byDate[bucket]
-		point.Date = bucket
+		point := pointsByBucket[bucketKey]
+		point.Date = bucketKey
 		point.Events++
 		if total.Valid {
 			point.Tokens += total.Int64
@@ -2239,8 +2398,8 @@ FROM usage_events WHERE `+where, args...)
 		if input.Valid {
 			point.InputTokens += input.Int64
 		}
-		if cached.Valid {
-			point.CachedTokens += cached.Int64
+		if cacheRead.Valid {
+			point.CachedTokens += cacheRead.Int64
 		}
 		if cacheWrite.Valid {
 			point.CachedTokens += cacheWrite.Int64
@@ -2248,18 +2407,128 @@ FROM usage_events WHERE `+where, args...)
 		if output.Valid {
 			point.OutputTokens += output.Int64
 		}
-		byDate[bucket] = point
+		pointsByBucket[bucketKey] = point
+
+		dimName := analyticsDimensionValue(query.Dimension, machine, provider, effectiveModel, tool, project)
+		bd := breakdownByName[dimName]
+		if bd == nil {
+			bd = &breakdownAccum{sessions: make(map[string]struct{})}
+			breakdownByName[dimName] = bd
+		}
+		bd.events++
+		if total.Valid {
+			bd.tokens += total.Int64
+			dimMap := bucketDimTokens[bucketKey]
+			if dimMap == nil {
+				dimMap = make(map[string]int64)
+				bucketDimTokens[bucketKey] = dimMap
+			}
+			dimMap[dimName] += total.Int64
+		}
+		if hasSessionNonEmpty {
+			bd.sessions[threadKey] = struct{}{}
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return AnalyticsSummary{}, nil, nil, nil, nil, err
 	}
-	result := make([]AnalyticsPoint, 0, len(byDate))
-	for _, point := range byDate {
-		point.Label = analyticsPointLabel(point.Date, query.Period, s.reportingLocation())
-		result = append(result, point)
+
+	summary.ActiveDays = int64(len(days))
+	summary.Threads = int64(len(threads))
+	if summary.ActiveDays > 0 {
+		summary.AverageActiveDay = float64(summary.Tokens) / float64(summary.ActiveDays)
 	}
-	sort.Slice(result, func(left, right int) bool { return result[left].Date < result[right].Date })
-	return result, nil
+	if summary.Cache.EligibleTokens > 0 {
+		summary.Cache.HitRate = float64(summary.Cache.CachedTokens) / float64(summary.Cache.EligibleTokens)
+	}
+
+	rawPoints := make([]AnalyticsPoint, 0, len(pointsByBucket))
+	for _, point := range pointsByBucket {
+		point.Label = analyticsPointLabel(point.Date, query.Period, loc)
+		rawPoints = append(rawPoints, point)
+	}
+	sort.Slice(rawPoints, func(left, right int) bool { return rawPoints[left].Date < rawPoints[right].Date })
+	points := s.fillAnalyticsPoints(rawPoints, query, start, end)
+
+	var breakdown []AnalyticsBreakdown
+	if len(breakdownByName) > 0 {
+		breakdown = make([]AnalyticsBreakdown, 0, len(breakdownByName))
+		for name, bd := range breakdownByName {
+			item := AnalyticsBreakdown{
+				Name:     name,
+				Tokens:   bd.tokens,
+				Events:   bd.events,
+				Sessions: int64(len(bd.sessions)),
+			}
+			if summary.Tokens > 0 {
+				item.Share = float64(item.Tokens) / float64(summary.Tokens)
+			}
+			breakdown = append(breakdown, item)
+		}
+		sort.Slice(breakdown, func(left, right int) bool {
+			if breakdown[left].Tokens == breakdown[right].Tokens {
+				return breakdown[left].Name < breakdown[right].Name
+			}
+			return breakdown[left].Tokens > breakdown[right].Tokens
+		})
+	}
+
+	const visibleSeries = 5
+	var series []AnalyticsShareSeries
+	var sharePoints []AnalyticsSharePoint
+	if len(breakdown) > 0 {
+		series = make([]AnalyticsShareSeries, 0, visibleSeries+1)
+		selected := make(map[string]int, visibleSeries)
+		for _, item := range breakdown {
+			if len(series) >= visibleSeries {
+				break
+			}
+			selected[item.Name] = len(series)
+			entry := AnalyticsShareSeries{Name: item.Name, Tokens: item.Tokens}
+			if summary.Tokens > 0 {
+				entry.Share = float64(item.Tokens) / float64(summary.Tokens)
+			}
+			series = append(series, entry)
+		}
+		if len(breakdown) > visibleSeries {
+			other := AnalyticsShareSeries{Name: "Other"}
+			for _, item := range breakdown[visibleSeries:] {
+				other.Tokens += item.Tokens
+			}
+			if summary.Tokens > 0 {
+				other.Share = float64(other.Tokens) / float64(summary.Tokens)
+			}
+			series = append(series, other)
+		}
+		shareByDate := make(map[string]AnalyticsSharePoint, len(pointsByBucket))
+		for bucketKey, pt := range pointsByBucket {
+			sp := AnalyticsSharePoint{
+				Date:          bucketKey,
+				Tokens:        pt.Tokens,
+				UnknownEvents: pt.UnknownEvents,
+				Values:        make([]AnalyticsShareSeries, len(series)),
+			}
+			copy(sp.Values, series)
+			for index := range sp.Values {
+				sp.Values[index].Tokens = 0
+				sp.Values[index].Share = 0
+			}
+			for name, tokens := range bucketDimTokens[bucketKey] {
+				index, ok := selected[name]
+				if !ok && len(series) > visibleSeries {
+					index = len(series) - 1
+					ok = true
+				}
+				if ok {
+					sp.Values[index].Tokens += tokens
+				}
+			}
+			shareByDate[bucketKey] = sp
+		}
+		sharePoints = s.fillAnalyticsSharePoints(shareByDate, series, query, start, end)
+	}
+
+	return summary, points, breakdown, series, sharePoints, nil
 }
 
 func (s *Store) fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuery, start, end time.Time) []AnalyticsPoint {
@@ -2278,9 +2547,8 @@ func (s *Store) fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuer
 	case "24h":
 		startLocal := start.In(location)
 		endLocal := end.In(location)
-		first = time.Date(startLocal.Year(), startLocal.Month(), startLocal.Day(), startLocal.Hour(), 0, 0, 0, location)
-		lastLocal := time.Date(endLocal.Year(), endLocal.Month(), endLocal.Day(), endLocal.Hour(), 0, 0, 0, location)
-		last = lastLocal.Add(time.Hour)
+		first = truncateLocalHour(startLocal)
+		last = truncateLocalHour(endLocal).Add(time.Hour)
 		step = func(value time.Time) time.Time { return value.Add(time.Hour) }
 	case "all":
 		parsed, err := time.Parse("2006-01-02", points[0].Date)
@@ -2333,132 +2601,14 @@ func analyticsPointLabel(date, period string, location *time.Location) string {
 	return parsed.Format("Jan 2")
 }
 
-func analyticsBreakdownExpression(dimension string) string {
-	switch dimension {
-	case "harnesses":
-		return "NULLIF(tool, '')"
-	case "providers":
-		return "NULLIF(provider, '')"
-	case "models":
-		return "NULLIF(COALESCE(NULLIF(canonical_model, ''), raw_model), '')"
-	case "machines":
-		return "NULLIF(machine_id, '')"
-	default:
-		return "NULLIF(project, '')"
-	}
+func truncateLocalHour(t time.Time) time.Time {
+	return t.Add(-time.Duration(t.Minute())*time.Minute - time.Duration(t.Second())*time.Second - time.Duration(t.Nanosecond()))
 }
 
-func (s *Store) analyticsBreakdown(ctx context.Context, query AnalyticsQuery, where string, args []any, total int64) ([]AnalyticsBreakdown, error) {
-	expression := "COALESCE(" + analyticsBreakdownExpression(query.Dimension) + ", 'Unknown')"
-	rows, err := s.db.QueryContext(ctx, `SELECT `+expression+`,
-COALESCE(SUM(total_tokens), 0),
-COUNT(*),
-COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END)
-FROM usage_events WHERE `+where+` GROUP BY 1 ORDER BY 2 DESC, 1`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []AnalyticsBreakdown
-	for rows.Next() {
-		var item AnalyticsBreakdown
-		if err := rows.Scan(&item.Name, &item.Tokens, &item.Events, &item.Sessions); err != nil {
-			return nil, err
-		}
-		if total > 0 {
-			item.Share = float64(item.Tokens) / float64(total)
-		}
-		result = append(result, item)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) analyticsShareTimeline(ctx context.Context, query AnalyticsQuery, where string, args []any, start, end time.Time, breakdown []AnalyticsBreakdown, total int64) ([]AnalyticsShareSeries, []AnalyticsSharePoint, error) {
-	const visibleSeries = 5
-	series := make([]AnalyticsShareSeries, 0, visibleSeries+1)
-	selected := make(map[string]int, visibleSeries)
-	for _, item := range breakdown {
-		if len(series) >= visibleSeries {
-			break
-		}
-		selected[item.Name] = len(series)
-		entry := AnalyticsShareSeries{Name: item.Name, Tokens: item.Tokens}
-		if total > 0 {
-			entry.Share = float64(item.Tokens) / float64(total)
-		}
-		series = append(series, entry)
-	}
-	if len(breakdown) > visibleSeries {
-		other := AnalyticsShareSeries{Name: "Other"}
-		for _, item := range breakdown[visibleSeries:] {
-			other.Tokens += item.Tokens
-		}
-		if total > 0 {
-			other.Share = float64(other.Tokens) / float64(total)
-		}
-		series = append(series, other)
-	}
-	if len(series) == 0 {
-		return nil, nil, nil
-	}
-
-	expression := "COALESCE(" + analyticsBreakdownExpression(query.Dimension) + ", 'Unknown')"
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, total_tokens, `+expression+`
-FROM usage_events WHERE `+where, args...)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
-	byDate := make(map[string]AnalyticsSharePoint)
-	for rows.Next() {
-		var timestamp, name string
-		var tokens sql.NullInt64
-		if err := rows.Scan(&timestamp, &tokens, &name); err != nil {
-			return nil, nil, err
-		}
-		parsed, err := timeParse(timestamp)
-		if err != nil {
-			return nil, nil, err
-		}
-		bucket := analyticsBucketKey(parsed.In(s.reportingLocation()), query.Period, s.reportingLocation())
-		point := byDate[bucket]
-		point.Date = bucket
-		if len(point.Values) == 0 {
-			point.Values = make([]AnalyticsShareSeries, len(series))
-			copy(point.Values, series)
-			for index := range point.Values {
-				point.Values[index].Tokens = 0
-				point.Values[index].Share = 0
-			}
-		}
-		if !tokens.Valid {
-			point.UnknownEvents++
-			byDate[bucket] = point
-			continue
-		}
-		point.Tokens += tokens.Int64
-		index, ok := selected[name]
-		if !ok && len(series) > visibleSeries {
-			index = len(series) - 1
-			ok = true
-		}
-		if ok {
-			point.Values[index].Tokens += tokens.Int64
-		}
-		byDate[bucket] = point
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	points := s.fillAnalyticsSharePoints(byDate, series, query, start, end)
-	return series, points, nil
-}
-
-func analyticsBucketKey(local time.Time, period string, location *time.Location) string {
+func analyticsBucketKey(local time.Time, period string) string {
 	switch period {
 	case "24h":
-		hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, location)
-		return hour.UTC().Format(time.RFC3339)
+		return truncateLocalHour(local).UTC().Format(time.RFC3339)
 	case "all":
 		return local.Format("2006-01") + "-01"
 	default:
@@ -2499,7 +2649,7 @@ func (s *Store) fillAnalyticsSharePoints(byDate map[string]AnalyticsSharePoint, 
 }
 
 func (s *Store) analyticsSessions(ctx context.Context, where string, args []any) ([]AnalyticsSession, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT
 MAX(timestamp),
 MAX(NULLIF(session_id, '')),
 machine_id,
@@ -2543,7 +2693,7 @@ func (s *Store) analyticsFacets(ctx context.Context) (AnalyticsFacets, error) {
 		{target: &result.Tools, expression: "NULLIF(tool, '')"},
 	}
 	for _, item := range queries {
-		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT `+item.expression+` FROM usage_events WHERE `+item.expression+` IS NOT NULL ORDER BY 1`)
+		rows, err := s.readHandle().QueryContext(ctx, `SELECT DISTINCT `+item.expression+` FROM usage_events WHERE `+item.expression+` IS NOT NULL ORDER BY 1`)
 		if err != nil {
 			return AnalyticsFacets{}, err
 		}
@@ -2563,29 +2713,94 @@ func (s *Store) analyticsFacets(ctx context.Context) (AnalyticsFacets, error) {
 }
 
 // facetsCacheTTL bounds how long cached filter facets may be served without
-// any ingest writing to the store; the ingest path invalidates immediately.
+// any ingest writing to the store; the ingest path updates them incrementally.
 // The facets are filter-independent distinct-value scans, the single most
 // expensive part of Store.Analytics on a large database, and every dashboard
 // page needs them — so repeat renders within the TTL reuse one compute.
 const facetsCacheTTL = time.Minute
 
+func cloneAnalyticsFacets(facets AnalyticsFacets) AnalyticsFacets {
+	return AnalyticsFacets{
+		Machines:  slices.Clone(facets.Machines),
+		Providers: slices.Clone(facets.Providers),
+		Models:    slices.Clone(facets.Models),
+		Tools:     slices.Clone(facets.Tools),
+	}
+}
+
+func insertSortedUnique(existing []string, additions map[string]struct{}) ([]string, bool) {
+	if len(additions) == 0 {
+		return existing, false
+	}
+	var missing []string
+	for value := range additions {
+		if value == "" {
+			continue
+		}
+		if _, found := slices.BinarySearch(existing, value); !found {
+			missing = append(missing, value)
+		}
+	}
+	if len(missing) == 0 {
+		return existing, false
+	}
+	merged := make([]string, len(existing)+len(missing))
+	copy(merged, existing)
+	copy(merged[len(existing):], missing)
+	slices.Sort(merged)
+	return merged, true
+}
+
 // Facets returns the distinct machines, providers, models, and tools present
 // in the store. Unlike Analytics it costs only the facet queries, so handlers
 // that need just the filter values do not pay for the full aggregation.
 func (s *Store) Facets(ctx context.Context) (AnalyticsFacets, error) {
+	s.facetsMu.RLock()
+	if s.facetsCache != nil && time.Since(s.facetsFetched) < facetsCacheTTL {
+		cloned := cloneAnalyticsFacets(*s.facetsCache)
+		s.facetsMu.RUnlock()
+		return cloned, nil
+	}
+	s.facetsMu.RUnlock()
+
 	s.facetsMu.Lock()
 	defer s.facetsMu.Unlock()
 	if s.facetsCache != nil && time.Since(s.facetsFetched) < facetsCacheTTL {
-		return *s.facetsCache, nil
+		return cloneAnalyticsFacets(*s.facetsCache), nil
 	}
 	result, err := s.analyticsFacets(ctx)
 	if err != nil {
 		return AnalyticsFacets{}, err
 	}
-	cached := result
+	cached := cloneAnalyticsFacets(result)
 	s.facetsCache = &cached
 	s.facetsFetched = time.Now()
-	return result, nil
+	return cloneAnalyticsFacets(cached), nil
+}
+
+func (s *Store) mergeFacetsCache(machines, providers, models, tools map[string]struct{}) {
+	s.facetsMu.Lock()
+	defer s.facetsMu.Unlock()
+	if s.facetsCache == nil {
+		return
+	}
+	if time.Since(s.facetsFetched) >= facetsCacheTTL {
+		s.facetsCache = nil
+		return
+	}
+	nextMachines, mChanged := insertSortedUnique(s.facetsCache.Machines, machines)
+	nextProviders, pChanged := insertSortedUnique(s.facetsCache.Providers, providers)
+	nextModels, modChanged := insertSortedUnique(s.facetsCache.Models, models)
+	nextTools, tChanged := insertSortedUnique(s.facetsCache.Tools, tools)
+	if !mChanged && !pChanged && !modChanged && !tChanged {
+		return
+	}
+	s.facetsCache = &AnalyticsFacets{
+		Machines:  nextMachines,
+		Providers: nextProviders,
+		Models:    nextModels,
+		Tools:     nextTools,
+	}
 }
 
 func (s *Store) invalidateFacetsCache() {
@@ -2595,7 +2810,7 @@ func (s *Store) invalidateFacetsCache() {
 }
 
 func (s *Store) Events(ctx context.Context) ([]usage.Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool,
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool,
 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
 cost, cost_estimated, currency, session_id, duration_ms, token_accuracy, adapter, adapter_version
 FROM usage_events ORDER BY timestamp, event_id`)
@@ -2645,6 +2860,21 @@ func timeParse(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, value)
 }
 
+func isCanonicalUTCTimestamp(timestamp string) bool {
+	if len(timestamp) < 20 || timestamp[10] != 'T' || timestamp[13] != ':' || timestamp[16] != ':' || timestamp[len(timestamp)-1] != 'Z' {
+		return false
+	}
+	if len(timestamp) > 20 {
+		if timestamp[19] != '.' || len(timestamp) == 21 || !isASCIIDigits(timestamp[20:len(timestamp)-1]) {
+			return false
+		}
+	}
+	return isASCIIDigits(timestamp[0:4]) && timestamp[4] == '-' && isASCIIDigits(timestamp[5:7]) && timestamp[7] == '-' && isASCIIDigits(timestamp[8:10]) &&
+		isASCIIDigits(timestamp[11:13]) && isASCIIDigits(timestamp[14:16]) && isASCIIDigits(timestamp[17:19]) &&
+		timestamp[11:13] <= "23" && timestamp[14:16] <= "59" && timestamp[17:19] <= "59" &&
+		isCalendarDate(timestamp[0:4], timestamp[5:7], timestamp[8:10])
+}
+
 // localDayBucket returns the calendar-day key for one stored timestamp.
 // Timestamps are always written by this store as UTC RFC3339 (trailing Z), so
 // when the reporting location is UTC the day is simply the string's date
@@ -2659,11 +2889,7 @@ func (s *Store) localDayBucket(timestamp string) (string, error) {
 	// 2026-02-30, or 2026-11-05T99:99:99Z must fall through to the parse so
 	// the previous error behavior is preserved instead of silently bucketing
 	// an impossible date.
-	if loc == time.UTC && len(timestamp) >= 20 && timestamp[10] == 'T' && timestamp[13] == ':' && timestamp[16] == ':' && timestamp[len(timestamp)-1] == 'Z' &&
-		isASCIIDigits(timestamp[0:4]) && timestamp[4] == '-' && isASCIIDigits(timestamp[5:7]) && timestamp[7] == '-' && isASCIIDigits(timestamp[8:10]) &&
-		isASCIIDigits(timestamp[11:13]) && isASCIIDigits(timestamp[14:16]) && isASCIIDigits(timestamp[17:19]) &&
-		timestamp[11:13] <= "23" && timestamp[14:16] <= "59" && timestamp[17:19] <= "59" &&
-		isCalendarDate(timestamp[0:4], timestamp[5:7], timestamp[8:10]) {
+	if loc == time.UTC && isCanonicalUTCTimestamp(timestamp) {
 		return timestamp[:10], nil
 	}
 	parsed, err := timeParse(timestamp)
@@ -2730,5 +2956,13 @@ func (s *Store) PurgeBefore(ctx context.Context, before string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if deleted > 0 {
+		s.invalidateFacetsCache()
+		s.invalidateQuotaCache()
+	}
+	return deleted, nil
 }

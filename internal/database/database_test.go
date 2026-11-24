@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2110,4 +2111,550 @@ INSERT INTO usage_events (
 			t.Fatalf("usage_events count = %d, want 2 (dedup DELETE must be skipped)", count)
 		}
 	})
+}
+
+func TestOpenConfiguresReadWriteSplitAndPragmas(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokemon.db")
+	store, err := Open(path, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if store.readDB == nil || store.readDB == store.db {
+		store.Close()
+		t.Fatalf("file-backed store must use separate readDB pool")
+	}
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		store.Close()
+		t.Fatalf("writer MaxOpenConnections = %d, want 1", got)
+	}
+	if got := store.readDB.Stats().MaxOpenConnections; got != 4 {
+		store.Close()
+		t.Fatalf("reader MaxOpenConnections = %d, want 4", got)
+	}
+
+	if _, err := store.readDB.Exec(`INSERT INTO machines (id, name, first_seen_at, last_seen_at) VALUES ('ro', 'ro', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err == nil {
+		store.Close()
+		t.Fatal("expected write on readDB to fail")
+	}
+
+	// Hold all 4 readDB connections simultaneously to verify PRAGMAs apply to every pooled conn.
+	ctx := context.Background()
+	conns := make([]*sql.Conn, 4)
+	for i := range conns {
+		conn, err := store.readDB.Conn(ctx)
+		if err != nil {
+			store.Close()
+			t.Fatalf("readDB.Conn[%d]: %v", i, err)
+		}
+		conns[i] = conn
+	}
+	for i, conn := range conns {
+		var busyTimeout, syncMode, cacheSize, tempStore int
+		var mmapSize int64
+		if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil || busyTimeout != 5000 {
+			t.Errorf("conn[%d] busy_timeout = %d, err=%v", i, busyTimeout, err)
+		}
+		if err := conn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&syncMode); err != nil || syncMode != 1 {
+			t.Errorf("conn[%d] synchronous = %d, err=%v (want 1/NORMAL)", i, syncMode, err)
+		}
+		if err := conn.QueryRowContext(ctx, `PRAGMA cache_size`).Scan(&cacheSize); err != nil || cacheSize != -64000 {
+			t.Errorf("conn[%d] cache_size = %d, err=%v", i, cacheSize, err)
+		}
+		if err := conn.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&tempStore); err != nil || tempStore != 2 {
+			t.Errorf("conn[%d] temp_store = %d, err=%v (want 2/MEMORY)", i, tempStore, err)
+		}
+		if err := conn.QueryRowContext(ctx, `PRAGMA mmap_size`).Scan(&mmapSize); err != nil || mmapSize < 0 {
+			t.Errorf("conn[%d] mmap_size = %d, err=%v", i, mmapSize, err)
+		}
+		_ = conn.Close()
+	}
+
+	if _, err := store.Ingest(ctx, []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "wal-cleanup-ev",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		TotalTokens:   usage.Int64(10),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
+		t.Fatalf("expected -wal sidecar to be cleaned up on Close, stat err = %v", err)
+	}
+
+	memStore, err := Open(":memory:", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memStore.readDB != memStore.db {
+		memStore.Close()
+		t.Fatal(":memory: store must alias readDB to db")
+	}
+	if _, err := memStore.Ingest(ctx, []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "mem-ev",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		TotalTokens:   usage.Int64(25),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		memStore.Close()
+		t.Fatal(err)
+	}
+	if got, err := memStore.LifetimeTokens(ctx); err != nil || got != 25 {
+		memStore.Close()
+		t.Fatalf("memStore LifetimeTokens = %d, err=%v", got, err)
+	}
+	if err := memStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadYourOwnWritesAndConcurrentIngestReads(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if _, err := store.Ingest(ctx, []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "ryow-1",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		SessionID:     "sess-ryow",
+		TotalTokens:   usage.Int64(77),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if total, err := store.LifetimeTokens(ctx); err != nil || total != 77 {
+		t.Fatalf("immediate read-your-own-write LifetimeTokens = %d, err=%v", total, err)
+	}
+	sessions, err := store.Sessions(ctx, AnalyticsQuery{Period: "30d"})
+	if err != nil || len(sessions) != 1 || sessions[0].SessionID != "sess-ryow" {
+		t.Fatalf("immediate read-your-own-write Sessions = %+v, err=%v", sessions, err)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				if _, err := store.Ingest(ctx, []usage.Event{{
+					SchemaVersion: usage.SchemaVersion,
+					EventID:       fmt.Sprintf("conc-%d-%d", worker, i),
+					Timestamp:     time.Now().UTC(),
+					MachineID:     fmt.Sprintf("box-%d", worker),
+					Provider:      "openai",
+					Model:         "gpt-5",
+					Tool:          "codex",
+					SessionID:     fmt.Sprintf("sess-%d-%d", worker, i),
+					TotalTokens:   usage.Int64(10),
+					TokenAccuracy: usage.AccuracyReported,
+					Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				}}); err != nil {
+					t.Errorf("concurrent ingest: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+	for r := 0; r < 6; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 15; i++ {
+				if err := store.Ready(ctx); err != nil {
+					t.Errorf("Ready: %v", err)
+					return
+				}
+				if _, err := store.LifetimeTokens(ctx); err != nil {
+					t.Errorf("LifetimeTokens: %v", err)
+					return
+				}
+				if _, err := store.Overview(ctx); err != nil {
+					t.Errorf("Overview: %v", err)
+					return
+				}
+				if _, err := store.Sessions(ctx, AnalyticsQuery{Period: "30d"}); err != nil {
+					t.Errorf("Sessions: %v", err)
+					return
+				}
+				if _, err := store.MachinesAt(ctx, time.Now()); err != nil {
+					t.Errorf("MachinesAt: %v", err)
+					return
+				}
+				if _, err := store.DisplayAliases(ctx); err != nil {
+					t.Errorf("DisplayAliases: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSessionsCompositeIndexExists(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var name string
+	if err := store.readHandle().QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_events_sessions_timestamp'`).Scan(&name); err != nil {
+		t.Fatalf("composite sessions index missing after migration: %v", err)
+	}
+}
+
+func TestAnalyticsSinglePassEdgeCases(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), ny)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 2026-03-08 06:30 UTC = 01:30 EST (before spring-forward)
+	// 2026-03-08 07:30 UTC = 03:30 EDT (after spring-forward)
+	// 2026-03-09 03:30 UTC = 2026-03-08 23:30 EDT
+	// 2026-03-09 04:30 UTC = 2026-03-09 00:30 EDT
+	events := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "sp-unknown-cost",
+			Timestamp: time.Date(2026, 3, 8, 6, 30, 0, 0, time.UTC),
+			MachineID: "m1", Project: "", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			SessionID: "s1", InputTokens: usage.Int64(10), CacheReadTokens: usage.Int64(5),
+			Cost: usage.Float64(0.25), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "sp-cache-write",
+			Timestamp: time.Date(2026, 3, 8, 7, 30, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-b", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			SessionID: "s1", InputTokens: usage.Int64(20), CacheReadTokens: usage.Int64(10), CacheWriteTokens: usage.Int64(5),
+			OutputTokens: usage.Int64(15), TotalTokens: usage.Int64(50),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "sp-tie-a",
+			Timestamp: time.Date(2026, 3, 9, 3, 30, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-a", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			SessionID: "s2", TotalTokens: usage.Int64(50),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "sp-next-day",
+			Timestamp: time.Date(2026, 3, 9, 4, 30, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-c", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens:   usage.Int64(30),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 3, 9, 12, 0, 0, 0, ny)
+	res, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "7d", Dimension: "projects", Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary.Events != 4 || res.Summary.UnknownEvents != 1 || res.Summary.Tokens != 130 {
+		t.Fatalf("summary = %+v", res.Summary)
+	}
+	if res.Summary.EstimatedCost.Amount != 0.25 || res.Summary.EstimatedCost.PricedTokens != 0 || res.Summary.EstimatedCost.UnpricedTokens != 130 {
+		t.Fatalf("cost summary = %+v", res.Summary.EstimatedCost)
+	}
+	// Summary.Cache counts cache_read_tokens only (5 + 10 = 15), eligible = (10+5) + (20+10) = 45.
+	if res.Summary.Cache.CachedTokens != 15 || res.Summary.Cache.EligibleTokens != 45 {
+		t.Fatalf("cache summary = %+v, want cached=15 eligible=45", res.Summary.Cache)
+	}
+	if res.Summary.Threads != 2 || res.Summary.SessionTokens != 100 || res.Summary.ActiveDays != 2 {
+		t.Fatalf("threads/sessions/days = %+v", res.Summary)
+	}
+
+	// Points.CachedTokens includes BOTH cache_read_tokens and cache_write_tokens (5 + 10 + 5 = 20 on 2026-03-08).
+	var mar8 AnalyticsPoint
+	for _, pt := range res.Points {
+		if pt.Date == "2026-03-08" {
+			mar8 = pt
+		}
+	}
+	if mar8.Tokens != 100 || mar8.UnknownEvents != 1 || mar8.CachedTokens != 20 {
+		t.Fatalf("mar8 point = %+v, want tokens=100 unknown=1 cached=20", mar8)
+	}
+
+	// Breakdown tie-breaking (Tokens DESC, Name ASC) and Unknown bucket.
+	if len(res.Breakdown) != 4 {
+		t.Fatalf("breakdown len = %d, want 4: %+v", len(res.Breakdown), res.Breakdown)
+	}
+	if res.Breakdown[0].Name != "proj-a" || res.Breakdown[0].Tokens != 50 ||
+		res.Breakdown[1].Name != "proj-b" || res.Breakdown[1].Tokens != 50 ||
+		res.Breakdown[2].Name != "proj-c" || res.Breakdown[2].Tokens != 30 ||
+		res.Breakdown[3].Name != "Unknown" || res.Breakdown[3].Tokens != 0 || res.Breakdown[3].Events != 1 {
+		t.Fatalf("unexpected breakdown order/buckets: %+v", res.Breakdown)
+	}
+
+	// 24h DST hourly buckets: 2026-03-08 06:30 UTC (01:30 EST) and 07:30 UTC (03:30 EDT) are consecutive hours.
+	hourly, err := store.Analytics(context.Background(), AnalyticsQuery{Period: "24h", Dimension: "projects", Now: time.Date(2026, 3, 8, 12, 0, 0, 0, ny)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hourly.Points) != 25 {
+		t.Fatalf("24h DST points len = %d, want 25", len(hourly.Points))
+	}
+}
+
+func TestOverviewByMachineReusesMachinesAndBreaksTies(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.RecordHeartbeat(ctx, AgentHeartbeat{MachineID: "hb-only"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(ctx, []usage.Event{
+		{SchemaVersion: usage.SchemaVersion, EventID: "ov-b", Timestamp: time.Now().UTC(), MachineID: "m-b", Provider: "openai", Model: "gpt-5", Tool: "codex", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "1"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "ov-a", Timestamp: time.Now().UTC(), MachineID: "m-a", Provider: "openai", Model: "gpt-5", Tool: "codex", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Insert an orphaned usage_events row with no machines entry.
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO usage_events (event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool, total_tokens, token_accuracy, adapter, adapter_version) VALUES ('ov-orphan', ?, 'm-orphan', '', 'openai', 'gpt-5', 'gpt-5', 'codex', 100, 'reported', 'codex', '1')`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	overview, err := store.Overview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.ByMachine) != 3 {
+		t.Fatalf("ByMachine = %+v, want 3 (orphan + 2 ingested, excluding heartbeat-only)", overview.ByMachine)
+	}
+	if overview.ByMachine[0].Machine != "m-orphan" || overview.ByMachine[0].Tokens != 100 ||
+		overview.ByMachine[1].Machine != "m-a" || overview.ByMachine[1].Tokens != 50 ||
+		overview.ByMachine[2].Machine != "m-b" || overview.ByMachine[2].Tokens != 50 {
+		t.Fatalf("ByMachine order/tie-break = %+v", overview.ByMachine)
+	}
+}
+
+func TestSessionsWithLimitBoundsResults(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	events := make([]usage.Event, 0, 12)
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < 12; i++ {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("lim-%d", i),
+			Timestamp:     base.Add(time.Duration(i) * time.Minute),
+			MachineID:     "box",
+			SessionID:     fmt.Sprintf("sess-%02d", i),
+			Provider:      "openai",
+			Model:         "gpt-5",
+			Tool:          "codex",
+			TotalTokens:   usage.Int64(int64(10 + i)),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		})
+	}
+	if _, err := store.Ingest(ctx, events); err != nil {
+		t.Fatal(err)
+	}
+
+	got8, err := store.SessionsWithLimit(ctx, AnalyticsQuery{Period: "30d"}, "when", "desc", 8)
+	if err != nil || len(got8) != 8 || got8[0].SessionID != "sess-11" {
+		t.Fatalf("limit 8 = len %d, first %+v, err=%v", len(got8), got8[0], err)
+	}
+	got2, err := store.SessionsWithLimit(ctx, AnalyticsQuery{Period: "30d"}, "tokens", "asc", 2)
+	if err != nil || len(got2) != 2 || got2[0].SessionID != "sess-00" {
+		t.Fatalf("limit 2 = len %d, err=%v", len(got2), err)
+	}
+	gotDefault, err := store.SessionsWithLimit(ctx, AnalyticsQuery{Period: "30d"}, "when", "desc", 0)
+	if err != nil || len(gotDefault) != 12 {
+		t.Fatalf("limit 0 default = len %d, err=%v", len(gotDefault), err)
+	}
+}
+
+func TestAnalytics24hFallBackDSTAndFractionalOffsetBuckets(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), ny)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Fall-back DST on 2026-11-01 in America/New_York:
+	//   2026-11-01T05:15:00Z = 01:15 EDT (-04:00) -> bucket 2026-11-01T05:00:00Z
+	//   2026-11-01T06:15:00Z = 01:15 EST (-05:00) -> bucket 2026-11-01T06:00:00Z
+	//   2026-11-01T06:45:00Z = 01:45 EST (-05:00) -> bucket 2026-11-01T06:00:00Z (inside [06:30Z, +24h))
+	events := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "dst-fb-edt",
+			Timestamp: time.Date(2026, 11, 1, 5, 15, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-edt", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			InputTokens: usage.Int64(100), CacheReadTokens: usage.Int64(50), OutputTokens: usage.Int64(100), TotalTokens: usage.Int64(250),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "dst-fb-est",
+			Timestamp: time.Date(2026, 11, 1, 6, 15, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-est", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			InputTokens: usage.Int64(200), CacheReadTokens: usage.Int64(100), OutputTokens: usage.Int64(100), TotalTokens: usage.Int64(400),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "dst-fb-est-after",
+			Timestamp: time.Date(2026, 11, 1, 6, 45, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-est-late", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			InputTokens: usage.Int64(75), CacheReadTokens: usage.Int64(25), OutputTokens: usage.Int64(50), TotalTokens: usage.Int64(150),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := store.Analytics(context.Background(), AnalyticsQuery{
+		Period:    "24h",
+		Dimension: "projects",
+		Now:       time.Date(2026, 11, 1, 23, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Points) != 25 {
+		t.Fatalf("fall-back DST 24h points len = %d, want 25", len(res.Points))
+	}
+	byDate := make(map[string]AnalyticsPoint, len(res.Points))
+	for _, pt := range res.Points {
+		byDate[pt.Date] = pt
+	}
+	if got := byDate["2026-11-01T05:00:00Z"]; got.Tokens != 250 || got.Events != 1 || got.InputTokens != 100 || got.CachedTokens != 50 || got.OutputTokens != 100 {
+		t.Fatalf("01:00 EDT bucket (05:00Z) = %+v, want tokens=250 events=1", got)
+	}
+	if got := byDate["2026-11-01T06:00:00Z"]; got.Tokens != 550 || got.Events != 2 || got.InputTokens != 275 || got.CachedTokens != 125 || got.OutputTokens != 150 {
+		t.Fatalf("01:00 EST bucket (06:00Z) = %+v, want tokens=550 events=2", got)
+	}
+	shareByDate := make(map[string]AnalyticsSharePoint, len(res.SharePoints))
+	for _, sp := range res.SharePoints {
+		shareByDate[sp.Date] = sp
+	}
+	if sp := shareByDate["2026-11-01T05:00:00Z"]; sp.Tokens != 250 {
+		t.Fatalf("05:00Z share point tokens = %d, want 250", sp.Tokens)
+	}
+	if sp := shareByDate["2026-11-01T06:00:00Z"]; sp.Tokens != 550 {
+		t.Fatalf("06:00Z share point tokens = %d, want 550", sp.Tokens)
+	}
+
+	// Window starting inside the second 01:xx hour (01:30 EST = 06:30Z):
+	// must emit 25 buckets from 2026-11-01T06:00:00Z through 2026-11-02T06:00:00Z.
+	shifted, err := store.Analytics(context.Background(), AnalyticsQuery{
+		Period:    "24h",
+		Dimension: "projects",
+		Now:       time.Date(2026, 11, 2, 6, 30, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shifted.Points) != 25 {
+		t.Fatalf("fall-back 01:30 EST 24h points len = %d, want 25", len(shifted.Points))
+	}
+	if shifted.Points[0].Date != "2026-11-01T06:00:00Z" || shifted.Points[len(shifted.Points)-1].Date != "2026-11-02T06:00:00Z" {
+		t.Fatalf("fall-back 01:30 EST 24h bounds = [%s .. %s], want [2026-11-01T06:00:00Z .. 2026-11-02T06:00:00Z]", shifted.Points[0].Date, shifted.Points[len(shifted.Points)-1].Date)
+	}
+	if shifted.Points[0].Tokens != 150 || shifted.Points[0].Events != 1 {
+		t.Fatalf("first bucket 2026-11-01T06:00:00Z = %+v, want tokens=150 events=1", shifted.Points[0])
+	}
+	if len(shifted.SharePoints) != 25 || shifted.SharePoints[0].Date != "2026-11-01T06:00:00Z" {
+		t.Fatalf("shifted SharePoints = len %d first %s, want len 25 starting 2026-11-01T06:00:00Z", len(shifted.SharePoints), shifted.SharePoints[0].Date)
+	}
+
+	// Fractional-hour offset (Asia/Kolkata +05:30):
+	// 2026-11-01T01:15:00Z = 06:45 IST -> local hour 06:00 IST = 2026-11-01T00:30:00Z.
+	ist, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	istStore, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon-ist.db"), catalog.Empty(), ist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer istStore.Close()
+	if _, err := istStore.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "ist-half-hour",
+			Timestamp: time.Date(2026, 11, 1, 1, 15, 0, 0, time.UTC),
+			MachineID: "m1", Project: "proj-ist", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(321), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	istRes, err := istStore.Analytics(context.Background(), AnalyticsQuery{
+		Period:    "24h",
+		Dimension: "projects",
+		Now:       time.Date(2026, 11, 1, 12, 15, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(istRes.Points) != 25 {
+		t.Fatalf("IST 24h points len = %d, want 25", len(istRes.Points))
+	}
+	var foundIST bool
+	for _, pt := range istRes.Points {
+		if pt.Date == "2026-11-01T00:30:00Z" {
+			foundIST = true
+			if pt.Tokens != 321 || pt.Events != 1 || pt.Label != "Nov 1 06:00" {
+				t.Fatalf("IST bucket = %+v, want tokens=321 events=1 label='Nov 1 06:00'", pt)
+			}
+		}
+	}
+	if !foundIST {
+		t.Fatalf("IST half-hour bucket 2026-11-01T00:30:00Z missing from %+v", istRes.Points)
+	}
 }

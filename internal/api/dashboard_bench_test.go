@@ -78,12 +78,9 @@ func BenchmarkDashboardRender(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	sessions, err := store.Sessions(ctx, database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()})
+	sessions, err := store.SessionsWithLimit(ctx, database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}, "when", "desc", 8)
 	if err != nil {
 		b.Fatal(err)
-	}
-	if len(sessions) > 8 {
-		sessions = sessions[:8]
 	}
 	page := dashboardPage{Overview: overview, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions, Freshness: dataFreshnessFor(overview.NewestEvent, time.Now())}
 	b.ResetTimer()

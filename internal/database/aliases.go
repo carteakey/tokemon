@@ -29,7 +29,7 @@ func (s *Store) DisplayAliases(ctx context.Context) ([]DisplayAlias, error) {
 	if s.aliasesCached {
 		return s.aliasesCache, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT kind, identity, alias FROM display_aliases ORDER BY kind, identity`)
+	rows, err := s.readHandle().QueryContext(ctx, `SELECT kind, identity, alias FROM display_aliases ORDER BY kind, identity`)
 	if err != nil {
 		return nil, err
 	}

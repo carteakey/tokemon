@@ -740,6 +740,7 @@ func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = server.Close() }()
 	initial := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "cache-initial", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{initial}); err != nil {
 		t.Fatal(err)
@@ -748,13 +749,18 @@ func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 	handler := testHandler(server)
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
-	if first.Code != http.StatusOK || server.evolutionCache == nil {
-		t.Fatalf("initial evolution response = %d %s, cache = %#v", first.Code, first.Body.String(), server.evolutionCache)
-	}
+	server.evolutionMu.Lock()
 	cached := server.evolutionCache
+	server.evolutionMu.Unlock()
+	if first.Code != http.StatusOK || cached == nil {
+		t.Fatalf("initial evolution response = %d %s, cache = %#v", first.Code, first.Body.String(), cached)
+	}
 	second := httptest.NewRecorder()
 	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
-	if second.Code != http.StatusOK || server.evolutionCache != cached || second.Body.String() != first.Body.String() {
+	server.evolutionMu.Lock()
+	afterSecond := server.evolutionCache
+	server.evolutionMu.Unlock()
+	if second.Code != http.StatusOK || afterSecond != cached || second.Body.String() != first.Body.String() {
 		t.Fatalf("repeated evolution response missed cache: first=%s second=%s", first.Body.String(), second.Body.String())
 	}
 
@@ -767,14 +773,60 @@ func TestEvolutionEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer secret")
 	accepted := httptest.NewRecorder()
 	handler.ServeHTTP(accepted, request)
-	if accepted.Code != http.StatusOK || server.evolutionCache != nil {
-		t.Fatalf("ingest response = %d %s, cache was not invalidated", accepted.Code, accepted.Body.String())
+	server.evolutionMu.Lock()
+	afterIngest := server.evolutionCache
+	var refreshDue time.Time
+	if afterIngest != nil {
+		refreshDue = afterIngest.refreshDue
+	}
+	server.evolutionMu.Unlock()
+	if accepted.Code != http.StatusOK || afterIngest == nil || refreshDue.IsZero() {
+		t.Fatalf("ingest response = %d %s, cache = %#v (expected SWR entry with refreshDue)", accepted.Code, accepted.Body.String(), afterIngest)
+	}
+
+	// Within the 2s coalescing window, readers still get the stale cached
+	// payload immediately and do not start a refresh.
+	insideWindow := httptest.NewRecorder()
+	handler.ServeHTTP(insideWindow, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if insideWindow.Code != http.StatusOK || !strings.Contains(insideWindow.Body.String(), `"lifetime_tokens":10`) || server.evolutionRefreshes.Load() != 0 {
+		t.Fatalf("inside-window response = %d %s, refreshes = %d", insideWindow.Code, insideWindow.Body.String(), server.evolutionRefreshes.Load())
+	}
+
+	// Expire the coalescing window: the next reader still serves stale
+	// immediately while triggering one background refresh.
+	server.evolutionMu.Lock()
+	warmedAt := server.evolutionCache.fetched
+	server.evolutionCache.refreshDue = time.Now().Add(-time.Millisecond)
+	server.evolutionMu.Unlock()
+
+	stale := httptest.NewRecorder()
+	handler.ServeHTTP(stale, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+	if stale.Code != http.StatusOK || !strings.Contains(stale.Body.String(), `"lifetime_tokens":10`) || server.evolutionRefreshes.Load() != 1 {
+		t.Fatalf("post-window stale response = %d %s, refreshes = %d", stale.Code, stale.Body.String(), server.evolutionRefreshes.Load())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		server.evolutionMu.Lock()
+		entry := server.evolutionCache
+		done := entry != nil && entry.fetched.After(warmedAt)
+		server.evolutionMu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background evolution refresh did not complete")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	refreshed := httptest.NewRecorder()
 	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
-	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) || server.evolutionCache == nil || server.evolutionCache == cached {
-		t.Fatalf("refreshed evolution response = %d %s, cache = %#v", refreshed.Code, refreshed.Body.String(), server.evolutionCache)
+	server.evolutionMu.Lock()
+	updatedEntry := server.evolutionCache
+	server.evolutionMu.Unlock()
+	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":25`) || updatedEntry == nil || updatedEntry == cached {
+		t.Fatalf("refreshed evolution response = %d %s, cache = %#v", refreshed.Code, refreshed.Body.String(), updatedEntry)
 	}
 }
 
@@ -788,6 +840,7 @@ func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = server.Close() }()
 	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "concurrent-cache", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(42), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
@@ -831,10 +884,28 @@ func TestEvolutionEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 	close(start)
 	wait.Wait()
 
-	final := httptest.NewRecorder()
-	handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
-	if final.Code != http.StatusOK || !strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
-		t.Fatalf("final evolution response = %d %s", final.Code, final.Body.String())
+	// Expire any pending coalescing window if the pre-ingest entry is still
+	// cached, then trigger and wait for the background SWR refresh.
+	server.evolutionMu.Lock()
+	if server.evolutionCache != nil && !server.evolutionCache.refreshDue.IsZero() {
+		server.evolutionCache.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.evolutionMu.Unlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		final := httptest.NewRecorder()
+		handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
+		if final.Code != http.StatusOK && !strings.Contains(final.Body.String(), `"lifetime_tokens":42`) {
+			t.Fatalf("final evolution response = %d %s", final.Code, final.Body.String())
+		}
+		if strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("final evolution response never converged to 43: %d %s", final.Code, final.Body.String())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -848,6 +919,7 @@ func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = server.Close() }()
 	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "ttl-event", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(7), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
@@ -856,29 +928,53 @@ func TestEvolutionEndpointRecomputesAfterCacheTTL(t *testing.T) {
 	handler := testHandler(server)
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
-	if first.Code != http.StatusOK || server.evolutionCache == nil {
+	server.evolutionMu.Lock()
+	original := server.evolutionCache
+	server.evolutionMu.Unlock()
+	if first.Code != http.StatusOK || original == nil {
 		t.Fatalf("initial evolution response = %d %s", first.Code, first.Body.String())
 	}
-	original := server.evolutionCache
 	if _, err := server.cachedEvolution(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if server.evolutionCache != original || time.Since(original.fetched) > time.Second {
-		t.Fatalf("fresh cache was overwritten: %#v", server.evolutionCache)
+	server.evolutionMu.Lock()
+	current := server.evolutionCache
+	fetched := current.fetched
+	server.evolutionMu.Unlock()
+	if current != original || time.Since(fetched) > time.Second {
+		t.Fatalf("fresh cache was overwritten: %#v", current)
 	}
 
+	server.evolutionMu.Lock()
 	server.evolutionCache.fetched = time.Now().Add(-evolutionCacheTTL - time.Second)
 	backdatedEntry := server.evolutionCache
+	server.evolutionMu.Unlock()
+
 	refreshed := httptest.NewRecorder()
 	handler.ServeHTTP(refreshed, httptest.NewRequest(http.MethodGet, "/api/v1/evolution", nil))
 	if refreshed.Code != http.StatusOK || !strings.Contains(refreshed.Body.String(), `"lifetime_tokens":7`) {
 		t.Fatalf("expired evolution response = %d %s", refreshed.Code, refreshed.Body.String())
 	}
-	server.evolutionMu.Lock()
-	recomputed := server.evolutionCache
-	server.evolutionMu.Unlock()
-	if recomputed == nil || recomputed == backdatedEntry || time.Since(recomputed.fetched) > time.Second {
-		t.Fatalf("expired cache was not recomputed: %#v", server.evolutionCache)
+	deadline := time.Now().Add(5 * time.Second)
+	var recomputed *evolutionCacheEntry
+	var recomputedFetched time.Time
+	for {
+		server.evolutionMu.Lock()
+		recomputed = server.evolutionCache
+		if recomputed != nil {
+			recomputedFetched = recomputed.fetched
+		}
+		server.evolutionMu.Unlock()
+		if recomputed != nil && recomputed != backdatedEntry {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired cache was not recomputed: %#v", recomputed)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if time.Since(recomputedFetched) > time.Second {
+		t.Fatalf("recomputed fetched time too old: %v", recomputedFetched)
 	}
 }
 
@@ -892,6 +988,7 @@ func TestOverviewEndpointCachesUntilSuccessfulIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = server.Close() }()
 	initial := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-cache-initial", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{initial}); err != nil {
 		t.Fatal(err)
@@ -954,6 +1051,7 @@ func TestOverviewEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = server.Close() }()
 	event := usage.Event{SchemaVersion: usage.SchemaVersion, EventID: "overview-concurrent-cache", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(42), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}}
 	if _, err := store.Ingest(context.Background(), []usage.Event{event}); err != nil {
 		t.Fatal(err)
@@ -997,10 +1095,20 @@ func TestOverviewEndpointCacheHandlesConcurrentPolling(t *testing.T) {
 	close(start)
 	wait.Wait()
 
-	final := httptest.NewRecorder()
-	handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
-	if final.Code != http.StatusOK || !strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
-		t.Fatalf("final overview response = %d %s", final.Code, final.Body.String())
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		final := httptest.NewRecorder()
+		handler.ServeHTTP(final, httptest.NewRequest(http.MethodGet, "/api/v1/analytics/overview", nil))
+		if final.Code == http.StatusOK && strings.Contains(final.Body.String(), `"lifetime_tokens":43`) {
+			break
+		}
+		if final.Code != http.StatusOK || !strings.Contains(final.Body.String(), `"lifetime_tokens":42`) {
+			t.Fatalf("final overview response = %d %s", final.Code, final.Body.String())
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("final overview response never converged to 43: %d %s", final.Code, final.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -3202,5 +3310,546 @@ func TestDashboardPrerendersTokenCompositionAndHonorsAutoPaused(t *testing.T) {
 	pollIdx := strings.Index(body, "const pollLifetime =")
 	if autoIdx < 0 || pollIdx < 0 || autoIdx > pollIdx {
 		t.Fatalf("autoPaused must be declared before pollLifetime (autoIdx=%d, pollIdx=%d)", autoIdx, pollIdx)
+	}
+}
+
+func TestDashboardRendersAtMostEightSessions(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Now().UTC().Add(-time.Hour)
+	events := make([]usage.Event, 0, 12)
+	for i := 0; i < 12; i++ {
+		events = append(events, usage.Event{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       fmt.Sprintf("dash-lim-%d", i),
+			Timestamp:     base.Add(time.Duration(i) * time.Minute),
+			MachineID:     "box",
+			Provider:      "openai",
+			Model:         "gpt-5",
+			Tool:          "codex",
+			SessionID:     fmt.Sprintf("dash-sess-%02d", i),
+			TotalTokens:   usage.Int64(100),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		})
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	rec := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for i := 4; i < 12; i++ {
+		if !strings.Contains(body, fmt.Sprintf("dash-sess-%02d", i)) {
+			t.Errorf("dashboard missing recent session dash-sess-%02d", i)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if strings.Contains(body, fmt.Sprintf("dash-sess-%02d", i)) {
+			t.Errorf("dashboard unexpectedly rendered older session dash-sess-%02d beyond LIMIT 8", i)
+		}
+	}
+}
+
+func TestCatalogSessionsInsightsSWRCoalescingAndBounds(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "swr-ev-1", Timestamp: now.Add(-time.Hour),
+			MachineID: "swr-machine", Project: "proj", Provider: "openai", Model: "gpt-swr-1", Tool: "codex",
+			SessionID: "sess-swr-1", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Close() }()
+	handler := testHandler(server)
+
+	// Warm /tokedex, /api/v1/models, /sessions, /api/v1/sessions, /insights, /api/v1/insights.
+	for _, path := range []string{"/tokedex", "/api/v1/catalog", "/api/v1/models", "/sessions", "/api/v1/sessions", "/insights", "/api/v1/insights"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("warm %s status = %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Alias update via POST /settings/aliases must reflect immediately on /sessions and /insights without waiting for TTL.
+	settingsPageRec := httptest.NewRecorder()
+	handler.ServeHTTP(settingsPageRec, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if settingsPageRec.Code != http.StatusOK {
+		t.Fatalf("settings status = %d", settingsPageRec.Code)
+	}
+	csrfMatch := regexp.MustCompile(`name="csrf_token" value="([^"]+)"`).FindStringSubmatch(settingsPageRec.Body.String())
+	if len(csrfMatch) != 2 {
+		t.Fatalf("missing csrf token in settings HTML")
+	}
+	form := url.Values{
+		"csrf_token":       {csrfMatch[1]},
+		"machine_identity": {"swr-machine"},
+		"machine_alias":    {"Studio Alias"},
+		"model_identity":   {"gpt-swr-1"},
+		"model_alias":      {"Model Alias"},
+	}
+	postAlias := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	postAlias.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postAlias.Header.Set("Origin", "http://example.com")
+	postAliasRec := httptest.NewRecorder()
+	handler.ServeHTTP(postAliasRec, postAlias)
+	if postAliasRec.Code != http.StatusSeeOther {
+		t.Fatalf("saveSettings status = %d: %s", postAliasRec.Code, postAliasRec.Body.String())
+	}
+
+	sessAliasRec := httptest.NewRecorder()
+	handler.ServeHTTP(sessAliasRec, httptest.NewRequest(http.MethodGet, "/sessions", nil))
+	if !strings.Contains(sessAliasRec.Body.String(), "Studio Alias") || !strings.Contains(sessAliasRec.Body.String(), "Model Alias") {
+		t.Fatalf("/sessions did not reflect updated aliases immediately")
+	}
+	insAliasRec := httptest.NewRecorder()
+	handler.ServeHTTP(insAliasRec, httptest.NewRequest(http.MethodGet, "/insights", nil))
+	if !strings.Contains(insAliasRec.Body.String(), "Studio Alias") || !strings.Contains(insAliasRec.Body.String(), "Model Alias") {
+		t.Fatalf("/insights did not reflect updated aliases immediately")
+	}
+
+	// HTTP ingest marks all three SWR caches stale with 2s coalescing window.
+	ingestPayload, err := json.Marshal(batchRequest{Events: []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "swr-ev-2", Timestamp: now,
+			MachineID: "swr-machine", Project: "proj", Provider: "openai", Model: "gpt-swr-2", Tool: "codex",
+			SessionID: "sess-swr-2", TotalTokens: usage.Int64(250), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		// Re-sending same batch / invalidating bursts inside window must coalesce.
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(ingestPayload))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ingest %d status = %d", i, rec.Code)
+		}
+	}
+
+	// Inside coalescing window: readers get stale cached payloads and 0 background refreshes start.
+	for _, path := range []string{"/api/v1/catalog", "/api/v1/sessions", "/api/v1/insights"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("inside-window %s status = %d", path, rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "gpt-swr-2") || strings.Contains(rec.Body.String(), "sess-swr-2") {
+			t.Fatalf("inside-window %s bypassed coalescing: %s", path, rec.Body.String())
+		}
+	}
+	if server.catalogRefreshes.Load() != 0 || server.sessionsRefreshes.Load() != 0 || server.insightsRefreshes.Load() != 0 {
+		t.Fatalf("refreshes inside window: cat=%d sess=%d ins=%d",
+			server.catalogRefreshes.Load(), server.sessionsRefreshes.Load(), server.insightsRefreshes.Load())
+	}
+
+	// Expire coalescing windows and trigger SWR refreshes.
+	sessKey := sessionsCacheKey(database.AnalyticsQuery{Period: "30d", Dimension: "projects"}, "when", "desc")
+	insKey := analyticsCacheKey(database.AnalyticsQuery{Period: "30d", Dimension: "projects"})
+
+	server.catalogMu.Lock()
+	catWarm := server.catalogCache.fetched
+	server.catalogCache.refreshDue = time.Now().Add(-time.Millisecond)
+	server.catalogMu.Unlock()
+
+	server.sessionsMu.Lock()
+	sessWarm := server.sessionsCache[sessKey].fetched
+	for _, entry := range server.sessionsCache {
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.sessionsMu.Unlock()
+
+	server.insightsMu.Lock()
+	insWarm := server.insightsCache[insKey].fetched
+	for _, entry := range server.insightsCache {
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.insightsMu.Unlock()
+
+	for _, path := range []string{"/api/v1/catalog", "/api/v1/sessions", "/api/v1/insights"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("post-window %s status = %d", path, rec.Code)
+		}
+	}
+	if server.catalogRefreshes.Load() != 1 || server.sessionsRefreshes.Load() != 1 || server.insightsRefreshes.Load() != 1 {
+		t.Fatalf("post-window refreshes: cat=%d sess=%d ins=%d, want 1 each",
+			server.catalogRefreshes.Load(), server.sessionsRefreshes.Load(), server.insightsRefreshes.Load())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		server.catalogMu.Lock()
+		catDone := server.catalogCache != nil && server.catalogCache.fetched.After(catWarm)
+		server.catalogMu.Unlock()
+
+		server.sessionsMu.Lock()
+		sessEntry := server.sessionsCache[sessKey]
+		sessDone := sessEntry != nil && sessEntry.fetched.After(sessWarm)
+		server.sessionsMu.Unlock()
+
+		server.insightsMu.Lock()
+		insEntry := server.insightsCache[insKey]
+		insDone := insEntry != nil && insEntry.fetched.After(insWarm)
+		server.insightsMu.Unlock()
+
+		if catDone && sessDone && insDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background SWR refreshes timed out: cat=%v sess=%v ins=%v", catDone, sessDone, insDone)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	catFresh := httptest.NewRecorder()
+	handler.ServeHTTP(catFresh, httptest.NewRequest(http.MethodGet, "/api/v1/catalog", nil))
+	if !strings.Contains(catFresh.Body.String(), "gpt-swr-2") {
+		t.Fatalf("catalog did not refresh after SWR: %s", catFresh.Body.String())
+	}
+	sessFresh := httptest.NewRecorder()
+	handler.ServeHTTP(sessFresh, httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil))
+	if !strings.Contains(sessFresh.Body.String(), "sess-swr-2") {
+		t.Fatalf("sessions did not refresh after SWR: %s", sessFresh.Body.String())
+	}
+	insFresh := httptest.NewRecorder()
+	handler.ServeHTTP(insFresh, httptest.NewRequest(http.MethodGet, "/api/v1/insights", nil))
+	if !strings.Contains(insFresh.Body.String(), `"known_events":2`) {
+		t.Fatalf("insights did not refresh after SWR: %s", insFresh.Body.String())
+	}
+
+	// LRU cap 64 on sessionsCache and insightsCache.
+	for i := 0; i < 80; i++ {
+		m := fmt.Sprintf("lru-m-%02d", i)
+		if _, err := server.cachedSessions(context.Background(), database.AnalyticsQuery{Period: "30d", Machine: m}, "when", "desc"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.cachedInsights(context.Background(), database.AnalyticsQuery{Period: "30d", Dimension: "projects", Machine: m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.sessionsMu.Lock()
+	sessLen := len(server.sessionsCache)
+	server.sessionsMu.Unlock()
+	server.insightsMu.Lock()
+	insLen := len(server.insightsCache)
+	server.insightsMu.Unlock()
+	if sessLen != sessionsCacheMaxEntries {
+		t.Fatalf("sessionsCache len = %d, want %d", sessLen, sessionsCacheMaxEntries)
+	}
+	if insLen != insightsCacheMaxEntries {
+		t.Fatalf("insightsCache len = %d, want %d", insLen, insightsCacheMaxEntries)
+	}
+
+	// Warm /tokedex, /sessions, /insights serve cleanly even after store is closed (cached Facets + DisplayAliases + SWR entries).
+	if _, err := store.Facets(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DisplayAliases(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.Close()
+	_ = store.Close()
+
+	// Re-warm default keys just before close? Wait: LRU evicted default keys when 80 lru-m-* keys were inserted!
+	// Verify one of the retained LRU keys serves with closed store.
+	recSess := httptest.NewRecorder()
+	handler.ServeHTTP(recSess, httptest.NewRequest(http.MethodGet, "/sessions?period=30d&machine=lru-m-79", nil))
+	if recSess.Code != http.StatusOK {
+		t.Fatalf("warm /sessions after store.Close status = %d", recSess.Code)
+	}
+	recIns := httptest.NewRecorder()
+	handler.ServeHTTP(recIns, httptest.NewRequest(http.MethodGet, "/insights?period=30d&dimension=projects&machine=lru-m-79", nil))
+	if recIns.Code != http.StatusOK {
+		t.Fatalf("warm /insights after store.Close status = %d", recIns.Code)
+	}
+	recCat := httptest.NewRecorder()
+	handler.ServeHTTP(recCat, httptest.NewRequest(http.MethodGet, "/tokedex", nil))
+	if recCat.Code != http.StatusOK {
+		t.Fatalf("warm /tokedex after store.Close status = %d", recCat.Code)
+	}
+}
+
+func TestServerCloseWaitsForBackgroundRefreshesUnderRace(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "close-race-1", Timestamp: time.Now().UTC(),
+			MachineID: "m1", Provider: "openai", Model: "gpt-5", Tool: "codex", SessionID: "s1",
+			TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := testHandler(server)
+	for _, path := range []string{"/", "/api/v1/evolution", "/api/v1/catalog", "/api/v1/sessions", "/api/v1/insights", "/api/v1/analytics"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("warm %s status = %d", path, rec.Code)
+		}
+	}
+
+	// Trigger background refreshes across all caches and race Server.Close() + Store.Close().
+	server.invalidateEvolutionCache()
+	server.invalidateOverviewCache()
+	server.invalidateAnalyticsCache()
+	server.invalidateCatalogCache()
+	server.invalidateSessionsCache()
+	server.invalidateInsightsCache()
+
+	server.evolutionMu.Lock()
+	if server.evolutionCache != nil {
+		server.evolutionCache.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.evolutionMu.Unlock()
+	server.catalogMu.Lock()
+	if server.catalogCache != nil {
+		server.catalogCache.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.catalogMu.Unlock()
+	server.analyticsMu.Lock()
+	for _, entry := range server.analyticsCache {
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.analyticsMu.Unlock()
+	server.sessionsMu.Lock()
+	for _, entry := range server.sessionsCache {
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.sessionsMu.Unlock()
+	server.insightsMu.Lock()
+	for _, entry := range server.insightsCache {
+		entry.refreshDue = time.Now().Add(-time.Millisecond)
+	}
+	server.insightsMu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		server.WarmCaches(context.Background())
+	}()
+	for _, path := range []string{"/", "/api/v1/evolution", "/api/v1/catalog", "/api/v1/sessions", "/api/v1/insights", "/api/v1/analytics"} {
+		p := path
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		}()
+	}
+	wg.Wait()
+
+	if err := server.Close(); err != nil {
+		t.Fatalf("server.Close() = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close() = %v", err)
+	}
+}
+
+func TestSWR24hRefreshAdvancesWindowNow(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	t0 := time.Now().UTC()
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "swr-24h-ev-1", Timestamp: t0.Add(-10 * time.Minute),
+			MachineID: "m1", Project: "proj", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			SessionID: "sess-24h-1", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Close() }()
+	handler := testHandler(server)
+
+	// Warm period=24h caches at t0.
+	paths := []string{"/api/v1/sessions?period=24h", "/api/v1/insights?period=24h", "/api/v1/analytics?period=24h"}
+	for _, path := range paths {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("warm %s status = %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Ensure the new event timestamp is strictly after the warm query.Now (t0).
+	time.Sleep(20 * time.Millisecond)
+	ingestPayload, err := json.Marshal(batchRequest{Events: []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "swr-24h-ev-2", Timestamp: time.Now().UTC(),
+			MachineID: "m1", Project: "proj", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			SessionID: "sess-24h-2", TotalTokens: usage.Int64(250), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingestReq := httptest.NewRequest(http.MethodPost, "/api/v1/events/batch", bytes.NewReader(ingestPayload))
+	ingestReq.Header.Set("Authorization", "Bearer secret")
+	ingestRec := httptest.NewRecorder()
+	handler.ServeHTTP(ingestRec, ingestReq)
+	if ingestRec.Code != http.StatusOK {
+		t.Fatalf("ingest status = %d: %s", ingestRec.Code, ingestRec.Body.String())
+	}
+
+	// Wait past the 2s coalescing window and trigger SWR refreshes.
+	time.Sleep(analyticsMinRefreshInterval + 100*time.Millisecond)
+	for _, path := range paths {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("post-window trigger %s status = %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Poll until all three endpoints reflect the newly ingested post-t0 event.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sessRec := httptest.NewRecorder()
+		handler.ServeHTTP(sessRec, httptest.NewRequest(http.MethodGet, "/api/v1/sessions?period=24h", nil))
+		insRec := httptest.NewRecorder()
+		handler.ServeHTTP(insRec, httptest.NewRequest(http.MethodGet, "/api/v1/insights?period=24h", nil))
+		anaRec := httptest.NewRecorder()
+		handler.ServeHTTP(anaRec, httptest.NewRequest(http.MethodGet, "/api/v1/analytics?period=24h", nil))
+
+		sessOK := sessRec.Code == http.StatusOK && strings.Contains(sessRec.Body.String(), "sess-24h-2")
+		insOK := insRec.Code == http.StatusOK && strings.Contains(insRec.Body.String(), `"known_events":2`)
+		anaOK := anaRec.Code == http.StatusOK && strings.Contains(anaRec.Body.String(), `"tokens":350`)
+		if sessOK && insOK && anaOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("24h SWR refresh did not advance query.Now: sessions=%s insights=%s analytics=%s",
+				sessRec.Body.String(), insRec.Body.String(), anaRec.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDashboardReflectsUpdatedAliasesImmediatelyAfterWarm(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "warm-alias-ev",
+			Timestamp: time.Now().UTC(),
+			MachineID: "raw-machine-id", Provider: "anthropic", Model: "raw-model-id", Tool: "claude",
+			SessionID: "sess-warm-alias", TotalTokens: usage.Int64(420), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "claude", AdapterVersion: "1"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.Close() }()
+	handler := testHandler(server)
+
+	// Warm GET / twice so overviewCache.html is populated with pre-alias HTML.
+	for i := 0; i < 2; i++ {
+		warm := httptest.NewRecorder()
+		handler.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, "/", nil))
+		if warm.Code != http.StatusOK {
+			t.Fatalf("warm GET / #%d = %d", i+1, warm.Code)
+		}
+	}
+	server.overviewMu.Lock()
+	warmHTMLLen := len(server.overviewCache.html)
+	server.overviewMu.Unlock()
+	if warmHTMLLen == 0 {
+		t.Fatal("GET / did not populate overviewCache.html")
+	}
+
+	form := url.Values{
+		"model_identity":   {"raw-model-id"},
+		"model_alias":      {"InstantModelName"},
+		"machine_identity": {"raw-machine-id"},
+		"machine_alias":    {"InstantStudioMac"},
+		"csrf_token":       {server.csrfToken()},
+	}
+	post := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader(form.Encode()))
+	post.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postRec := httptest.NewRecorder()
+	handler.ServeHTTP(postRec, post)
+	if postRec.Code != http.StatusSeeOther || postRec.Header().Get("Location") != "/settings?saved=1" {
+		t.Fatalf("POST /settings/aliases = %d, location %q", postRec.Code, postRec.Header().Get("Location"))
+	}
+
+	// Immediate next GET / must render fresh HTML with both updated aliases.
+	immediate := httptest.NewRecorder()
+	handler.ServeHTTP(immediate, httptest.NewRequest(http.MethodGet, "/", nil))
+	if immediate.Code != http.StatusOK {
+		t.Fatalf("immediate GET / = %d", immediate.Code)
+	}
+	body := immediate.Body.String()
+	for _, want := range []string{">InstantModelName</span>", ">InstantStudioMac</span>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("immediate GET / after POST /settings/aliases missing %q", want)
+		}
 	}
 }

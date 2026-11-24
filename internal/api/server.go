@@ -45,6 +45,7 @@ type Server struct {
 	evolutionCache       *evolutionCacheEntry
 	evolutionReady       chan struct{}
 	evolutionGeneration  uint64
+	evolutionRefreshes   atomic.Int64
 	overviewMu           sync.Mutex
 	overviewCache        *overviewCacheEntry
 	overviewReady        chan struct{}
@@ -56,12 +57,65 @@ type Server struct {
 	// process start. Tests assert on it to prove invalidation coalescing;
 	// production code never reads it.
 	analyticsRefreshes atomic.Int64
+	catalogMu          sync.Mutex
+	catalogCache       *catalogCacheEntry
+	catalogReady       chan struct{}
+	catalogGeneration  uint64
+	catalogRefreshes   atomic.Int64
+	sessionsMu         sync.Mutex
+	sessionsCache      map[string]*sessionsCacheEntry
+	sessionsGeneration uint64
+	sessionsRefreshes  atomic.Int64
+	insightsMu         sync.Mutex
+	insightsCache      map[string]*insightsCacheEntry
+	insightsGeneration uint64
+	insightsRefreshes  atomic.Int64
+
+	bgMu      sync.Mutex
+	bgClosed  bool
+	bgCtx     context.Context
+	bgCancel  context.CancelFunc
+	bgWG      sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type evolutionCacheEntry struct {
-	result  evolutionResponse
-	err     error
-	fetched time.Time
+	result     evolutionResponse
+	err        error
+	fetched    time.Time
+	refreshDue time.Time
+}
+
+type catalogCacheEntry struct {
+	result     database.CatalogSnapshot
+	err        error
+	fetched    time.Time
+	refreshDue time.Time
+}
+
+type sessionsCacheEntry struct {
+	query      database.AnalyticsQuery
+	sort       string
+	dir        string
+	result     []database.SessionRecord
+	err        error
+	fetched    time.Time
+	ready      chan struct{}
+	hasResult  bool
+	lastUse    time.Time
+	refreshDue time.Time
+}
+
+type insightsCacheEntry struct {
+	query      database.AnalyticsQuery
+	result     database.Insights
+	err        error
+	fetched    time.Time
+	ready      chan struct{}
+	hasResult  bool
+	lastUse    time.Time
+	refreshDue time.Time
 }
 
 type overviewCacheEntry struct {
@@ -1864,6 +1918,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if err != nil {
 		return nil, err
 	}
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	return &Server{
 		store:                store,
 		config:               config,
@@ -1876,7 +1931,45 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		template:             page,
 		static:               http.FileServer(http.FS(staticFiles)),
 		recapProvider:        recap,
+		bgCtx:                bgCtx,
+		bgCancel:             bgCancel,
 	}, nil
+}
+
+func (s *Server) backgroundContext() context.Context {
+	if s.bgCtx != nil {
+		return s.bgCtx
+	}
+	return context.Background()
+}
+
+func (s *Server) tryStartBackground() bool {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgClosed || s.bgCtx == nil {
+		return false
+	}
+	s.bgWG.Add(1)
+	return true
+}
+
+// Close cancels any in-flight background cache refreshes and waits for them to
+// finish so callers can safely close the underlying Store afterwards.
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.bgMu.Lock()
+		s.bgClosed = true
+		cancel := s.bgCancel
+		s.bgMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		s.bgWG.Wait()
+	})
+	return s.closeErr
 }
 
 func (s *Server) Handler() http.Handler {
@@ -2100,6 +2193,9 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.invalidateEvolutionCache()
 	s.invalidateOverviewCache()
 	s.invalidateAnalyticsCache()
+	s.invalidateCatalogCache()
+	s.invalidateSessionsCache()
+	s.invalidateInsightsCache()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -2364,9 +2460,12 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) catalogAPI(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.CatalogSnapshot(r.Context())
+	result, err := s.cachedCatalog(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2375,9 +2474,12 @@ func (s *Server) catalogAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) modelsAPI(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.CatalogSnapshot(r.Context())
+	result, err := s.cachedCatalog(r.Context())
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2386,9 +2488,12 @@ func (s *Server) modelsAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sessionsAPI(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, err := s.store.Sessions(r.Context(), analyticsQueryFromRequest(r))
+	result, err := s.cachedSessions(r.Context(), analyticsQueryFromRequest(r), "when", "desc")
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2398,9 +2503,12 @@ func (s *Server) sessionsAPI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	started := time.Now()
-	result, err := s.store.Sessions(r.Context(), query)
+	result, err := s.cachedSessions(r.Context(), query, "when", "desc")
 	s.metrics.observeDB(started)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2520,13 +2628,22 @@ func (s *Server) evolution(w http.ResponseWriter, r *http.Request) {
 }
 
 // evolutionCacheTTL bounds how long cached evolution data may be served without
-// any ingest writing to the store; the ingest path still invalidates immediately.
+// any ingest writing to the store.
 const evolutionCacheTTL = time.Minute
+
+// evolutionMinRefreshInterval coalesces ingest invalidations into at most one
+// background refresh per window while readers keep serving the last good value.
+const evolutionMinRefreshInterval = 2 * time.Second
 
 func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error) {
 	for {
 		s.evolutionMu.Lock()
-		if cached := s.evolutionCache; cached != nil && time.Since(cached.fetched) < evolutionCacheTTL {
+		if cached := s.evolutionCache; cached != nil {
+			stale := time.Since(cached.fetched) >= evolutionCacheTTL ||
+				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
+			if stale && s.evolutionReady == nil {
+				s.startEvolutionRefreshLocked()
+			}
 			result, err := cached.result, cached.err
 			s.evolutionMu.Unlock()
 			return result, err
@@ -2562,6 +2679,30 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 	}
 }
 
+func (s *Server) startEvolutionRefreshLocked() {
+	if !s.tryStartBackground() {
+		return
+	}
+	s.evolutionRefreshes.Add(1)
+	generation := s.evolutionGeneration
+	ready := make(chan struct{})
+	s.evolutionReady = ready
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.computeEvolution(ctx)
+
+		s.evolutionMu.Lock()
+		if s.evolutionGeneration == generation && !clientGone(err) {
+			s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.evolutionReady = nil
+		s.evolutionMu.Unlock()
+		close(ready)
+	}()
+}
+
 func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error) {
 	started := time.Now()
 	snapshot, err := s.store.Evolution(ctx)
@@ -2579,9 +2720,16 @@ func (s *Server) computeEvolution(ctx context.Context) (evolutionResponse, error
 }
 
 func (s *Server) invalidateEvolutionCache() {
+	now := time.Now()
 	s.evolutionMu.Lock()
 	s.evolutionGeneration++
-	s.evolutionCache = nil
+	if s.evolutionCache != nil {
+		due := now
+		if windowEnd := s.evolutionCache.fetched.Add(evolutionMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		s.evolutionCache.refreshDue = due
+	}
 	s.evolutionMu.Unlock()
 }
 
@@ -2663,11 +2811,15 @@ func (s *Server) cachedOverviewEntry(ctx context.Context) overviewCacheEntry {
 // that readers keep the previous entry for the render's duration, which is the
 // same stale-while-revalidate bargain they already accept for the refresh.
 func (s *Server) startOverviewRefreshLocked() {
+	if !s.tryStartBackground() {
+		return
+	}
 	generation := s.overviewGeneration
 	ready := make(chan struct{})
 	s.overviewReady = ready
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), sharedComputeTimeout)
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
 		defer cancel()
 		result, err := s.store.Overview(ctx)
 
@@ -2696,18 +2848,20 @@ func (s *Server) startOverviewRefreshLocked() {
 	}()
 }
 
-// WarmCaches pre-computes the overview (with its pre-rendered dashboard) and
-// then the default analytics window, strictly in that order: the two full
+// WarmCaches pre-computes the overview (with its pre-rendered dashboard),
+// the default analytics window, and evolution, strictly in that order: the
 // scans contend on the same SQLite database, and running them concurrently
 // on a cold page cache slows the overview compute the first / joins from
-// ~0.7s to ~13s (live regression, 2026-11-07). The analytics warm is the
-// long pole and still starts as early as the overview+pre-render allows.
+// ~0.7s to ~13s (live regression, 2026-11-07).
 // The compute is detached from the caller's context — a shutdown signal
 // racing the warm must not leave the first request cold — and bounded by
-// sharedComputeTimeout per compute. Failures are logged at debug: every
-// cache stays lazily computed on demand.
-func (s *Server) WarmCaches(ctx context.Context) {
-	computeCtx, cancel := detachedComputeContext(ctx)
+// sharedComputeTimeout per compute while honoring Server.Close().
+func (s *Server) WarmCaches(_ context.Context) {
+	if !s.tryStartBackground() {
+		return
+	}
+	defer s.bgWG.Done()
+	computeCtx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
 	defer cancel()
 	if result, fetched, err := s.cachedOverview(computeCtx); err != nil {
 		s.logger.Debug("warmup_overview_failed", "error", err.Error())
@@ -2717,6 +2871,9 @@ func (s *Server) WarmCaches(ctx context.Context) {
 	query := database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}
 	if _, err := s.cachedAnalytics(computeCtx, query); err != nil {
 		s.logger.Debug("warmup_analytics_failed", "error", err.Error())
+	}
+	if _, err := s.cachedEvolution(computeCtx); err != nil {
+		s.logger.Debug("warmup_evolution_failed", "error", err.Error())
 	}
 }
 
@@ -2728,6 +2885,16 @@ func (s *Server) invalidateOverviewCache() {
 		// zero fetched time marks it stale and the next request refreshes it.
 		// The rendered page rides along on the entry, so the stale overview and
 		// its page stay a pair until the refresh replaces both.
+		s.overviewCache.fetched = time.Time{}
+	}
+	s.overviewMu.Unlock()
+}
+
+func (s *Server) dropOverviewHTMLCache() {
+	s.overviewMu.Lock()
+	s.overviewGeneration++
+	if s.overviewCache != nil {
+		s.overviewCache.html = nil
 		s.overviewCache.fetched = time.Time{}
 	}
 	s.overviewMu.Unlock()
@@ -2816,18 +2983,24 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 // result while it runs, and the generation guard drops a result that an
 // ingest superseded.
 func (s *Server) startAnalyticsRefreshLocked(key string, entry *analyticsCacheEntry) {
+	if !s.tryStartBackground() {
+		return
+	}
 	s.analyticsRefreshes.Add(1)
 	generation := s.analyticsGeneration
-	entry.ready = make(chan struct{})
-	ready := entry.ready
+	query := entry.query
+	query.Now = time.Now().UTC()
+	ready := make(chan struct{})
+	entry.ready = ready
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), sharedComputeTimeout)
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
 		defer cancel()
-		result, err := s.store.Analytics(ctx, entry.query)
+		result, err := s.store.Analytics(ctx, query)
 
 		s.analyticsMu.Lock()
 		if s.analyticsGeneration == generation && !clientGone(err) {
-			s.analyticsCache[key] = &analyticsCacheEntry{query: entry.query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+			s.analyticsCache[key] = &analyticsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
 		}
 		entry.ready = nil
 		s.analyticsMu.Unlock()
@@ -2967,12 +3140,9 @@ func (s *Server) renderDashboardHTML(ctx context.Context, result database.Overvi
 		return nil, err
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	sessions, err := s.store.Sessions(ctx, database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()})
+	sessions, err := s.store.SessionsWithLimit(ctx, database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}, "when", "desc", 8)
 	if err != nil {
 		return nil, err
-	}
-	if len(sessions) > 8 {
-		sessions = sessions[:8]
 	}
 	// The pre-rendered page is served to every authenticated user, so the
 	// logout affordance keys on the password account being configured, not
@@ -2996,8 +3166,11 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	snapshot, err := s.store.CatalogSnapshot(r.Context())
+	snapshot, err := s.cachedCatalog(r.Context())
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -3024,8 +3197,11 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	sort, dir := database.NormalizeSessionSort(r.URL.Query().Get("sort"), r.URL.Query().Get("dir"))
-	result, err := s.store.SessionsWithSort(r.Context(), query, sort, dir)
+	result, err := s.cachedSessions(r.Context(), query, sort, dir)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -3147,8 +3323,11 @@ func (s *Server) insightsRecap(ctx context.Context, result database.Insights) In
 
 func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
-	result, err := s.store.Insights(r.Context(), query)
+	result, err := s.cachedInsights(r.Context(), query)
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		http.Error(w, "Insights are temporarily unavailable.", http.StatusInternalServerError)
 		return
 	}
@@ -3183,8 +3362,11 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
-	result, err := s.store.Insights(r.Context(), analyticsQueryFromRequest(r))
+	result, err := s.cachedInsights(r.Context(), analyticsQueryFromRequest(r))
 	if err != nil {
+		if clientGone(err) {
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -3193,6 +3375,330 @@ func (s *Server) insightsAPI(w http.ResponseWriter, r *http.Request) {
 		AIRecap InsightsRecap `json:"ai_recap"`
 	}{Insights: result, AIRecap: s.insightsRecap(r.Context(), result)}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+const (
+	catalogCacheTTL           = time.Minute
+	catalogMinRefreshInterval = 2 * time.Second
+
+	sessionsCacheTTL           = time.Minute
+	sessionsMinRefreshInterval = 2 * time.Second
+	sessionsCacheMaxEntries    = 64
+
+	insightsCacheTTL           = time.Minute
+	insightsMinRefreshInterval = 2 * time.Second
+	insightsCacheMaxEntries    = 64
+)
+
+func (s *Server) cachedCatalog(ctx context.Context) (database.CatalogSnapshot, error) {
+	for {
+		s.catalogMu.Lock()
+		if cached := s.catalogCache; cached != nil {
+			stale := time.Since(cached.fetched) >= catalogCacheTTL ||
+				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
+			if stale && s.catalogReady == nil {
+				s.startCatalogRefreshLocked()
+			}
+			result, err := cached.result, cached.err
+			s.catalogMu.Unlock()
+			return result, err
+		}
+		if ready := s.catalogReady; ready != nil {
+			s.catalogMu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return database.CatalogSnapshot{}, ctx.Err()
+			}
+		}
+		generation := s.catalogGeneration
+		s.catalogReady = make(chan struct{})
+		s.catalogMu.Unlock()
+
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.store.CatalogSnapshot(computeCtx)
+		cancel()
+
+		s.catalogMu.Lock()
+		ready := s.catalogReady
+		s.catalogReady = nil
+		if s.catalogGeneration == generation && !clientGone(err) {
+			s.catalogCache = &catalogCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.catalogMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) startCatalogRefreshLocked() {
+	if !s.tryStartBackground() {
+		return
+	}
+	s.catalogRefreshes.Add(1)
+	generation := s.catalogGeneration
+	ready := make(chan struct{})
+	s.catalogReady = ready
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.store.CatalogSnapshot(ctx)
+
+		s.catalogMu.Lock()
+		if s.catalogGeneration == generation && !clientGone(err) {
+			s.catalogCache = &catalogCacheEntry{result: result, err: err, fetched: time.Now()}
+		}
+		s.catalogReady = nil
+		s.catalogMu.Unlock()
+		close(ready)
+	}()
+}
+
+func (s *Server) invalidateCatalogCache() {
+	now := time.Now()
+	s.catalogMu.Lock()
+	s.catalogGeneration++
+	if s.catalogCache != nil {
+		due := now
+		if windowEnd := s.catalogCache.fetched.Add(catalogMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		s.catalogCache.refreshDue = due
+	}
+	s.catalogMu.Unlock()
+}
+
+func sessionsCacheKey(query database.AnalyticsQuery, sort, dir string) string {
+	return query.Period + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool + "\x1f" + sort + "\x1f" + dir
+}
+
+func (s *Server) cachedSessions(ctx context.Context, query database.AnalyticsQuery, sort, dir string) ([]database.SessionRecord, error) {
+	sort, dir = database.NormalizeSessionSort(sort, dir)
+	key := sessionsCacheKey(query, sort, dir)
+	for {
+		s.sessionsMu.Lock()
+		if entry, ok := s.sessionsCache[key]; ok && entry.ready != nil && !entry.hasResult {
+			s.sessionsMu.Unlock()
+			select {
+			case <-entry.ready:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if entry, ok := s.sessionsCache[key]; ok && entry.hasResult {
+			stale := time.Since(entry.fetched) >= sessionsCacheTTL ||
+				(!entry.refreshDue.IsZero() && !time.Now().Before(entry.refreshDue))
+			if stale && entry.ready == nil {
+				s.startSessionsRefreshLocked(key, entry)
+			}
+			entry.lastUse = time.Now()
+			result, err := entry.result, entry.err
+			s.sessionsMu.Unlock()
+			return result, err
+		}
+		if s.sessionsCache == nil {
+			s.sessionsCache = make(map[string]*sessionsCacheEntry)
+		}
+		computing := &sessionsCacheEntry{query: query, sort: sort, dir: dir, ready: make(chan struct{})}
+		s.sessionsCache[key] = computing
+		s.evictSessionsEntriesLocked()
+		generation := s.sessionsGeneration
+		s.sessionsMu.Unlock()
+
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.store.SessionsWithSort(computeCtx, query, sort, dir)
+		cancel()
+
+		s.sessionsMu.Lock()
+		if s.sessionsGeneration == generation && !clientGone(err) {
+			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+		} else {
+			delete(s.sessionsCache, key)
+		}
+		ready := computing.ready
+		s.sessionsMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) startSessionsRefreshLocked(key string, entry *sessionsCacheEntry) {
+	if !s.tryStartBackground() {
+		return
+	}
+	s.sessionsRefreshes.Add(1)
+	generation := s.sessionsGeneration
+	query := entry.query
+	query.Now = time.Now().UTC()
+	sort := entry.sort
+	dir := entry.dir
+	ready := make(chan struct{})
+	entry.ready = ready
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.store.SessionsWithSort(ctx, query, sort, dir)
+
+		s.sessionsMu.Lock()
+		if s.sessionsGeneration == generation && !clientGone(err) {
+			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+		}
+		entry.ready = nil
+		s.sessionsMu.Unlock()
+		close(ready)
+	}()
+}
+
+func (s *Server) evictSessionsEntriesLocked() {
+	for len(s.sessionsCache) > sessionsCacheMaxEntries {
+		victim := ""
+		var oldest time.Time
+		for key, entry := range s.sessionsCache {
+			if entry.ready != nil {
+				continue
+			}
+			if victim == "" || entry.lastUse.Before(oldest) {
+				victim, oldest = key, entry.lastUse
+			}
+		}
+		if victim == "" {
+			return
+		}
+		delete(s.sessionsCache, victim)
+	}
+}
+
+func (s *Server) invalidateSessionsCache() {
+	now := time.Now()
+	s.sessionsMu.Lock()
+	s.sessionsGeneration++
+	for _, entry := range s.sessionsCache {
+		if entry.ready != nil {
+			continue
+		}
+		due := now
+		if windowEnd := entry.fetched.Add(sessionsMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		entry.refreshDue = due
+	}
+	s.sessionsMu.Unlock()
+}
+
+func (s *Server) cachedInsights(ctx context.Context, query database.AnalyticsQuery) (database.Insights, error) {
+	key := analyticsCacheKey(query)
+	for {
+		s.insightsMu.Lock()
+		if entry, ok := s.insightsCache[key]; ok && entry.ready != nil && !entry.hasResult {
+			s.insightsMu.Unlock()
+			select {
+			case <-entry.ready:
+				continue
+			case <-ctx.Done():
+				return database.Insights{}, ctx.Err()
+			}
+		}
+		if entry, ok := s.insightsCache[key]; ok && entry.hasResult {
+			stale := time.Since(entry.fetched) >= insightsCacheTTL ||
+				(!entry.refreshDue.IsZero() && !time.Now().Before(entry.refreshDue))
+			if stale && entry.ready == nil {
+				s.startInsightsRefreshLocked(key, entry)
+			}
+			entry.lastUse = time.Now()
+			result, err := entry.result, entry.err
+			s.insightsMu.Unlock()
+			return result, err
+		}
+		if s.insightsCache == nil {
+			s.insightsCache = make(map[string]*insightsCacheEntry)
+		}
+		computing := &insightsCacheEntry{query: query, ready: make(chan struct{})}
+		s.insightsCache[key] = computing
+		s.evictInsightsEntriesLocked()
+		generation := s.insightsGeneration
+		s.insightsMu.Unlock()
+
+		computeCtx, cancel := detachedComputeContext(ctx)
+		result, err := s.store.Insights(computeCtx, query)
+		cancel()
+
+		s.insightsMu.Lock()
+		if s.insightsGeneration == generation && !clientGone(err) {
+			s.insightsCache[key] = &insightsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+		} else {
+			delete(s.insightsCache, key)
+		}
+		ready := computing.ready
+		s.insightsMu.Unlock()
+		close(ready)
+		return result, err
+	}
+}
+
+func (s *Server) startInsightsRefreshLocked(key string, entry *insightsCacheEntry) {
+	if !s.tryStartBackground() {
+		return
+	}
+	s.insightsRefreshes.Add(1)
+	generation := s.insightsGeneration
+	query := entry.query
+	query.Now = time.Now().UTC()
+	ready := make(chan struct{})
+	entry.ready = ready
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
+		defer cancel()
+		result, err := s.store.Insights(ctx, query)
+
+		s.insightsMu.Lock()
+		if s.insightsGeneration == generation && !clientGone(err) {
+			s.insightsCache[key] = &insightsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+		}
+		entry.ready = nil
+		s.insightsMu.Unlock()
+		close(ready)
+	}()
+}
+
+func (s *Server) evictInsightsEntriesLocked() {
+	for len(s.insightsCache) > insightsCacheMaxEntries {
+		victim := ""
+		var oldest time.Time
+		for key, entry := range s.insightsCache {
+			if entry.ready != nil {
+				continue
+			}
+			if victim == "" || entry.lastUse.Before(oldest) {
+				victim, oldest = key, entry.lastUse
+			}
+		}
+		if victim == "" {
+			return
+		}
+		delete(s.insightsCache, victim)
+	}
+}
+
+func (s *Server) invalidateInsightsCache() {
+	now := time.Now()
+	s.insightsMu.Lock()
+	s.insightsGeneration++
+	for _, entry := range s.insightsCache {
+		if entry.ready != nil {
+			continue
+		}
+		due := now
+		if windowEnd := entry.fetched.Add(insightsMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		entry.refreshDue = due
+	}
+	s.insightsMu.Unlock()
 }
 
 func (s *Server) timelineAPI(w http.ResponseWriter, r *http.Request) {
@@ -3336,7 +3842,7 @@ func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
 	s.metrics.observeDB(started)
 	// Alias edits change the rendered dashboard page; drop the cached page so
 	// the next view renders with the new names instead of waiting out the TTL.
-	s.invalidateOverviewCache()
+	s.dropOverviewHTMLCache()
 	http.Redirect(w, r, "/settings?saved=1", http.StatusSeeOther)
 }
 

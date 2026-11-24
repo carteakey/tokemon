@@ -4,10 +4,32 @@ import (
 	"context"
 	"database/sql"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tokemon/tokemon/internal/quota"
 )
+
+const (
+	quotaCacheTTL           = time.Minute
+	quotaMinRefreshInterval = 2 * time.Second
+)
+
+type cachedQuotaBucket struct {
+	configured  quota.Quota
+	start       time.Time
+	end         time.Time
+	periodStart string
+	periodEnd   string
+	perDay      map[string]quotaDay
+}
+
+type quotaCacheEntry struct {
+	localDay   string
+	buckets    []cachedQuotaBucket
+	fetched    time.Time
+	refreshDue time.Time
+}
 
 // QuotaPoint is one day's cumulative usage inside the quota period, in the
 // reporting timezone.
@@ -44,6 +66,15 @@ type QuotaStatus struct {
 	State string `json:"state"`
 }
 
+func (s *Store) orderedQuotas() []quota.Quota {
+	ordered := make([]quota.Quota, len(s.quotas))
+	copy(ordered, s.quotas)
+	sort.SliceStable(ordered, func(left, right int) bool {
+		return quota.Specificity(ordered[left]) < quota.Specificity(ordered[right])
+	})
+	return ordered
+}
+
 // QuotaStatus measures every configured quota over its current period in the
 // store's reporting timezone. Each usage event is attributed to exactly one
 // quota — the most specific match — so overlapping quotas never double-count
@@ -53,12 +84,97 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 	if len(s.quotas) == 0 {
 		return nil
 	}
-	ordered := make([]quota.Quota, len(s.quotas))
-	copy(ordered, s.quotas)
-	sort.SliceStable(ordered, func(left, right int) bool {
-		return quota.Specificity(ordered[left]) < quota.Specificity(ordered[right])
-	})
+	loc := s.reportingLocation()
+	localDay := now.In(loc).Format("2006-01-02")
 
+	for {
+		s.quotaMu.Lock()
+		if cached := s.quotaCache; cached != nil && cached.localDay == localDay {
+			stale := time.Since(cached.fetched) >= quotaCacheTTL ||
+				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
+			if stale && s.quotaReady == nil {
+				s.startQuotaRefreshLocked(localDay, now)
+			}
+			entry := cached
+			s.quotaMu.Unlock()
+			return buildQuotaStatuses(entry, loc, now)
+		}
+		if ready := s.quotaReady; ready != nil {
+			s.quotaMu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return unknownQuotaStatuses(s.orderedQuotas(), loc, now)
+			}
+		}
+		generation := s.quotaGeneration
+		ready := make(chan struct{})
+		s.quotaReady = ready
+		s.quotaReadyDay = localDay
+		s.quotaMu.Unlock()
+
+		entry, ok := s.computeQuotaCacheEntry(ctx, localDay, now)
+
+		s.quotaMu.Lock()
+		if ok && s.quotaGeneration == generation {
+			s.quotaCache = entry
+		}
+		s.quotaReady = nil
+		s.quotaReadyDay = ""
+		s.quotaMu.Unlock()
+		close(ready)
+
+		if !ok {
+			return unknownQuotaStatuses(s.orderedQuotas(), loc, now)
+		}
+		return buildQuotaStatuses(entry, loc, now)
+	}
+}
+
+func (s *Store) startQuotaRefreshLocked(localDay string, now time.Time) {
+	if !s.tryStartBackground() {
+		return
+	}
+	s.quotaRefreshes.Add(1)
+	generation := s.quotaGeneration
+	ready := make(chan struct{})
+	s.quotaReady = ready
+	s.quotaReadyDay = localDay
+	go func() {
+		defer s.bgWG.Done()
+		ctx, cancel := context.WithTimeout(s.backgroundContext(), 30*time.Second)
+		defer cancel()
+
+		entry, ok := s.computeQuotaCacheEntry(ctx, localDay, now)
+
+		s.quotaMu.Lock()
+		if ok && s.quotaGeneration == generation {
+			s.quotaCache = entry
+		}
+		s.quotaReady = nil
+		s.quotaReadyDay = ""
+		s.quotaMu.Unlock()
+		close(ready)
+	}()
+}
+
+func (s *Store) invalidateQuotaCache() {
+	now := time.Now()
+	s.quotaMu.Lock()
+	s.quotaGeneration++
+	if s.quotaCache != nil {
+		due := now
+		if windowEnd := s.quotaCache.fetched.Add(quotaMinRefreshInterval); windowEnd.After(now) {
+			due = windowEnd
+		}
+		s.quotaCache.refreshDue = due
+	}
+	s.quotaMu.Unlock()
+}
+
+func (s *Store) computeQuotaCacheEntry(ctx context.Context, localDay string, now time.Time) (*quotaCacheEntry, bool) {
+	ordered := s.orderedQuotas()
 	loc := s.reportingLocation()
 	measurements := make([]quotaMeasurement, 0, len(ordered))
 	var windowStart, windowEnd time.Time
@@ -82,35 +198,78 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 				ResetDay:    configured.ResetDay,
 				PeriodStart: start.In(loc).Format("2006-01-02"),
 				PeriodEnd:   end.In(loc).Format("2006-01-02"),
-				Daily:       []QuotaPoint{},
 			},
 		})
 	}
 
-	// One fetch covers the union of the periods; attribution happens in Go so
-	// each event is counted at most once. The measurement windows are
-	// candidates too: with mismatched reset days a specific quota's period can
-	// miss a day its broader quota covers, and the event then falls through to
-	// the broader quota instead of vanishing from every budget.
-	events, ok := s.quotaEvents(ctx, windowStart, windowEnd, loc)
+	// One SQL aggregation covers the union of the periods; attribution happens
+	// in Go so each aggregate bucket is counted at most once.
+	aggregates, ok := s.quotaAggregates(ctx, windowStart, windowEnd, loc)
 	if !ok {
-		for index := range measurements {
-			measurements[index].status.State = "unknown"
-		}
-	} else {
-		for _, event := range events {
-			if index := mostSpecificQuota(measurements, event); index >= 0 {
-				measurements[index].add(event)
-			}
-		}
-		for index := range measurements {
-			measurements[index].fillStatus(loc, now)
+		return nil, false
+	}
+	for _, agg := range aggregates {
+		if index := mostSpecificQuota(measurements, agg); index >= 0 {
+			measurements[index].addAggregate(agg)
 		}
 	}
 
-	statuses := make([]QuotaStatus, 0, len(measurements))
+	buckets := make([]cachedQuotaBucket, len(measurements))
 	for index := range measurements {
-		statuses = append(statuses, measurements[index].status)
+		buckets[index] = cachedQuotaBucket{
+			configured:  measurements[index].configured,
+			start:       measurements[index].start,
+			end:         measurements[index].end,
+			periodStart: measurements[index].status.PeriodStart,
+			periodEnd:   measurements[index].status.PeriodEnd,
+			perDay:      measurements[index].perDay,
+		}
+	}
+	return &quotaCacheEntry{
+		localDay: localDay,
+		buckets:  buckets,
+		fetched:  time.Now(),
+	}, true
+}
+
+func buildQuotaStatuses(entry *quotaCacheEntry, loc *time.Location, now time.Time) []QuotaStatus {
+	statuses := make([]QuotaStatus, 0, len(entry.buckets))
+	for _, bucket := range entry.buckets {
+		m := quotaMeasurement{
+			configured: bucket.configured,
+			start:      bucket.start,
+			end:        bucket.end,
+			perDay:     bucket.perDay,
+			status: QuotaStatus{
+				Provider:    bucket.configured.Provider,
+				Model:       bucket.configured.Model,
+				Label:       bucket.configured.Label,
+				ResetDay:    bucket.configured.ResetDay,
+				PeriodStart: bucket.periodStart,
+				PeriodEnd:   bucket.periodEnd,
+				Daily:       []QuotaPoint{},
+			},
+		}
+		m.fillStatus(loc, now)
+		statuses = append(statuses, m.status)
+	}
+	return statuses
+}
+
+func unknownQuotaStatuses(ordered []quota.Quota, loc *time.Location, now time.Time) []QuotaStatus {
+	statuses := make([]QuotaStatus, 0, len(ordered))
+	for _, configured := range ordered {
+		start, end := quota.PeriodFor(now, configured.ResetDay, loc)
+		statuses = append(statuses, QuotaStatus{
+			Provider:    configured.Provider,
+			Model:       configured.Model,
+			Label:       configured.Label,
+			ResetDay:    configured.ResetDay,
+			PeriodStart: start.In(loc).Format("2006-01-02"),
+			PeriodEnd:   end.In(loc).Format("2006-01-02"),
+			Daily:       []QuotaPoint{},
+			State:       "unknown",
+		})
 	}
 	return statuses
 }
@@ -135,20 +294,17 @@ func (m *quotaMeasurement) containsDay(day string) bool {
 	return day >= m.status.PeriodStart && day < m.status.PeriodEnd
 }
 
-// add folds one attributed event into the quota's per-day totals.
-func (m *quotaMeasurement) add(event quotaEvent) {
-	day := m.perDay[event.day]
-	day.events++
-	if !event.total.Valid {
-		day.unknownEvents++
-	} else {
-		day.tokens += event.total.Int64
-	}
-	if event.cost.Valid {
-		day.cost += event.cost.Float64
+// addAggregate folds one attributed SQL aggregate row into the quota's per-day totals.
+func (m *quotaMeasurement) addAggregate(agg quotaAggregateRow) {
+	day := m.perDay[agg.day]
+	day.events += agg.events
+	day.unknownEvents += agg.unknownEvents
+	day.tokens += agg.tokens
+	if agg.cost.Valid {
+		day.cost += agg.cost.Float64
 		day.costKnown = true
 	}
-	m.perDay[event.day] = day
+	m.perDay[agg.day] = day
 }
 
 // fillStatus folds the per-day usage into the status: a continuous daily
@@ -190,61 +346,103 @@ func (m *quotaMeasurement) fillStatus(loc *time.Location, now time.Time) {
 	}
 }
 
-// mostSpecificQuota returns the index of the quota an event belongs to: the
-// most specific matching quota whose current period contains the event's day,
+// mostSpecificQuota returns the index of the quota an aggregate row belongs to:
+// the most specific matching quota whose current period contains the row's day,
 // or -1 when no configured quota covers it. The measurements are ordered by
 // ascending specificity, so the first match wins; equal ranks fall back to
 // configuration order.
-func mostSpecificQuota(measurements []quotaMeasurement, event quotaEvent) int {
+func mostSpecificQuota(measurements []quotaMeasurement, agg quotaAggregateRow) int {
 	for index := range measurements {
-		if measurements[index].matchesEvent(event.provider, event.canonical, event.raw) &&
-			measurements[index].containsDay(event.day) {
+		if measurements[index].matchesEvent(agg.provider, agg.canonical, agg.raw) &&
+			measurements[index].containsDay(agg.day) {
 			return index
 		}
 	}
 	return -1
 }
 
-// quotaEvent is one usage row inside the union quota window, pre-parsed to
-// its reporting-timezone day for attribution.
-type quotaEvent struct {
-	day       string
-	provider  string
-	canonical string
-	raw       string
-	total     sql.NullInt64
-	cost      sql.NullFloat64
+type quotaAggregateRow struct {
+	day           string
+	provider      string
+	canonical     string
+	raw           string
+	tokens        int64
+	unknownEvents int64
+	cost          sql.NullFloat64
+	events        int64
 }
 
-// quotaEvents loads the usage rows covering the union of the configured
-// periods. ok is false when the rows cannot be read or parsed: every quota
-// then reports unknown rather than a partial measurement.
-func (s *Store) quotaEvents(ctx context.Context, start, end time.Time, loc *time.Location) ([]quotaEvent, bool) {
-	rows, err := s.db.QueryContext(ctx, `SELECT timestamp, provider, canonical_model, raw_model, total_tokens, cost FROM usage_events
-WHERE timestamp >= ? AND timestamp < ?`,
-		start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+// quotaAggregates aggregates usage rows covering [start, end) in SQL by
+// (local_day, provider, canonical_model, raw_model). Local-day boundaries are
+// formatted in UTC without a trailing 'Z' ("2006-01-02T15:04:05") so ASCII
+// lexicographic comparison handles sub-second fractional timestamps and DST
+// transitions identically to Go's time.In(loc). Non-Z timestamps are scanned
+// with a +/-24h window to cover all local offsets and filtered/bucketed in Go.
+// ok is false when rows cannot be read or parsed.
+func (s *Store) quotaAggregates(ctx context.Context, start, end time.Time, loc *time.Location) ([]quotaAggregateRow, bool) {
+	if !end.After(start) {
+		return nil, true
+	}
+	var caseSQL strings.Builder
+	args := make([]any, 0, 74)
+	caseSQL.WriteString("CASE WHEN substr(timestamp, -1) != 'Z' THEN timestamp")
+	for day := start; day.Before(end); {
+		nextDay := time.Date(day.Year(), day.Month(), day.Day()+1, 0, 0, 0, 0, loc)
+		if !nextDay.Before(end) {
+			caseSQL.WriteString(" ELSE ?")
+			args = append(args, day.Format("2006-01-02"))
+			break
+		}
+		caseSQL.WriteString(" WHEN timestamp < ? THEN ?")
+		args = append(args, nextDay.UTC().Format("2006-01-02T15:04:05"), day.Format("2006-01-02"))
+		day = nextDay
+	}
+	caseSQL.WriteString(" END")
+
+	startStr := start.UTC().Format("2006-01-02T15:04:05")
+	endStr := end.UTC().Format("2006-01-02T15:04:05")
+	paddedStartStr := start.Add(-24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	paddedEndStr := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	args = append(args, paddedStartStr, paddedEndStr, startStr, endStr)
+
+	query := `SELECT ` + caseSQL.String() + `, provider, canonical_model, raw_model,
+COALESCE(SUM(total_tokens), 0),
+SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END),
+SUM(cost),
+COUNT(*)
+FROM usage_events
+WHERE timestamp >= ? AND timestamp < ?
+  AND (substr(timestamp, -1) != 'Z' OR (timestamp >= ? AND timestamp < ?))
+GROUP BY 1, provider, canonical_model, raw_model`
+
+	rows, err := s.readHandle().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false
 	}
 	defer rows.Close()
-	var events []quotaEvent
+	var result []quotaAggregateRow
 	for rows.Next() {
-		var timestamp string
-		var event quotaEvent
-		if err := rows.Scan(&timestamp, &event.provider, &event.canonical, &event.raw, &event.total, &event.cost); err != nil {
+		var row quotaAggregateRow
+		if err := rows.Scan(&row.day, &row.provider, &row.canonical, &row.raw,
+			&row.tokens, &row.unknownEvents, &row.cost, &row.events); err != nil {
 			return nil, false
 		}
-		parsed, err := timeParse(timestamp)
-		if err != nil {
-			return nil, false
+		if len(row.day) != 10 {
+			parsed, err := timeParse(row.day)
+			if err != nil {
+				return nil, false
+			}
+			if parsed.Before(start) || !parsed.Before(end) {
+				continue
+			}
+			row.day = parsed.In(loc).Format("2006-01-02")
 		}
-		event.day = parsed.In(loc).Format("2006-01-02")
-		events = append(events, event)
+		result = append(result, row)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false
 	}
-	return events, true
+	return result, true
 }
 
 // quotaDay is one local day's measured usage.

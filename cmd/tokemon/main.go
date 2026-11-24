@@ -228,6 +228,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer server.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// Warm the dashboard and default analytics while the listener and server

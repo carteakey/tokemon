@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -348,4 +349,380 @@ func TestQuotaStatusClampsResetDay31Period(t *testing.T) {
 	if last := status.Daily[len(status.Daily)-1]; last.Date != "2026-02-27" || last.CumulativeTokens != 100_000 {
 		t.Errorf("final point = %+v, want 100000 on 2026-02-27", last)
 	}
+}
+
+func TestQuotaStatusTimezoneDSTAndSubsecondMidnightBoundaries(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kolkata, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kathmandu, err := time.LoadLocation("Asia/Kathmandu")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	budget := int64(10_000_000)
+	costBudget := 50.0
+	q := []quota.Quota{{Label: "Global", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget, CostPerMonth: &costBudget}}}
+
+	t.Run("spring-forward-and-subsecond-midnight-NY", func(t *testing.T) {
+		store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), ny, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		// Period 2026-03-01 .. 2026-04-01 in America/New_York:
+		// 2026-03-01 00:00 EST = 2026-03-01T05:00:00Z
+		// 2026-03-08 is spring-forward (2026-03-08 04:59:59.999Z -> Mar 7; 2026-03-08 05:00:00.123Z -> Mar 8;
+		// 2026-03-09 03:59:59.999Z -> Mar 8; 2026-03-09 04:00:00.123Z -> Mar 9).
+		// 2026-04-01 00:00:00.123 EDT = 2026-04-01T04:00:00.123Z -> belongs to NEXT period (excluded!).
+		events := []usage.Event{
+			quotaUsageEvent("before-start", time.Date(2026, 3, 1, 4, 59, 59, 999_000_000, time.UTC), "openai", "gpt-5", 999),
+			quotaUsageEvent("start-subsec", time.Date(2026, 3, 1, 5, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 100),
+			quotaUsageEvent("dst-mar7-end", time.Date(2026, 3, 8, 4, 59, 59, 999_000_000, time.UTC), "openai", "gpt-5", 200),
+			quotaUsageEvent("dst-mar8-subsec", time.Date(2026, 3, 8, 5, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 300),
+			quotaUsageEvent("dst-mar8-end", time.Date(2026, 3, 9, 3, 59, 59, 999_000_000, time.UTC), "openai", "gpt-5", 400),
+			quotaUsageEvent("dst-mar9-subsec", time.Date(2026, 3, 9, 4, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 500),
+			quotaUsageEvent("after-end-subsec", time.Date(2026, 4, 1, 4, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 888),
+		}
+		ingestQuotaEvents(t, store, events)
+
+		statuses := store.QuotaStatus(context.Background(), time.Date(2026, 3, 15, 12, 0, 0, 0, ny))
+		if len(statuses) != 1 {
+			t.Fatalf("statuses = %+v", statuses)
+		}
+		st := statuses[0]
+		if st.TokensUsed != 1500 {
+			t.Fatalf("TokensUsed = %d, want 1500 (excluding before-start and after-end-subsec)", st.TokensUsed)
+		}
+		byDate := map[string]int64{}
+		for _, pt := range st.Daily {
+			byDate[pt.Date] = pt.CumulativeTokens
+		}
+		if byDate["2026-03-01"] != 100 || byDate["2026-03-07"] != 300 || byDate["2026-03-08"] != 1000 || byDate["2026-03-09"] != 1500 {
+			t.Fatalf("cumulative DST buckets mismatch: mar1=%d mar7=%d mar8=%d mar9=%d",
+				byDate["2026-03-01"], byDate["2026-03-07"], byDate["2026-03-08"], byDate["2026-03-09"])
+		}
+	})
+
+	t.Run("fall-back-NY", func(t *testing.T) {
+		store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), ny, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		// 2026-11-01 is fall-back in NY (EDT -> EST):
+		// 2026-11-01 00:00 EDT = 2026-11-01T04:00:00Z
+		// 2026-11-02 00:00 EST = 2026-11-02T05:00:00Z
+		events := []usage.Event{
+			quotaUsageEvent("nov1-early", time.Date(2026, 11, 1, 4, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 100),
+			quotaUsageEvent("nov1-late", time.Date(2026, 11, 2, 4, 59, 59, 0, time.UTC), "openai", "gpt-5", 200),
+			quotaUsageEvent("nov2-start", time.Date(2026, 11, 2, 5, 0, 0, 123_000_000, time.UTC), "openai", "gpt-5", 300),
+		}
+		ingestQuotaEvents(t, store, events)
+		st := store.QuotaStatus(context.Background(), time.Date(2026, 11, 10, 12, 0, 0, 0, ny))[0]
+		if st.Daily[0].Date != "2026-11-01" || st.Daily[0].CumulativeTokens != 300 || st.Daily[1].CumulativeTokens != 600 {
+			t.Fatalf("fall-back cumulative = %+v", st.Daily[:2])
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		loc  *time.Location
+		// Just before and just after 2026-11-05 00:00 local in UTC
+		beforeUTC time.Time
+		afterUTC  time.Time
+	}{
+		{
+			name:      "half-hour-Kolkata",
+			loc:       kolkata, // UTC+05:30 -> midnight is 18:30 UTC prior day
+			beforeUTC: time.Date(2026, 11, 4, 18, 29, 59, 0, time.UTC),
+			afterUTC:  time.Date(2026, 11, 4, 18, 30, 0, 123_000_000, time.UTC),
+		},
+		{
+			name:      "45min-Kathmandu",
+			loc:       kathmandu, // UTC+05:45 -> midnight is 18:15 UTC prior day
+			beforeUTC: time.Date(2026, 11, 4, 18, 14, 59, 0, time.UTC),
+			afterUTC:  time.Date(2026, 11, 4, 18, 15, 0, 123_000_000, time.UTC),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), tc.loc, q...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			evBefore := quotaUsageEvent("b", tc.beforeUTC, "openai", "gpt-5", 100)
+			evAfter := quotaUsageEvent("a", tc.afterUTC, "openai", "gpt-5", 250)
+			// Also include a non-Z legacy timestamp row directly in SQLite to exercise the fallback path.
+			ingestQuotaEvents(t, store, []usage.Event{evBefore, evAfter})
+			if _, err := store.db.Exec(`INSERT INTO usage_events (event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool, total_tokens, cost, token_accuracy, adapter, adapter_version) VALUES ('legacy-offset', ?, 'm', '', 'openai', 'gpt-5', '', 'codex', 50, 1.5, 'reported', 'codex', '1')`,
+				time.Date(2026, 11, 5, 10, 0, 0, 0, tc.loc).Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+
+			st := store.QuotaStatus(context.Background(), time.Date(2026, 11, 10, 12, 0, 0, 0, tc.loc))[0]
+			byDate := map[string]int64{}
+			for _, pt := range st.Daily {
+				byDate[pt.Date] = pt.CumulativeTokens
+			}
+			if byDate["2026-11-04"] != 100 || byDate["2026-11-05"] != 400 {
+				t.Fatalf("%s buckets = nov4:%d nov5:%d", tc.name, byDate["2026-11-04"], byDate["2026-11-05"])
+			}
+			if st.CostUsed == nil || *st.CostUsed != 1.5 {
+				t.Fatalf("%s CostUsed = %+v, want 1.5", tc.name, st.CostUsed)
+			}
+		})
+	}
+}
+
+func TestQuotaStatusSWRCoalescingAndDayRollover(t *testing.T) {
+	budget := int64(100_000)
+	store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), time.UTC,
+		quota.Quota{Label: "Cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("q-swr-1", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5", 10_000),
+	})
+
+	now1 := time.Date(2026, 11, 10, 2, 0, 0, 0, time.UTC)
+	st1 := store.QuotaStatus(ctx, now1)
+	if len(st1) != 1 || st1[0].TokensUsed != 10_000 || st1[0].ProjectedTokens == nil {
+		t.Fatalf("initial QuotaStatus = %+v", st1)
+	}
+	proj1 := *st1[0].ProjectedTokens
+	store.quotaMu.Lock()
+	cachePtr1 := store.quotaCache
+	store.quotaMu.Unlock()
+
+	// Cache hit with a later 'now' on the same localDay recomputes projection accurately without DB query.
+	now2 := time.Date(2026, 11, 10, 22, 0, 0, 0, time.UTC)
+	st2 := store.QuotaStatus(ctx, now2)
+	store.quotaMu.Lock()
+	cachePtr2 := store.quotaCache
+	store.quotaMu.Unlock()
+	if cachePtr2 != cachePtr1 {
+		t.Fatalf("expected same-localDay read to hit existing cache entry (%p vs %p)", cachePtr2, cachePtr1)
+	}
+	if st2[0].ProjectedTokens == nil || *st2[0].ProjectedTokens >= proj1 {
+		t.Fatalf("expected projection to decrease at later elapsed time: proj1=%d proj2=%v", proj1, st2[0].ProjectedTokens)
+	}
+	if got := store.quotaRefreshes.Load(); got != 0 {
+		t.Fatalf("refreshes on warm same-day read = %d, want 0", got)
+	}
+
+	// Burst of ingests inside 2s coalescing window keeps serving stale immediately and starts 0 refreshes inside window.
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("q-swr-2", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "openai", "gpt-5", 20_000),
+		quotaUsageEvent("q-swr-3", time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC), "openai", "gpt-5", 5_000),
+	})
+	inside := store.QuotaStatus(ctx, now2)
+	if inside[0].TokensUsed != 10_000 || store.quotaRefreshes.Load() != 0 {
+		t.Fatalf("inside coalescing window = %+v, refreshes = %d", inside[0], store.quotaRefreshes.Load())
+	}
+
+	// Expire coalescing window; next read returns stale immediately and triggers 1 background refresh.
+	store.quotaMu.Lock()
+	warmed := store.quotaCache.fetched
+	store.quotaCache.refreshDue = time.Now().Add(-time.Millisecond)
+	store.quotaMu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = store.QuotaStatus(ctx, now2)
+		}()
+	}
+	wg.Wait()
+	if got := store.quotaRefreshes.Load(); got != 1 {
+		t.Fatalf("refreshes after post-window burst = %d, want 1", got)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		store.quotaMu.Lock()
+		done := store.quotaCache != nil && store.quotaCache.fetched.After(warmed)
+		store.quotaMu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background quota refresh did not complete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	afterIngest := store.QuotaStatus(ctx, now2)
+	if afterIngest[0].TokensUsed != 35_000 {
+		t.Fatalf("TokensUsed after SWR refresh = %d, want 35000", afterIngest[0].TokensUsed)
+	}
+
+	// PurgeBefore deleting rows invalidates quotaCache too.
+	if deleted, err := store.PurgeBefore(ctx, "2026-11-06"); err != nil || deleted != 3 {
+		t.Fatalf("PurgeBefore = %d, err=%v", deleted, err)
+	}
+	store.quotaMu.Lock()
+	warmed2 := store.quotaCache.fetched
+	store.quotaCache.refreshDue = time.Now().Add(-time.Millisecond)
+	store.quotaMu.Unlock()
+	_ = store.QuotaStatus(ctx, now2)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		store.quotaMu.Lock()
+		done := store.quotaCache != nil && store.quotaCache.fetched.After(warmed2)
+		store.quotaMu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background quota refresh after purge did not complete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	afterPurge := store.QuotaStatus(ctx, now2)
+	if afterPurge[0].TokensUsed != 0 {
+		t.Fatalf("TokensUsed after purge refresh = %d, want 0", afterPurge[0].TokensUsed)
+	}
+
+	// Same-month localDay rollover (2026-11-10 -> 2026-11-20) bypasses prior-day cache synchronously.
+	store.quotaMu.Lock()
+	cacheBeforeRollover := store.quotaCache
+	store.quotaMu.Unlock()
+	refreshesBeforeRollover := store.quotaRefreshes.Load()
+	laterSameMonth := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	rolledDay := store.QuotaStatus(ctx, laterSameMonth)
+	store.quotaMu.Lock()
+	cacheAfterRollover := store.quotaCache
+	store.quotaMu.Unlock()
+	if cacheAfterRollover == nil || cacheAfterRollover == cacheBeforeRollover || cacheAfterRollover.localDay != "2026-11-20" {
+		t.Fatalf("expected new cache entry for localDay rollover 2026-11-20, got %+v", cacheAfterRollover)
+	}
+	if store.quotaRefreshes.Load() != refreshesBeforeRollover {
+		t.Fatalf("expected synchronous recompute on localDay rollover without async refresh increment")
+	}
+	if rolledDay[0].PeriodStart != "2026-11-01" || rolledDay[0].PeriodEnd != "2026-12-01" {
+		t.Fatalf("same-month rollover period = %s .. %s", rolledDay[0].PeriodStart, rolledDay[0].PeriodEnd)
+	}
+
+	// localDay rollover (next month) bypasses prior-day cache synchronously and resets period.
+	nextMonth := time.Date(2026, 12, 5, 12, 0, 0, 0, time.UTC)
+	rolled := store.QuotaStatus(ctx, nextMonth)
+	if rolled[0].PeriodStart != "2026-12-01" || rolled[0].PeriodEnd != "2027-01-01" {
+		t.Fatalf("rollover period = %s .. %s", rolled[0].PeriodStart, rolled[0].PeriodEnd)
+	}
+}
+
+func TestQuotaStatusNonZLegacyBoundary(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kolkata, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	budget := int64(10_000_000)
+	q := []quota.Quota{{Label: "Global", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget}}}
+
+	insertRaw := func(t *testing.T, store *Store, id, ts string, tokens int64) {
+		t.Helper()
+		if _, err := store.db.Exec(
+			`INSERT INTO usage_events (event_id, timestamp, machine_id, project, provider, raw_model, canonical_model, tool, total_tokens, token_accuracy, adapter, adapter_version) VALUES (?, ?, 'm', '', 'openai', 'gpt-5', '', 'codex', ?, 'reported', 'codex', '1')`,
+			id, ts, tokens,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("NY-start-offset-included", func(t *testing.T) {
+		store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), ny, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		insertRaw(t, store, "ny-in", "2026-03-01T01:00:00-05:00", 333)
+		st := store.QuotaStatus(context.Background(), time.Date(2026, 3, 15, 12, 0, 0, 0, ny))
+		if len(st) != 1 || st[0].TokensUsed != 333 {
+			t.Fatalf("NY start non-Z TokensUsed = %+v, want 333", st)
+		}
+		if st[0].Daily[0].Date != "2026-03-01" || st[0].Daily[0].CumulativeTokens != 333 {
+			t.Fatalf("NY start daily[0] = %+v, want 2026-03-01 cumulative 333", st[0].Daily[0])
+		}
+	})
+
+	t.Run("Kolkata-end-offset-included", func(t *testing.T) {
+		store, err := OpenWithLocation(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty(), kolkata, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		insertRaw(t, store, "kol-in", "2026-11-30T23:00:00+05:30", 333)
+		st := store.QuotaStatus(context.Background(), time.Date(2026, 11, 15, 12, 0, 0, 0, kolkata))
+		if len(st) != 1 || st[0].TokensUsed != 333 {
+			t.Fatalf("Kolkata end non-Z TokensUsed = %+v, want 333", st)
+		}
+		last := st[0].Daily[len(st[0].Daily)-1]
+		if last.Date != "2026-11-30" || last.CumulativeTokens != 333 {
+			t.Fatalf("Kolkata end last daily = %+v, want 2026-11-30 cumulative 333", last)
+		}
+	})
+
+	t.Run("out-of-period-non-Z-neighbors-excluded", func(t *testing.T) {
+		storeNY, err := OpenWithLocation(filepath.Join(t.TempDir(), "ny.db"), catalog.Empty(), ny, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer storeNY.Close()
+		insertRaw(t, storeNY, "ny-before", "2026-02-28T23:00:00-05:00", 777)
+		insertRaw(t, storeNY, "ny-after", "2026-04-01T00:30:00-04:00", 888)
+		stNY := storeNY.QuotaStatus(context.Background(), time.Date(2026, 3, 15, 12, 0, 0, 0, ny))
+		if len(stNY) != 1 || stNY[0].TokensUsed != 0 {
+			t.Fatalf("NY out-of-period non-Z TokensUsed = %+v, want 0", stNY)
+		}
+
+		storeKol, err := OpenWithLocation(filepath.Join(t.TempDir(), "kol.db"), catalog.Empty(), kolkata, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer storeKol.Close()
+		insertRaw(t, storeKol, "kol-before", "2026-10-31T23:00:00+05:30", 777)
+		insertRaw(t, storeKol, "kol-after", "2026-12-01T01:00:00+05:30", 888)
+		stKol := storeKol.QuotaStatus(context.Background(), time.Date(2026, 11, 15, 12, 0, 0, 0, kolkata))
+		if len(stKol) != 1 || stKol[0].TokensUsed != 0 {
+			t.Fatalf("Kolkata out-of-period non-Z TokensUsed = %+v, want 0", stKol)
+		}
+	})
+
+	t.Run("subsecond-non-Z-boundaries", func(t *testing.T) {
+		store, err := OpenWithLocation(filepath.Join(t.TempDir(), "subsec.db"), catalog.Empty(), ny, q...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		insertRaw(t, store, "subsec-before", "2026-02-28T23:59:59.999-05:00", 999)
+		insertRaw(t, store, "subsec-in", "2026-03-01T00:00:00.123-05:00", 333)
+		insertRaw(t, store, "subsec-after", "2026-04-01T00:00:00.123-04:00", 555)
+		st := store.QuotaStatus(context.Background(), time.Date(2026, 3, 15, 12, 0, 0, 0, ny))
+		if len(st) != 1 || st[0].TokensUsed != 333 {
+			t.Fatalf("sub-second non-Z TokensUsed = %+v, want 333", st)
+		}
+	})
 }
