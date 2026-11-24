@@ -46,8 +46,8 @@ func TestFacetsCacheTracksIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Machines) != 1 || first.Machines[0] != "machine-a" {
-		t.Fatalf("facets machines = %v, want [machine-a]", first.Machines)
+	if len(first.Machines) != 1 || first.Machines[0] != "machine-a" || len(first.Projects) != 0 {
+		t.Fatalf("facets = %+v, want machine-a and empty projects", first)
 	}
 
 	// Second read is served from the cache and must be identical.
@@ -59,15 +59,17 @@ func TestFacetsCacheTracksIngest(t *testing.T) {
 		t.Fatalf("cached facets machines = %v, want [machine-a]", second.Machines)
 	}
 
-	if _, err := store.Ingest(ctx, []usage.Event{facetsEvent("machine-b", "prov", "model", "tool", 50)}); err != nil {
+	evB := facetsEvent("machine-b", "prov", "model", "tool", 50)
+	evB.Project = "proj-one"
+	if _, err := store.Ingest(ctx, []usage.Event{evB}); err != nil {
 		t.Fatal(err)
 	}
 	third, err := store.Facets(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(third.Machines) != 2 {
-		t.Fatalf("facets after ingest machines = %v, want both machines (cache not invalidated)", third.Machines)
+	if len(third.Machines) != 2 || !slices.Equal(third.Projects, []string{"proj-one"}) {
+		t.Fatalf("facets after ingest = %+v, want both machines and [proj-one]", third)
 	}
 
 	// The cached path and the raw compute must never diverge.
@@ -75,8 +77,8 @@ func TestFacetsCacheTracksIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(direct.Machines) != len(third.Machines) {
-		t.Fatalf("cached facets = %v, direct compute = %v", third.Machines, direct.Machines)
+	if len(direct.Machines) != len(third.Machines) || !slices.Equal(direct.Projects, third.Projects) {
+		t.Fatalf("cached facets = %+v, direct compute = %+v", third, direct)
 	}
 }
 
@@ -128,7 +130,7 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	if _, err := store.Ingest(ctx, []usage.Event{
 		{
 			SchemaVersion: usage.SchemaVersion, EventID: "inc-1", Timestamp: tsNew,
-			MachineID: "m2", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
+			MachineID: "m2", Project: "proj-z", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
 			TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported,
 			Source: usage.Source{Adapter: "claude", AdapterVersion: "1"},
 		},
@@ -140,13 +142,14 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(f1.Models, []string{"claude-sonnet-4"}) {
-		t.Fatalf("resolved model facet = %v, want [claude-sonnet-4]", f1.Models)
+	if !slices.Equal(f1.Models, []string{"claude-sonnet-4"}) || !slices.Equal(f1.Projects, []string{"proj-z"}) {
+		t.Fatalf("resolved facets = %+v, want model [claude-sonnet-4] and project [proj-z]", f1)
 	}
 	// Mutating returned slice must not affect cached slices.
 	f1.Machines[0] = "mutated"
+	f1.Projects[0] = "mutated-proj"
 	f1Again, err := store.Facets(ctx)
-	if err != nil || f1Again.Machines[0] != "m2" {
+	if err != nil || f1Again.Machines[0] != "m2" || f1Again.Projects[0] != "proj-z" {
 		t.Fatalf("caller mutation leaked into cache: %+v, err=%v", f1Again, err)
 	}
 
@@ -154,11 +157,11 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	ptrBefore := store.facetsCache
 	store.facetsMu.RUnlock()
 
-	// Ingest with already-known facets must keep exact cache pointer (no rebuild/invalidation).
+	// Ingest with already-known facets (and empty project) must keep exact cache pointer.
 	if _, err := store.Ingest(ctx, []usage.Event{
 		{
 			SchemaVersion: usage.SchemaVersion, EventID: "inc-2", Timestamp: tsNew,
-			MachineID: "m2", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
+			MachineID: "m2", Project: "", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
 			TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported,
 			Source: usage.Source{Adapter: "claude", AdapterVersion: "1"},
 		},
@@ -176,7 +179,7 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	if _, err := store.Ingest(ctx, []usage.Event{
 		{
 			SchemaVersion: usage.SchemaVersion, EventID: "inc-2", Timestamp: tsNew,
-			MachineID: "m2", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
+			MachineID: "m2", Project: "", Provider: "anthropic", Model: "sonnet-alias", Tool: "claude-code",
 			TotalTokens: usage.Int64(75), TokenAccuracy: usage.AccuracyReported,
 			Source: usage.Source{Adapter: "claude", AdapterVersion: "1"},
 		},
@@ -190,11 +193,11 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 		t.Fatal("non-facet-changing refresh invalidated facets cache")
 	}
 
-	// Ingest with a new machine & model sorts into the cached slices cleanly.
+	// Ingest with a new machine, model, and project sorts into the cached slices cleanly.
 	if _, err := store.Ingest(ctx, []usage.Event{
 		{
 			SchemaVersion: usage.SchemaVersion, EventID: "inc-3", Timestamp: tsOld,
-			MachineID: "m1", Provider: "openai", Model: "alpha-model", Tool: "codex",
+			MachineID: "m1", Project: "/tmp/proj-a", Provider: "openai", Model: "alpha-model", Tool: "codex",
 			TotalTokens: usage.Int64(25), TokenAccuracy: usage.AccuracyReported,
 			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
 		},
@@ -208,15 +211,16 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	if !slices.Equal(f2.Machines, []string{"m1", "m2"}) ||
 		!slices.Equal(f2.Providers, []string{"anthropic", "openai"}) ||
 		!slices.Equal(f2.Models, []string{"alpha-model", "claude-sonnet-4"}) ||
-		!slices.Equal(f2.Tools, []string{"claude-code", "codex"}) {
+		!slices.Equal(f2.Tools, []string{"claude-code", "codex"}) ||
+		!slices.Equal(f2.Projects, []string{"proj-a", "proj-z"}) {
 		t.Fatalf("incremental facets mismatch: %+v", f2)
 	}
 
-	// Facet-changing refresh on inc-3 (model changed from alpha-model to beta-model) invalidates stale alpha-model.
+	// Facet-changing refresh on inc-3 (model & project changed) invalidates stale model & project.
 	if _, err := store.Ingest(ctx, []usage.Event{
 		{
 			SchemaVersion: usage.SchemaVersion, EventID: "inc-3", Timestamp: tsOld,
-			MachineID: "m1", Provider: "openai", Model: "beta-model", Tool: "codex",
+			MachineID: "m1", Project: "proj-b", Provider: "openai", Model: "beta-model", Tool: "codex",
 			TotalTokens: usage.Int64(25), TokenAccuracy: usage.AccuracyReported,
 			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
 		},
@@ -227,8 +231,9 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(f3.Models, []string{"beta-model", "claude-sonnet-4"}) {
-		t.Fatalf("facets after facet-changing refresh = %v, want [beta-model claude-sonnet-4]", f3.Models)
+	if !slices.Equal(f3.Models, []string{"beta-model", "claude-sonnet-4"}) ||
+		!slices.Equal(f3.Projects, []string{"proj-b", "proj-z"}) {
+		t.Fatalf("facets after facet-changing refresh = %+v, want beta-model & proj-b", f3)
 	}
 
 	// Codex aggregate snapshot superseded by detailed Codex event invalidates aggregate's stale model.
@@ -285,8 +290,11 @@ func TestIncrementalFacetsPreservesAndInvalidatesAccurately(t *testing.T) {
 		t.Fatalf("PurgeBefore did not invalidate m1 from facets: %+v, err=%v", f6, err)
 	}
 	direct, err := store.analyticsFacets(ctx)
-	if err != nil || !slices.Equal(f6.Machines, direct.Machines) || !slices.Equal(f6.Models, direct.Models) {
+	if err != nil || !slices.Equal(f6.Machines, direct.Machines) || !slices.Equal(f6.Models, direct.Models) || !slices.Equal(f6.Projects, direct.Projects) {
 		t.Fatalf("facets %+v diverged from direct %+v, err=%v", f6, direct, err)
+	}
+	if slices.Contains(f6.Projects, "proj-b") {
+		t.Fatalf("PurgeBefore did not drop proj-b from facets: %+v", f6)
 	}
 }
 
@@ -309,6 +317,7 @@ func TestFacetsConcurrentIngestPurgeRace(t *testing.T) {
 					EventID:       fmt.Sprintf("race-%d-%d", worker, i),
 					Timestamp:     time.Date(2026, 6, 1+i%20, 12, 0, 0, 0, time.UTC),
 					MachineID:     fmt.Sprintf("m-%d-%d", worker, i%4),
+					Project:       fmt.Sprintf("proj-%d-%d", worker, i%3),
 					Provider:      "openai",
 					Model:         fmt.Sprintf("model-%d", i%5),
 					Tool:          "codex",

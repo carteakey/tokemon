@@ -3871,6 +3871,21 @@ func TestAuthenticatedPagesShareChromeTopbarActionsAndCAR205(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "chrome-ev",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		SessionID:     "chrome-sess",
+		TotalTokens:   usage.Int64(42),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := passwordAccountServer(t, store)
 	defer func() { _ = server.Close() }()
@@ -3878,7 +3893,7 @@ func TestAuthenticatedPagesShareChromeTopbarActionsAndCAR205(t *testing.T) {
 	navInsightsPattern := regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`)
 	wantStylesheet := `<link rel="stylesheet" href="/static/tokemon/base.css?v=` + server.assetVersion + `">`
 
-	for _, path := range []string{"/", "/analytics", "/tokedex", "/sessions", "/settings", "/insights"} {
+	for _, path := range []string{"/", "/analytics", "/tokedex", "/sessions", "/sessions/chrome-sess", "/settings", "/insights"} {
 		body := renderAccessiblePage(t, server, path)
 		for _, want := range []string{
 			wantStylesheet,

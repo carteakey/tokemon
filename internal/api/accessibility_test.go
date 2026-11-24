@@ -41,6 +41,7 @@ func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
 		Provider:      "provider",
 		Model:         "model",
 		Tool:          "tool",
+		SessionID:     "accessibility-session",
 		TotalTokens:   usage.Int64(42),
 		TokenAccuracy: usage.AccuracyReported,
 		Source:        usage.Source{Adapter: "test", AdapterVersion: "1"},
@@ -52,7 +53,7 @@ func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/", "/settings", "/analytics", "/sessions", "/insights", "/tokedex"} {
+	for _, path := range []string{"/", "/settings", "/analytics", "/sessions", "/sessions/accessibility-session", "/insights", "/tokedex"} {
 		body, css := renderAccessibleBundle(t, server, path)
 		assertAccessibleDocument(t, path, body, css)
 	}

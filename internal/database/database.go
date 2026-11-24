@@ -235,8 +235,17 @@ type AnalyticsQuery struct {
 	Provider  string    `json:"provider,omitempty"`
 	Model     string    `json:"model,omitempty"`
 	Tool      string    `json:"tool,omitempty"`
+	Project   string    `json:"project,omitempty"`
+	Search    string    `json:"q,omitempty"`
+	From      string    `json:"from,omitempty"`
+	To        string    `json:"to,omitempty"`
 	Now       time.Time `json:"-"`
+
+	invalidRange bool
 }
+
+// UnknownProjectFilter explicitly matches events whose project label is empty.
+const UnknownProjectFilter = "__unknown__"
 
 type AnalyticsSummary struct {
 	Tokens           int64        `json:"tokens"`
@@ -312,6 +321,7 @@ type AnalyticsFacets struct {
 	Providers []string `json:"providers"`
 	Models    []string `json:"models"`
 	Tools     []string `json:"tools"`
+	Projects  []string `json:"projects"`
 }
 
 type Analytics struct {
@@ -788,6 +798,9 @@ WHERE adapter = 'codex'
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_sessions_timestamp ON usage_events(timestamp DESC, session_id, machine_id, provider, tool)`); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON usage_events(session_id, timestamp)`); err != nil {
+		return err
+	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, databaseSchemaVersion))
 	return err
 }
@@ -882,6 +895,7 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 		addedProviders       map[string]struct{}
 		addedModels          map[string]struct{}
 		addedTools           map[string]struct{}
+		addedProjects        map[string]struct{}
 	)
 	addFacet := func(dst *map[string]struct{}, val string) {
 		if val == "" {
@@ -1003,6 +1017,7 @@ adapter, adapter_version
 			addFacet(&addedProviders, event.Provider)
 			addFacet(&addedModels, effectiveModel)
 			addFacet(&addedTools, event.Tool)
+			addFacet(&addedProjects, event.Project)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1011,7 +1026,7 @@ adapter, adapter_version
 	if facetsNeedInvalidate {
 		s.invalidateFacetsCache()
 	} else if result.Accepted > 0 {
-		s.mergeFacetsCache(addedMachines, addedProviders, addedModels, addedTools)
+		s.mergeFacetsCache(addedMachines, addedProviders, addedModels, addedTools, addedProjects)
 	}
 	if result.Accepted > 0 || result.Duplicates > 0 || facetsNeedInvalidate {
 		s.invalidateQuotaCache()
@@ -1037,9 +1052,9 @@ func usageEventArgs(event usage.Event, canonicalModel string, cost *float64, cos
 }
 
 func refreshUsageEvent(ctx context.Context, tx *sql.Tx, event usage.Event, effectiveModel string, args []any) (bool, bool, error) {
-	var oldMachine, oldProvider, oldModel, oldTool string
-	err := tx.QueryRowContext(ctx, `SELECT machine_id, provider, COALESCE(NULLIF(canonical_model, ''), raw_model), tool FROM usage_events WHERE event_id = ?`, event.EventID).
-		Scan(&oldMachine, &oldProvider, &oldModel, &oldTool)
+	var oldMachine, oldProvider, oldModel, oldTool, oldProject string
+	err := tx.QueryRowContext(ctx, `SELECT machine_id, provider, COALESCE(NULLIF(canonical_model, ''), raw_model), tool, project FROM usage_events WHERE event_id = ?`, event.EventID).
+		Scan(&oldMachine, &oldProvider, &oldModel, &oldTool, &oldProject)
 	haveOld := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, false, err
@@ -1061,7 +1076,7 @@ WHERE event_id=?`, updateArgs...)
 		return false, false, err
 	}
 	if rows > 0 {
-		facetsChanged := !haveOld || oldMachine != event.MachineID || oldProvider != event.Provider || oldModel != effectiveModel || oldTool != event.Tool
+		facetsChanged := !haveOld || oldMachine != event.MachineID || oldProvider != event.Provider || oldModel != effectiveModel || oldTool != event.Tool || oldProject != event.Project
 		return true, facetsChanged, nil
 	}
 
@@ -1635,18 +1650,26 @@ FROM usage_events GROUP BY project ORDER BY 2 DESC`)
 
 func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics, error) {
 	query, start, end := s.normalizeAnalyticsQuery(query)
+	bucketPeriod := query.Period
+	if query.From != "" || query.To != "" {
+		bucketPeriod = "day"
+	}
 	result := Analytics{Timezone: s.Timezone(), Filter: query, Bucket: "day"}
-	if query.Period == "24h" {
+	if bucketPeriod == "24h" {
 		result.Bucket = "hour"
+	} else if bucketPeriod == "all" {
+		result.Bucket = "month"
 	}
 	result.LifetimeTokens, _ = s.LifetimeTokens(ctx)
-	result.EndDate = s.dateOnly(end.Add(-time.Nanosecond)).Format("2006-01-02")
-	result.StartDate = result.EndDate
-	if !start.IsZero() {
-		result.StartDate = start.In(s.reportingLocation()).Format("2006-01-02")
-	}
-	if query.Period == "all" {
-		result.Bucket = "month"
+	if query.invalidRange {
+		result.StartDate = query.From
+		result.EndDate = query.To
+	} else {
+		result.EndDate = s.dateOnly(end.Add(-time.Nanosecond)).Format("2006-01-02")
+		result.StartDate = result.EndDate
+		if !start.IsZero() {
+			result.StartDate = start.In(s.reportingLocation()).Format("2006-01-02")
+		}
 	}
 
 	where, args := analyticsWhere(query, start, end)
@@ -1655,7 +1678,7 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 	if err != nil {
 		return Analytics{}, err
 	}
-	if !start.IsZero() {
+	if !query.invalidRange && !start.IsZero() && end.After(start) {
 		previousEnd := start
 		previousStart := previousEnd.Add(-end.Sub(start))
 		previousWhere, previousArgs := analyticsWhere(query, previousStart, previousEnd)
@@ -1685,7 +1708,7 @@ FROM usage_events WHERE `+previousWhere, previousArgs...).Scan(&previousTokens, 
 			result.MaxTokens = point.Tokens
 		}
 	}
-	if query.Period == "all" && len(result.Points) > 0 {
+	if bucketPeriod == "all" && len(result.Points) > 0 {
 		result.StartDate = result.Points[0].Date
 	}
 	result.Sessions, err = s.analyticsSessions(ctx, where, args)
@@ -2157,6 +2180,12 @@ func analyticsInsightURL(query AnalyticsQuery) string {
 	values := url.Values{}
 	values.Set("period", query.Period)
 	values.Set("dimension", query.Dimension)
+	if query.From != "" {
+		values.Set("from", query.From)
+	}
+	if query.To != "" {
+		values.Set("to", query.To)
+	}
 	if query.Machine != "" {
 		values.Set("machine", query.Machine)
 	}
@@ -2168,6 +2197,12 @@ func analyticsInsightURL(query AnalyticsQuery) string {
 	}
 	if query.Tool != "" {
 		values.Set("tool", query.Tool)
+	}
+	if query.Project != "" {
+		values.Set("project", query.Project)
+	}
+	if query.Search != "" {
+		values.Set("q", query.Search)
 	}
 	return "/analytics?" + values.Encode()
 }
@@ -2208,7 +2243,38 @@ func maxInt64(left, right int64) int64 {
 	return right
 }
 
+func parseLocalDay(raw string, loc *time.Location) (time.Time, error) {
+	if len(raw) != 10 {
+		return time.Time{}, fmt.Errorf("invalid date %q", raw)
+	}
+	parsed, err := time.ParseInLocation("2006-01-02", raw, loc)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if parsed.Format("2006-01-02") != raw {
+		return time.Time{}, fmt.Errorf("invalid date %q", raw)
+	}
+	return time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, loc), nil
+}
+
+func escapeLikePattern(value string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + replacer.Replace(value) + "%"
+}
+
 func (s *Store) normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, time.Time, time.Time) {
+	query.Period = strings.TrimSpace(query.Period)
+	query.Dimension = strings.TrimSpace(query.Dimension)
+	query.Machine = strings.TrimSpace(query.Machine)
+	query.Provider = strings.TrimSpace(query.Provider)
+	query.Model = strings.TrimSpace(query.Model)
+	query.Tool = strings.TrimSpace(query.Tool)
+	query.Project = strings.TrimSpace(query.Project)
+	query.Search = strings.TrimSpace(query.Search)
+	query.From = strings.TrimSpace(query.From)
+	query.To = strings.TrimSpace(query.To)
+	query.invalidRange = false
+
 	switch query.Period {
 	case "24h", "7d", "30d", "90d", "all":
 	default:
@@ -2219,11 +2285,52 @@ func (s *Store) normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, t
 	default:
 		query.Dimension = "projects"
 	}
-	now := query.Now.In(s.reportingLocation())
-	if now.IsZero() {
-		now = time.Now().In(s.reportingLocation())
+	loc := s.reportingLocation()
+	now := query.Now.In(loc)
+	if query.Now.IsZero() {
+		now = time.Now().In(loc)
 	}
 	today := s.dateOnly(now)
+
+	if query.From != "" || query.To != "" {
+		var fromDay, toDay time.Time
+		if query.From != "" {
+			parsed, err := parseLocalDay(query.From, loc)
+			if err != nil {
+				query.invalidRange = true
+				query.Now = time.Time{}
+				return query, time.Time{}, time.Time{}
+			}
+			fromDay = parsed
+		}
+		if query.To != "" {
+			parsed, err := parseLocalDay(query.To, loc)
+			if err != nil {
+				query.invalidRange = true
+				query.Now = time.Time{}
+				return query, time.Time{}, time.Time{}
+			}
+			toDay = parsed
+		}
+		var start, end time.Time
+		switch {
+		case query.From != "" && query.To != "":
+			start = fromDay
+			end = toDay.AddDate(0, 0, 1)
+		case query.From != "":
+			start = fromDay
+			end = today.AddDate(0, 0, 1)
+		default:
+			start = toDay
+			end = toDay.AddDate(0, 0, 1)
+		}
+		if !end.After(start) {
+			query.invalidRange = true
+		}
+		query.Now = time.Time{}
+		return query, start, end
+	}
+
 	end := today.AddDate(0, 0, 1)
 	start := time.Time{}
 	switch query.Period {
@@ -2242,15 +2349,32 @@ func (s *Store) normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, t
 }
 
 func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) {
-	conditions := []string{"1 = 1"}
-	args := make([]any, 0, 6)
-	if !start.IsZero() {
-		conditions = append(conditions, "timestamp >= ?")
-		args = append(args, start.UTC().Format(time.RFC3339))
+	if query.invalidRange || (!start.IsZero() && !end.IsZero() && !end.After(start)) {
+		return "1 = 0", nil
 	}
-	if !end.IsZero() {
-		conditions = append(conditions, "timestamp < ?")
-		args = append(args, end.UTC().Format(time.RFC3339))
+	conditions := []string{"1 = 1"}
+	args := make([]any, 0, 14)
+	switch {
+	case !start.IsZero() && !end.IsZero():
+		paddedStart := start.Add(-24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+		paddedEnd := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+		startEpoch := float64(start.UnixNano()) / 1e9
+		endEpoch := float64(end.UnixNano()) / 1e9
+		if start.Nanosecond() == 0 && end.Nanosecond() == 0 {
+			startNoZ := start.UTC().Format("2006-01-02T15:04:05")
+			endNoZ := end.UTC().Format("2006-01-02T15:04:05")
+			conditions = append(conditions, "(timestamp >= ? AND timestamp < ? AND ((substr(timestamp, -1) = 'Z' AND timestamp >= ? AND timestamp < ?) OR (substr(timestamp, -1) != 'Z' AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)))")
+			args = append(args, paddedStart, paddedEnd, startNoZ, endNoZ, startEpoch, endEpoch)
+		} else {
+			conditions = append(conditions, "(timestamp >= ? AND timestamp < ? AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)")
+			args = append(args, paddedStart, paddedEnd, startEpoch, endEpoch)
+		}
+	case !end.IsZero():
+		paddedEnd := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+		endNoZ := end.UTC().Format("2006-01-02T15:04:05")
+		endEpoch := float64(end.UnixNano()) / 1e9
+		conditions = append(conditions, "(timestamp < ? AND ((substr(timestamp, -1) = 'Z' AND timestamp < ?) OR (substr(timestamp, -1) != 'Z' AND unixepoch(timestamp, 'subsec') < ?)))")
+		args = append(args, paddedEnd, endNoZ, endEpoch)
 	}
 	if query.Machine != "" {
 		conditions = append(conditions, "machine_id = ?")
@@ -2267,6 +2391,17 @@ func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) 
 	if query.Tool != "" {
 		conditions = append(conditions, "tool = ?")
 		args = append(args, query.Tool)
+	}
+	if query.Project == UnknownProjectFilter {
+		conditions = append(conditions, "project = ''")
+	} else if query.Project != "" {
+		conditions = append(conditions, "project = ?")
+		args = append(args, query.Project)
+	}
+	if query.Search != "" {
+		pattern := escapeLikePattern(query.Search)
+		conditions = append(conditions, `(session_id LIKE ? ESCAPE '\' OR project LIKE ? ESCAPE '\')`)
+		args = append(args, pattern, pattern)
 	}
 	return strings.Join(conditions, " AND "), args
 }
@@ -2328,6 +2463,10 @@ FROM usage_events WHERE `+where, args...)
 	defer rows.Close()
 
 	loc := s.reportingLocation()
+	bucketPeriod := query.Period
+	if query.From != "" || query.To != "" {
+		bucketPeriod = "day"
+	}
 	var summary AnalyticsSummary
 	days := make(map[string]struct{})
 	threads := make(map[string]struct{})
@@ -2350,7 +2489,7 @@ FROM usage_events WHERE `+where, args...)
 			&session, &machine, &provider, &tool, &project, &effectiveModel); err != nil {
 			return AnalyticsSummary{}, nil, nil, nil, nil, err
 		}
-		dayKey, bucketKey, err := s.analyticsBuckets(timestamp, query.Period, loc)
+		dayKey, bucketKey, err := s.analyticsBuckets(timestamp, bucketPeriod, loc)
 		if err != nil {
 			return AnalyticsSummary{}, nil, nil, nil, nil, err
 		}
@@ -2444,7 +2583,7 @@ FROM usage_events WHERE `+where, args...)
 
 	rawPoints := make([]AnalyticsPoint, 0, len(pointsByBucket))
 	for _, point := range pointsByBucket {
-		point.Label = analyticsPointLabel(point.Date, query.Period, loc)
+		point.Label = analyticsPointLabel(point.Date, bucketPeriod, loc)
 		rawPoints = append(rawPoints, point)
 	}
 	sort.Slice(rawPoints, func(left, right int) bool { return rawPoints[left].Date < rawPoints[right].Date })
@@ -2532,8 +2671,12 @@ FROM usage_events WHERE `+where, args...)
 }
 
 func (s *Store) fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuery, start, end time.Time) []AnalyticsPoint {
-	if len(points) == 0 {
+	if len(points) == 0 || query.invalidRange || (!start.IsZero() && !end.IsZero() && !end.After(start)) {
 		return points
+	}
+	bucketPeriod := query.Period
+	if query.From != "" || query.To != "" {
+		bucketPeriod = "day"
 	}
 	byDate := make(map[string]AnalyticsPoint, len(points))
 	for _, point := range points {
@@ -2543,7 +2686,7 @@ func (s *Store) fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuer
 	location := s.reportingLocation()
 	var first, last time.Time
 	var step func(time.Time) time.Time
-	switch query.Period {
+	switch bucketPeriod {
 	case "24h":
 		startLocal := start.In(location)
 		endLocal := end.In(location)
@@ -2568,16 +2711,16 @@ func (s *Store) fillAnalyticsPoints(points []AnalyticsPoint, query AnalyticsQuer
 	result := make([]AnalyticsPoint, 0, len(points))
 	for cursor := first; cursor.Before(last); cursor = step(cursor) {
 		key := cursor.Format("2006-01-02")
-		if query.Period == "24h" {
+		if bucketPeriod == "24h" {
 			key = cursor.UTC().Format(time.RFC3339)
-		} else if query.Period == "all" {
+		} else if bucketPeriod == "all" {
 			key = cursor.Format("2006-01-02")
 		}
 		point, ok := byDate[key]
 		if !ok {
 			point = AnalyticsPoint{Date: key}
 		}
-		point.Label = analyticsPointLabel(point.Date, query.Period, location)
+		point.Label = analyticsPointLabel(point.Date, bucketPeriod, location)
 		result = append(result, point)
 	}
 	return result
@@ -2620,6 +2763,10 @@ func (s *Store) fillAnalyticsSharePoints(byDate map[string]AnalyticsSharePoint, 
 	if len(byDate) == 0 {
 		return nil
 	}
+	bucketPeriod := query.Period
+	if query.From != "" || query.To != "" {
+		bucketPeriod = "day"
+	}
 	seed := make([]AnalyticsPoint, 0, len(byDate))
 	for _, point := range byDate {
 		seed = append(seed, AnalyticsPoint{Date: point.Date})
@@ -2637,7 +2784,7 @@ func (s *Store) fillAnalyticsSharePoints(byDate map[string]AnalyticsSharePoint, 
 				point.Values[index].Share = 0
 			}
 		}
-		point.Label = analyticsPointLabel(point.Date, query.Period, s.reportingLocation())
+		point.Label = analyticsPointLabel(point.Date, bucketPeriod, s.reportingLocation())
 		if point.Tokens > 0 {
 			for index := range point.Values {
 				point.Values[index].Share = float64(point.Values[index].Tokens) / float64(point.Tokens)
@@ -2686,14 +2833,20 @@ func (s *Store) analyticsFacets(ctx context.Context) (AnalyticsFacets, error) {
 	queries := []struct {
 		target     *[]string
 		expression string
+		sql        string
 	}{
 		{target: &result.Machines, expression: "NULLIF(machine_id, '')"},
 		{target: &result.Providers, expression: "NULLIF(provider, '')"},
 		{target: &result.Models, expression: "NULLIF(COALESCE(NULLIF(canonical_model, ''), raw_model), '')"},
 		{target: &result.Tools, expression: "NULLIF(tool, '')"},
+		{target: &result.Projects, sql: `SELECT DISTINCT project FROM usage_events WHERE project != '' ORDER BY 1`},
 	}
 	for _, item := range queries {
-		rows, err := s.readHandle().QueryContext(ctx, `SELECT DISTINCT `+item.expression+` FROM usage_events WHERE `+item.expression+` IS NOT NULL ORDER BY 1`)
+		querySQL := item.sql
+		if querySQL == "" {
+			querySQL = `SELECT DISTINCT ` + item.expression + ` FROM usage_events WHERE ` + item.expression + ` IS NOT NULL ORDER BY 1`
+		}
+		rows, err := s.readHandle().QueryContext(ctx, querySQL)
 		if err != nil {
 			return AnalyticsFacets{}, err
 		}
@@ -2725,6 +2878,7 @@ func cloneAnalyticsFacets(facets AnalyticsFacets) AnalyticsFacets {
 		Providers: slices.Clone(facets.Providers),
 		Models:    slices.Clone(facets.Models),
 		Tools:     slices.Clone(facets.Tools),
+		Projects:  slices.Clone(facets.Projects),
 	}
 }
 
@@ -2778,7 +2932,7 @@ func (s *Store) Facets(ctx context.Context) (AnalyticsFacets, error) {
 	return cloneAnalyticsFacets(cached), nil
 }
 
-func (s *Store) mergeFacetsCache(machines, providers, models, tools map[string]struct{}) {
+func (s *Store) mergeFacetsCache(machines, providers, models, tools, projects map[string]struct{}) {
 	s.facetsMu.Lock()
 	defer s.facetsMu.Unlock()
 	if s.facetsCache == nil {
@@ -2792,7 +2946,8 @@ func (s *Store) mergeFacetsCache(machines, providers, models, tools map[string]s
 	nextProviders, pChanged := insertSortedUnique(s.facetsCache.Providers, providers)
 	nextModels, modChanged := insertSortedUnique(s.facetsCache.Models, models)
 	nextTools, tChanged := insertSortedUnique(s.facetsCache.Tools, tools)
-	if !mChanged && !pChanged && !modChanged && !tChanged {
+	nextProjects, projChanged := insertSortedUnique(s.facetsCache.Projects, projects)
+	if !mChanged && !pChanged && !modChanged && !tChanged && !projChanged {
 		return
 	}
 	s.facetsCache = &AnalyticsFacets{
@@ -2800,6 +2955,7 @@ func (s *Store) mergeFacetsCache(machines, providers, models, tools map[string]s
 		Providers: nextProviders,
 		Models:    nextModels,
 		Tools:     nextTools,
+		Projects:  nextProjects,
 	}
 }
 

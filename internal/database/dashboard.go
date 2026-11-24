@@ -142,6 +142,23 @@ FROM usage_events WHERE timestamp >= ? AND timestamp < ?`,
 	return result, nil
 }
 
+const (
+	DefaultSessionsPageSize = 100
+	MaxSessionsPageSize     = 200
+)
+
+// SessionsPageResult holds one paginated slice of metadata-only sessions along
+// with total count and page metadata.
+type SessionsPageResult struct {
+	Rows       []SessionRecord `json:"rows"`
+	Total      int             `json:"total"`
+	Page       int             `json:"page"`
+	PageSize   int             `json:"page_size"`
+	TotalPages int             `json:"total_pages"`
+	HasPrev    bool            `json:"has_prev"`
+	HasNext    bool            `json:"has_next"`
+}
+
 // NormalizeSessionSort validates the session-table sort request. Unknown or
 // missing values fall back to the timestamp default.
 func NormalizeSessionSort(sort, dir string) (string, string) {
@@ -156,6 +173,17 @@ func NormalizeSessionSort(sort, dir string) (string, string) {
 	return sort, dir
 }
 
+func sessionOrderClause(sort, dir string) string {
+	expressions := map[string]string{
+		"when":     "MAX(timestamp)",
+		"tokens":   "CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END",
+		"cost":     "CASE WHEN COUNT(cost) = 0 THEN NULL ELSE SUM(cost) END",
+		"duration": "CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END",
+	}
+	column := expressions[sort]
+	return "ORDER BY " + column + " IS NULL ASC, " + column + " " + strings.ToUpper(dir) + ", MAX(timestamp) DESC"
+}
+
 // sessionOrderBy builds the session-table ORDER BY and LIMIT from a validated
 // sort key. Only whitelisted literals reach the query; rows with an unknown
 // sort value (NULL aggregate) sort last regardless of direction, and timestamp
@@ -164,14 +192,45 @@ func sessionOrderBy(sort, dir string, limit int) string {
 	if limit <= 0 {
 		limit = 100
 	}
-	expressions := map[string]string{
-		"when":     "MAX(timestamp)",
-		"tokens":   "CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END",
-		"cost":     "CASE WHEN COUNT(cost) = 0 THEN NULL ELSE SUM(cost) END",
-		"duration": "CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END",
+	return sessionOrderClause(sort, dir) + " LIMIT " + strconv.Itoa(limit)
+}
+
+const sessionSelectSQL = `SELECT
+MAX(timestamp),
+MAX(NULLIF(session_id, '')),
+machine_id,
+provider,
+COALESCE(NULLIF(MAX(NULLIF(canonical_model, '')), ''), MAX(raw_model)),
+MAX(tool),
+MAX(project),
+CASE WHEN COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END,
+CASE WHEN COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END,
+CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END,
+CASE WHEN COUNT(cost) = 0 THEN NULL ELSE SUM(cost) END,
+MAX(cost_estimated),
+CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END,
+CASE WHEN COUNT(DISTINCT token_accuracy) = 1 THEN MAX(token_accuracy) ELSE 'unknown' END,
+COUNT(*)
+FROM usage_events WHERE `
+
+func scanSessionRecords(rows *sql.Rows) ([]SessionRecord, error) {
+	var result []SessionRecord
+	for rows.Next() {
+		var item SessionRecord
+		var input, output, total, duration sql.NullInt64
+		var cost sql.NullFloat64
+		if err := rows.Scan(&item.Timestamp, &item.SessionID, &item.Machine, &item.Provider, &item.Model, &item.Tool, &item.Project,
+			&input, &output, &total, &cost, &item.CostEstimated, &duration, &item.Accuracy, &item.Events); err != nil {
+			return nil, err
+		}
+		item.InputTokens = nullInt64(input)
+		item.OutputTokens = nullInt64(output)
+		item.TotalTokens = nullInt64(total)
+		item.Cost = nullFloat64(cost)
+		item.DurationMS = nullInt64(duration)
+		result = append(result, item)
 	}
-	column := expressions[sort]
-	return "ORDER BY " + column + " IS NULL ASC, " + column + " " + strings.ToUpper(dir) + ", MAX(timestamp) DESC LIMIT " + strconv.Itoa(limit)
+	return result, rows.Err()
 }
 
 func (s *Store) Sessions(ctx context.Context, query AnalyticsQuery) ([]SessionRecord, error) {
@@ -194,46 +253,93 @@ func (s *Store) SessionsWithLimit(ctx context.Context, query AnalyticsQuery, sor
 	}
 	query, start, end := s.normalizeAnalyticsQuery(query)
 	where, args := analyticsWhere(query, start, end)
-	rows, err := s.readHandle().QueryContext(ctx, `SELECT
-MAX(timestamp),
-MAX(NULLIF(session_id, '')),
-machine_id,
-provider,
-COALESCE(NULLIF(MAX(NULLIF(canonical_model, '')), ''), MAX(raw_model)),
-MAX(tool),
-MAX(project),
-CASE WHEN COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END,
-CASE WHEN COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END,
-CASE WHEN COUNT(total_tokens) = COUNT(*) THEN SUM(total_tokens) END,
-CASE WHEN COUNT(cost) = 0 THEN NULL ELSE SUM(cost) END,
-MAX(cost_estimated),
-CASE WHEN COUNT(duration_ms) = COUNT(*) THEN SUM(duration_ms) END,
-CASE WHEN COUNT(DISTINCT token_accuracy) = 1 THEN MAX(token_accuracy) ELSE 'unknown' END,
-COUNT(*)
-FROM usage_events WHERE `+where+` AND NULLIF(session_id, '') IS NOT NULL
+	rows, err := s.readHandle().QueryContext(ctx, sessionSelectSQL+where+` AND NULLIF(session_id, '') IS NOT NULL
 GROUP BY session_id, machine_id, provider, tool
 `+sessionOrderBy(sort, dir, limit), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var result []SessionRecord
-	for rows.Next() {
-		var item SessionRecord
-		var input, output, total, duration sql.NullInt64
-		var cost sql.NullFloat64
-		if err := rows.Scan(&item.Timestamp, &item.SessionID, &item.Machine, &item.Provider, &item.Model, &item.Tool, &item.Project,
-			&input, &output, &total, &cost, &item.CostEstimated, &duration, &item.Accuracy, &item.Events); err != nil {
-			return nil, err
-		}
-		item.InputTokens = nullInt64(input)
-		item.OutputTokens = nullInt64(output)
-		item.TotalTokens = nullInt64(total)
-		item.Cost = nullFloat64(cost)
-		item.DurationMS = nullInt64(duration)
-		result = append(result, item)
+	return scanSessionRecords(rows)
+}
+
+// SessionsPage returns a paginated slice of sessions beyond LIMIT 100, clamping
+// out-of-range pages and page sizes cleanly.
+func (s *Store) SessionsPage(ctx context.Context, query AnalyticsQuery, sort, dir string, page, pageSize int) (SessionsPageResult, error) {
+	sort, dir = NormalizeSessionSort(sort, dir)
+	if pageSize <= 0 {
+		pageSize = DefaultSessionsPageSize
 	}
-	return result, rows.Err()
+	if pageSize > MaxSessionsPageSize {
+		pageSize = MaxSessionsPageSize
+	}
+	query, start, end := s.normalizeAnalyticsQuery(query)
+	where, args := analyticsWhere(query, start, end)
+
+	var total int
+	countSQL := `SELECT COUNT(*) FROM (
+SELECT 1 FROM usage_events
+WHERE ` + where + ` AND NULLIF(session_id, '') IS NOT NULL
+GROUP BY session_id, machine_id, provider, tool
+)`
+	if err := s.readHandle().QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+		return SessionsPageResult{}, err
+	}
+
+	totalPages := (total + pageSize - 1) / pageSize
+	if page < 1 {
+		page = 1
+	}
+	if totalPages == 0 {
+		page = 1
+	} else if page > totalPages {
+		page = totalPages
+	}
+	result := SessionsPageResult{
+		Total:      total,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalPages: totalPages,
+		HasPrev:    page > 1 && totalPages > 0,
+		HasNext:    page < totalPages,
+	}
+	if total == 0 {
+		return result, nil
+	}
+
+	offset := (page - 1) * pageSize
+	queryArgs := make([]any, 0, len(args)+2)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, pageSize, offset)
+	rows, err := s.readHandle().QueryContext(ctx, sessionSelectSQL+where+` AND NULLIF(session_id, '') IS NOT NULL
+GROUP BY session_id, machine_id, provider, tool
+`+sessionOrderClause(sort, dir)+` LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return SessionsPageResult{}, err
+	}
+	defer rows.Close()
+	records, err := scanSessionRecords(rows)
+	if err != nil {
+		return SessionsPageResult{}, err
+	}
+	result.Rows = records
+	return result, nil
+}
+
+// ExportSessions returns all matching sessions without the 100-row UI cap so
+// CSV/JSON exports include the complete filtered set.
+func (s *Store) ExportSessions(ctx context.Context, query AnalyticsQuery, sort, dir string) ([]SessionRecord, error) {
+	sort, dir = NormalizeSessionSort(sort, dir)
+	query, start, end := s.normalizeAnalyticsQuery(query)
+	where, args := analyticsWhere(query, start, end)
+	rows, err := s.readHandle().QueryContext(ctx, sessionSelectSQL+where+` AND NULLIF(session_id, '') IS NOT NULL
+GROUP BY session_id, machine_id, provider, tool
+`+sessionOrderClause(sort, dir), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSessionRecords(rows)
 }
 
 // MachineSourceHealth is one source's connector health as of the machine's

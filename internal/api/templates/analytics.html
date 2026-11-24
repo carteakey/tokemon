@@ -65,7 +65,8 @@
     .trend-grid { position: absolute; z-index: 0; inset: 18px 16px 31px 0; pointer-events: none; }
     .trend-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .44); }
     .trend-chart { position: relative; z-index: 1; display: flex; min-height: 252px; align-items: end; gap: 4px; margin-top: 8px; padding: 12px 16px 16px 0; overflow-x: auto; }
-    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; min-height: 220px; padding: 0 0 18px; border: 0; background: transparent; color: inherit; cursor: crosshair; }
+    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; min-height: 220px; padding: 0 0 18px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+    .trend-column:hover .trend-bar { border-color: var(--accent); }
     .trend-column:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 2px; }
     .trend-column.selected .trend-bar { border-color: var(--text); box-shadow: 0 0 0 1px rgba(240, 237, 229, .16); }
     .trend-column.unknown::after { position: absolute; right: 0; bottom: 19px; left: 0; height: 3px; border: 1px solid var(--warm); background: transparent; content: ""; }
@@ -147,9 +148,14 @@
     th:first-child, td:first-child { width: 42%; }
     th:not(:first-child), td:not(:first-child) { padding-left: 9px; text-align: right; white-space: nowrap; }
     td:first-child { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    .breakdown-panel td:first-child { overflow: visible; }
     tbody tr { transition: background-color 140ms ease; }
     tbody tr:hover { background: rgba(155, 187, 160, .035); }
     .breakdown-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .breakdown-link { display: block; min-width: 0; max-width: 100%; border-radius: 3px; color: inherit; }
+    .breakdown-link:hover { color: var(--accent); }
+    .breakdown-link:hover .breakdown-name { text-decoration: underline; text-underline-offset: 2px; }
+    .breakdown-link:focus-visible { color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
     .breakdown-meter { display: block; height: 2px; margin-top: 5px; overflow: hidden; background: var(--line); }
     .breakdown-meter span { display: block; width: var(--share); height: 100%; background: var(--accent-dim); animation: meter-grow 680ms cubic-bezier(.2, .75, .25, 1) both; }
     .empty-row td { padding: 30px 0 12px; color: var(--faint); text-align: left; }
@@ -222,6 +228,9 @@
   <section class="panel filter-panel" aria-label="Analytics filters">
     <form class="filter-form" method="get" action="/analytics">
       <input type="hidden" name="period" value="{{.Filter.Period}}">
+      {{if .Filter.Project}}<input type="hidden" name="project" value="{{.Filter.Project}}">{{end}}
+      {{if .Filter.From}}<input type="hidden" name="from" value="{{.Filter.From}}">{{end}}
+      {{if .Filter.To}}<input type="hidden" name="to" value="{{.Filter.To}}">{{end}}
       <label for="dimension-filter">Breakdown
         <select id="dimension-filter" name="dimension">
           <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
@@ -300,9 +309,9 @@
           {{$trendStop := -1}}
           {{range $index, $point := .Points}}{{if and (lt $trendStop 0) (gt $.PeakPoint.Tokens 0) (eq $point.Tokens $.PeakPoint.Tokens)}}{{$trendStop = $index}}{{end}}{{end}}
           {{if lt $trendStop 0}}{{$trendStop = 0}}{{end}}
-          <div class="trend-chart period-{{.Filter.Period}}" tabindex="0" role="region" aria-label="Token volume over the selected window">
+          <div class="trend-chart period-{{.Filter.Period}}" tabindex="0" role="region" aria-label="Token volume over the selected window" data-filter-machine="{{.Filter.Machine}}" data-filter-provider="{{.Filter.Provider}}" data-filter-model="{{.Filter.Model}}" data-filter-tool="{{.Filter.Tool}}" data-filter-project="{{.Filter.Project}}">
             {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-date="{{trendPointDate . $.Bucket}}" data-from="{{trendPointFrom . $.Bucket}}" data-to="{{trendPointTo . $.Bucket}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
               <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
               <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
@@ -326,7 +335,8 @@
       <div class="table-scroll breakdown-scroll" tabindex="0" aria-label="Analytics breakdown table, scrollable">
         <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
-          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
+          {{$href := breakdownDrillURL $.Filter .Name}}
+          <tr><td title="{{.Name}}">{{if $href}}<a class="breakdown-link" href="{{$href}}"><span class="breakdown-name">{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}</span></a>{{else}}<span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span>{{end}}<span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
@@ -420,6 +430,23 @@
       value.textContent = column.dataset.label + ' · ' + number.format(Number(column.dataset.tokens)) + ' tokens';
       mix.textContent = 'Input ' + number.format(Number(column.dataset.input)) + ' · Cached ' + number.format(Number(column.dataset.cached)) + ' · Output ' + number.format(Number(column.dataset.output));
     };
+    const openTrendSessions = (column) => {
+      const from = column.dataset.from || column.dataset.date || '';
+      const to = column.dataset.to || from;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return;
+      const params = new URLSearchParams();
+      params.set('from', from);
+      params.set('to', to);
+      const chart = column.closest('.trend-chart');
+      if (chart) {
+        if (chart.dataset.filterMachine) params.set('machine', chart.dataset.filterMachine);
+        if (chart.dataset.filterProvider) params.set('provider', chart.dataset.filterProvider);
+        if (chart.dataset.filterModel) params.set('model', chart.dataset.filterModel);
+        if (chart.dataset.filterTool) params.set('tool', chart.dataset.filterTool);
+        if (chart.dataset.filterProject) params.set('project', chart.dataset.filterProject);
+      }
+      window.location.assign('/sessions?' + params.toString());
+    };
     document.querySelectorAll('.trend-column').forEach((column, index, columns) => {
       column.addEventListener('mouseenter', () => showPoint(column));
       column.addEventListener('focus', () => {
@@ -428,7 +455,10 @@
         // makes the focused bucket the chart's single Tab stop.
         columns.forEach((button) => button.setAttribute('tabindex', button === column ? '0' : '-1'));
       });
-      column.addEventListener('click', () => showPoint(column));
+      column.addEventListener('click', () => {
+        showPoint(column);
+        openTrendSessions(column);
+      });
       column.addEventListener('keydown', (event) => {
         let target = null;
         if (event.key === 'ArrowRight') target = columns[index + 1] || columns[columns.length - 1];

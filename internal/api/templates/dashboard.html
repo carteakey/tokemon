@@ -123,6 +123,13 @@
     td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
     .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
     .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .data-panel tbody tr:has(.row-link):hover { background: rgba(155, 187, 160, .035); }
+    .row-link { display: block; min-width: 0; border-radius: 3px; color: inherit; }
+    .row-link:hover { color: var(--accent); }
+    .row-link:hover .row-name > span:last-child { text-decoration: underline; text-underline-offset: 2px; }
+    .row-link:focus-visible { color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
+    .session-link { border-radius: 3px; color: var(--text); }
+    .session-link:hover, .session-link:focus-visible { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
     .row-icon { display: block; flex: 0 0 17px; width: 17px; height: 17px; object-fit: contain; image-rendering: pixelated; }
     .pixel-glyph { display: grid; flex: 0 0 17px; width: 17px; height: 17px; grid-template: repeat(5, 2px) / repeat(5, 2px); place-content: center; gap: 1px; border: 1px solid var(--glyph-edge); border-radius: 3px; background: #11130f; image-rendering: pixelated; }
     .pixel-glyph i { display: block; width: 2px; height: 2px; background: transparent; }
@@ -287,7 +294,7 @@
           {{range .Activity.Weeks}}
           <div class="activity-week" role="row">
             <span class="activity-month" role="presentation">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="{{activityTabStop . $initialTab}}"{{end}}></span>{{end}}
+            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-date="{{.Date}}" data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="{{activityTabStop . $initialTab}}"{{end}}></span>{{end}}
           </div>
           {{end}}
         </div>
@@ -302,19 +309,19 @@
     <h2 id="breakdowns-title" class="sr-only">Usage breakdowns</h2>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Projects</h2></div>
-      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if .Project}}<span title="{{.Project}}">{{.Project}}</span>{{else}}<span class="unknown-value">Unknown project</span>{{end}}</span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}{{$href := overviewDrillURL "project" .Project}}<tr><td>{{if $href}}<a class="row-link" href="{{$href}}"><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Project}}">{{.Project}}</span></span></a>{{else}}<span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if .Project}}<span title="{{.Project}}">{{.Project}}</span>{{else}}<span class="unknown-value">Unknown project</span>{{end}}</span>{{end}}</td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Harnesses</h2></div>
-      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}{{$href := overviewDrillURL "tool" .Tool}}<tr><td>{{if $href}}<a class="row-link" href="{{$href}}"><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></a>{{else}}<span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if or (eq .Tool "") (isUnknownName .Tool)}}<span class="unknown-value">Unknown harness</span>{{else}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span>{{end}}</span>{{end}}</td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Models</h2></div>
-      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if eq .Model "unknown"}}<span class="unknown-value" title="{{.Model}}">Unknown model</span>{{else}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span>{{end}}</span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}{{$href := overviewDrillURL "model" .Model}}<tr><td>{{if $href}}<a class="row-link" href="{{$href}}"><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span></span></a>{{else}}<span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if or (eq .Model "") (isUnknownName .Model)}}<span class="unknown-value" title="{{.Model}}">Unknown model</span>{{else}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span>{{end}}</span>{{end}}</td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
     </article>
     <article class="panel data-panel">
       <div class="section-head"><h2 class="section-title">Machines</h2></div>
-      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
+      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}{{$href := overviewDrillURL "machine" .Machine}}<tr><td>{{if $href}}<a class="row-link" href="{{$href}}"><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></a>{{else}}<span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if or (eq .Machine "") (isUnknownName .Machine)}}<span class="unknown-value">Unknown machine</span>{{else}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span>{{end}}</span>{{end}}</td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
     </article>
   </section>
 
@@ -325,7 +332,7 @@
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
     <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><a class="section-link" href="/sessions">Open session timeline</a></div>
-    <div class="sessions-scroll" tabindex="0" role="region" aria-label="Recent sessions table, scrollable"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="table-muted">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td data-label="Input">{{tokenValue .InputTokens}}</td><td data-label="Output">{{tokenValue .OutputTokens}}</td><td data-label="Total">{{tokenValue .TotalTokens}}</td><td data-label="Cost">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
+    <div class="sessions-scroll" tabindex="0" role="region" aria-label="Recent sessions table, scrollable"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><a class="session-link" href="{{sessionDetailURL .SessionID}}" title="Inspect session {{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span></a>{{copyID .SessionID "session"}}<span class="table-muted">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td data-label="Input"{{if .InputTokens}} title="{{commasPtr .InputTokens}} tokens" aria-label="{{commasPtr .InputTokens}} tokens"{{else}} class="unknown-value" title="Token count unavailable" aria-label="Unknown"{{end}}>{{compactTokenValue .InputTokens}}</td><td data-label="Output"{{if .OutputTokens}} title="{{commasPtr .OutputTokens}} tokens" aria-label="{{commasPtr .OutputTokens}} tokens"{{else}} class="unknown-value" title="Token count unavailable" aria-label="Unknown"{{end}}>{{compactTokenValue .OutputTokens}}</td><td data-label="Total"{{if .TotalTokens}} title="{{commasPtr .TotalTokens}} tokens" aria-label="{{commasPtr .TotalTokens}} tokens"{{else}} class="unknown-value" title="Token count unavailable" aria-label="Unknown"{{end}}>{{compactTokenValue .TotalTokens}}</td><td data-label="Cost">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   {{if eq .LifetimeTokens 0}}
@@ -760,6 +767,16 @@
     }
     cell.tabIndex = 0;
   };
+  const openDaySessions = (cell) => {
+    const date = cell && cell.dataset ? cell.dataset.date || '' : '';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+    window.location.assign('/sessions?from=' + encodeURIComponent(date) + '&to=' + encodeURIComponent(date));
+  };
+  grid.addEventListener('click', (event) => {
+    const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
+    if (!cell || !navigable(cell)) return;
+    openDaySessions(cell);
+  });
   // Focus moving into a cell — by tab, click, or the arrows below — makes it
   // the one tab stop.
   grid.addEventListener('focusin', (event) => {
@@ -770,6 +787,11 @@
   grid.addEventListener('keydown', (event) => {
     const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
     if (!cell || !navigable(cell)) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      openDaySessions(cell);
+      return;
+    }
     const row = cell.closest('.activity-week');
     if (!row) return;
     const allRows = rows();

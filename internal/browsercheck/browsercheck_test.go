@@ -826,6 +826,50 @@ const sortInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+const sessionsFilterInvariantJS = `(() => {
+	const problems = [];
+	for (const id of ['sessions-search', 'sessions-project', 'sessions-from', 'sessions-to', 'sessions-period', 'sessions-machine', 'sessions-provider', 'sessions-model', 'sessions-tool']) {
+		const control = document.getElementById(id);
+		if (!control) {
+			problems.push('missing filter control #' + id);
+			continue;
+		}
+		if (!document.querySelector('label[for="' + id + '"]')) {
+			problems.push('missing explicit label[for="' + id + '"]');
+		}
+		control.focus();
+		if (document.activeElement !== control) {
+			problems.push('filter control #' + id + ' is not keyboard-reachable');
+		}
+	}
+	if (document.activeElement && document.activeElement !== document.body) {
+		document.activeElement.blur();
+	}
+	return JSON.stringify(problems);
+})()`
+
+const sessionDetailInvariantJS = `(() => {
+	const problems = [];
+	if (!document.querySelector('h1')) {
+		problems.push('session detail missing <h1>');
+	}
+	const copyBtn = document.querySelector('.copy-id[data-copy-value="smoke-sess-alpha"]');
+	if (!copyBtn) {
+		problems.push('session detail missing copy-id button for smoke-sess-alpha');
+	}
+	if (!document.querySelector('a[href="/sessions"]')) {
+		problems.push('session detail missing back link to /sessions');
+	}
+	if (!document.querySelector('table')) {
+		problems.push('session detail missing semantic breakdown/timeline table');
+	}
+	const html = document.documentElement.innerHTML;
+	if (html.includes('/Users/') || html.includes('/home/') || html.includes('ZgotmplZ')) {
+		problems.push('session detail leaked path or template error marker');
+	}
+	return JSON.stringify(problems);
+})()`
+
 // settleAnimationJS injects a stylesheet that disables animations and
 // transitions. Headless Chrome can leave elements parked at an animation's
 // backwards fill (from) state when no frame ticks after load — the stat cards
@@ -909,7 +953,8 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			chartRovingInvariantJS,
 		}},
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
-		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
+		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS, sessionsFilterInvariantJS}},
+		{path: "/sessions/smoke-sess-alpha", invariants: []string{sessionDetailInvariantJS}},
 		{path: "/insights"},
 		{path: "/settings"},
 	}
@@ -1419,6 +1464,161 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			t.Fatalf("signed-out navigation landed on %s with status %d, want /login with 200", signedOutNavResponse.URL, signedOutNavResponse.Status)
 		}
 	})
+
+	t.Run("sessions-drilldown-and-filters", func(t *testing.T) {
+		if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+			t.Fatalf("emulate desktop: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/sessions?project=smoke-project&q=smoke-sess-alpha")); err != nil {
+			t.Fatalf("navigate filtered /sessions: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("a.session-link")); err != nil {
+			t.Fatalf("session link never appeared: %v", err)
+		}
+		assertNoProblems(t, ctx, exportInvariantJS)
+		filteredProblems := `(() => {
+			const problems = [];
+			const rows = Array.from(document.querySelectorAll('tbody tr'));
+			if (rows.length !== 1 || !rows[0].textContent.includes('smoke-sess-alpha')) {
+				problems.push('expected 1 row for smoke-sess-alpha, got ' + rows.length);
+			}
+			const exp = document.querySelector('a.action[href*="export"]');
+			if (!exp || !exp.getAttribute('href').includes('project=smoke-project') || !exp.getAttribute('href').includes('q=smoke-sess-alpha')) {
+				problems.push('export link lost active filters: ' + (exp && exp.getAttribute('href')));
+			}
+			return JSON.stringify(problems);
+		})()`
+		assertNoProblems(t, ctx, filteredProblems)
+		resp, err := chromedp.RunResponse(ctx, chromedp.Click("a.session-link"))
+		if err != nil {
+			t.Fatalf("click session-link: %v", err)
+		}
+		if resp.Status != http.StatusOK || !strings.Contains(resp.URL, "/sessions/smoke-sess-alpha") {
+			t.Fatalf("click session-link landed on %s status=%d", resp.URL, resp.Status)
+		}
+		assertNoProblems(t, ctx, sessionDetailInvariantJS)
+		assertAxeAllowlist(t, ctx, "/sessions/smoke-sess-alpha")
+
+		notFoundResp, err := chromedp.RunResponse(ctx, chromedp.Navigate(baseURL+"/sessions/nonexistent-id"))
+		if err != nil {
+			t.Fatalf("navigate missing session: %v", err)
+		}
+		if notFoundResp.Status != http.StatusNotFound {
+			t.Fatalf("GET /sessions/nonexistent-id status = %d, want 404", notFoundResp.Status)
+		}
+	})
+
+	t.Run("sessions-pagination", func(t *testing.T) {
+		pagStore, err := database.Open(filepath.Join(t.TempDir(), "pag.db"), smokeCatalog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { pagStore.Close() })
+		now := time.Now().UTC().Add(-time.Hour)
+		evts := make([]usage.Event, 0, 105)
+		for i := 0; i < 105; i++ {
+			evts = append(evts, usage.Event{
+				SchemaVersion: usage.SchemaVersion,
+				EventID:       fmt.Sprintf("pag-ev-%03d", i),
+				Timestamp:     now.Add(time.Duration(i) * time.Second),
+				MachineID:     "smoke-laptop",
+				Project:       "pag-proj",
+				Provider:      "anthropic",
+				Model:         "claude-sonnet-4",
+				Tool:          "claude-code",
+				SessionID:     fmt.Sprintf("pag-sess-%03d", i),
+				InputTokens:   usage.Int64(100 + int64(i)),
+				OutputTokens:  usage.Int64(50),
+				TotalTokens:   usage.Int64(150 + int64(i)),
+				TokenAccuracy: usage.AccuracyReported,
+				Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "smoke"},
+			})
+		}
+		if _, err := pagStore.Ingest(context.Background(), evts); err != nil {
+			t.Fatal(err)
+		}
+		pagURL := serveStore(t, pagStore, false)
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(pagURL+"/sessions?project=pag-proj&sort=tokens&dir=asc")); err != nil {
+			t.Fatalf("navigate paginated /sessions: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("nav.pagination a.page-link")); err != nil {
+			t.Fatalf("pagination nav never appeared: %v", err)
+		}
+		p1Problems := `(() => {
+			const problems = [];
+			const rows = document.querySelectorAll('tbody tr');
+			if (rows.length !== 100) problems.push('page 1 expected 100 rows, got ' + rows.length);
+			const next = document.querySelector('nav.pagination a.page-link');
+			const href = next ? next.getAttribute('href') : '';
+			if (!href.includes('page=2') || !href.includes('project=pag-proj') || !href.includes('sort=tokens') || !href.includes('dir=asc')) {
+				problems.push('next link missing preserved params: ' + href);
+			}
+			return JSON.stringify(problems);
+		})()`
+		assertNoProblems(t, ctx, p1Problems)
+		resp, err := chromedp.RunResponse(ctx, chromedp.Click("nav.pagination a.page-link"))
+		if err != nil {
+			t.Fatalf("click next page: %v", err)
+		}
+		if resp.Status != http.StatusOK || !strings.Contains(resp.URL, "page=2") {
+			t.Fatalf("page 2 landed on %s status=%d", resp.URL, resp.Status)
+		}
+		p2Problems := `(() => {
+			const problems = [];
+			const rows = document.querySelectorAll('tbody tr');
+			if (rows.length !== 5) problems.push('page 2 expected 5 rows, got ' + rows.length);
+			return JSON.stringify(problems);
+		})()`
+		assertNoProblems(t, ctx, p2Problems)
+		assertNoProblems(t, ctx, sharedInvariantJS)
+		assertAxeAllowlist(t, ctx, "/sessions")
+	})
+
+	t.Run("drilldowns-and-click-throughs", func(t *testing.T) {
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/")); err != nil {
+			t.Fatalf("navigate /: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("a.row-link")); err != nil {
+			t.Fatalf("row-link missing on /: %v", err)
+		}
+		resp, err := chromedp.RunResponse(ctx, chromedp.Click("a.row-link"))
+		if err != nil {
+			t.Fatalf("click overview row-link: %v", err)
+		}
+		if resp.Status != http.StatusOK || (!strings.Contains(resp.URL, "/sessions?") && !strings.Contains(resp.URL, "/analytics?")) {
+			t.Fatalf("overview row-link landed on %s status=%d", resp.URL, resp.Status)
+		}
+
+		// Heatmap day click-through on /.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/")); err != nil {
+			t.Fatalf("navigate / for heatmap: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`.activity-cell[data-date]`)); err != nil {
+			t.Fatalf("heatmap cell missing data-date: %v", err)
+		}
+		hmResp, err := chromedp.RunResponse(ctx, chromedp.Click(`.activity-cell[data-date]`))
+		if err != nil {
+			t.Fatalf("click heatmap cell: %v", err)
+		}
+		if hmResp.Status != http.StatusOK || !strings.Contains(hmResp.URL, "/sessions?from=") {
+			t.Fatalf("heatmap click landed on %s status=%d", hmResp.URL, hmResp.Status)
+		}
+
+		// Trend bar click-through on /analytics.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/analytics?period=7d&dimension=projects")); err != nil {
+			t.Fatalf("navigate /analytics: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`.trend-column[data-from]`)); err != nil {
+			t.Fatalf("trend-column missing data-from: %v", err)
+		}
+		trendResp, err := chromedp.RunResponse(ctx, chromedp.Click(`.trend-column[data-from]`))
+		if err != nil {
+			t.Fatalf("click trend-column: %v", err)
+		}
+		if trendResp.Status != http.StatusOK || !strings.Contains(trendResp.URL, "/sessions?from=") {
+			t.Fatalf("trend click landed on %s status=%d", trendResp.URL, trendResp.Status)
+		}
+	})
 }
 
 // assertPageAtViewports renders one page at every gated viewport, runs the
@@ -1606,6 +1806,7 @@ func seedSmokeStore(t *testing.T) *database.Store {
 			Provider:      "anthropic",
 			Model:         "claude-sonnet-4",
 			Tool:          "claude-code",
+			SessionID:     "smoke-sess-alpha",
 			InputTokens:   usage.Int64(70),
 			OutputTokens:  usage.Int64(30),
 			TotalTokens:   usage.Int64(100),
@@ -1622,6 +1823,7 @@ func seedSmokeStore(t *testing.T) *database.Store {
 			Provider:      "anthropic",
 			Model:         "claude-sonnet-4",
 			Tool:          "claude-code",
+			SessionID:     "smoke-sess-alpha",
 			InputTokens:   usage.Int64(700),
 			OutputTokens:  usage.Int64(300),
 			TotalTokens:   usage.Int64(1000),
@@ -1638,6 +1840,7 @@ func seedSmokeStore(t *testing.T) *database.Store {
 			Provider:      "openai",
 			Model:         "gpt-5",
 			Tool:          "codex",
+			SessionID:     "smoke-sess-beta",
 			InputTokens:   usage.Int64(200),
 			OutputTokens:  usage.Int64(100),
 			TotalTokens:   usage.Int64(300),

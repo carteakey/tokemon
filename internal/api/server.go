@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/csv"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -100,7 +102,9 @@ type sessionsCacheEntry struct {
 	query      database.AnalyticsQuery
 	sort       string
 	dir        string
-	result     []database.SessionRecord
+	page       int
+	pageSize   int
+	result     database.SessionsPageResult
 	err        error
 	fetched    time.Time
 	ready      chan struct{}
@@ -398,6 +402,11 @@ type catalogPageData struct {
 	UncatalogedModels      int
 }
 
+type activeFilterPill struct {
+	Label     string
+	RemoveURL string
+}
+
 type sessionsPageData struct {
 	PageChrome
 	Sessions       []database.SessionRecord
@@ -406,6 +415,26 @@ type sessionsPageData struct {
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
 	Sorts          map[string]sessionSortState
+	Sort           string
+	Dir            string
+	Page           int
+	PageSize       int
+	TotalCount     int64
+	TotalPages     int
+	HasPrev        bool
+	HasNext        bool
+	RangeStart     int
+	RangeEnd       int
+	ActiveFilters  []activeFilterPill
+	PrevURL        string
+	NextURL        string
+}
+
+type sessionDetailPageData struct {
+	PageChrome
+	Detail         database.SessionDetail
+	ModelAliases   map[string]string
+	MachineAliases map[string]string
 }
 
 // sessionSortState carries the per-column sortable header state: the toggle
@@ -927,6 +956,34 @@ func analyticsDateTickClass(index, total int, period string) string {
 		class += " tick-end"
 	}
 	return class
+}
+
+func analyticsPointDateRange(point database.AnalyticsPoint, bucket string, loc *time.Location) (date, from, to string) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	switch bucket {
+	case "hour":
+		parsed, err := time.Parse(time.RFC3339, point.Date)
+		if err != nil {
+			return "", "", ""
+		}
+		day := parsed.In(loc).Format("2006-01-02")
+		return day, day, day
+	case "month":
+		parsed, err := time.Parse("2006-01-02", point.Date)
+		if err != nil {
+			return "", "", ""
+		}
+		fromDay := parsed.Format("2006-01-02")
+		toDay := parsed.AddDate(0, 1, -1).Format("2006-01-02")
+		return fromDay, fromDay, toDay
+	default:
+		if len(point.Date) != 10 {
+			return "", "", ""
+		}
+		return point.Date, point.Date, point.Date
+	}
 }
 
 func analyticsDateTickLabel(point database.AnalyticsPoint, period string) string {
@@ -1503,6 +1560,34 @@ func analyticsShortTimeAt(raw string, loc *time.Location, now time.Time) templat
 	))
 }
 
+func parseQueryDate(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) != 10 {
+		return ""
+	}
+	parsed, err := time.Parse("2006-01-02", raw)
+	if err != nil || parsed.Format("2006-01-02") != raw {
+		return ""
+	}
+	return raw
+}
+
+func validDateRange(query database.AnalyticsQuery) bool {
+	if query.From == "" && query.To == "" {
+		return true
+	}
+	if query.From != "" && parseQueryDate(query.From) == "" {
+		return false
+	}
+	if query.To != "" && parseQueryDate(query.To) == "" {
+		return false
+	}
+	if query.From != "" && query.To != "" && query.From > query.To {
+		return false
+	}
+	return true
+}
+
 func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
 	values := r.URL.Query()
 	period := values.Get("period")
@@ -1524,14 +1609,48 @@ func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
 		Provider:  strings.TrimSpace(values.Get("provider")),
 		Model:     strings.TrimSpace(values.Get("model")),
 		Tool:      strings.TrimSpace(values.Get("tool")),
+		Project:   strings.TrimSpace(values.Get("project")),
+		Search:    strings.TrimSpace(values.Get("q")),
+		From:      strings.TrimSpace(values.Get("from")),
+		To:        strings.TrimSpace(values.Get("to")),
 		Now:       time.Now().UTC(),
 	}
+}
+
+func sessionPaginationFromRequest(r *http.Request) (page, pageSize int) {
+	values := r.URL.Query()
+	page = 1
+	if raw := strings.TrimSpace(values.Get("page")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	pageSize = database.DefaultSessionsPageSize
+	rawSize := strings.TrimSpace(values.Get("page_size"))
+	if rawSize == "" {
+		rawSize = strings.TrimSpace(values.Get("limit"))
+	}
+	if rawSize != "" {
+		if parsed, err := strconv.Atoi(rawSize); err == nil && parsed > 0 {
+			if parsed > database.MaxSessionsPageSize {
+				parsed = database.MaxSessionsPageSize
+			}
+			pageSize = parsed
+		}
+	}
+	return page, pageSize
 }
 
 func analyticsQueryValues(query database.AnalyticsQuery) url.Values {
 	values := url.Values{}
 	values.Set("period", query.Period)
 	values.Set("dimension", query.Dimension)
+	if query.From != "" {
+		values.Set("from", query.From)
+	}
+	if query.To != "" {
+		values.Set("to", query.To)
+	}
 	if query.Machine != "" {
 		values.Set("machine", query.Machine)
 	}
@@ -1543,35 +1662,35 @@ func analyticsQueryValues(query database.AnalyticsQuery) url.Values {
 	}
 	if query.Tool != "" {
 		values.Set("tool", query.Tool)
+	}
+	if query.Project != "" {
+		values.Set("project", query.Project)
+	}
+	if query.Search != "" {
+		values.Set("q", query.Search)
 	}
 	return values
 }
 
 func analyticsExportURL(query database.AnalyticsQuery, format string) string {
-	values := url.Values{}
-	values.Set("period", query.Period)
-	values.Set("dimension", query.Dimension)
-	if query.Machine != "" {
-		values.Set("machine", query.Machine)
-	}
-	if query.Provider != "" {
-		values.Set("provider", query.Provider)
-	}
-	if query.Model != "" {
-		values.Set("model", query.Model)
-	}
-	if query.Tool != "" {
-		values.Set("tool", query.Tool)
-	}
+	values := analyticsQueryValues(query)
 	if format != "" {
 		values.Set("format", format)
 	}
 	return "/api/v1/analytics/export?" + values.Encode()
 }
 
-func sessionsExportURL(query database.AnalyticsQuery, format string) string {
+func sessionsFilterValues(query database.AnalyticsQuery) url.Values {
 	values := url.Values{}
-	values.Set("period", query.Period)
+	if query.Period != "" {
+		values.Set("period", query.Period)
+	}
+	if query.From != "" {
+		values.Set("from", query.From)
+	}
+	if query.To != "" {
+		values.Set("to", query.To)
+	}
 	if query.Machine != "" {
 		values.Set("machine", query.Machine)
 	}
@@ -1584,34 +1703,162 @@ func sessionsExportURL(query database.AnalyticsQuery, format string) string {
 	if query.Tool != "" {
 		values.Set("tool", query.Tool)
 	}
+	if query.Project != "" {
+		values.Set("project", query.Project)
+	}
+	if query.Search != "" {
+		values.Set("q", query.Search)
+	}
+	return values
+}
+
+func sessionsExportURL(query database.AnalyticsQuery, format string) string {
+	values := sessionsFilterValues(query)
 	if format != "" {
 		values.Set("format", format)
 	}
 	return "/api/v1/sessions/export?" + values.Encode()
 }
 
-func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
-	query.Dimension = dimension
-	values := url.Values{}
-	values.Set("period", query.Period)
-	values.Set("dimension", query.Dimension)
+func sessionsPageURL(query database.AnalyticsQuery, sort, dir string, page, pageSize int) string {
+	values := sessionsFilterValues(query)
+	if sort != "" && (sort != "when" || dir != "desc") {
+		values.Set("sort", sort)
+		values.Set("dir", dir)
+	}
+	if page > 1 {
+		values.Set("page", strconv.Itoa(page))
+	}
+	if pageSize > 0 && pageSize != database.DefaultSessionsPageSize {
+		values.Set("page_size", strconv.Itoa(pageSize))
+	}
+	encoded := values.Encode()
+	if encoded == "" {
+		return "/sessions"
+	}
+	return "/sessions?" + encoded
+}
+
+func sessionsActiveFilters(query database.AnalyticsQuery, sort, dir string, pageSize int, modelAliases, machineAliases map[string]string) []activeFilterPill {
+	var pills []activeFilterPill
+	addPill := func(label string, mutate func(*database.AnalyticsQuery)) {
+		next := query
+		mutate(&next)
+		pills = append(pills, activeFilterPill{
+			Label:     label,
+			RemoveURL: sessionsPageURL(next, sort, dir, 1, pageSize),
+		})
+	}
+	if query.Search != "" {
+		addPill("Search: "+query.Search, func(q *database.AnalyticsQuery) { q.Search = "" })
+	}
+	if query.From != "" {
+		addPill("From: "+query.From, func(q *database.AnalyticsQuery) { q.From = "" })
+	}
+	if query.To != "" {
+		addPill("To: "+query.To, func(q *database.AnalyticsQuery) { q.To = "" })
+	}
+	if query.Project != "" {
+		label := query.Project
+		if label == database.UnknownProjectFilter {
+			label = "Unknown project"
+		}
+		addPill("Project: "+label, func(q *database.AnalyticsQuery) { q.Project = "" })
+	}
 	if query.Machine != "" {
-		values.Set("machine", query.Machine)
+		addPill("Machine: "+machineDisplayName(machineAliases, query.Machine), func(q *database.AnalyticsQuery) { q.Machine = "" })
 	}
 	if query.Provider != "" {
-		values.Set("provider", query.Provider)
+		addPill("Provider: "+query.Provider, func(q *database.AnalyticsQuery) { q.Provider = "" })
 	}
 	if query.Model != "" {
-		values.Set("model", query.Model)
+		addPill("Model: "+modelDisplayName(modelAliases, query.Model), func(q *database.AnalyticsQuery) { q.Model = "" })
 	}
 	if query.Tool != "" {
-		values.Set("tool", query.Tool)
+		addPill("Harness: "+harnessName(query.Tool), func(q *database.AnalyticsQuery) { q.Tool = "" })
 	}
-	return "/analytics?" + values.Encode()
+	if query.From == "" && query.To == "" && query.Period != "" && query.Period != "30d" {
+		addPill("Period: "+strings.ToUpper(query.Period), func(q *database.AnalyticsQuery) { q.Period = "30d" })
+	}
+	return pills
+}
+
+func sessionDetailURL(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "/sessions"
+	}
+	return "/sessions/" + url.PathEscape(id)
+}
+
+func isDrillableBucket(name string) bool {
+	return strings.TrimSpace(name) != "" && !isUnknownBucketName(name)
+}
+
+func overviewDrillURL(kind, value string) string {
+	if !isDrillableBucket(value) {
+		return ""
+	}
+	switch kind {
+	case "project":
+		return "/sessions?period=all&project=" + url.QueryEscape(value)
+	case "tool":
+		return "/analytics?period=all&dimension=projects&tool=" + url.QueryEscape(value)
+	case "model":
+		return "/analytics?period=all&dimension=projects&model=" + url.QueryEscape(value)
+	case "machine":
+		return "/analytics?period=all&dimension=projects&machine=" + url.QueryEscape(value)
+	default:
+		return ""
+	}
+}
+
+func analyticsBreakdownDrillURL(query database.AnalyticsQuery, name string) string {
+	if !isDrillableBucket(name) {
+		return ""
+	}
+	if query.Dimension == "projects" {
+		next := query
+		next.Project = name
+		encoded := sessionsFilterValues(next).Encode()
+		if encoded == "" {
+			return "/sessions"
+		}
+		return "/sessions?" + encoded
+	}
+	next := query
+	switch query.Dimension {
+	case "machines":
+		next.Machine = name
+	case "providers":
+		next.Provider = name
+	case "models":
+		next.Model = name
+	case "harnesses":
+		next.Tool = name
+	default:
+		return ""
+	}
+	nextDim := "projects"
+	if next.Project != "" {
+		if query.Dimension == "models" {
+			nextDim = "harnesses"
+		} else {
+			nextDim = "models"
+		}
+	}
+	return analyticsViewURL(next, nextDim)
+}
+
+func analyticsViewURL(query database.AnalyticsQuery, dimension string) string {
+	query.Dimension = dimension
+	return "/analytics?" + analyticsQueryValues(query).Encode()
 }
 
 func analyticsPeriodURL(query database.AnalyticsQuery, period string) string {
 	query.Period = period
+	query.From = ""
+	query.To = ""
 	return analyticsViewURL(query, query.Dimension)
 }
 
@@ -1838,6 +2085,25 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
 		"sessionsExportURL":    sessionsExportURL,
+		"sessionsPageURL":      sessionsPageURL,
+		"sessionDetailURL":     sessionDetailURL,
+		"validDateInput":       parseQueryDate,
+		"validDateRange":       validDateRange,
+		"overviewDrillURL":     overviewDrillURL,
+		"breakdownDrillURL":    analyticsBreakdownDrillURL,
+		"unknownProjectFilter": func() string { return database.UnknownProjectFilter },
+		"trendPointDate": func(point database.AnalyticsPoint, bucket string) string {
+			date, _, _ := analyticsPointDateRange(point, bucket, store.Location())
+			return date
+		},
+		"trendPointFrom": func(point database.AnalyticsPoint, bucket string) string {
+			_, from, _ := analyticsPointDateRange(point, bucket, store.Location())
+			return from
+		},
+		"trendPointTo": func(point database.AnalyticsPoint, bucket string) string {
+			_, _, to := analyticsPointDateRange(point, bucket, store.Location())
+			return to
+		},
 		"analyticsChange":      analyticsChangeLabel,
 		"analyticsChangeClass": analyticsChangeClass,
 		"insightsURL":          insightsViewURL,
@@ -1849,6 +2115,16 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"copyID":               copyIDButton,
 		"copyIDScript":         func() template.HTML { return template.HTML(copyIDScript) },
 		"sortableHeader":       sortableHeader,
+		"compactTokenValue": func(value *int64) string {
+			if value == nil {
+				return "Unknown"
+			}
+			return compact(*value)
+		},
+		"ptrInt64": func(v int64) *int64 { return &v },
+		"hasString": func(list []string, target string) bool {
+			return slices.Contains(list, target)
+		},
 		"tokenValue": func(value *int64) string {
 			if value == nil {
 				return "Unknown"
@@ -2007,6 +2283,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /tokedex", dashboard(http.HandlerFunc(s.catalogPage)))
 	mux.Handle("GET /catalog", dashboard(http.HandlerFunc(s.catalogPage)))
 	mux.Handle("GET /sessions", dashboard(http.HandlerFunc(s.sessionsPage)))
+	mux.Handle("GET /sessions/", dashboard(http.NotFoundHandler()))
+	mux.Handle("GET /sessions/{id}", dashboard(http.HandlerFunc(s.sessionDetailPage)))
 	mux.Handle("GET /settings", dashboard(http.HandlerFunc(s.settings)))
 	mux.Handle("GET /settings/aliases", dashboard(http.HandlerFunc(s.settings)))
 	mux.Handle("POST /settings/aliases", dashboard(http.HandlerFunc(s.saveSettings)))
@@ -2506,8 +2784,9 @@ func (s *Server) modelsAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sessionsAPI(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := sessionPaginationFromRequest(r)
 	started := time.Now()
-	result, err := s.cachedSessions(r.Context(), analyticsQueryFromRequest(r), "when", "desc")
+	result, err := s.cachedSessionsPage(r.Context(), analyticsQueryFromRequest(r), "when", "desc", page, pageSize)
 	s.metrics.observeDB(started)
 	if err != nil {
 		if clientGone(err) {
@@ -2516,13 +2795,17 @@ func (s *Server) sessionsAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	w.Header().Set("X-Total-Count", strconv.Itoa(result.Total))
+	w.Header().Set("X-Page", strconv.Itoa(result.Page))
+	w.Header().Set("X-Page-Size", strconv.Itoa(result.PageSize))
+	w.Header().Set("X-Total-Pages", strconv.Itoa(result.TotalPages))
+	writeJSON(w, http.StatusOK, result.Rows)
 }
 
 func (s *Server) sessionsExport(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	started := time.Now()
-	result, err := s.cachedSessions(r.Context(), query, "when", "desc")
+	result, err := s.store.ExportSessions(r.Context(), query, "when", "desc")
 	s.metrics.observeDB(started)
 	if err != nil {
 		if clientGone(err) {
@@ -2938,7 +3221,7 @@ const analyticsMinRefreshInterval = 2 * time.Second
 // computed for. Now is deliberately excluded: it moves per request and the
 // TTL already bounds how far the cached window may lag.
 func analyticsCacheKey(query database.AnalyticsQuery) string {
-	return query.Period + "\x1f" + query.Dimension + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool
+	return query.Period + "\x1f" + query.Dimension + "\x1f" + query.From + "\x1f" + query.To + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool + "\x1f" + query.Project + "\x1f" + query.Search
 }
 
 func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQuery) (database.Analytics, error) {
@@ -3216,7 +3499,8 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 	query := analyticsQueryFromRequest(r)
 	sort, dir := database.NormalizeSessionSort(r.URL.Query().Get("sort"), r.URL.Query().Get("dir"))
-	result, err := s.cachedSessions(r.Context(), query, sort, dir)
+	pageNum, pageSize := sessionPaginationFromRequest(r)
+	result, err := s.cachedSessionsPage(r.Context(), query, sort, dir, pageNum, pageSize)
 	if err != nil {
 		if clientGone(err) {
 			return
@@ -3238,15 +3522,87 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{PageChrome: s.pageChrome("Tokemon · Sessions", "sessions", false), Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
+	rangeStart, rangeEnd := 0, 0
+	if result.Total > 0 && len(result.Rows) > 0 {
+		rangeStart = (result.Page-1)*result.PageSize + 1
+		rangeEnd = rangeStart + len(result.Rows) - 1
+	}
+	var prevURL, nextURL string
+	if result.HasPrev {
+		prevURL = sessionsPageURL(query, sort, dir, result.Page-1, result.PageSize)
+	}
+	if result.HasNext {
+		nextURL = sessionsPageURL(query, sort, dir, result.Page+1, result.PageSize)
+	}
+	page := sessionsPageData{
+		PageChrome:     s.pageChrome("Tokemon · Sessions", "sessions", false),
+		Sessions:       result.Rows,
+		Filter:         query,
+		Facets:         analytics,
+		ModelAliases:   modelAliases,
+		MachineAliases: machineAliases,
+		Sorts:          sessionSortStates(r, sort, dir),
+		Sort:           sort,
+		Dir:            dir,
+		Page:           result.Page,
+		PageSize:       result.PageSize,
+		TotalCount:     int64(result.Total),
+		TotalPages:     result.TotalPages,
+		HasPrev:        result.HasPrev,
+		HasNext:        result.HasNext,
+		RangeStart:     rangeStart,
+		RangeEnd:       rangeEnd,
+		ActiveFilters:  sessionsActiveFilters(query, sort, dir, result.PageSize, modelAliases, machineAliases),
+		PrevURL:        prevURL,
+		NextURL:        nextURL,
+	}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
+		return
+	}
+}
+
+func (s *Server) sessionDetailPage(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" || len([]rune(id)) > usage.MaxSessionIDLength || strings.ContainsAny(id, "/\\\r\n\t ") {
+		http.NotFound(w, r)
+		return
+	}
+	detail, err := s.store.SessionDetail(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if clientGone(err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	aliases, err := s.store.DisplayAliases(r.Context())
+	if err != nil {
+		if clientGone(err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	page := sessionDetailPageData{
+		PageChrome:     s.pageChrome("Tokemon · Session", "sessions", false),
+		Detail:         detail,
+		ModelAliases:   modelAliases,
+		MachineAliases: machineAliases,
+	}
+	if err := s.template.ExecuteTemplate(w, "session_detail", page); err != nil {
 		return
 	}
 }
 
 // sessionSortStates builds the sortable-header state for the four server-side
 // sorted columns. The active column toggles direction; the others default to
-// descending. Filter parameters are preserved in each toggle URL.
+// descending. Filter parameters are preserved in each toggle URL and page
+// resets to 1 so sorting restarts from the top.
 func sessionSortStates(r *http.Request, activeSort, activeDir string) map[string]sessionSortState {
 	states := map[string]sessionSortState{}
 	for _, key := range []string{"when", "tokens", "cost", "duration"} {
@@ -3265,6 +3621,7 @@ func sessionSortStates(r *http.Request, activeSort, activeDir string) map[string
 			dir = "desc"
 		}
 		values := r.URL.Query()
+		values.Del("page")
 		values.Set("sort", key)
 		values.Set("dir", dir)
 		states[key] = sessionSortState{URL: "?" + values.Encode(), Active: active, AriaSort: ariaSort, Indicator: indicator}
@@ -3488,12 +3845,34 @@ func (s *Server) invalidateCatalogCache() {
 }
 
 func sessionsCacheKey(query database.AnalyticsQuery, sort, dir string) string {
-	return query.Period + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool + "\x1f" + sort + "\x1f" + dir
+	return query.Period + "\x1f" + query.From + "\x1f" + query.To + "\x1f" + query.Machine + "\x1f" + query.Provider + "\x1f" + query.Model + "\x1f" + query.Tool + "\x1f" + query.Project + "\x1f" + query.Search + "\x1f" + sort + "\x1f" + dir
+}
+
+func sessionsPageCacheKey(query database.AnalyticsQuery, sort, dir string, page, pageSize int) string {
+	base := sessionsCacheKey(query, sort, dir)
+	if page <= 1 && pageSize == database.DefaultSessionsPageSize {
+		return base
+	}
+	return base + "\x1f" + strconv.Itoa(page) + "\x1f" + strconv.Itoa(pageSize)
 }
 
 func (s *Server) cachedSessions(ctx context.Context, query database.AnalyticsQuery, sort, dir string) ([]database.SessionRecord, error) {
+	result, err := s.cachedSessionsPage(ctx, query, sort, dir, 1, database.DefaultSessionsPageSize)
+	return result.Rows, err
+}
+
+func (s *Server) cachedSessionsPage(ctx context.Context, query database.AnalyticsQuery, sort, dir string, page, pageSize int) (database.SessionsPageResult, error) {
 	sort, dir = database.NormalizeSessionSort(sort, dir)
-	key := sessionsCacheKey(query, sort, dir)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = database.DefaultSessionsPageSize
+	}
+	if pageSize > database.MaxSessionsPageSize {
+		pageSize = database.MaxSessionsPageSize
+	}
+	key := sessionsPageCacheKey(query, sort, dir, page, pageSize)
 	for {
 		s.sessionsMu.Lock()
 		if entry, ok := s.sessionsCache[key]; ok && entry.ready != nil && !entry.hasResult {
@@ -3502,7 +3881,7 @@ func (s *Server) cachedSessions(ctx context.Context, query database.AnalyticsQue
 			case <-entry.ready:
 				continue
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return database.SessionsPageResult{}, ctx.Err()
 			}
 		}
 		if entry, ok := s.sessionsCache[key]; ok && entry.hasResult {
@@ -3519,19 +3898,19 @@ func (s *Server) cachedSessions(ctx context.Context, query database.AnalyticsQue
 		if s.sessionsCache == nil {
 			s.sessionsCache = make(map[string]*sessionsCacheEntry)
 		}
-		computing := &sessionsCacheEntry{query: query, sort: sort, dir: dir, ready: make(chan struct{})}
+		computing := &sessionsCacheEntry{query: query, sort: sort, dir: dir, page: page, pageSize: pageSize, ready: make(chan struct{})}
 		s.sessionsCache[key] = computing
 		s.evictSessionsEntriesLocked()
 		generation := s.sessionsGeneration
 		s.sessionsMu.Unlock()
 
 		computeCtx, cancel := detachedComputeContext(ctx)
-		result, err := s.store.SessionsWithSort(computeCtx, query, sort, dir)
+		result, err := s.store.SessionsPage(computeCtx, query, sort, dir, page, pageSize)
 		cancel()
 
 		s.sessionsMu.Lock()
 		if s.sessionsGeneration == generation && !clientGone(err) {
-			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, page: page, pageSize: pageSize, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
 		} else {
 			delete(s.sessionsCache, key)
 		}
@@ -3552,17 +3931,19 @@ func (s *Server) startSessionsRefreshLocked(key string, entry *sessionsCacheEntr
 	query.Now = time.Now().UTC()
 	sort := entry.sort
 	dir := entry.dir
+	page := entry.page
+	pageSize := entry.pageSize
 	ready := make(chan struct{})
 	entry.ready = ready
 	go func() {
 		defer s.bgWG.Done()
 		ctx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
 		defer cancel()
-		result, err := s.store.SessionsWithSort(ctx, query, sort, dir)
+		result, err := s.store.SessionsPage(ctx, query, sort, dir, page, pageSize)
 
 		s.sessionsMu.Lock()
 		if s.sessionsGeneration == generation && !clientGone(err) {
-			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+			s.sessionsCache[key] = &sessionsCacheEntry{query: query, sort: sort, dir: dir, page: page, pageSize: pageSize, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
 		}
 		entry.ready = nil
 		s.sessionsMu.Unlock()

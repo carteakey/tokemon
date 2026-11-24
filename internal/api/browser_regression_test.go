@@ -74,12 +74,27 @@ func TestMobileNavigation390BrowserRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "mobile-nav-ev",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		SessionID:     "reg-sess",
+		TotalTokens:   usage.Int64(42),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	server, err := newTestServer(store, "mobile-nav-token")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pages := []string{"/", "/analytics", "/tokedex", "/sessions", "/insights", "/settings"}
+	pages := []string{"/", "/analytics", "/tokedex", "/sessions", "/sessions/reg-sess", "/insights", "/settings"}
 	for _, path := range pages {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.SetBasicAuth("tokemon", testDashboardToken)

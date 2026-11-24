@@ -1,0 +1,105 @@
+{{define "session_detail"}}<!doctype html>
+<html lang="en">
+<head>
+  {{template "head" .}}
+  <style>
+    .detail-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 20px 10px 15px; }
+    .back-link { display: inline-flex; align-items: center; min-height: 32px; padding: 4px 10px; border: 1px solid var(--control-border); border-radius: 4px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; }
+    .back-link:hover, .back-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .eyebrow, .section-title, .stat-label, .meta-label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .detail-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 8px; }
+    h1 { margin: 0; font: 700 clamp(26px, 3.8vw, 40px)/1 var(--font-display); overflow-wrap: anywhere; }
+    .detail-id { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; color: var(--faint); font: 11px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .detail-id code { color: var(--muted); }
+    .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+    .stat { min-width: 0; min-height: 82px; padding: 12px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .stat-value { margin-top: 8px; overflow: hidden; color: var(--text); font: 700 clamp(17px, 2vw, 23px)/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .stat-value.unknown-value { color: var(--warm); font-size: 16px; }
+    .stat-meta { margin-top: 6px; color: var(--faint); font: 10px/1.25 var(--font-data); overflow-wrap: anywhere; }
+    .meta-panel, .detail-panel { margin-top: 10px; overflow: hidden; }
+    .section-head { padding: 13px 16px 10px; }
+    .section-meta { color: var(--faint); font: 10px var(--font-data); }
+    .meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px 16px 16px; }
+    .meta-item { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); }
+    .meta-value { margin-top: 6px; color: var(--text); font: 600 13px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .meta-sub { margin-top: 4px; color: var(--faint); font: 10px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .meta-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .meta-link:hover, .meta-link:focus-visible { color: var(--text); }
+    .table-scroll { padding: 0 16px 14px; }
+    table { min-width: 820px; table-layout: auto; }
+    th, td { padding: 9px 0; vertical-align: top; }
+    th { color: var(--faint); }
+    td { color: var(--muted); font: 12px/1.25 var(--font-data); }
+    th:first-child, td:first-child { width: auto; }
+    th:not(:first-child), td:not(:first-child) { padding-left: 16px; text-align: right; white-space: nowrap; }
+    td:first-child { color: var(--text); font-weight: 600; }
+    .subline { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; font-weight: 400; }
+    .unknown { color: var(--warm); }
+    @media (max-width: 900px) {
+      .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .detail-heading { align-items: start; flex-direction: column; padding: 16px 8px 12px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .meta-grid { grid-template-columns: 1fr; }
+      table { min-width: 0; }
+      thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+      tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+      tbody td, tbody td:not(:first-child) { display: block; width: auto; padding: 0; border: 0; text-align: left; white-space: normal; }
+      tbody td:first-child { grid-column: 1 / -1; }
+      td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    }
+    @media (max-width: 420px) {
+      .summary-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>{{template "topbar" .}}
+  <section class="detail-heading">
+    <div>
+      <div class="eyebrow">Metadata-only session</div>
+      <div class="detail-title-row">
+        <h1>{{sessionDisplayName .Detail.SessionID}}</h1>
+      </div>
+      <div class="detail-id"><code>{{.Detail.SessionID}}</code>{{copyID .Detail.SessionID "session"}}</div>
+    </div>
+    <a class="back-link" href="/sessions">&larr; All sessions</a>
+  </section>
+
+  <section class="summary-grid" aria-label="Session token summary">
+    <article class="stat"><div class="stat-label">Total tokens</div><div class="stat-value{{if not .Detail.TotalTokens}} unknown-value{{end}}">{{tokenValue .Detail.TotalTokens}}</div><div class="stat-meta">{{commas .Detail.Events}} event{{if ne .Detail.Events 1}}s{{end}} · {{.Detail.Accuracy}}</div></article>
+    <article class="stat"><div class="stat-label">Input / Output</div><div class="stat-value{{if and (not .Detail.InputTokens) (not .Detail.OutputTokens)}} unknown-value{{end}}">{{compactTokenValue .Detail.InputTokens}} / {{compactTokenValue .Detail.OutputTokens}}</div><div class="stat-meta">Exact: {{tokenValue .Detail.InputTokens}} in · {{tokenValue .Detail.OutputTokens}} out</div></article>
+    <article class="stat"><div class="stat-label">Cache</div><div class="stat-value{{if eq .Detail.Cache.EligibleTokens 0}} unknown-value{{end}}">{{if .Detail.Cache.EligibleTokens}}{{printf "%.1f%%" (percent .Detail.Cache.HitRate)}}{{else}}—{{end}}</div><div class="stat-meta">Read: {{tokenValue .Detail.CacheReadTokens}} · Write: {{tokenValue .Detail.CacheWriteTokens}}</div></article>
+    <article class="stat"><div class="stat-label">Reasoning</div><div class="stat-value{{if not .Detail.ReasoningTokens}} unknown-value{{end}}">{{tokenValue .Detail.ReasoningTokens}}</div><div class="stat-meta">Reported reasoning tokens</div></article>
+    <article class="stat"><div class="stat-label">Est. Cost / Span</div><div class="stat-value{{if not .Detail.Cost}} unknown-value{{end}}">{{costValue .Detail.Cost .Detail.CostEstimated}}</div><div class="stat-meta">Wall: {{durationValue (ptrInt64 .Detail.WallDurationMS)}} · Events: {{durationValue .Detail.DurationMS}}</div></article>
+  </section>
+
+  <section class="panel meta-panel" aria-labelledby="session-context-title">
+    <div class="section-head"><h2 class="section-title" id="session-context-title">Context metadata</h2><div class="section-meta">{{.Detail.ModelSwitches}} model switch{{if ne .Detail.ModelSwitches 1}}es{{end}}</div></div>
+    <div class="meta-grid">
+      <div class="meta-item"><div class="meta-label">Project</div><div class="meta-value">{{if .Detail.Projects}}{{range $i, $p := .Detail.Projects}}{{if $i}}, {{end}}<a class="meta-link" href="/sessions?period=all&amp;project={{urlquery $p}}">{{$p}}</a>{{end}}{{else}}<span class="unknown-value">Unknown project</span>{{end}}</div><div class="meta-sub">Normalized repository basename only</div></div>
+      <div class="meta-item"><div class="meta-label">Machine</div><div class="meta-value">{{if .Detail.Machines}}{{range $i, $m := .Detail.Machines}}{{if $i}}, {{end}}{{machineDisplayName $.MachineAliases $m}}{{end}}{{else}}<span class="unknown-value">Unknown</span>{{end}}</div><div class="meta-sub">{{if .Detail.Machine}}{{.Detail.Machine}}{{end}}</div></div>
+      <div class="meta-item"><div class="meta-label">Provider / Harness</div><div class="meta-value">{{if .Detail.Providers}}{{range $i, $p := .Detail.Providers}}{{if $i}}, {{end}}{{$p}}{{end}}{{else}}Unknown{{end}} / {{if .Detail.Tools}}{{range $i, $t := .Detail.Tools}}{{if $i}}, {{end}}{{harnessName $t}}{{end}}{{else}}Unknown{{end}}</div><div class="meta-sub">{{len .Detail.Models}} model{{if ne (len .Detail.Models) 1}}s{{end}} observed</div></div>
+      <div class="meta-item"><div class="meta-label">First seen</div><div class="meta-value">{{analyticsTime .Detail.FirstSeen}}</div><div class="meta-sub">Localized to reporting timezone</div></div>
+      <div class="meta-item"><div class="meta-label">Last seen</div><div class="meta-value">{{analyticsTime .Detail.LastSeen}}</div><div class="meta-sub">Wall span: {{durationValue (ptrInt64 .Detail.WallDurationMS)}}</div></div>
+      <div class="meta-item"><div class="meta-label">Accuracy / Currency</div><div class="meta-value">{{.Detail.Accuracy}}</div><div class="meta-sub">{{if .Detail.Currency}}{{.Detail.Currency}}{{else}}USD{{end}}</div></div>
+    </div>
+  </section>
+
+  <section class="panel detail-panel" aria-labelledby="model-breakdown-title">
+    <div class="section-head"><h2 class="section-title" id="model-breakdown-title">Model breakdown</h2><div class="section-meta">{{len .Detail.ModelBreakdown}} model{{if ne (len .Detail.ModelBreakdown) 1}}s{{end}}</div></div>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Session model breakdown table, scrollable">
+      <table aria-label="Session model breakdown"><caption class="sr-only">Session model breakdown</caption><thead><tr><th scope="col">Model / provider</th><th scope="col">Events</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Cache read</th><th scope="col">Total</th><th scope="col">Cache hit</th><th scope="col">Cost</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Detail.ModelBreakdown}}<tr><td>{{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{.Provider}}</span></td><td data-label="Events">{{commas .Events}}</td><td data-label="Input"{{if not .InputTokens}} class="unknown"{{end}}>{{tokenValue .InputTokens}}</td><td data-label="Output"{{if not .OutputTokens}} class="unknown"{{end}}>{{tokenValue .OutputTokens}}</td><td data-label="Cache read"{{if not .CacheReadTokens}} class="unknown"{{end}}>{{tokenValue .CacheReadTokens}}</td><td data-label="Total"{{if not .TotalTokens}} class="unknown"{{end}}>{{tokenValue .TotalTokens}}</td><td data-label="Cache hit">{{if .Cache.EligibleTokens}}{{printf "%.1f%%" (percent .Cache.HitRate)}}{{else}}—{{end}}</td><td data-label="Cost"{{if not .Cost}} class="unknown"{{end}}>{{costValue .Cost .CostEstimated}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{end}}</tbody></table>
+    </div>
+  </section>
+
+  <section class="panel detail-panel" aria-labelledby="timeline-title">
+    <div class="section-head"><h2 class="section-title" id="timeline-title">Event timeline</h2><div class="section-meta">{{len .Detail.Timeline}} of {{commas .Detail.Events}} events{{if .Detail.TimelineTruncated}} (latest {{len .Detail.Timeline}} shown){{end}}</div></div>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Session event timeline table, scrollable">
+      <table aria-label="Session event timeline"><caption class="sr-only">Session event timeline</caption><thead><tr><th scope="col">When</th><th scope="col">Model / provider</th><th scope="col">Machine / harness</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Detail.Timeline}}<tr><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Model / provider">{{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{.Provider}}</span></td><td data-label="Machine / harness">{{machineDisplayName $.MachineAliases .Machine}}<span class="subline">{{harnessName .Tool}}{{if .Project}} · {{.Project}}{{end}}</span></td><td data-label="Input"{{if not .InputTokens}} class="unknown"{{end}}>{{tokenValue .InputTokens}}</td><td data-label="Output"{{if not .OutputTokens}} class="unknown"{{end}}>{{tokenValue .OutputTokens}}</td><td data-label="Total"{{if not .TotalTokens}} class="unknown"{{end}}>{{tokenValue .TotalTokens}}</td><td data-label="Cost"{{if not .Cost}} class="unknown"{{end}}>{{costValue .Cost .CostEstimated}}</td><td data-label="Duration"{{if not .DurationMS}} class="unknown"{{end}}>{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{end}}</tbody></table>
+    </div>
+  </section>
+
+  {{template "footer" .}}
+{{copyIDScript}}</body></html>{{end}}

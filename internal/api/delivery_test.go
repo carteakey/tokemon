@@ -69,6 +69,7 @@ func TestGzipMiddlewareCompressesHTMLJSONCSVAndStaticJSON(t *testing.T) {
 		wantBody string
 	}{
 		{path: "/", wantCT: "text/html", wantBody: "<!doctype html>"},
+		{path: "/sessions/gzip-sess-1", wantCT: "text/html", wantBody: "gzip-sess-1"},
 		{path: "/healthz", wantCT: "application/json", wantBody: `"status":"ok"`},
 		{path: "/api/v1/machines", wantCT: "application/json", wantBody: `"gzip-machine"`},
 		{path: "/api/v1/sessions/export?format=csv", wantCT: "text/csv", wantBody: "gzip-sess-1"},
@@ -518,6 +519,21 @@ func TestAllSevenTemplatesServeVersionedStaticURLsFontPreloadLCPAndContentVisibi
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "delivery-ev",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "box",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		SessionID:     "delivery-sess",
+		TotalTokens:   usage.Int64(42),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := passwordAccountServer(t, store)
 	defer func() { _ = server.Close() }()
@@ -528,7 +544,7 @@ func TestAllSevenTemplatesServeVersionedStaticURLsFontPreloadLCPAndContentVisibi
 	wantBaseCSS := `<link rel="stylesheet" href="/static/tokemon/base.css?v=` + server.assetVersion + `">`
 	staticRefPattern := regexp.MustCompile(`/static/[^\s"')]+`)
 
-	for _, path := range []string{"/", "/analytics", "/sessions", "/settings", "/insights", "/tokedex", "/login"} {
+	for _, path := range []string{"/", "/analytics", "/sessions", "/sessions/delivery-sess", "/settings", "/insights", "/tokedex", "/login"} {
 		body := renderAccessiblePage(t, server, path)
 		if strings.Contains(body, "ZgotmplZ") {
 			t.Fatalf("%s contains ZgotmplZ template escaping marker", path)
