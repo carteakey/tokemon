@@ -1655,11 +1655,14 @@ func TestAnalyticsUnknownBucketLabelsAreDimensionAware(t *testing.T) {
 			t.Errorf("analyticsUnknownLabel(%q) = %q, want %q", dimension, got, want)
 		}
 	}
-	if got := breakdownDisplayName("projects", nil, "Unknown"); got != "Unknown project" {
+	if got := breakdownDisplayName("projects", nil, nil, "Unknown"); got != "Unknown project" {
 		t.Errorf("breakdownDisplayName projects sentinel = %q", got)
 	}
-	if got := breakdownDisplayName("projects", nil, "project-a"); got != "project-a" {
+	if got := breakdownDisplayName("projects", nil, nil, "project-a"); got != "project-a" {
 		t.Errorf("breakdownDisplayName projects real name = %q", got)
+	}
+	if got := breakdownDisplayName("machines", map[string]string{"raw-box": "Wrong Model Alias"}, map[string]string{"raw-box": "Build Box"}, "raw-box"); got != "Build Box" {
+		t.Errorf("breakdownDisplayName machines = %q, want Build Box", got)
 	}
 
 	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
@@ -2904,5 +2907,300 @@ func TestHeartbeatAcceptsManySources(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("heartbeat with 300 sources = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestMachineHealthGroupsSourcesByAdapter(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	freshSync := now.Add(-2 * time.Minute).Format(time.RFC3339)
+	staleSync := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	// Seed 1 machine with 1 fresh claude-code source and 60 codex sources (58 stale,
+	// 2 fresh, 1 with error) to verify adapter grouping, attention-first sorting,
+	// collapsed <details>, problem-row cap, and untouched /api/v1/machines JSON.
+	sources := []string{
+		fmt.Sprintf(`{"adapter":"claude-code","identity_hash":"sha256:%064x","last_successful_sync":%q}`, 1, freshSync),
+		fmt.Sprintf(`{"adapter":"codex","identity_hash":"sha256:%064x","last_successful_sync":%q,"last_error_class":"timeout"}`, 2, staleSync),
+	}
+	for i := 3; i <= 59; i++ {
+		sources = append(sources, fmt.Sprintf(`{"adapter":"codex","identity_hash":"sha256:%064x","last_successful_sync":%q}`, i, staleSync))
+	}
+	for i := 60; i <= 61; i++ {
+		sources = append(sources, fmt.Sprintf(`{"adapter":"codex","identity_hash":"sha256:%064x","last_successful_sync":%q}`, i, freshSync))
+	}
+	payload := fmt.Sprintf(`{"machine_id":"grouped-box","agent_version":"0.4.5","operating_system":"darwin","architecture":"arm64","adapters":[{"id":"claude-code"},{"id":"codex"}],"source_count":%d,"source_error_count":1,"sources":[%s]}`, len(sources), strings.Join(sources, ","))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/heartbeat", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	machinesRec := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(machinesRec, httptest.NewRequest(http.MethodGet, "/api/v1/machines", nil))
+	if machinesRec.Code != http.StatusOK {
+		t.Fatalf("machines status = %d", machinesRec.Code)
+	}
+	var machines []database.MachineInfo
+	if err := json.Unmarshal(machinesRec.Body.Bytes(), &machines); err != nil {
+		t.Fatal(err)
+	}
+	if len(machines) != 1 || len(machines[0].Sources) != 61 {
+		t.Fatalf("expected /api/v1/machines to keep all 61 raw sources, got %+v", machines)
+	}
+
+	page := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("overview status = %d", page.Code)
+	}
+	body := page.Body.String()
+	if got := strings.Count(body, `class="source-health-line"`); got != 2 {
+		t.Fatalf("source-health-line count = %d, want 2 (1 per adapter)", got)
+	}
+	// codex (with error & stale) must appear before claude-code (fresh) inside .source-health.
+	shStart := strings.Index(body, `<span class="source-health">`)
+	if shStart < 0 {
+		t.Fatal("overview missing .source-health block")
+	}
+	sourceHealth := body[shStart:]
+	codexIdx := strings.Index(sourceHealth, "codex · 58 stale · 2 fresh")
+	claudeIdx := strings.Index(sourceHealth, "claude-code · ")
+	if codexIdx < 0 || claudeIdx < 0 || codexIdx > claudeIdx {
+		t.Fatalf("expected codex summary before claude-code (codexIdx=%d, claudeIdx=%d)", codexIdx, claudeIdx)
+	}
+	for _, want := range []string{
+		`<details class="source-details">`,
+		`<summary class="source-details-summary">58 stale or errored (61 total)</summary>`,
+		`+ 8 more stale or errored sources`,
+		`timeout`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("overview missing %q", want)
+		}
+	}
+	if got := strings.Count(body, `class="source-detail-line"`); got != maxMachineDetailProblems+1 {
+		t.Fatalf("source-detail-line count = %d, want %d (%d capped + 1 omitted notice)", got, maxMachineDetailProblems+1, maxMachineDetailProblems)
+	}
+	if strings.Contains(body, `<details class="source-details" open`) {
+		t.Fatal("source-details must be collapsed by default")
+	}
+}
+
+func TestAnalyticsUsesMachineAliasesInBreakdownAndUsageShare(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SetDisplayAlias(context.Background(), database.AliasKindMachine, "raw-build-host", "Build Box"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDisplayAlias(context.Background(), database.AliasKindModel, "raw-build-host", "Wrong Model Alias"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "mach-alias-1", Timestamp: now.Add(-time.Hour),
+			MachineID: "raw-build-host", SessionID: "s1", Project: "proj", Provider: "openai",
+			Model: "gpt-5", Tool: "codex", TotalTokens: usage.Int64(500), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/analytics?period=30d&dimension=machines", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("analytics status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`<span class="breakdown-name">Build Box</span>`,
+		`<strong>Build Box</strong> 100.0%`,
+		`<th scope="col">Build Box share</th>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("analytics machines page missing %q", want)
+		}
+	}
+	if strings.Contains(body, "Wrong Model Alias") {
+		t.Fatal("analytics machines page leaked ModelAliases into machines breakdown/legend")
+	}
+}
+
+func TestAnalyticsShortTimeLocalization(t *testing.T) {
+	loc := time.FixedZone("UTC-5", -5*60*60)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	ts := "2026-11-20T03:30:00Z" // 2026-11-19 22:30 in UTC-5 (8h ago)
+	got := string(analyticsShortTimeAt(ts, loc, now))
+	for _, want := range []string{
+		`<time datetime="2026-11-19T22:30:00-05:00"`,
+		`title="2026-11-19 22:30:00 UTC-5"`,
+		`>Nov 19, 22:30 · 8h ago</time>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("analyticsShortTimeAt = %q, want substring %q", got, want)
+		}
+	}
+	if empty := string(analyticsShortTimeAt("  ", loc, now)); empty != "—" {
+		t.Errorf("empty analyticsShortTimeAt = %q, want —", empty)
+	}
+	escaped := string(analyticsShortTimeAt("<script>alert(1)</script>", loc, now))
+	if strings.Contains(escaped, "<script>") || !strings.Contains(escaped, "&lt;script&gt;") {
+		t.Errorf("invalid input was not HTML-escaped: %q", escaped)
+	}
+
+	store, err := database.OpenWithLocation(t.TempDir()+"/tokemon.db", catalog.Empty(), loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	eventTime := time.Now().UTC().Truncate(time.Second).Add(-10 * time.Minute)
+	expectedLocal := eventTime.In(loc).Format("Jan 2, 15:04")
+	if err := store.RecordHeartbeat(context.Background(), database.AgentHeartbeat{
+		MachineID: "loc-box", OperatingSystem: "darwin", Architecture: "arm64",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "loc-ev-1", Timestamp: eventTime,
+			MachineID: "loc-box", SessionID: "loc-sess-1", Project: "proj", Provider: "openai",
+			Model: "gpt-5", Tool: "codex", TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range []string{"/", "/sessions", "/analytics?period=30d&dimension=projects"} {
+		rec := httptest.NewRecorder()
+		testHandler(server).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d", route, rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "<time datetime=") || !strings.Contains(body, expectedLocal) {
+			t.Errorf("%s did not render localized <time> containing %q", route, expectedLocal)
+		}
+	}
+}
+
+func TestDashboardPrerendersTokenCompositionAndHonorsAutoPaused(t *testing.T) {
+	// Empty database: counts render 0, shares render —, segments are hidden at 0%.
+	emptyStore, err := database.Open(t.TempDir()+"/empty.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emptyStore.Close()
+	emptyServer, err := newTestServer(emptyStore, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRec := httptest.NewRecorder()
+	testHandler(emptyServer).ServeHTTP(emptyRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if emptyRec.Code != http.StatusOK {
+		t.Fatalf("empty overview status = %d", emptyRec.Code)
+	}
+	emptyBody := emptyRec.Body.String()
+	for _, want := range []string{
+		`id="live-uncached-segment" hidden style="width: 0%"`,
+		`id="live-cached-segment" hidden style="width: 0%"`,
+		`id="live-output-segment" hidden style="width: 0%"`,
+		`id="live-input-share">—</span>`,
+		`id="live-output-share">—</span>`,
+		`id="live-input-tokens" data-display="0"><span class="odometer-static">0</span>`,
+		`id="live-output-tokens" data-display="0"><span class="odometer-static">0</span>`,
+		`aria-label="Input: 0 tokens"`,
+		`aria-label="Output: 0 tokens"`,
+	} {
+		if !strings.Contains(emptyBody, want) {
+			t.Errorf("empty overview missing %q", want)
+		}
+	}
+	if strings.Contains(emptyBody, "Usage totals are loading") {
+		t.Fatal("overview still contains loading placeholder text")
+	}
+
+	// Seeded database: detailed + aggregate-only events pre-render exact bar
+	// widths and counts without exposing UnclassifiedTokens.
+	store, err := database.Open(t.TempDir()+"/seeded.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Ingest(context.Background(), []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "comp-detailed", Timestamp: time.Now().UTC(),
+			MachineID: "box", SessionID: "s1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			InputTokens: usage.Int64(400), CacheReadTokens: usage.Int64(600), OutputTokens: usage.Int64(200),
+			TotalTokens: usage.Int64(1200), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "test"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "comp-unclassified", Timestamp: time.Now().UTC(),
+			MachineID: "box", SessionID: "s2", Provider: "other", Model: "m1", Tool: "other",
+			TotalTokens: usage.Int64(500), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "other", AdapterVersion: "test"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := newTestServer(store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	testHandler(server).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seeded overview status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`id="live-input-share">83.3%</span>`,
+		`id="live-output-share">16.7%</span>`,
+		`id="live-input-tokens" data-display="1,000"><span class="odometer-static">1,000</span>`,
+		`id="live-output-tokens" data-display="200"><span class="odometer-static">200</span>`,
+		`aria-label="Input: 1,000 tokens"`,
+		`aria-label="Output: 200 tokens"`,
+		`data-tooltip="Input` + "\n" + `1,000 tokens"`,
+		`data-tooltip="Output` + "\n" + `200 tokens"`,
+		`if (polling || document.hidden || autoPaused()) return;`,
+		`if (!paused) pollLifetime();`,
+		`window.setInterval(pollLifetime, 2000)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("seeded overview missing %q", want)
+		}
+	}
+	if strings.Contains(body, "ZgotmplZ") {
+		t.Fatal("overview contains ZgotmplZ sanitization marker")
+	}
+	if strings.Contains(body, `live-unclassified`) || strings.Contains(body, `Unknown</span>`) {
+		t.Fatal("overview leaked unclassified token composition")
+	}
+	autoIdx := strings.Index(body, "const autoPaused =")
+	pollIdx := strings.Index(body, "const pollLifetime =")
+	if autoIdx < 0 || pollIdx < 0 || autoIdx > pollIdx {
+		t.Fatalf("autoPaused must be declared before pollLifetime (autoIdx=%d, pollIdx=%d)", autoIdx, pollIdx)
 	}
 }

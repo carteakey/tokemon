@@ -1837,3 +1837,277 @@ func TestDailyUsageDSTTransitionSegments(t *testing.T) {
 		t.Fatalf("dst daily buckets = %+v, want 10 tokens on 11-01 and 1 on 11-02", daily)
 	}
 }
+
+func TestStoreLocationContract(t *testing.T) {
+	var nilStore *Store
+	if got := nilStore.Location(); got != time.UTC {
+		t.Fatalf("(*Store)(nil).Location() = %v, want UTC", got)
+	}
+	if got := (&Store{}).Location(); got != time.UTC {
+		t.Fatalf("(&Store{}).Location() = %v, want UTC", got)
+	}
+
+	defaultStore, err := Open(filepath.Join(t.TempDir(), "default.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer defaultStore.Close()
+	if got := defaultStore.Location(); got != time.UTC {
+		t.Fatalf("Open().Location() = %v, want UTC", got)
+	}
+
+	custom := time.FixedZone("UTC-4", -4*60*60)
+	customStore, err := OpenWithLocation(filepath.Join(t.TempDir(), "custom.db"), catalog.Empty(), custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer customStore.Close()
+	if got := customStore.Location(); got != custom {
+		t.Fatalf("OpenWithLocation().Location() = %v, want %v", got, custom)
+	}
+}
+
+func TestOverviewPopulatesCompositionAndEmptyZeroes(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	emptyOverview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptyOverview.Composition != (TokenComposition{}) {
+		t.Fatalf("empty overview.Composition = %+v, want zero value", emptyOverview.Composition)
+	}
+
+	events := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "ov-detailed", Timestamp: time.Now().UTC(),
+			MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex",
+			InputTokens: usage.Int64(40), CacheReadTokens: usage.Int64(50), CacheWriteTokens: usage.Int64(10),
+			OutputTokens: usage.Int64(20), TotalTokens: usage.Int64(120),
+			TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion, EventID: "ov-aggregate", Timestamp: time.Now().UTC(),
+			MachineID: "machine", Provider: "other", Model: "model", Tool: "other",
+			TotalTokens:   usage.Int64(30),
+			TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "other", AdapterVersion: "1"},
+		},
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+
+	overview, err := store.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := TokenComposition{
+		InputTokens:         100,
+		UncachedInputTokens: 40,
+		CachedInputTokens:   60,
+		OutputTokens:        20,
+		UnclassifiedTokens:  30,
+	}
+	if overview.Composition != want {
+		t.Fatalf("overview.Composition = %+v, want %+v", overview.Composition, want)
+	}
+	direct, err := store.TokenComposition(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Composition != direct {
+		t.Fatalf("overview.Composition = %+v != TokenComposition = %+v", overview.Composition, direct)
+	}
+}
+
+func TestMigrateDeduplicatesCodexUsageWhenBelowSchemaVersion(t *testing.T) {
+	for _, fromVersion := range []int{0, 3} {
+		t.Run(fmt.Sprintf("from-v%d", fromVersion), func(t *testing.T) {
+			directory := t.TempDir()
+			path := filepath.Join(directory, "tokemon.db")
+			store, err := Open(path, catalog.Empty())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(`DROP INDEX idx_usage_events_codex_usage`); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			ts := "2026-11-20T12:00:00Z"
+			for _, id := range []string{"codex-dup-1", "codex-dup-2"} {
+				if _, err := raw.Exec(`
+INSERT INTO usage_events (
+  event_id, timestamp, machine_id, project, provider, raw_model, canonical_model,
+  tool, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+  cost, cost_estimated, currency, session_id, duration_ms, token_accuracy, adapter, adapter_version
+) VALUES (?, ?, 'box', 'proj', 'openai', 'gpt-5', 'gpt-5', 'codex', 10, 5, 2, 0, 1, 18, 0.01, 0, 'USD', 'sess-1', 100, 'reported', 'codex', '1')`,
+					id, ts); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+			}
+			if _, err := raw.Exec(`
+INSERT INTO usage_events (
+  event_id, timestamp, machine_id, project, provider, raw_model, canonical_model,
+  tool, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+  cost, cost_estimated, currency, session_id, duration_ms, token_accuracy, adapter, adapter_version
+) VALUES ('other-1', ?, 'box', 'proj', 'anthropic', 'claude-sonnet-4', 'claude-sonnet-4', 'claude-code', 20, 10, 0, 0, 0, 30, 0.02, 0, 'USD', 'sess-2', 200, 'reported', 'claude-code', '1')`,
+				ts); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, fromVersion)); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := Open(path, catalog.Empty())
+			if err != nil {
+				t.Fatalf("Open from v%d failed: %v", fromVersion, err)
+			}
+			defer reopened.Close()
+
+			gotVersion, err := schemaVersion(context.Background(), reopened.db)
+			if err != nil || gotVersion != databaseSchemaVersion {
+				t.Fatalf("schemaVersion = %d (err=%v), want %d", gotVersion, err, databaseSchemaVersion)
+			}
+			var indexCount int
+			if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_events_codex_usage'`).Scan(&indexCount); err != nil || indexCount != 1 {
+				t.Fatalf("idx_usage_events_codex_usage count = %d, err = %v", indexCount, err)
+			}
+			events, err := reopened.Events(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 2 {
+				t.Fatalf("len(Events) = %d, want 2: %+v", len(events), events)
+			}
+			if events[0].EventID != "codex-dup-1" || events[1].EventID != "other-1" {
+				t.Fatalf("Events = %+v, want [codex-dup-1, other-1]", events)
+			}
+			backups, err := filepath.Glob(filepath.Join(directory, "backups", fmt.Sprintf("tokemon-v%d-before-v%d-*.db", fromVersion, databaseSchemaVersion)))
+			if err != nil || len(backups) != 1 {
+				t.Fatalf("backups = %v, err = %v", backups, err)
+			}
+		})
+	}
+}
+
+func TestMigrateSkipsCodexDeduplicationAtCurrentSchemaVersion(t *testing.T) {
+	t.Run("steady-state-reopen", func(t *testing.T) {
+		directory := t.TempDir()
+		path := filepath.Join(directory, "tokemon.db")
+		store, err := Open(path, catalog.Empty())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Ingest(context.Background(), []usage.Event{
+			{
+				SchemaVersion: usage.SchemaVersion, EventID: "codex-1", Timestamp: time.Now().UTC(),
+				MachineID: "box", SessionID: "s1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+				InputTokens: usage.Int64(10), OutputTokens: usage.Int64(5), CacheReadTokens: usage.Int64(0),
+				CacheWriteTokens: usage.Int64(0), ReasoningTokens: usage.Int64(0), TotalTokens: usage.Int64(15),
+				TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+			},
+			{
+				SchemaVersion: usage.SchemaVersion, EventID: "agg-1", Timestamp: time.Now().UTC(),
+				MachineID: "box", SessionID: "s2", Provider: "other", Model: "m1", Tool: "other",
+				TotalTokens:   usage.Int64(25),
+				TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "other", AdapterVersion: "1"},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		reopened, err := Open(path, catalog.Empty())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		events, err := reopened.Events(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 2 {
+			t.Fatalf("len(Events) = %d, want 2", len(events))
+		}
+		backups, err := filepath.Glob(filepath.Join(directory, "backups", "*.db"))
+		if err != nil || len(backups) != 0 {
+			t.Fatalf("unexpected backups on steady-state reopen: %v, err=%v", backups, err)
+		}
+	})
+
+	t.Run("skips-delete-when-at-current-version", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "tokemon.db")
+		store, err := Open(path, catalog.Empty())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`DROP INDEX idx_usage_events_codex_usage`); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+		ts := "2026-11-20T12:00:00Z"
+		for _, id := range []string{"codex-dup-1", "codex-dup-2"} {
+			if _, err := raw.Exec(`
+INSERT INTO usage_events (
+  event_id, timestamp, machine_id, project, provider, raw_model, canonical_model,
+  tool, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+  cost, cost_estimated, currency, session_id, duration_ms, token_accuracy, adapter, adapter_version
+) VALUES (?, ?, 'box', 'proj', 'openai', 'gpt-5', 'gpt-5', 'codex', 10, 5, 2, 0, 1, 18, 0.01, 0, 'USD', 'sess-1', 100, 'reported', 'codex', '1')`,
+				id, ts); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+		}
+		if err := raw.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Because PRAGMA user_version is already databaseSchemaVersion, migrate()
+		// must skip the Codex dedup DELETE and fail on CREATE UNIQUE INDEX.
+		_, err = Open(path, catalog.Empty())
+		if err == nil || !strings.Contains(err.Error(), "create Codex usage deduplication index") {
+			t.Fatalf("Open at current schema version err = %v, want create Codex usage deduplication index error", err)
+		}
+
+		check, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer check.Close()
+		var count int
+		if err := check.QueryRow(`SELECT COUNT(*) FROM usage_events`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 2 {
+			t.Fatalf("usage_events count = %d, want 2 (dedup DELETE must be skipped)", count)
+		}
+	})
+}

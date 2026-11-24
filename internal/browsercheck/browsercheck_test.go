@@ -880,6 +880,83 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		assertAxeAllowlist(t, ctx, "/")
 	})
 
+	// Multi-source same-adapter machines group into one summary line per
+	// adapter with a collapsed <details> panel that expands cleanly across all
+	// gated viewports without horizontal overflow or axe violations.
+	t.Run("connector-health-grouped", func(t *testing.T) {
+		groupedStore, err := database.Open(filepath.Join(t.TempDir(), "grouped.db"), smokeCatalog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { groupedStore.Close() })
+		now := time.Now().UTC()
+		freshSync := now.Add(-time.Minute)
+		staleSync := now.Add(-2 * time.Hour)
+		if err := groupedStore.RecordHeartbeat(context.Background(), database.AgentHeartbeat{
+			MachineID:        "smoke-grouped",
+			OperatingSystem:  "darwin",
+			Architecture:     "arm64",
+			SourceCount:      4,
+			SourceErrorCount: 1,
+			Sources: []database.AgentSourceHealth{
+				{Adapter: "claude-code", SourceHash: "smoke-cc-1", LastSuccessfulSync: &freshSync},
+				{Adapter: "codex", SourceHash: "smoke-codex-1", LastSuccessfulSync: &freshSync},
+				{Adapter: "codex", SourceHash: "smoke-codex-2", LastSuccessfulSync: &freshSync},
+				{Adapter: "codex", SourceHash: "smoke-codex-3", LastSuccessfulSync: &staleSync, LastErrorClass: "timeout"},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		groupedURL := serveStore(t, groupedStore, false)
+		for _, viewport := range gateViewports {
+			t.Run(viewport.name, func(t *testing.T) {
+				if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(viewport.width, viewport.height)); err != nil {
+					t.Fatalf("could not emulate %s: %v", viewport.name, err)
+				}
+				if _, err := chromedp.Run(ctx, chromedp.Navigate(groupedURL+"/")); err != nil {
+					t.Fatalf("navigation failed at %s: %v", viewport.name, err)
+				}
+				if _, err := chromedp.Run(ctx, chromedp.WaitReady("details.source-details")); err != nil {
+					t.Fatalf("details.source-details missing at %s: %v", viewport.name, err)
+				}
+				if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+					t.Fatalf("could not settle animations at %s: %v", viewport.name, err)
+				}
+				assertNoProblems(t, ctx, sharedInvariantJS)
+				collapsedProblems := `(() => {
+					const problems = [];
+					const lines = document.querySelectorAll('.source-health-line');
+					if (lines.length !== 2) problems.push('expected 2 grouped adapter lines, got ' + lines.length);
+					const details = document.querySelector('details.source-details');
+					if (!details || details.open) problems.push('expected details.source-details collapsed by default');
+					return JSON.stringify(problems);
+				})()`
+				assertNoProblems(t, ctx, collapsedProblems)
+				assertAxeAllowlist(t, ctx, "/")
+
+				if _, err := chromedp.Run(ctx, chromedp.Click("summary.source-details-summary")); err != nil {
+					t.Fatalf("could not expand source-details at %s: %v", viewport.name, err)
+				}
+				expandedProblems := `(() => {
+					const problems = [];
+					const details = document.querySelector('details.source-details');
+					if (!details || !details.open) problems.push('details.source-details did not open on summary click');
+					const items = document.querySelectorAll('.source-detail-line');
+					if (items.length !== 1 || !items[0].textContent.includes('timeout')) {
+						problems.push('expected 1 stale/errored detail row with timeout, got ' + items.length);
+					}
+					return JSON.stringify(problems);
+				})()`
+				assertNoProblems(t, ctx, expandedProblems)
+				assertNoProblems(t, ctx, sharedInvariantJS)
+				assertAxeAllowlist(t, ctx, "/")
+			})
+		}
+		if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+			t.Fatalf("could not restore desktop viewport: %v", err)
+		}
+	})
+
 	// With the default configuration the catalog UI is opt-in: the route
 	// answers 404 for an authenticated user and no page advertises it.
 	t.Run("tokedex-disabled", func(t *testing.T) {

@@ -196,6 +196,7 @@ type Overview struct {
 	Today          PeriodSummary            `json:"today"`
 	Week           PeriodSummary            `json:"week"`
 	Evolution      evolution.Snapshot       `json:"evolution"`
+	Composition    TokenComposition         `json:"composition"`
 	Activity       ActivityHeatmap          `json:"activity"`
 	ByModel        []ModelTotal             `json:"by_model"`
 	ByTool         []ToolTotal              `json:"by_tool"`
@@ -506,21 +507,28 @@ func (s *Store) Ready(ctx context.Context) error {
 }
 
 func (s *Store) Timezone() string {
-	if s.location == nil {
-		return time.UTC.String()
-	}
-	return s.location.String()
+	return s.reportingLocation().String()
+}
+
+// Location returns the store's configured reporting timezone, defaulting to
+// time.UTC when the store or location is nil.
+func (s *Store) Location() *time.Location {
+	return s.reportingLocation()
 }
 
 func (s *Store) reportingLocation() *time.Location {
-	if s.location == nil {
+	if s == nil || s.location == nil {
 		return time.UTC
 	}
 	return s.location
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	currentVersion, err := schemaVersion(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS machines (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -600,7 +608,8 @@ CREATE TABLE IF NOT EXISTS display_aliases (
 			}
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	if currentVersion < databaseSchemaVersion {
+		if _, err := s.db.ExecContext(ctx, `
 DELETE FROM usage_events
 WHERE adapter = 'codex'
   AND input_tokens IS NOT NULL
@@ -622,7 +631,8 @@ WHERE adapter = 'codex'
     GROUP BY machine_id, session_id, timestamp, provider, raw_model, tool,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens
   )`); err != nil {
-		return fmt.Errorf("deduplicate Codex usage: %w", err)
+			return fmt.Errorf("deduplicate Codex usage: %w", err)
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, `
 CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_codex_usage
@@ -1117,14 +1127,16 @@ func (s *Store) LifetimeTokens(ctx context.Context) (int64, error) {
 	return total.Int64, err
 }
 
-func (s *Store) TokenComposition(ctx context.Context) (TokenComposition, error) {
-	var result TokenComposition
-	err := s.db.QueryRowContext(ctx, `SELECT
+const tokenCompositionColumns = `
 COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0),
 COALESCE(SUM(input_tokens), 0),
 COALESCE(SUM(COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0),
 COALESCE(SUM(output_tokens), 0),
-COALESCE(SUM(MAX(COALESCE(total_tokens, 0) - COALESCE(input_tokens, 0) - COALESCE(cache_read_tokens, 0) - COALESCE(cache_write_tokens, 0) - COALESCE(output_tokens, 0), 0)), 0)
+COALESCE(SUM(MAX(COALESCE(total_tokens, 0) - COALESCE(input_tokens, 0) - COALESCE(cache_read_tokens, 0) - COALESCE(cache_write_tokens, 0) - COALESCE(output_tokens, 0), 0)), 0)`
+
+func (s *Store) TokenComposition(ctx context.Context) (TokenComposition, error) {
+	var result TokenComposition
+	err := s.db.QueryRowContext(ctx, `SELECT`+tokenCompositionColumns+`
 FROM usage_events`).Scan(
 		&result.InputTokens,
 		&result.UncachedInputTokens,
@@ -1331,7 +1343,7 @@ COALESCE(SUM(CASE WHEN cost IS NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN cache_read_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN input_tokens + cache_read_tokens ELSE 0 END), 0),
 COUNT(DISTINCT CASE WHEN NULLIF(session_id, '') IS NOT NULL THEN machine_id || char(31) || provider || char(31) || tool || char(31) || session_id END),
-MAX(timestamp)
+MAX(timestamp),` + tokenCompositionColumns + `
 FROM usage_events`
 
 func (s *Store) Overview(ctx context.Context) (Overview, error) {
@@ -1347,6 +1359,11 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 		&eligibleTokens,
 		&result.Threads,
 		&newestEvent,
+		&result.Composition.InputTokens,
+		&result.Composition.UncachedInputTokens,
+		&result.Composition.CachedInputTokens,
+		&result.Composition.OutputTokens,
+		&result.Composition.UnclassifiedTokens,
 	); err != nil {
 		return Overview{}, err
 	}

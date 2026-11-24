@@ -925,15 +925,15 @@ func isUnknownBucketName(name string) bool {
 // breakdownDisplayName renders one breakdown/share name for display: the
 // empty bucket becomes the dimension-aware unknown label and real names keep
 // their per-dimension formatting (model/machine aliases, harness names).
-func breakdownDisplayName(dimension string, aliases map[string]string, name string) string {
+func breakdownDisplayName(dimension string, modelAliases, machineAliases map[string]string, name string) string {
 	if isUnknownBucketName(name) {
 		return analyticsUnknownLabel(dimension)
 	}
 	switch dimension {
 	case "models":
-		return modelDisplayName(aliases, name)
+		return modelDisplayName(modelAliases, name)
 	case "machines":
-		return machineDisplayName(aliases, name)
+		return machineDisplayName(machineAliases, name)
 	case "harnesses":
 		return harnessName(name)
 	default:
@@ -1239,12 +1239,197 @@ func analyticsChangeClass(value *float64) string {
 	return "down"
 }
 
-func analyticsShortTime(raw string) string {
-	parsed, err := time.Parse(time.RFC3339Nano, raw)
-	if err != nil {
-		return raw
+const maxMachineDetailProblems = 50
+
+type machineAdapterGroup struct {
+	Adapter          string
+	State            string
+	Summary          string
+	ErrorSummary     string
+	SingleAge        string
+	SingleSourceHash string
+	Count            int
+	FreshCount       int
+	StaleCount       int
+	UnknownCount     int
+	ErrorCount       int
+}
+
+type machineSourceSummary struct {
+	Groups          []machineAdapterGroup
+	ProblemSources  []database.MachineSourceHealth
+	OmittedProblems int
+	TotalSources    int
+	ProblemCount    int
+	HasDetails      bool
+}
+
+func groupMachineSources(sources []database.MachineSourceHealth) machineSourceSummary {
+	if len(sources) == 0 {
+		return machineSourceSummary{}
 	}
-	return parsed.UTC().Format("Jan 2, 15:04")
+	type adapterAcc struct {
+		group  machineAdapterGroup
+		errors map[string]struct{}
+	}
+	byAdapter := make(map[string]*adapterAcc)
+	var allProblems []database.MachineSourceHealth
+	for _, source := range sources {
+		acc := byAdapter[source.Adapter]
+		if acc == nil {
+			acc = &adapterAcc{
+				group:  machineAdapterGroup{Adapter: source.Adapter},
+				errors: make(map[string]struct{}),
+			}
+			byAdapter[source.Adapter] = acc
+		}
+		acc.group.Count++
+		switch source.State {
+		case "Fresh":
+			acc.group.FreshCount++
+		case "Stale":
+			acc.group.StaleCount++
+		default:
+			acc.group.UnknownCount++
+		}
+		if source.LastErrorClass != "" {
+			acc.group.ErrorCount++
+			acc.errors[source.LastErrorClass] = struct{}{}
+		}
+		if acc.group.Count == 1 {
+			acc.group.SingleAge = source.Age
+			acc.group.SingleSourceHash = source.SourceHash
+		}
+		if source.State != "Fresh" || source.LastErrorClass != "" {
+			allProblems = append(allProblems, source)
+		}
+	}
+	groups := make([]machineAdapterGroup, 0, len(byAdapter))
+	for _, acc := range byAdapter {
+		g := acc.group
+		switch {
+		case g.StaleCount > 0:
+			g.State = "Stale"
+		case g.UnknownCount > 0 && g.FreshCount == 0:
+			g.State = "Unknown"
+		case g.UnknownCount > 0:
+			g.State = "Stale"
+		default:
+			g.State = "Fresh"
+		}
+		var parts []string
+		if g.StaleCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d stale", g.StaleCount))
+		}
+		if g.UnknownCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d never synced", g.UnknownCount))
+		}
+		if g.FreshCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d fresh", g.FreshCount))
+		}
+		g.Summary = strings.Join(parts, " · ")
+		if len(acc.errors) > 0 {
+			errList := make([]string, 0, len(acc.errors))
+			for errClass := range acc.errors {
+				errList = append(errList, errClass)
+			}
+			sort.Strings(errList)
+			g.ErrorSummary = strings.Join(errList, ", ")
+		}
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		li, lj := groups[i], groups[j]
+		if (li.ErrorCount > 0) != (lj.ErrorCount > 0) {
+			return li.ErrorCount > 0
+		}
+		if (li.State != "Fresh") != (lj.State != "Fresh") {
+			return li.State != "Fresh"
+		}
+		return li.Adapter < lj.Adapter
+	})
+	sort.Slice(allProblems, func(i, j int) bool {
+		pi, pj := allProblems[i], allProblems[j]
+		if (pi.LastErrorClass != "") != (pj.LastErrorClass != "") {
+			return pi.LastErrorClass != ""
+		}
+		if pi.State != pj.State {
+			return sourceStateRank(pi.State) < sourceStateRank(pj.State)
+		}
+		if pi.Adapter != pj.Adapter {
+			return pi.Adapter < pj.Adapter
+		}
+		return pi.SourceHash < pj.SourceHash
+	})
+	problemCount := len(allProblems)
+	omitted := 0
+	if len(allProblems) > maxMachineDetailProblems {
+		omitted = len(allProblems) - maxMachineDetailProblems
+		allProblems = allProblems[:maxMachineDetailProblems]
+	}
+	return machineSourceSummary{
+		Groups:          groups,
+		ProblemSources:  allProblems,
+		OmittedProblems: omitted,
+		TotalSources:    len(sources),
+		ProblemCount:    problemCount,
+		HasDetails:      len(sources) > len(groups),
+	}
+}
+
+func sourceStateRank(state string) int {
+	switch state {
+	case "Stale":
+		return 0
+	case "Unknown":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func conciseRelativeAge(parsed, now time.Time) string {
+	elapsed := now.Sub(parsed)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	switch {
+	case elapsed < time.Minute:
+		return "just now"
+	case elapsed < time.Hour:
+		return fmt.Sprintf("%dm ago", int(elapsed/time.Minute))
+	case elapsed < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(elapsed/time.Hour))
+	default:
+		return fmt.Sprintf("%dd ago", int(elapsed/(24*time.Hour)))
+	}
+}
+
+func analyticsShortTimeAt(raw string, loc *time.Location, now time.Time) template.HTML {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return template.HTML("—")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, trimmed)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, trimmed)
+		if err != nil {
+			return template.HTML(template.HTMLEscapeString(raw))
+		}
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	local := parsed.In(loc)
+	datetime := local.Format(time.RFC3339)
+	title := local.Format("2006-01-02 15:04:05 MST")
+	display := local.Format("Jan 2, 15:04") + " · " + conciseRelativeAge(parsed, now)
+	return template.HTML(fmt.Sprintf(
+		`<time datetime="%s" title="%s">%s</time>`,
+		template.HTMLEscapeString(datetime),
+		template.HTMLEscapeString(title),
+		template.HTMLEscapeString(display),
+	))
 }
 
 func analyticsQueryFromRequest(r *http.Request) database.AnalyticsQuery {
@@ -1536,22 +1721,43 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 			}
 			return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 		},
-		"topProjects":          topProjects,
-		"topModels":            topModels,
-		"topTools":             topTools,
-		"harnessName":          harnessName,
-		"modelDisplayName":     modelDisplayName,
-		"machineDisplayName":   machineDisplayName,
-		"analyticsBar":         analyticsBarPercent,
-		"analyticsPart":        analyticsPartPercent,
-		"analyticsDateTick":    analyticsDateTickClass,
-		"analyticsDateLabel":   analyticsDateTickLabel,
-		"shareDateLabel":       analyticsShareDateTickLabel,
-		"dimensionLabel":       analyticsDimensionLabel,
-		"unknownLabel":         analyticsUnknownLabel,
-		"isUnknownName":        isUnknownBucketName,
-		"breakdownName":        breakdownDisplayName,
-		"analyticsTime":        analyticsShortTime,
+		"topProjects":        topProjects,
+		"topModels":          topModels,
+		"topTools":           topTools,
+		"harnessName":        harnessName,
+		"modelDisplayName":   modelDisplayName,
+		"machineDisplayName": machineDisplayName,
+		"analyticsBar":       analyticsBarPercent,
+		"analyticsPart":      analyticsPartPercent,
+		"analyticsDateTick":  analyticsDateTickClass,
+		"analyticsDateLabel": analyticsDateTickLabel,
+		"shareDateLabel":     analyticsShareDateTickLabel,
+		"dimensionLabel":     analyticsDimensionLabel,
+		"unknownLabel":       analyticsUnknownLabel,
+		"isUnknownName":      isUnknownBucketName,
+		"breakdownName":      breakdownDisplayName,
+		"analyticsTime": func(raw string) template.HTML {
+			return analyticsShortTimeAt(raw, store.Location(), time.Now())
+		},
+		"machineSourceGroups": groupMachineSources,
+		"compositionTotal": func(comp database.TokenComposition) int64 {
+			return comp.InputTokens + comp.OutputTokens
+		},
+		"compositionWidth": func(part, total int64) float64 {
+			if part <= 0 || total <= 0 {
+				return 0
+			}
+			return float64(part) * 100 / float64(total)
+		},
+		"compositionShare": func(part, total int64) string {
+			if total <= 0 {
+				return "—"
+			}
+			return strings.TrimSuffix(fmt.Sprintf("%.1f", float64(part)*100/float64(total)), ".0") + "%"
+		},
+		"compositionTooltip": func(label string, value int64) string {
+			return label + "\n" + commas(value) + " tokens"
+		},
 		"analyticsURL":         analyticsViewURL,
 		"analyticsPeriodURL":   analyticsPeriodURL,
 		"sessionsExportURL":    sessionsExportURL,
@@ -3381,6 +3587,13 @@ const dashboardTemplate = `<!doctype html>
     .source-health-line { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; }
     .source-health-line .status-pill { vertical-align: middle; }
     .source-health-line .sync-error { color: var(--warm); font-weight: 700; }
+    .source-details { margin-top: 5px; max-width: 340px; margin-left: auto; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+    .source-details-summary { cursor: pointer; color: var(--accent); font: 700 10px/1.3 var(--font-data); }
+    .source-details-summary:hover, .source-details-summary:focus-visible { color: var(--text); }
+    .source-details-list { display: grid; gap: 3px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--line-bright); }
+    .source-detail-line { display: block; color: var(--faint); font-size: 10px; line-height: 1.35; }
+    .source-detail-line .status-pill { vertical-align: middle; }
+    .source-detail-line .sync-error { color: var(--warm); font-weight: 700; }
     .sessions-table td:nth-child(3) { color: var(--text); }
     .first-run { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 16px; padding: 18px 22px; border: 1px solid rgba(155, 187, 160, .24); border-radius: 10px; background: linear-gradient(100deg, rgba(155, 187, 160, .08), rgba(155, 187, 160, .025)); }
     .first-run h2 { margin: 0 0 4px; color: var(--text); font-family: var(--font-display); font-size: 14px; font-weight: 600; letter-spacing: .01em; text-transform: none; }
@@ -3418,6 +3631,7 @@ const dashboardTemplate = `<!doctype html>
       .health-table td:first-child, .sessions-table td:first-child, .empty-row td { grid-column: 1 / -1; }
       .sessions-table td:nth-child(4), .sessions-table td:nth-child(5) { display: none; }
       .health-table td[data-label]::before, .sessions-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+      .source-details { max-width: none; margin-left: 0; }
     }
     @media (max-width: 500px) {
       main { width: min(100% - 12px, 420px); margin: 6px auto; padding: 6px; border-radius: 8px; }
@@ -3489,15 +3703,16 @@ const dashboardTemplate = `<!doctype html>
     <article class="panel power-panel">
       <div class="power-kicker">Lifetime tokens</div>
       <div class="power-value odometer" id="lifetime-counter" data-display="{{commas .LifetimeTokens}}" data-label="Lifetime tokens" aria-label="Lifetime tokens: {{commas .LifetimeTokens}}"><span class="odometer-static">{{commas .LifetimeTokens}}</span></div>
+      {{$comp := .Composition}}{{$compTotal := compositionTotal $comp}}
       <div class="power-composition" id="token-composition" aria-label="Token mix">
         <div class="composition-meter" id="live-composition-meter" aria-hidden="true">
-          <span class="composition-segment uncached" id="live-uncached-segment"></span>
-          <span class="composition-segment cached" id="live-cached-segment"></span>
-          <span class="composition-segment output" id="live-output-segment"></span>
+          <span class="composition-segment uncached" id="live-uncached-segment"{{if eq $comp.UncachedInputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.UncachedInputTokens $compTotal}}%"></span>
+          <span class="composition-segment cached" id="live-cached-segment"{{if eq $comp.CachedInputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.CachedInputTokens $compTotal}}%"></span>
+          <span class="composition-segment output" id="live-output-segment"{{if eq $comp.OutputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.OutputTokens $compTotal}}%"></span>
         </div>
         <div class="composition-primary">
-          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="Input&#10;Usage totals are loading" aria-label="Input token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><span class="composition-share" id="live-input-share">—</span></span><strong class="mini-odometer" id="live-input-tokens" data-display="—">—</strong></span>
-          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="Output&#10;Usage totals are loading" aria-label="Output token details" tabindex="0"><span class="composition-label"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><span class="composition-share" id="live-output-share">—</span></span><strong class="mini-odometer" id="live-output-tokens" data-display="—">—</strong></span>
+          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="{{compositionTooltip "Input" $comp.InputTokens}}" aria-label="Input: {{commas $comp.InputTokens}} tokens" tabindex="0"><span class="composition-label"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><span class="composition-share" id="live-input-share">{{compositionShare $comp.InputTokens $compTotal}}</span></span><strong class="mini-odometer" id="live-input-tokens" data-display="{{commas $comp.InputTokens}}"><span class="odometer-static">{{commas $comp.InputTokens}}</span></strong></span>
+          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="{{compositionTooltip "Output" $comp.OutputTokens}}" aria-label="Output: {{commas $comp.OutputTokens}} tokens" tabindex="0"><span class="composition-label"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><span class="composition-share" id="live-output-share">{{compositionShare $comp.OutputTokens $compTotal}}</span></span><strong class="mini-odometer" id="live-output-tokens" data-display="{{commas $comp.OutputTokens}}"><span class="odometer-static">{{commas $comp.OutputTokens}}</span></strong></span>
         </div>
       </div>
       <div class="progress-block">
@@ -3567,7 +3782,7 @@ const dashboardTemplate = `<!doctype html>
 
   <section class="panel health-panel" aria-labelledby="health-title">
     <div class="section-head"><h2 class="section-title" id="health-title">Machine health</h2><a class="section-link" href="/api/v1/machines">Read API</a></div>
-    <div class="health-scroll" tabindex="0" role="region" aria-label="Machine health table, scrollable"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}<span class="source-health">{{range .Sources}}<span class="source-health-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
+    <div class="health-scroll" tabindex="0" role="region" aria-label="Machine health table, scrollable"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}{{$summary := machineSourceGroups .Sources}}<span class="source-health">{{range $summary.Groups}}{{if eq .Count 1}}<span class="source-health-line" title="{{.SingleSourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}} · {{.SingleAge}}</span>{{else}}<span class="source-health-line"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}} · {{.Summary}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}}</span>{{end}}{{end}}{{if $summary.HasDetails}}<details class="source-details"><summary class="source-details-summary">{{if $summary.ProblemCount}}{{$summary.ProblemCount}} stale or errored ({{$summary.TotalSources}} total){{else}}{{$summary.TotalSources}} sources across {{len $summary.Groups}} adapter{{if ne (len $summary.Groups) 1}}s{{end}}{{end}}</summary><div class="source-details-list">{{if $summary.ProblemSources}}{{range $summary.ProblemSources}}<span class="source-detail-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}{{if $summary.OmittedProblems}}<span class="source-detail-line">+ {{$summary.OmittedProblems}} more stale or errored sources</span>{{end}}{{else}}{{range $summary.Groups}}<span class="source-detail-line">{{.Adapter}}: {{.Summary}}</span>{{end}}{{end}}</div></details>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
   </section>
 
   <section class="panel sessions-panel" aria-labelledby="sessions-title">
@@ -3776,8 +3991,17 @@ const dashboardTemplate = `<!doctype html>
     setTooltip('live-output', 'Output', output, []);
   };
 
+  // Auto-refresh replaces the old 60s meta refresh: a client timer drives a
+  // server re-render, pausable from the topbar, never firing while a copy or
+  // selection is in progress, and restoring keyboard focus across the reload.
+  const AUTO_REFRESH_MS = 60000;
+  const AUTO_REFRESH_KEY = 'tokemon-auto-refresh';
+  const FOCUS_KEY = 'tokemon-restore-focus';
+  const autoPaused = () => { try { return sessionStorage.getItem(AUTO_REFRESH_KEY) === 'paused'; } catch (_) { return false; } };
+  const setAutoPaused = (paused) => { try { sessionStorage.setItem(AUTO_REFRESH_KEY, paused ? 'paused' : 'on'); } catch (_) {} };
+
   const pollLifetime = async () => {
-    if (polling || document.hidden) return;
+    if (polling || document.hidden || autoPaused()) return;
     polling = true;
     try {
       const response = await fetch('/api/v1/evolution', { cache: 'no-store', headers: { Accept: 'application/json' } });
@@ -3816,15 +4040,6 @@ const dashboardTemplate = `<!doctype html>
   window.setInterval(pollLifetime, 2000);
   document.addEventListener('visibilitychange', pollLifetime);
 
-  // Auto-refresh replaces the old 60s meta refresh: a client timer drives a
-  // server re-render, pausable from the topbar, never firing while a copy or
-  // selection is in progress, and restoring keyboard focus across the reload.
-  const AUTO_REFRESH_MS = 60000;
-  const AUTO_REFRESH_KEY = 'tokemon-auto-refresh';
-  const FOCUS_KEY = 'tokemon-restore-focus';
-  const autoPaused = () => { try { return sessionStorage.getItem(AUTO_REFRESH_KEY) === 'paused'; } catch (_) { return false; } };
-  const setAutoPaused = (paused) => { try { sessionStorage.setItem(AUTO_REFRESH_KEY, paused ? 'paused' : 'on'); } catch (_) {} };
-
   const autoToggle = document.getElementById('auto-refresh-toggle');
   const renderAutoToggle = () => {
     const paused = autoPaused();
@@ -3838,9 +4053,11 @@ const dashboardTemplate = `<!doctype html>
   };
   renderAutoToggle();
   autoToggle.addEventListener('click', () => {
-    setAutoPaused(!autoPaused());
+    const paused = !autoPaused();
+    setAutoPaused(paused);
     renderAutoToggle();
     autoToggle.focus();
+    if (!paused) pollLifetime();
   });
   document.getElementById('refresh-now').addEventListener('click', () => location.reload());
 
@@ -4966,7 +5183,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       <div class="table-scroll breakdown-scroll" tabindex="0" aria-label="Analytics breakdown table, scrollable">
         <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
           {{range .Breakdown}}
-          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases .Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
+          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
           {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
@@ -4977,7 +5194,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     <div class="section-head"><h2 class="section-title" id="share-title">Usage share</h2><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
     {{if .SharePoints}}
     <div class="share-legend" aria-label="Usage share legend">
-      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if isUnknownName $series.Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
+      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if isUnknownName $series.Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases $series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
     </div>
     <div class="share-visual">
       <div class="share-y-axis" aria-label="Share scale"><span style="bottom: 100%">100%</span><span style="bottom: 50%">50%</span><span style="bottom: 0">0%</span></div>
@@ -5010,7 +5227,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       </div>
     </div>
     <div class="sr-only" id="share-data-table">
-      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}{{if isUnknownName .Name}}<th scope="col">{{unknownLabel $.Filter.Dimension}} share</th>{{else}}<th scope="col">{{.Name}} share</th>{{end}}{{end}}</tr></thead><tbody>
+      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}{{if isUnknownName .Name}}<th scope="col">{{unknownLabel $.Filter.Dimension}} share</th>{{else}}<th scope="col">{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}} share</th>{{end}}{{end}}</tr></thead><tbody>
         {{range .SharePoints}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td>{{range .Values}}<td>{{printf "%.1f%%" (mul .Share 100)}}</td>{{end}}</tr>{{end}}
       </tbody></table>
     </div>
