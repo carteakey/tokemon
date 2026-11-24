@@ -17,7 +17,7 @@ export async function generateMetadata(): Promise<Metadata> {
       title: "Tokemon — Your coding tokens are evolving",
       description: "Metadata-only token analytics for coding agents, with an evolving creature, focused analytics, a static Tokedex, and multi-machine collection.",
       type: "website",
-      images: [{ url: new URL("/og.png", base), width: 1729, height: 910, alt: "Tokemon — your coding tokens are evolving" }],
+      images: [{ url: new URL("/og.png", base), width: 1734, height: 907, alt: "Tokemon — your coding tokens are evolving" }],
     },
     twitter: { card: "summary_large_image", images: [new URL("/og.png", base)] },
   };

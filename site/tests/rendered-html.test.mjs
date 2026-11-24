@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 async function render() {
@@ -53,6 +55,16 @@ test("keeps the evolution archive a teaser", async () => {
   assert.doesNotMatch(page, /stage-(0[1-7]|09|1[0-2]|1[4-7])\.(png|webp)/);
   assert.doesNotMatch(page, /Parameter Colossus|World Weaver|Cosmic Architect|Universe Engine|Agent Beast|Token Titan/);
   assert.doesNotMatch(page, /tokemon-dashboard\.png/);
+});
+
+test("ships only public teaser stage assets in public/tokemon", () => {
+  const publicDir = new URL("../public/tokemon", import.meta.url);
+  const stageFiles = fs
+    .readdirSync(publicDir)
+    .filter((name) => /^stage-/.test(name))
+    .sort();
+  assert.deepEqual(stageFiles, ["stage-00.webp", "stage-08.webp", "stage-13.webp", "stage-18.webp"]);
+  assert.ok(fs.statSync(path.join(publicDir.pathname, "../og.png")).size < 400_000, "og.png should stay compressed");
 });
 
 test("guards product facts", async () => {
