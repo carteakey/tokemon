@@ -251,6 +251,14 @@ func (s *StateStore) Pending(ctx context.Context, machineID string, events []usa
 
 	pending := make([]usage.Event, 0, len(events))
 	for _, event := range events {
+		// Codex thread snapshots carry the source-of-truth total for a thread
+		// whose rollout may be partially archived. Send them every pass so the
+		// hub can keep the residual (thread total minus detailed events) in
+		// step as detailed events stream in.
+		if isCodexThreadSnapshot(event) {
+			pending = append(pending, event)
+			continue
+		}
 		fingerprint := eventFingerprint(event)
 		if previous, ok := known[event.EventID]; ok && previous == fingerprint {
 			continue
@@ -339,4 +347,11 @@ ON CONFLICT(machine_id, event_id) DO UPDATE SET
 // committed sync times.
 func SourceKey(adapter, path string) string {
 	return adapter + "\x00" + path
+}
+
+func isCodexThreadSnapshot(event usage.Event) bool {
+	return event.Source.Adapter == "codex" && event.SessionID != "" &&
+		event.InputTokens == nil && event.OutputTokens == nil &&
+		event.CacheReadTokens == nil && event.CacheWriteTokens == nil &&
+		event.TotalTokens != nil
 }

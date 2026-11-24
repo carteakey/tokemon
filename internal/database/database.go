@@ -168,7 +168,7 @@ type TokenComposition struct {
 const activityWeeks = 53
 
 const (
-	databaseSchemaVersion = 5
+	databaseSchemaVersion = 6
 	backupRetention       = 10
 )
 
@@ -751,6 +751,13 @@ CREATE TABLE IF NOT EXISTS usage_events (
   adapter TEXT NOT NULL,
   adapter_version TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS codex_thread_totals (
+  machine_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  source_total INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (machine_id, session_id)
+);
 CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(canonical_model, raw_model);
 CREATE INDEX IF NOT EXISTS idx_usage_events_machine ON usage_events(machine_id);
@@ -1000,41 +1007,36 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 			result.Errors = append(result.Errors, fmt.Sprintf("event %d: %v", index+1, err))
 			continue
 		}
-		if isAggregateCodexEvent(event) && event.SessionID != "" {
-			var detailedExists bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-SELECT 1 FROM usage_events
-WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
-AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL)
-)`, event.MachineID, event.SessionID).Scan(&detailedExists); err != nil {
+		codexThreadSnapshot := isAggregateCodexEvent(event) && event.SessionID != "" && event.TotalTokens != nil
+		if codexThreadSnapshot {
+			if err := upsertCodexThreadTotal(ctx, tx, event.MachineID, event.SessionID, *event.TotalTokens); err != nil {
 				return result, err
 			}
-			if detailedExists {
-				// Older agents may keep sending aggregate snapshots while a rollout
-				// is in progress. Once detailed events exist for the session, the
-				// aggregate is obsolete and must not be allowed to double-count it.
-				result.Duplicates++
-				continue
-			}
-		}
-		if event.Source.Adapter == "codex" && event.SessionID != "" && event.InputTokens != nil && event.TotalTokens != nil {
-			// Detailed Codex JSONL events supersede the older aggregate thread
-			// snapshot for the same session. Remove it before inserting component
-			// events so upgrading an agent cannot double-count lifetime usage.
-			// The removal requires the replacement event to carry a total: a
-			// sanitized event whose contradictory provider total was dropped
-			// (TotalTokens nil, components preserved) must keep the aggregate
-			// counting until a corrected event with a real total arrives,
-			// otherwise the session's contribution collapses to zero.
-			res, err := tx.ExecContext(ctx, `DELETE FROM usage_events
-WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
-AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL`, event.MachineID, event.SessionID)
+			detailed, err := codexDetailedTotal(ctx, tx, event.MachineID, event.SessionID)
 			if err != nil {
 				return result, err
 			}
-			if deleted, err := res.RowsAffected(); err == nil && deleted > 0 {
-				facetsNeedInvalidate = true
+			residual := *event.TotalTokens - detailed
+			if residual < 0 {
+				residual = 0
 			}
+			if residual == 0 {
+				// Detailed rollout events cover the whole thread. Drop the
+				// aggregate row so it cannot appear as a zero-token session.
+				res, err := tx.ExecContext(ctx, `DELETE FROM usage_events WHERE event_id = ?`, event.EventID)
+				if err != nil {
+					return result, err
+				}
+				if deleted, err := res.RowsAffected(); err == nil && deleted > 0 {
+					facetsNeedInvalidate = true
+				}
+				result.Duplicates++
+				continue
+			}
+			// Keep only the part of the thread total not covered by detailed
+			// rollout events. The agent re-sends thread snapshots every pass so
+			// this row stays in step as detailed events stream in.
+			event.TotalTokens = usage.Int64(residual)
 		}
 		if event.Source.Adapter == "antigravity" && strings.HasPrefix(event.SessionID, "sha256:") && event.CacheReadTokens != nil && event.TotalTokens != nil {
 			// Upgraded Antigravity events (v0.3.0+) include cache_read_tokens
@@ -1117,6 +1119,15 @@ adapter, adapter_version
 			addFacet(&addedModels, effectiveModel)
 			addFacet(&addedTools, event.Tool)
 			addFacet(&addedProjects, event.Project)
+		}
+		if event.Source.Adapter == "codex" && event.SessionID != "" && !isAggregateCodexEvent(event) {
+			changed, err := refreshCodexResidual(ctx, tx, event.MachineID, event.SessionID)
+			if err != nil {
+				return result, err
+			}
+			if changed {
+				facetsNeedInvalidate = true
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1254,6 +1265,80 @@ func isAggregateCodexEvent(event usage.Event) bool {
 	return event.Source.Adapter == "codex" &&
 		event.InputTokens == nil && event.OutputTokens == nil &&
 		event.CacheReadTokens == nil && event.CacheWriteTokens == nil
+}
+
+// upsertCodexThreadTotal remembers the source-of-truth total Codex reports for
+// a thread. Detailed rollout events may not cover the whole thread (archived
+// or deleted rollouts), so the aggregate row is kept as the residual:
+// source_total - sum(detailed event totals).
+func upsertCodexThreadTotal(ctx context.Context, tx *sql.Tx, machineID, sessionID string, total int64) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO codex_thread_totals (machine_id, session_id, source_total, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(machine_id, session_id) DO UPDATE SET
+    source_total = excluded.source_total,
+    updated_at = excluded.updated_at`,
+		machineID, sessionID, total, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("record Codex thread total: %w", err)
+	}
+	return nil
+}
+
+func codexDetailedTotal(ctx context.Context, tx *sql.Tx, machineID, sessionID string) (int64, error) {
+	var total int64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(COALESCE(total_tokens, 0)), 0)
+FROM usage_events
+WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
+AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL)`,
+		machineID, sessionID).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("sum Codex detailed events: %w", err)
+	}
+	return total, nil
+}
+
+// refreshCodexResidual keeps the aggregate row equal to the part of the
+// thread total that detailed rollout events do not account for.
+func refreshCodexResidual(ctx context.Context, tx *sql.Tx, machineID, sessionID string) (bool, error) {
+	var sourceTotal int64
+	err := tx.QueryRowContext(ctx, `SELECT source_total FROM codex_thread_totals WHERE machine_id = ? AND session_id = ?`,
+		machineID, sessionID).Scan(&sourceTotal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read Codex thread total: %w", err)
+	}
+	detailed, err := codexDetailedTotal(ctx, tx, machineID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	residual := sourceTotal - detailed
+	if residual < 0 {
+		residual = 0
+	}
+	if residual == 0 {
+		res, err := tx.ExecContext(ctx, `DELETE FROM usage_events
+WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
+AND input_tokens IS NULL AND output_tokens IS NULL
+AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+AND reasoning_tokens IS NULL`, machineID, sessionID)
+		if err != nil {
+			return false, fmt.Errorf("drop Codex residual: %w", err)
+		}
+		deleted, err := res.RowsAffected()
+		return deleted > 0, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE usage_events SET total_tokens = ?
+WHERE machine_id = ? AND session_id = ? AND adapter = 'codex'
+AND input_tokens IS NULL AND output_tokens IS NULL
+AND cache_read_tokens IS NULL AND cache_write_tokens IS NULL
+AND reasoning_tokens IS NULL`, residual, machineID, sessionID)
+	if err != nil {
+		return false, fmt.Errorf("refresh Codex residual: %w", err)
+	}
+	updated, err := res.RowsAffected()
+	return updated > 0, err
 }
 
 func upsertMachine(ctx context.Context, tx *sql.Tx, event usage.Event, name string) error {

@@ -3184,3 +3184,83 @@ func TestIngestAntigravityBackfillRefreshesAndReplacesLegacyUUID(t *testing.T) {
 		t.Fatalf("Cache.CachedTokens = %d, want %d", overview.Cache.CachedTokens, wantCached)
 	}
 }
+
+func TestCodexResidualTopUpKeepsThreadTotalsWhole(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	aggregate := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "thread-snapshot", Timestamp: time.Now().UTC(),
+		MachineID: "m1", SessionID: "thread-1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+		TotalTokens: usage.Int64(1000), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "0.7.0"},
+	}
+	detailed := func(id string, total int64) usage.Event {
+		return usage.Event{
+			SchemaVersion: usage.SchemaVersion, EventID: id, Timestamp: time.Now().UTC(),
+			MachineID: "m1", SessionID: "thread-1", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			InputTokens: usage.Int64(total / 2), OutputTokens: usage.Int64(total / 4),
+			CacheReadTokens: usage.Int64(total / 8), CacheWriteTokens: usage.Int64(total / 8),
+			ReasoningTokens: usage.Int64(0), TotalTokens: usage.Int64(total),
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "codex", AdapterVersion: "0.7.0"},
+		}
+	}
+	rowTotals := func() (aggregateTotal int64, rows int) {
+		events, err := store.Events(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			rows++
+			if event.EventID == "thread-snapshot" && event.TotalTokens != nil {
+				aggregateTotal = *event.TotalTokens
+			}
+		}
+		return aggregateTotal, rows
+	}
+
+	if _, err := store.Ingest(ctx, []usage.Event{aggregate}); err != nil {
+		t.Fatal(err)
+	}
+	if total, rows := rowTotals(); total != 1000 || rows != 1 {
+		t.Fatalf("aggregate-only = total %d rows %d, want 1000/1", total, rows)
+	}
+
+	if result, err := store.Ingest(ctx, []usage.Event{detailed("det-1", 600)}); err != nil || result.CurrentTotal != 1000 {
+		t.Fatalf("first detailed ingest = %+v, err %v", result, err)
+	}
+	if total, rows := rowTotals(); total != 400 || rows != 2 {
+		t.Fatalf("after 600 detailed = aggregate %d rows %d, want 400/2", total, rows)
+	}
+
+	if result, err := store.Ingest(ctx, []usage.Event{aggregate}); err != nil || result.CurrentTotal != 1000 {
+		t.Fatalf("snapshot refresh = %+v, err %v", result, err)
+	}
+	if total, rows := rowTotals(); total != 400 || rows != 2 {
+		t.Fatalf("snapshot refresh double-counted = aggregate %d rows %d", total, rows)
+	}
+
+	if result, err := store.Ingest(ctx, []usage.Event{detailed("det-2", 300)}); err != nil || result.CurrentTotal != 1000 {
+		t.Fatalf("second detailed ingest = %+v, err %v", result, err)
+	}
+	if total, rows := rowTotals(); total != 100 || rows != 3 {
+		t.Fatalf("after 900 detailed = aggregate %d rows %d, want 100/3", total, rows)
+	}
+
+	if result, err := store.Ingest(ctx, []usage.Event{detailed("det-3", 100)}); err != nil || result.CurrentTotal != 1000 {
+		t.Fatalf("third detailed ingest = %+v, err %v", result, err)
+	}
+	if total, rows := rowTotals(); total != 0 || rows != 3 {
+		t.Fatalf("fully covered thread = aggregate %d rows %d, want 0/3", total, rows)
+	}
+
+	var sourceTotal int64
+	if err := store.readHandle().QueryRowContext(ctx, `SELECT source_total FROM codex_thread_totals WHERE machine_id='m1' AND session_id='thread-1'`).Scan(&sourceTotal); err != nil || sourceTotal != 1000 {
+		t.Fatalf("thread total = %d, err %v, want 1000", sourceTotal, err)
+	}
+}

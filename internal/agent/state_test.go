@@ -294,3 +294,43 @@ CREATE TABLE IF NOT EXISTS source_state (
 		t.Fatalf("migrated schema lost cursor state: %+v != %+v", got, committed)
 	}
 }
+
+func TestPendingAlwaysIncludesCodexThreadSnapshots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const machineID = "machine-a"
+	snapshot := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "thread-snapshot",
+		MachineID: machineID, SessionID: "thread-1", Provider: "openai", Model: "gpt-5",
+		Tool: "codex", TotalTokens: usage.Int64(1000), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "0.7.0"},
+	}
+	if err := store.Commit(context.Background(), machineID, StateSnapshot{}, nil, []usage.Event{snapshot}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.Pending(context.Background(), machineID, []usage.Event{snapshot})
+	if err != nil || len(pending) != 1 || pending[0].EventID != "thread-snapshot" {
+		t.Fatalf("thread snapshot was filtered out: %+v, err %v", pending, err)
+	}
+
+	detailed := usage.Event{
+		SchemaVersion: usage.SchemaVersion, EventID: "detailed-1",
+		MachineID: machineID, SessionID: "thread-1", Provider: "openai", Model: "gpt-5",
+		Tool: "codex", InputTokens: usage.Int64(10), OutputTokens: usage.Int64(10),
+		CacheReadTokens: usage.Int64(0), CacheWriteTokens: usage.Int64(0), ReasoningTokens: usage.Int64(0),
+		TotalTokens: usage.Int64(20), TokenAccuracy: usage.AccuracyReported,
+		Source: usage.Source{Adapter: "codex", AdapterVersion: "0.7.0"},
+	}
+	if err := store.Commit(context.Background(), machineID, StateSnapshot{}, nil, []usage.Event{detailed}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.Pending(context.Background(), machineID, []usage.Event{detailed})
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("unchanged detailed event was not filtered: %+v, err %v", pending, err)
+	}
+}

@@ -809,8 +809,8 @@ PRAGMA user_version = 4;`
 
 	ctx := context.Background()
 	ver, err := schemaVersion(ctx, store.db)
-	if err != nil || ver != 5 {
-		t.Fatalf("schemaVersion = %d, err = %v, want 5", ver, err)
+	if err != nil || ver != databaseSchemaVersion {
+		t.Fatalf("schemaVersion = %d, err = %v, want %d", ver, err, databaseSchemaVersion)
 	}
 	var tableName string
 	if err := store.readHandle().QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='quotas'`).Scan(&tableName); err != nil || tableName != "quotas" {
