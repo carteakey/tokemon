@@ -794,7 +794,7 @@ const freshnessInvariantJS = `(() => {
 
 // creatureArtInvariantJS verifies the hero .creature-art LCP image loads with
 // explicit manifest dimensions, fetchpriority="high", and zero aspect-ratio
-// distortion across all gated viewports (both 640x640 and stage-09 568x640).
+// distortion across all gated viewports (640x640 across all 19 stages).
 const creatureArtInvariantJS = `(() => {
 	const problems = [];
 	const img = document.querySelector('img.creature-art');
@@ -1276,9 +1276,9 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		t.Fatalf("could not restore the desktop viewport: %v", err)
 	}
 
-	// Stage 9 (token-titan, stage-09.png) has natural dimensions 568x640
-	// instead of 640x640; verify its explicit width/height attributes and
-	// distortion-free rendering across all gated viewports.
+	// Stage 9 (token-titan, stage-09.png, previously 568x640 and now padded to
+	// 640x640): verify its explicit width/height attributes and distortion-free
+	// rendering across all gated viewports.
 	t.Run("creature-art-stage9", func(t *testing.T) {
 		stage9Store, err := database.Open(filepath.Join(t.TempDir(), "stage9.db"), smokeCatalog())
 		if err != nil {
@@ -2276,7 +2276,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			return JSON.stringify(problems);
 		})()`)
 
-		// Resume auto-refresh, focus active .activity-cell, ingest +400 -> 1,000 (Stage 3 Promptling).
+		// Resume auto-refresh, focus active .activity-cell, ingest +400 -> 1,000 (Stage 3 Prompt Imp).
 		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
 			t.Fatalf("resume auto-refresh: %v", err)
 		}
@@ -2297,13 +2297,13 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 				const p = document.querySelector('.creature-panel');
 				const f = document.querySelector('.form-name');
 				const s = document.querySelector('.sessions-panel');
-				return Boolean(c && c.dataset.display === '1,000' && p && p.dataset.stage === '3' && f && f.textContent === 'Promptling' && s && s.textContent.includes('live-sess-3'));
+				return Boolean(c && c.dataset.display === '1,000' && p && p.dataset.stage === '3' && f && f.textContent === 'Prompt Imp' && s && s.textContent.includes('live-sess-3'));
 			})()`))
 			if err == nil && evolved {
 				break
 			}
 			if time.Now().After(deadline) {
-				t.Fatal("auto-update did not evolve creature to Stage 3 Promptling at 1,000 tokens in time")
+				t.Fatal("auto-update did not evolve creature to Stage 3 Prompt Imp at 1,000 tokens in time")
 			}
 			time.Sleep(150 * time.Millisecond)
 		}

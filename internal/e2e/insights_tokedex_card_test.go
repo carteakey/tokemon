@@ -116,7 +116,7 @@ var (
 	itcKnownWordRe       = regexp.MustCompile(`(?i)\bknown\b`)
 	itcPositiveTabIdxRe  = regexp.MustCompile(`(?i)\btabindex="[1-9][0-9]*"`)
 	itcSVGGeometryRe     = regexp.MustCompile(`(?i)<(rect|path|polyline|polygon|line)\b`)
-	itcCardStageRe       = regexp.MustCompile(`(?i)(egg|bitling|bytelet|promptling|context cub|token scout|code caster|agent beast|context dragon|token titan)`)
+	itcCardStageRe       = regexp.MustCompile(`(?i)(egg|bitling|bytelet|prompt imp|cache cub|vector lynx|code caster|agent hound|context dragon|token titan)`)
 )
 
 func itcDo(t *testing.T, client *http.Client, method, fullURL string, body []byte, headers map[string]string) (int, http.Header, []byte) {
@@ -1865,9 +1865,9 @@ func TestCardSVG_F24_T1_ReflectsAggregateStageTokensStreakAndSparkline(t *testin
 	_ = itcValidateSVGXML(t, svgBytes)
 	svg := string(svgBytes)
 	svgText := itcExtractSVGText(t, svgBytes)
-	// 1,500 tokens = Stage 3 Promptling.
-	if !strings.Contains(svgText, "Promptling") {
-		t.Fatalf("/api/v1/card.svg missing Stage 3 form name Promptling in SVG <text> (%q):\n%s", svgText, svg)
+	// 1,500 tokens = Stage 3 Prompt Imp.
+	if !strings.Contains(svgText, "Prompt Imp") {
+		t.Fatalf("/api/v1/card.svg missing Stage 3 form name Prompt Imp in SVG <text> (%q):\n%s", svgText, svg)
 	}
 	if !strings.Contains(svgText, "1,500") && !strings.Contains(svgText, "1.5K") {
 		t.Fatalf("/api/v1/card.svg missing formatted lifetime token total 1,500 / 1.5K in SVG <text> (%q):\n%s", svgText, svg)

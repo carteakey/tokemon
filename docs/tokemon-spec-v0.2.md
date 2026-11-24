@@ -169,21 +169,21 @@ The initial progression:
 | 0–9 | 0 | Egg |
 | 10–99 | 1 | Bitling |
 | 100–999 | 2 | Bytelet |
-| 1,000–9,999 | 3 | Promptling |
-| 10,000–99,999 | 4 | Context Cub |
-| 100,000–999,999 | 5 | Token Scout |
+| 1,000–9,999 | 3 | Prompt Imp |
+| 10,000–99,999 | 4 | Cache Cub |
+| 100,000–999,999 | 5 | Vector Lynx |
 | 1M–9.99M | 6 | Code Caster |
-| 10M–99.99M | 7 | Agent Beast |
+| 10M–99.99M | 7 | Agent Hound |
 | 100M–999.99M | 8 | Context Dragon |
 | 1B–1.99B | 9 | Token Titan |
 | 2B–4.99B | 10 | Model Eater |
-| 5B–9.99B | 11 | Context Deity |
-| 10B–19.99B | 12 | Reality Core |
+| 5B–9.99B | 11 | Attention Seraph |
+| 10B–19.99B | 12 | Latent Core |
 | 20B–49.99B | 13 | Inference Leviathan |
 | 50B–99.99B | 14 | Parameter Colossus |
-| 100B–199.99B | 15 | World Weaver |
-| 200B–499.99B | 16 | Cosmic Architect |
-| 500B–999.99B | 17 | Universe Engine |
+| 100B–199.99B | 15 | Tensor Weaver |
+| 200B–499.99B | 16 | Lattice Spire |
+| 500B–999.99B | 17 | Gradient Engine |
 | 1T+ | 18 | The Singularity |
 
 These names are working copy, not hard product terminology. The visual form and stage number matter more than the labels.

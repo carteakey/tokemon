@@ -1,3 +1,18 @@
+## Unreleased
+
+### Changed
+
+- **Evolution forms naming and sprite cleanup pass.** Eliminated repeated
+  prefixes and late-game sci-fi drift across 9 sealed evolution forms (`03
+  Prompt Imp`, `04 Cache Cub`, `05 Vector Lynx`, `07 Agent Hound`, `11 Attention
+  Seraph`, `12 Latent Core`, `15 Tensor Weaver`, `16 Lattice Spire`, `17
+  Gradient Engine`) while keeping all 4 public forms unchanged. Cleaned 17
+  chroma-key speckle artifacts and green fringe pixels from `stage-09.png` and
+  padded it from `568×640` to `640×640` for a uniform square canvas across all
+  19 stages; rescaled `stage-18.png` (`The Singularity`, +`stage-18.webp`) and
+  `stage-01.png` (`Bitling`) cleanly via nearest-neighbor for better presence
+  and readability. See `docs/evolution-forms-review-2026-11-24.md`.
+
 ## 0.5.0
 
 A major speed, UI/UX, and utility release: split SQLite read/write pools with

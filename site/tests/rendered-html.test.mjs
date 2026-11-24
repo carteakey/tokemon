@@ -53,7 +53,7 @@ test("keeps the evolution archive a teaser", async () => {
   // Sealed art and names must never reach the page.
   assert.doesNotMatch(page, /stage-14\.png/);
   assert.doesNotMatch(page, /stage-(0[1-7]|09|1[0-2]|1[4-7])\.(png|webp)/);
-  assert.doesNotMatch(page, /Parameter Colossus|World Weaver|Cosmic Architect|Universe Engine|Agent Beast|Token Titan/);
+  assert.doesNotMatch(page, /Parameter Colossus|Tensor Weaver|Lattice Spire|Gradient Engine|Attention Seraph|Latent Core|Agent Hound|World Weaver|Cosmic Architect|Universe Engine|Agent Beast|Token Titan/);
   assert.doesNotMatch(page, /tokemon-dashboard\.png/);
 });
 

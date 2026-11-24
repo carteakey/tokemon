@@ -1441,8 +1441,8 @@ func TestPairwise_F12_F22_F24_CAR205PasswordAuthTokedexDetailAndCardSVG(t *testi
 			}
 		}
 		svgText := itcExtractSVGText(t, svgBytes)
-		if !strings.Contains(svgText, "Promptling") || (!strings.Contains(svgText, "1,700") && !strings.Contains(svgText, "1.7K")) {
-			t.Fatalf("card.svg (%s) missing Promptling or 1,700/1.7K in %q", av.name, svgText)
+		if !strings.Contains(svgText, "Prompt Imp") || (!strings.Contains(svgText, "1,700") && !strings.Contains(svgText, "1.7K")) {
+			t.Fatalf("card.svg (%s) missing Prompt Imp or 1,700/1.7K in %q", av.name, svgText)
 		}
 		if !regexp.MustCompile(`(?:^|\D)3(?:\D|$)`).MatchString(svgText) {
 			t.Fatalf("card.svg (%s) missing streak 3 in %q", av.name, svgText)

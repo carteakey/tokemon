@@ -562,7 +562,7 @@ func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) 
 		label  string
 	}{
 		{name: "empty egg", tokens: 0, stage: 0, form: "egg", label: "Egg"},
-		{name: "populated context cub", tokens: 12_345, stage: 4, form: "context-cub", label: "Context Cub"},
+		{name: "populated cache cub", tokens: 12_345, stage: 4, form: "cache-cub", label: "Cache Cub"},
 		{name: "before late threshold", tokens: 1_999_999_999, stage: 9, form: "token-titan", label: "Token Titan"},
 		{name: "late threshold", tokens: 2_000_000_000, stage: 10, form: "model-eater", label: "Model Eater"},
 		{name: "final singularity", tokens: 1_000_000_000_000, stage: 18, form: "the-singularity", label: "The Singularity"},
@@ -602,14 +602,10 @@ func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) 
 				t.Fatalf("dashboard status = %d, want 200: %s", response.Code, response.Body.String())
 			}
 			body := response.Body.String()
-			wantWidth, wantHeight := 640, 640
-			if test.stage == 9 {
-				wantWidth, wantHeight = 568, 640
-			}
 			for _, want := range []string{
 				fmt.Sprintf(`data-stage="%d"`, test.stage),
 				fmt.Sprintf(`src="/static/tokemon/stage-%02d.png?v=%s"`, test.stage, server.assetVersion),
-				fmt.Sprintf(`width="%d" height="%d" fetchpriority="high"`, wantWidth, wantHeight),
+				`width="640" height="640" fetchpriority="high"`,
 				fmt.Sprintf(`alt="%s, stage %d"`, test.label, test.stage),
 				fmt.Sprintf(`<div class="stage-chip">FORM / %02d</div>`, test.stage),
 			} {

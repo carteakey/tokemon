@@ -186,8 +186,8 @@ func TestTwoAgentSystemFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Stage != 4 || snapshot.Form != "context-cub" {
-		t.Fatalf("final evolution = %+v, want stage 4 context-cub", snapshot)
+	if snapshot.Stage != 4 || snapshot.Form != "cache-cub" {
+		t.Fatalf("final evolution = %+v, want stage 4 cache-cub", snapshot)
 	}
 	for _, event := range stored {
 		if event.MachineID != "agent-a" && event.MachineID != "agent-b" {
