@@ -1,7 +1,59 @@
 ## Unreleased
 
+### Added
+
+- **Slices 3–4 UI, investigation, and utility features.** Extracted shared
+  `web/static/tokemon/base.css` and `internal/api/templates/chrome.html`
+  partials across all 7 pages (#22), added clickable Overview/Analytics/heatmap/trend
+  drill-downs, decluttered the Analytics filter bar with active filter pills and
+  auto-submit, replaced the 60s full-page reload on `/` with ETag-driven in-place
+  updates, upgraded `/sessions` with project filter, search, pagination, and a
+  metadata-only `/sessions/<id>` detail page, added roving-tabindex 24h rhythm
+  readouts on `/insights`, and upgraded `/settings` with usage-sorted filterable
+  aliases, SQLite-backed editable quotas (schema v5), optional quota overage
+  alerts, and last-backup age.
+- **Analytics efficiency metrics, streaks, Tokedex detail, CLI status, and share
+  card.** Added Estimated Cache Savings (`$X saved`), effective `$/1M` tokens,
+  per-dimension cache hit rates, Activity Streaks (`current`/`longest` + peak
+  day), custom `from`/`to` date ranges, `/tokedex/<model>` detail view with 30d
+  what-if pricing, `tokemon status` (`--short`/`--json`), built-in daily WAL-safe
+  automated backups, and authenticated aggregate-only `/api/v1/card.svg` (#21).
+- **Codex `.jsonl.zst` archived rollouts & `claude-desktop` harness.** The Codex
+  adapter now reads zstd-compressed archived rollouts alongside live JSONL logs,
+  and the Claude adapter distinguishes `entrypoint=claude-desktop` sessions.
+- **Opaque-box E2E suite (`internal/e2e/`, `//go:build e2e`).** Added 368 E2E
+  tests (386 checks with subtests) covering all 4 slices and live workflows. See
+  `docs/delivery-report-2026-11-24.md`.
+
+### Performance
+
+- **SQLite read/write pool split, incremental facets, single-pass Analytics, and
+  HTTP/asset delivery.** Split writes (`SetMaxOpenConns(1)`) from a read-only
+  pool (`?mode=ro`, `SetMaxOpenConns(4)`) with WAL PRAGMAs, updated `Facets`
+  incrementally on ingest, merged `Analytics` summary/points/share into one
+  streaming pass, deduplicated `Overview` `ByMachine` scans, capped `/` sessions
+  to `LIMIT 8`, added SWR + coalescing to evolution, quotas (#38), sessions,
+  Tokedex, and insights, guarded startup Codex dedup behind `user_version`,
+  added outbound gzip compression, immutable `?v=` `/static/` caching, lossless
+  PNG optimization, LCP `fetchpriority="high"`, and `content-visibility: auto`.
+
 ### Fixed
 
+- **Antigravity captures `cache_read_tokens` and `reasoning_tokens` (`v0.3.0`).**
+  `decodeStepMetadata` and `decodeGenerationMetadata` previously read only
+  uncached input (field 2) and output (field 3 / legacy field 1), omitting
+  `cache_read_tokens` (field 5) and `reasoning_tokens` (field 9). The adapter
+  now decodes both fields, prefers actual output (field 3) on legacy records,
+  honors incremental step offsets for `0.3.0` cursors, and rotates cursor
+  identity so upgrading agents backfill cleanly while `Store.Ingest` replaces
+  superseded pre-`sha256` UUID rows without double-counting. On the primary Mac
+  hub this recovered 1.72B cached tokens across 327 conversations.
+- **Dashboard hygiene fixes (Slice 1).** Grouped `machine_source_health` rows by
+  adapter with collapsed `<details>` for stale/errored sources, fixed Analytics
+  breakdown and Usage Share legend ignoring `MachineAliases`, localized "When"
+  and "Last seen" timestamps to the configured reporting timezone with
+  `<time datetime>`, pre-rendered hero `TokenComposition`, and respected
+  `autoPaused()` in `pollLifetime`.
 - **The dashboard server runs at interactive scheduling priority.** The macOS
   LaunchAgent was written with `ProcessType=Background`, so launchd scheduled
   the hub at priority 4 and stretched every request under load. The installer
