@@ -82,7 +82,7 @@ func BenchmarkDashboardRender(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	page := dashboardPage{Overview: overview, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions, Freshness: dataFreshnessFor(overview.NewestEvent, time.Now())}
+	page := dashboardPage{PageChrome: PageChrome{Title: "Tokemon · Overview", ActiveNav: "overview", ShowRefresh: true}, Overview: overview, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: machines, Sessions: sessions, Freshness: dataFreshnessFor(overview.NewestEvent, time.Now())}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := server.template.ExecuteTemplate(io.Discard, "dashboard", page); err != nil {

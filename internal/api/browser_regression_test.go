@@ -20,19 +20,27 @@ import (
 // authenticated desktop and 390px checks are performed against the deployed
 // hub with the in-app browser skill (see docs/system-tests.md).
 func TestAnalyticsDesktopBrowserRegression(t *testing.T) {
-	body := renderAnalyticsRegressionPage(t)
+	body, css := renderAnalyticsRegressionPage(t)
+	combined := append(append([]byte(nil), body...), css...)
 	for _, want := range []string{
 		`<meta name="viewport" content="width=device-width, initial-scale=1">`,
 		`<input type="hidden" name="period"`, `<select id="dimension-filter" name="dimension">`, `<select id="machine-filter" name="machine">`, `<select id="provider-filter" name="provider">`, `<select id="model-filter" name="model">`, `<select id="harness-filter" name="tool">`,
 		"Apply filters", "Reset", "Token trend", "Usage share", "Recent sessions",
 		`<table aria-label="Analytics breakdown">`, `class="trend-column`, `class="share-point`, `type="button"`,
 		`aria-describedby="share-tooltip"`, `role="tooltip"`,
-		`.trend-chart { position: relative; z-index: 1; display: flex;`, `.table-scroll { overflow-x: auto;`,
 		`point.addEventListener('focus'`, `column.addEventListener('focus'`,
-		`@media (prefers-reduced-motion: reduce)`, `window.matchMedia('(prefers-reduced-motion: reduce)')`,
+		`window.matchMedia('(prefers-reduced-motion: reduce)')`,
 	} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("desktop analytics output missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`.trend-chart { position: relative; z-index: 1; display: flex;`, `.table-scroll { overflow-x: auto;`,
+		`@media (prefers-reduced-motion: reduce)`,
+	} {
+		if !bytes.Contains(combined, []byte(want)) {
+			t.Fatalf("desktop analytics CSS bundle missing %q", want)
 		}
 	}
 	if strings.Contains(string(body), "private prompt") || strings.Contains(string(body), "/private/repo") {
@@ -41,10 +49,12 @@ func TestAnalyticsDesktopBrowserRegression(t *testing.T) {
 }
 
 func TestAnalyticsMobile390BrowserRegression(t *testing.T) {
-	body := renderAnalyticsRegressionPage(t)
+	body, css := renderAnalyticsRegressionPage(t)
+	combined := append(append([]byte(nil), body...), css...)
 	for _, want := range []string{
-		`@media (max-width: 700px)`, `@media (max-width: 430px)`,
-		`main { width: min(100% - 12px, 620px);`,
+		`@media (max-width: 820px)`, `@media (max-width: 700px)`, `@media (max-width: 430px)`,
+		`main:not(.login-card) { width: min(100% - 20px, 620px);`,
+		`main:not(.login-card) { width: min(100% - 12px, 420px);`,
 		`.filter-form, .stats { grid-template-columns: 1fr; }`,
 		`.analytics-grid { grid-template-columns: minmax(0, 1fr); }`,
 		`.trend-chart { position: relative;`, `overflow-x: auto;`,
@@ -52,7 +62,7 @@ func TestAnalyticsMobile390BrowserRegression(t *testing.T) {
 		`.table-scroll { overflow-x: auto;`,
 		`@media (prefers-reduced-motion: reduce)`,
 	} {
-		if !bytes.Contains(body, []byte(want)) {
+		if !bytes.Contains(combined, []byte(want)) {
 			t.Fatalf("390px analytics output missing responsive contract %q", want)
 		}
 	}
@@ -69,37 +79,37 @@ func TestMobileNavigation390BrowserRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pages := []struct {
-		path  string
-		media string
-	}{
-		{path: "/", media: `@media (max-width: 500px)`},
-		{path: "/analytics", media: `@media (max-width: 700px)`},
-		{path: "/tokedex", media: `@media (max-width:620px)`},
-		{path: "/sessions", media: `@media (max-width:640px)`},
-	}
-	for _, page := range pages {
-		request := httptest.NewRequest(http.MethodGet, page.path, nil)
+	pages := []string{"/", "/analytics", "/tokedex", "/sessions", "/insights", "/settings"}
+	for _, path := range pages {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.SetBasicAuth("tokemon", testDashboardToken)
 		response := httptest.NewRecorder()
 		server.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusOK {
-			t.Fatalf("%s status = %d: %s", page.path, response.Code, response.Body.String())
+			t.Fatalf("%s status = %d: %s", path, response.Code, response.Body.String())
 		}
 		body := response.Body.Bytes()
-		if !bytes.Contains(body, []byte(page.media)) {
-			t.Fatalf("%s missing mobile breakpoint %q", page.path, page.media)
+		css := fetchLinkedCSS(t, server, body)
+		compactCSS := strings.NewReplacer(" ", "", "\n", "", "\r", "", "\t", "").Replace(string(css))
+		for _, media := range []string{`@media (max-width: 820px)`, `@media (max-width: 640px)`, `@media (max-width: 500px)`} {
+			if !bytes.Contains(css, []byte(media)) {
+				t.Fatalf("%s linked CSS missing mobile breakpoint %q", path, media)
+			}
 		}
-		compactCSS := strings.NewReplacer(" ", "", "\n", "", "\r", "", "\t", "").Replace(response.Body.String())
 		if !strings.Contains(compactCSS, `.nav-link{padding:6px7px;font-size:10px;}`) {
-			t.Fatalf("%s missing compact mobile navigation contract", page.path)
+			t.Fatalf("%s linked CSS missing compact mobile navigation contract", path)
+		}
+		if !strings.Contains(compactCSS, `.topbar-actions{margin-left:auto;}`) {
+			t.Fatalf("%s linked CSS missing .topbar-actions wrap alignment", path)
 		}
 		for _, want := range []string{
 			`<nav class="nav"`,
 			`href="/analytics"`,
+			`<div class="topbar-actions">`,
+			`<a class="settings-link`,
 		} {
 			if !bytes.Contains(body, []byte(want)) {
-				t.Fatalf("%s missing navigation contract %q", page.path, want)
+				t.Fatalf("%s missing navigation contract %q", path, want)
 			}
 		}
 	}
@@ -126,14 +136,22 @@ func TestOverviewWideTablesKeepTheirOwnLayout(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	body := response.Body.String()
+	css := string(fetchLinkedCSS(t, server, response.Body.Bytes()))
+	combined := body + "\n" + css
 	for _, want := range []string{
 		`.health-table, .sessions-table { table-layout: auto; }`,
 		`.health-table :is(th, td):first-child, .sessions-table :is(th, td):first-child { width: 100%;`,
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("overview missing wide-table CSS contract %q", want)
+		}
+	}
+	for _, want := range []string{
 		`<td data-label="Last seen">`, `<td data-label="Lifetime">`, `class="sync-error">1 source error<span class="table-muted">of 3 sources</span>`,
 		`<a class="settings-link" href="/settings"`,
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("overview missing wide-table contract %q", want)
+			t.Errorf("overview missing wide-table HTML contract %q", want)
 		}
 	}
 }
@@ -162,7 +180,31 @@ func TestAnalyticsEmptyStateBrowserRegression(t *testing.T) {
 	}
 }
 
-func renderAnalyticsRegressionPage(t *testing.T) []byte {
+func fetchLinkedCSS(t *testing.T, server *Server, html []byte) []byte {
+	t.Helper()
+	matches := stylesheetPattern.FindAllSubmatch(html, -1)
+	if len(matches) == 0 {
+		t.Fatalf("rendered HTML missing linked stylesheet")
+	}
+	var out bytes.Buffer
+	for _, match := range matches {
+		href := string(match[1])
+		req := httptest.NewRequest(http.MethodGet, href, nil)
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("stylesheet %s status = %d", href, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
+			t.Fatalf("stylesheet %s Content-Type = %q, want text/css", href, ct)
+		}
+		out.Write(rec.Body.Bytes())
+		out.WriteByte('\n')
+	}
+	return out.Bytes()
+}
+
+func renderAnalyticsRegressionPage(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 	store, err := database.Open(t.TempDir()+"/analytics.db", catalog.Empty())
 	if err != nil {
@@ -218,5 +260,6 @@ func renderAnalyticsRegressionPage(t *testing.T) []byte {
 	if response.Code != http.StatusOK {
 		t.Fatalf("analytics status = %d: %s", response.Code, response.Body.String())
 	}
-	return response.Body.Bytes()
+	body := response.Body.Bytes()
+	return body, fetchLinkedCSS(t, server, body)
 }

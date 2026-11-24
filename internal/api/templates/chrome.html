@@ -1,0 +1,33 @@
+{{define "head"}}<meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10110f">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
+  <title>{{if .Title}}{{.Title}}{{else}}Tokemon{{end}}</title>
+  <style>@font-face{font-family:"Pixelify Sans";font-style:normal;font-weight:400 700;font-display:swap;src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2");}</style>
+  <link rel="stylesheet" href="{{staticURL "/static/tokemon/base.css"}}">{{end}}
+
+{{define "topbar"}}<a class="skip-link" href="#main-content">Skip to content</a>
+<main id="main-content">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Tokemon overview">
+      <img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34">
+      <span class="brand-name">TOKEMON</span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="nav-link{{if eq .ActiveNav "overview"}} active{{end}}" href="/"{{if eq .ActiveNav "overview"}} aria-current="page"{{end}}>Overview</a>
+      <a class="nav-link{{if eq .ActiveNav "analytics"}} active{{end}}" href="/analytics"{{if eq .ActiveNav "analytics"}} aria-current="page"{{end}}>Analytics</a>
+      {{if tokedexEnabled}}<a class="nav-link{{if eq .ActiveNav "tokedex"}} active{{end}}" href="/tokedex"{{if eq .ActiveNav "tokedex"}} aria-current="page"{{end}}>Tokedex</a>{{end}}
+      <a class="nav-link{{if eq .ActiveNav "sessions"}} active{{end}}" href="/sessions"{{if eq .ActiveNav "sessions"}} aria-current="page"{{end}}>Sessions</a>
+    </nav>
+    <div class="topbar-actions">
+      {{if .ShowRefresh}}<div class="refresh-control">
+        <button type="button" id="refresh-now" class="refresh-btn" aria-label="Refresh now"><span class="refresh-glyph" aria-hidden="true">&#8635;</span><span class="refresh-label">Refresh now</span></button>
+        <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false"><span class="refresh-glyph" aria-hidden="true">&#9208;</span><span class="refresh-label">Pause auto-refresh</span></button>
+      </div>{{end}}
+      <a class="settings-link{{if eq .ActiveNav "settings"}} active{{end}}" href="/settings" aria-label="Settings" title="Settings"{{if eq .ActiveNav "settings"}} aria-current="page"{{end}}>⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
+    </div>
+  </header>{{end}}
+
+{{define "footer"}}  <footer>{{if eq .ActiveNav "overview"}}<span>Local-first · no conversation content</span><span>Just for fun · not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.</span>{{else if eq .ActiveNav "tokedex"}}<span>Static YAML-backed catalog · metadata only</span><span>Unknown pricing stays Unknown, never zero · <a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span>{{else if eq .ActiveNav "sessions"}}<span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span>{{else if eq .ActiveNav "analytics"}}<span>Local-first · metadata only</span><span>Export contains analytics metadata, not prompts, responses, source code, or repository contents.</span>{{else if eq .ActiveNav "insights"}}<span>Local-first · metadata only</span><span>No prompts, responses, source paths, repository contents, or session IDs are used.</span>{{else if eq .ActiveNav "settings"}}<span>Local-first · metadata only</span><span>Aliases affect dashboard presentation only; usage records and analytics identifiers remain unchanged.</span>{{else}}<span>Local-first · metadata only</span><span>Unknown fields remain unavailable, not zero.</span>{{end}}</footer>
+</main>{{end}}

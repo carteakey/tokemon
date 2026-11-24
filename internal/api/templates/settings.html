@@ -1,0 +1,71 @@
+{{define "settings"}}<!doctype html>
+<html lang="en">
+<head>
+  {{template "head" .}}
+  <style>
+    .settings-body { max-width: 920px; padding: 0 10px 4px; }
+    .eyebrow { margin-top: 26px; }
+    h1, h2 { margin: 0; font-family: var(--font-data); }
+    h1 { margin-top: 8px; color: var(--text); font: 700 clamp(28px, 4vw, 42px)/1 var(--font-display); }
+    h2 { margin-top: 24px; padding-bottom: 8px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+    .intro { margin: 14px 0 0; color: var(--muted); }
+    .notice { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-data); font-size: 12px; }
+    .alias-list { display: grid; gap: 8px; margin-top: 10px; }
+    .alias-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, .7fr); align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
+    .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .settings-body input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
+    .settings-body input:focus { border-color: var(--accent); }
+    .settings-body input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+    .settings-body button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .settings-body button:hover, .settings-body button:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
+    .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
+    @media (max-width: 620px) {
+      .settings-body { padding: 0 6px 4px; }
+      .alias-row { grid-template-columns: 1fr; gap: 8px; }
+    }
+  </style>
+</head>
+<body>
+  {{template "topbar" .}}
+  <div class="settings-body">
+  <div class="eyebrow">Display names</div>
+  <h1>Settings</h1>
+  <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
+  <p class="intro">Auth mode: <strong>{{.AuthMode}}</strong> · Dashboard token: <strong>{{.TokenSource}}</strong>.</p>
+  {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
+  {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
+  <form action="/settings/aliases" method="post" aria-label="Display name aliases">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <h2 id="settings-form-title">Models</h2>
+    {{if .Models}}
+    <div class="alias-list">
+      {{range $index, $row := .Models}}
+      <div class="alias-row">
+        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
+        <input id="model-alias-{{$index}}" name="model_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
+        <input type="hidden" name="model_identity" value="{{$row.Identity}}">
+      </div>
+      {{end}}
+    </div>
+    {{else}}<p class="empty">No models recorded yet.</p>{{end}}
+    <h2 id="machines-title">Machines</h2>
+    {{if .Machines}}
+    <div class="alias-list">
+      {{range $index, $row := .Machines}}
+      <div class="alias-row">
+        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
+        <input id="machine-alias-{{$index}}" name="machine_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
+        <input type="hidden" name="machine_identity" value="{{$row.Identity}}">
+      </div>
+      {{end}}
+    </div>
+    {{else}}<p class="empty">No machines recorded yet.</p>{{end}}
+    <div class="actions"><button type="submit">Save aliases</button></div>
+  </form>
+  </div>
+  {{template "footer" .}}
+</body>
+</html>{{end}}

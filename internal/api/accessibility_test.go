@@ -18,11 +18,13 @@ import (
 )
 
 var (
-	tablePattern     = regexp.MustCompile(`(?s)<table\b([^>]*)>(.*?)</table>`)
-	headerPattern    = regexp.MustCompile(`(?s)<th\b([^>]*)>`)
-	colorPattern     = regexp.MustCompile(`--([a-z-]+):\s*(#[0-9a-fA-F]{6})`)
-	focusNoneRegex   = regexp.MustCompile(`(?is):focus-visible[^}]*outline\s*:\s*none`)
-	positiveTabRegex = regexp.MustCompile(`(?i)tabindex\s*=\s*["']?[1-9]`)
+	tablePattern      = regexp.MustCompile(`(?s)<table\b([^>]*)>(.*?)</table>`)
+	headerPattern     = regexp.MustCompile(`(?s)<th\b([^>]*)>`)
+	colorPattern      = regexp.MustCompile(`--([a-z-]+):\s*(#[0-9a-fA-F]{6})`)
+	focusNoneRegex    = regexp.MustCompile(`(?is):focus-visible[^}]*outline\s*:\s*none`)
+	positiveTabRegex  = regexp.MustCompile(`(?i)tabindex\s*=\s*["']?[1-9]`)
+	stylesheetPattern = regexp.MustCompile(`(?i)<link\b[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["']`)
+	inlineStyleRegex  = regexp.MustCompile(`(?is)<style\b[^>]*>(.*?)</style>`)
 )
 
 func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
@@ -50,15 +52,15 @@ func TestAccessiblePagesExposeDeterministicContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/", "/settings", "/analytics", "/sessions", "/insights"} {
-		body := renderAccessiblePage(t, server, path)
-		assertAccessibleDocument(t, path, body)
+	for _, path := range []string{"/", "/settings", "/analytics", "/sessions", "/insights", "/tokedex"} {
+		body, css := renderAccessibleBundle(t, server, path)
+		assertAccessibleDocument(t, path, body, css)
 	}
 	// The sign-in form only renders when a password account is configured, so
 	// it comes from its own server; it still owes the same document contract,
 	// including the skip link and its main target.
-	loginBody := renderAccessiblePage(t, passwordAccountServer(t, store), "/login")
-	assertAccessibleDocument(t, "/login", loginBody)
+	loginBody, loginCSS := renderAccessibleBundle(t, passwordAccountServer(t, store), "/login")
+	assertAccessibleDocument(t, "/login", loginBody, loginCSS)
 
 	invalid := httptest.NewRequest(http.MethodPost, "/settings/aliases", strings.NewReader("model_identity=a&model_alias=b"))
 	invalid.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -80,6 +82,35 @@ func renderAccessiblePage(t *testing.T, server *Server, path string) string {
 		t.Fatalf("%s status = %d: %s", path, response.Code, response.Body.String())
 	}
 	return response.Body.String()
+}
+
+func renderAccessibleBundle(t *testing.T, server *Server, path string) (string, string) {
+	t.Helper()
+	body := renderAccessiblePage(t, server, path)
+	matches := stylesheetPattern.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		t.Fatalf("%s missing linked stylesheet", path)
+	}
+	var css strings.Builder
+	for _, match := range matches {
+		href := match[1]
+		req := httptest.NewRequest(http.MethodGet, href, nil)
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s stylesheet %s status = %d", path, href, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
+			t.Fatalf("%s stylesheet %s Content-Type = %q, want text/css", path, href, ct)
+		}
+		css.WriteString(rec.Body.String())
+		css.WriteByte('\n')
+	}
+	for _, style := range inlineStyleRegex.FindAllStringSubmatch(body, -1) {
+		css.WriteString(style[1])
+		css.WriteByte('\n')
+	}
+	return body, css.String()
 }
 
 // passwordAccountServer serves the same store behind a dashboard password
@@ -104,37 +135,45 @@ func passwordAccountServer(t *testing.T, store *database.Store) *Server {
 	return server
 }
 
-func assertAccessibleDocument(t *testing.T, path, body string) {
+func assertAccessibleDocument(t *testing.T, path, body, css string) {
 	t.Helper()
-	required := []string{
+	htmlRequired := []string{
 		`<html lang="en">`,
 		`<meta name="viewport"`,
 		`<a class="skip-link" href="#main-content">Skip to content</a>`,
 		`<h1`,
+	}
+	cssRequired := []string{
 		`:focus-visible`,
 		`prefers-reduced-motion`,
 	}
 	// The sign-in form is a single card: it has no section headings and no
 	// responsive breakpoint of its own to assert.
 	if path != "/login" {
-		required = append(required, `<h2`, `@media (max-width:`)
+		htmlRequired = append(htmlRequired, `<h2`)
+		cssRequired = append(cssRequired, `@media (max-width:`)
 	}
-	for _, contract := range required {
+	for _, contract := range htmlRequired {
 		if !strings.Contains(body, contract) {
 			t.Errorf("%s missing accessibility contract %q", path, contract)
 		}
 	}
-	if focusNoneRegex.MatchString(body) {
+	for _, contract := range cssRequired {
+		if !strings.Contains(css, contract) {
+			t.Errorf("%s missing CSS accessibility contract %q", path, contract)
+		}
+	}
+	if focusNoneRegex.MatchString(css) {
 		t.Errorf("%s removes the visible focus indicator", path)
 	}
 	if positiveTabRegex.MatchString(body) {
 		t.Errorf("%s uses a positive tabindex and breaks predictable keyboard order", path)
 	}
-	assertContrastPolicy(t, path, body)
+	assertContrastPolicy(t, path, css)
 
 	// Pages built from cards, charts, and forms rather than tabular data have
 	// no data table to name; every other page must expose one.
-	tableless := map[string]bool{"/settings": true, "/insights": true, "/login": true}
+	tableless := map[string]bool{"/settings": true, "/insights": true, "/tokedex": true, "/login": true}
 	tables := tablePattern.FindAllStringSubmatch(body, -1)
 	if len(tables) == 0 && !tableless[path] {
 		t.Errorf("%s has no semantic data table", path)

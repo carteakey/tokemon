@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -160,15 +161,35 @@ type evolutionResponse struct {
 	Composition database.TokenComposition `json:"composition"`
 }
 
+//go:embed templates/*.html
+var templateFS embed.FS
+
+type PageChrome struct {
+	Title       string
+	ActiveNav   string
+	CanLogout   bool
+	CSRFToken   string
+	ShowRefresh bool
+}
+
+func (s *Server) pageChrome(title, activeNav string, showRefresh bool) PageChrome {
+	return PageChrome{
+		Title:       title,
+		ActiveNav:   activeNav,
+		CanLogout:   s.passwordAccountConfigured(),
+		CSRFToken:   s.csrfToken(),
+		ShowRefresh: showRefresh,
+	}
+}
+
 type dashboardPage struct {
+	PageChrome
 	database.Overview
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
 	Machines       []database.MachineInfo
 	Sessions       []database.SessionRecord
 	Freshness      dataFreshness
-	CanLogout      bool
-	CSRFToken      string
 }
 
 // dataFreshness describes how recent the newest persisted event is, using the
@@ -195,6 +216,7 @@ func dataFreshnessFor(newest *time.Time, now time.Time) dataFreshness {
 }
 
 type analyticsPageData struct {
+	PageChrome
 	database.Analytics
 	ModelAliases   map[string]string
 	MachineAliases map[string]string
@@ -206,8 +228,6 @@ type analyticsPageData struct {
 	AxisTicks      []analyticsAxisTick
 	Insights       []analyticsInsight
 	Quotas         []quotaView
-	CanLogout      bool
-	CSRFToken      string
 }
 
 type analyticsAxisTick struct {
@@ -284,11 +304,10 @@ func aggregateAIInput(result database.Insights) insightai.Input {
 }
 
 type insightsPageData struct {
+	PageChrome
 	database.Insights
 	Facets         database.AnalyticsFacets
 	ModelAliases   map[string]string
-	CanLogout      bool
-	CSRFToken      string
 	MachineAliases map[string]string
 	HourlyMax      int64
 	WeekdayMax     int64
@@ -302,14 +321,13 @@ type aliasRow struct {
 }
 
 type settingsPage struct {
+	PageChrome
 	Models      []aliasRow
 	Machines    []aliasRow
-	CSRFToken   string
 	Saved       bool
 	Error       string
 	AuthMode    string
 	TokenSource string
-	CanLogout   bool
 }
 
 type catalogTier struct {
@@ -368,6 +386,7 @@ func catalogProviders(tiers []catalogTier) []string {
 }
 
 type catalogPageData struct {
+	PageChrome
 	Tiers                  []catalogTier
 	TierLegend             []catalogTierInfo
 	Providers              []string
@@ -377,17 +396,14 @@ type catalogPageData struct {
 	PricedTokens           int64
 	CatalogedUnknownTokens int64
 	UncatalogedModels      int
-	CanLogout              bool
-	CSRFToken              string
 }
 
 type sessionsPageData struct {
+	PageChrome
 	Sessions       []database.SessionRecord
 	Filter         database.AnalyticsQuery
 	Facets         database.AnalyticsFacets
 	ModelAliases   map[string]string
-	CanLogout      bool
-	CSRFToken      string
 	MachineAliases map[string]string
 	Sorts          map[string]sessionSortState
 }
@@ -1763,7 +1779,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	}
 	assetVersion := embeddedStaticVersion()
 	artDims := loadArtDimensions(staticFiles)
-	page, err := template.New("dashboard").Funcs(template.FuncMap{
+	page, err := template.New("").Funcs(template.FuncMap{
 		"tokedexEnabled":     func() bool { return config.EnableTokedex },
 		"commas":             commas,
 		"commasPtr":          commasPtr,
@@ -1914,26 +1930,8 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 			}
 			return 640
 		},
-	}).Parse(dashboardTemplate)
+	}).ParseFS(templateFS, "templates/*.html")
 	if err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(settingsTemplate); err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(analyticsTemplate); err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(catalogTemplate); err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(sessionsTemplate); err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(loginTemplate); err != nil {
-		return nil, err
-	}
-	if _, err := page.Parse(insightsTemplate); err != nil {
 		return nil, err
 	}
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -2359,9 +2357,9 @@ func (s *Server) quotasAPI(w http.ResponseWriter, r *http.Request) {
 // ——— Login form ———
 
 type loginPageData struct {
-	CSRFToken string
-	Next      string
-	Error     string
+	PageChrome
+	Next  string
+	Error string
 }
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
@@ -2370,7 +2368,7 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.URL.Query().Get("next"))}
+	page := loginPageData{PageChrome: s.pageChrome("Tokemon · Sign in", "login", false), Next: safeRedirectPath(r.URL.Query().Get("next"))}
 	s.renderLogin(w, http.StatusOK, page)
 }
 
@@ -2384,7 +2382,9 @@ func (s *Server) renderLogin(w http.ResponseWriter, status int, page loginPageDa
 // next target from the query — used before the POST body has been parsed.
 func (s *Server) renderLoginMessage(w http.ResponseWriter, status int, csrfToken, next, message string) {
 	w.WriteHeader(status)
-	s.renderLogin(w, status, loginPageData{CSRFToken: csrfToken, Next: safeRedirectPath(next), Error: message})
+	chrome := s.pageChrome("Tokemon · Sign in", "login", false)
+	chrome.CSRFToken = csrfToken
+	s.renderLogin(w, status, loginPageData{PageChrome: chrome, Next: safeRedirectPath(next), Error: message})
 }
 
 // maxLoginFormBytes bounds the login/logout POST bodies; the forms carry a
@@ -2411,7 +2411,7 @@ func (s *Server) loginSubmit(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginMessage(w, http.StatusBadRequest, s.csrfToken(), r.URL.Query().Get("next"), "Could not read the sign-in form.")
 		return
 	}
-	page := loginPageData{CSRFToken: s.csrfToken(), Next: safeRedirectPath(r.Form.Get("next"))}
+	page := loginPageData{PageChrome: s.pageChrome("Tokemon · Sign in", "login", false), Next: safeRedirectPath(r.Form.Get("next"))}
 	render := func(status int, message string) {
 		page.Error = message
 		w.WriteHeader(status)
@@ -3167,7 +3167,7 @@ func (s *Server) renderDashboardHTML(ctx context.Context, result database.Overvi
 	// logout affordance keys on the password account being configured, not
 	// on the per-request auth method. POST /logout is a no-op redirect for
 	// credentials-authenticated users.
-	page := dashboardPage{Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now()), CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
+	page := dashboardPage{PageChrome: s.pageChrome("Tokemon · Overview", "overview", true), Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now())}
 	var buffer bytes.Buffer
 	if err := s.template.ExecuteTemplate(&buffer, "dashboard", page); err != nil {
 		return nil, err
@@ -3197,7 +3197,7 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 	for _, model := range snapshot.Models {
 		byTier[model.Tier] = append(byTier[model.Tier], model)
 	}
-	page := catalogPageData{Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels, CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
+	page := catalogPageData{PageChrome: s.pageChrome("Tokemon · Tokedex", "tokedex", false), Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels}
 	for _, tier := range snapshot.Tiers {
 		models := byTier[tier]
 		if len(models) == 0 {
@@ -3238,7 +3238,7 @@ func (s *Server) sessionsPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
-	page := sessionsPageData{Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir), CanLogout: s.passwordAccountConfigured(), CSRFToken: s.csrfToken()}
+	page := sessionsPageData{PageChrome: s.pageChrome("Tokemon · Sessions", "sessions", false), Sessions: result, Filter: query, Facets: analytics, ModelAliases: modelAliases, MachineAliases: machineAliases, Sorts: sessionSortStates(r, sort, dir)}
 	if err := s.template.ExecuteTemplate(w, "sessions", page); err != nil {
 		return
 	}
@@ -3296,6 +3296,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 	modelAliases, machineAliases := aliasMaps(aliases)
 	axisMax := analyticsNiceMax(result.MaxTokens)
 	page := analyticsPageData{
+		PageChrome:     s.pageChrome("Tokemon · Analytics", "analytics", false),
 		Analytics:      result,
 		ModelAliases:   modelAliases,
 		MachineAliases: machineAliases,
@@ -3307,8 +3308,6 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AxisTicks:      analyticsAxisTicks(axisMax),
 		Insights:       analyticsInsights(result, time.Now(), modelAliases, machineAliases),
 		Quotas:         quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
-		CanLogout:      s.passwordAccountConfigured(),
-		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "analytics", page); err != nil {
 		return
@@ -3365,6 +3364,7 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	modelAliases, machineAliases := aliasMaps(aliases)
 	page := insightsPageData{
+		PageChrome:     s.pageChrome("Tokemon · Insights", "insights", false),
 		Insights:       result,
 		Facets:         facets,
 		ModelAliases:   modelAliases,
@@ -3372,8 +3372,6 @@ func (s *Server) insightsPage(w http.ResponseWriter, r *http.Request) {
 		HourlyMax:      insightDistributionMax(result.Hourly),
 		WeekdayMax:     insightDistributionMax(result.Weekdays),
 		Recap:          s.insightsRecap(r.Context(), result),
-		CanLogout:      s.passwordAccountConfigured(),
-		CSRFToken:      s.csrfToken(),
 	}
 	if err := s.template.ExecuteTemplate(w, "insights", page); err != nil {
 		return
@@ -3822,13 +3820,12 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	modelAliases, machineAliases := aliasMaps(aliases)
 	authMode, tokenSource := s.authSummary()
 	page := settingsPage{
+		PageChrome:  s.pageChrome("Tokemon · Settings", "settings", false),
 		Models:      modelAliasRows(result.ByModel, modelAliases),
 		Machines:    machineAliasRows(result.ByMachine, machineAliases),
-		CSRFToken:   s.csrfToken(),
 		Saved:       r.URL.Query().Get("saved") == "1",
 		AuthMode:    authMode,
 		TokenSource: tokenSource,
-		CanLogout:   s.passwordAccountConfigured(),
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
@@ -3888,919 +3885,6 @@ func writeAccessibleError(w http.ResponseWriter, status int, message string) {
 	w.WriteHeader(status)
 	_, _ = fmt.Fprintf(w, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Tokemon error</title></head><body><main><h1>Settings error</h1><div role=\"alert\" tabindex=\"-1\">%s</div><p><a href=\"/settings\">Return to settings</a></p></main></body></html>", template.HTMLEscapeString(message))
 }
-
-const dashboardTemplate = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
-  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
-  <title>Tokemon · Overview</title>
-  <style>
-    @font-face {
-      font-family: "Pixelify Sans";
-      font-style: normal;
-      font-weight: 400 700;
-      font-display: swap;
-      src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2");
-    }
-    :root {
-      color-scheme: dark;
-      --font-display: "Pixelify Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      --bg: #10110f;
-      --surface: #171916;
-      --surface-raised: #1d201b;
-      --surface-soft: #22261f;
-      --text: #f0ede5;
-      --muted: #a2a69b;
-      --faint: #a5ad9c;
-      --line: #30352d;
-      --line-bright: #485044;
-      --control-border: #66705f;
-      --accent: #9bbba0;
-      --accent-dim: #607864;
-      --warm: #d2a477;
-      --danger: #bd7164;
-      --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
-    * { box-sizing: border-box; }
-    [hidden] { display: none !important; }
-    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
-    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
-    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    a { color: inherit; text-decoration: none; }
-    button { font: inherit; }
-    main { width: min(1408px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
-    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
-    .topbar-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 12px; }
-    .refresh-control { display: inline-flex; gap: 6px; }
-    .refresh-glyph { display: none; }
-    .refresh-btn { padding: 6px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
-    .refresh-btn:hover, .refresh-btn:focus-visible { border-color: var(--accent); color: var(--accent); }
-    .refresh-btn[aria-pressed="true"] { border-color: var(--warm); color: var(--warm); }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, .22)); }
-    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
-    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
-    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
-    .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--control-border); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .hero { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.45fr); gap: 10px; padding: 10px 0; }
-    .hero > .panel, .content-grid > .panel { min-width: 0; }
-    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
-    .creature-panel { position: relative; min-height: 360px; overflow: hidden; padding: 14px 16px; background: radial-gradient(circle at 50% 40%, rgba(155, 187, 160, .11), transparent 48%), var(--surface); }
-    .creature-art-wrap { display: grid; min-height: 252px; place-items: center; padding: 2px 20px 0; }
-    .creature-art { width: auto; max-width: min(100%, 278px); height: auto; max-height: 252px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 20px 24px rgba(0, 0, 0, .22)); transition: transform .35s ease, filter .35s ease; }
-    .creature-art:hover { transform: translateY(-5px) scale(1.02); filter: drop-shadow(0 25px 30px rgba(0, 0, 0, .32)); }
-    .creature-fallback { display: grid; width: 220px; height: 220px; place-items: center; border: 1px dashed var(--line-bright); border-radius: 50%; color: var(--accent); font: 700 30px ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .creature-fallback[hidden] { display: none; }
-    .creature-caption { display: flex; align-items: center; flex-direction: column; gap: 6px; padding-top: 3px; text-align: center; }
-    .form-name { margin-top: 2px; color: var(--text); font-family: var(--font-display); font-size: clamp(24px, 3vw, 34px); font-weight: 700; letter-spacing: .02em; }
-    .stage-chip { padding: 5px 10px; border: 1px solid var(--warm); border-radius: 5px; color: var(--warm); font: 600 10px/1 var(--font-data); letter-spacing: .08em; white-space: nowrap; }
-    .power-panel { display: flex; min-height: 360px; flex-direction: column; padding: 16px 18px; }
-    .power-kicker { color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .power-value { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin: 9px 0 0; overflow: hidden; column-gap: 3px; color: var(--text); font: 700 clamp(30px, 6vw, 90px)/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
-    .odometer-static { white-space: nowrap; }
-    .odometer-reel { position: relative; display: block; flex: 0 0 .82em; height: 1em; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 4px; background: linear-gradient(180deg, #292c26 0 49%, #1d201b 50% 100%); box-shadow: inset 0 1px rgba(255,255,255,.035), inset 0 -8px 18px rgba(0,0,0,.16); line-height: 1; }
-    .odometer-reel::after { position: absolute; z-index: 2; top: 50%; right: 0; left: 0; border-top: 1px solid rgba(8, 9, 8, .65); border-bottom: 1px solid rgba(255, 255, 255, .025); content: ""; pointer-events: none; }
-    .odometer-separator { display: block; flex: 0 0 .2em; color: var(--muted); line-height: 1; text-align: center; }
-    .odometer-strip { display: flex; flex-direction: column; transform: translateY(0); transition: transform 1.35s cubic-bezier(.2, .75, .2, 1); will-change: transform; }
-    .odometer-digit { display: grid; flex: 0 0 1em; height: 1em; place-items: center; color: var(--text); line-height: 1; text-align: center; text-shadow: 0 2px 0 rgba(0,0,0,.32); }
-    .odometer.is-ready .odometer-static, .mini-odometer.is-ready .odometer-static { display: none; }
-    .power-composition { margin-top: 18px; }
-    .composition-meter { display: flex; height: 30px; overflow: hidden; gap: 3px; border: 0; border-radius: 4px; background: transparent; }
-    .composition-segment { display: block; min-width: 0; transition: width .45s ease; }
-    .composition-segment.uncached { background: var(--accent-dim); }
-    .composition-segment.cached { background: var(--accent); }
-    .composition-segment.output { background: var(--warm); }
-    .composition-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
-    .composition-item { display: flex; min-width: 0; align-items: start; flex-direction: column; justify-content: start; gap: 4px; padding: 8px 10px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); color: var(--muted); cursor: help; font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .composition-label { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; }
-    .composition-share { color: var(--accent); font-weight: 700; letter-spacing: 0; }
-    .composition-item.output .composition-share { color: var(--warm); }
-    .composition-item:hover, .composition-item:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
-    .composition-item.output { border-color: rgba(210, 164, 119, .58); background: rgba(210, 164, 119, .06); }
-    .composition-item.output:hover, .composition-item.output:focus-visible { border-color: var(--warm); outline-color: var(--warm); }
-    .composition-item strong { color: var(--text); font-size: 20px; font-weight: 700; letter-spacing: 0; line-height: 1; }
-    .composition-item.output strong { color: var(--warm); font-size: 22px; }
-    .mini-odometer { display: flex; align-items: center; width: 100%; min-width: 0; height: 1.14em; margin-top: 2px; overflow: hidden; column-gap: 1px; color: var(--text); font: 700 20px/1 var(--font-data); font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
-    .mini-odometer .odometer-reel { flex-basis: .82em; }
-    .mini-odometer .odometer-separator { flex-basis: .18em; }
-    .composition-item.output .odometer-digit, .composition-item.output .odometer-separator { color: var(--warm); }
-    .composition-swatch { display: inline-block; width: 7px; height: 7px; margin: 0 5px 1px 0; border-radius: 1px; }
-    .composition-swatch.output { background: var(--warm); }
-    .composition-swatch.input { background: var(--accent-dim); }
-    .progress-block { margin-top: auto; padding-top: 18px; }
-    .progress-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .progress-row strong { color: var(--text); font-weight: 600; }
-    .progress-value { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; margin-top: 7px; font: 700 20px/1 var(--font-data); }
-    .progress-value strong:first-child { color: var(--warm); }
-    .progress-value small { color: var(--text); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-    .progress-value strong:last-child { color: var(--accent); }
-    .progress { height: 22px; margin: 8px 0 0; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 4px; background: #11130f; }
-    .progress span { display: block; width: {{percent .Evolution.Progress}}%; height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); box-shadow: 0 0 18px rgba(155, 187, 160, .2); }
-    .stat-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; padding: 0 0 10px; }
-    .stat { display: grid; min-width: 0; min-height: 76px; grid-template-columns: 36px minmax(0, 1fr); align-items: center; gap: 11px; padding: 10px 13px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
-    .stat-icon { display: block; width: 36px; height: 36px; object-fit: contain; image-rendering: pixelated; }
-    .stat-copy { min-width: 0; }
-    .stat-label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    .stat-value { margin-top: 8px; overflow: hidden; color: var(--text); font: 700 20px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .stat-value.muted { color: var(--muted); font-size: 13px; font-weight: 500; }
-    .stat-detail { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 9px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .activity-panel { margin-bottom: 10px; padding: 12px 16px; border-radius: 7px; }
-    .activity-shell { display: flex; gap: 8px; margin-top: 7px; min-width: 0; }
-    .activity-weekday-labels { display: grid; flex: 0 0 26px; grid-template-rows: 12px repeat(7, 12px); gap: 2px; color: var(--faint); font: 8px/12px var(--font-data); text-align: right; }
-    .activity-weekday-labels span { height: 12px; }
-    .activity-scroll { min-width: 0; flex: 1; overflow-x: auto; padding: 0 3px 7px 0; scrollbar-color: var(--line-bright) transparent; }
-    .activity-grid { display: grid; width: 100%; min-width: 670px; grid-template-columns: repeat(53, minmax(9px, 1fr)); gap: 2px; }
-    .activity-week { display: grid; min-width: 0; grid-template-rows: 12px repeat(7, 12px); gap: 2px; }
-    .activity-month { overflow: visible; color: var(--faint); font: 8px/12px var(--font-data); white-space: nowrap; }
-    .activity-cell { display: block; width: 100%; height: 12px; border: 1px solid #293127; border-radius: 0; background: #1a1f19; image-rendering: pixelated; }
-    .activity-cell.level-1 { border-color: #36533b; background: #2a4430; }
-    .activity-cell.level-2 { border-color: #4f724c; background: #416b46; }
-    .activity-cell.level-3 { border-color: #779b5f; background: #6b8d56; }
-    .activity-cell.level-4 { border-color: #aecb79; background: #9bb76d; }
-    .activity-cell.unknown { border-color: var(--warm); }
-    .activity-cell.future { border-color: transparent; background: transparent; box-shadow: none; }
-    .activity-cell:not(.future) { cursor: pointer; }
-    .activity-cell:not(.future):hover, .activity-cell:not(.future):focus-visible { position: relative; z-index: 1; outline: 2px solid var(--warm); outline-offset: 2px; }
-    .activity-legend { display: flex; align-items: center; gap: 4px; color: var(--faint); font: 9px var(--font-data); }
-    .activity-legend .activity-cell { width: 11px; height: 11px; }
-    .activity-empty { margin-top: 4px; color: var(--faint); font-size: 12px; }
-    .activity-tooltip { position: fixed; z-index: 20; width: min(320px, calc(100vw - 24px)); padding: 15px 16px 16px; border: 2px solid var(--warm); border-radius: 0; background: #12160f; box-shadow: 4px 4px 0 #090b08, inset 0 0 0 1px rgba(155, 187, 160, .16); color: var(--text); pointer-events: none; }
-    .activity-tooltip[hidden] { display: none; }
-    .activity-tooltip-date { color: var(--accent); font-family: var(--font-display); font-size: 15px; font-weight: 600; letter-spacing: .02em; line-height: 1.2; }
-    .activity-tooltip-summary { margin-top: 10px; padding: 8px 0; border-top: 1px solid var(--line-bright); border-bottom: 1px solid var(--line-bright); color: var(--text); font: 700 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .activity-tooltip-note { margin-top: 8px; color: var(--warm); font-family: var(--font-display); font-size: 11px; line-height: 1.25; }
-    .activity-tooltip-section { margin-top: 12px; }
-    .activity-tooltip-section-title { color: var(--faint); font-family: var(--font-display); font-size: 10px; font-weight: 600; letter-spacing: .14em; line-height: 1; }
-    .activity-tooltip-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 5px 0 4px; border-bottom: 1px dotted var(--line); font: 12px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .activity-tooltip-row span:first-child { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
-    .activity-tooltip-row span:last-child { flex: 0 0 auto; color: var(--accent); white-space: nowrap; }
-    .content-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .context-grid, .health-panel, .sessions-panel { margin-top: 10px; }
-    .context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-    .context-card { padding: 13px 16px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
-    .context-card h2 { margin: 0; color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    .context-value { margin-top: 9px; color: var(--text); font: 700 24px/1 var(--font-data); }
-    .context-detail { margin-top: 6px; color: var(--muted); font: 10px/1.3 var(--font-data); }
-    .health-panel, .sessions-panel { padding: 12px 16px; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
-    .health-table, .sessions-table { min-width: 700px; overflow-wrap: anywhere; }
-    .health-scroll, .sessions-scroll { overflow-x: auto; }
-    .status-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--line-bright); border-radius: 999px; font: 700 9px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .status-pill::before { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); content: ""; }
-    .status-pill.connected { border-color: rgba(155, 187, 160, .55); color: var(--accent); }
-    .status-pill.connected::before { background: var(--accent); }
-    .status-pill.stale { border-color: rgba(210, 164, 119, .6); color: var(--warm); }
-    .status-pill.stale::before { background: var(--warm); }
-    .status-pill.offline { border-color: rgba(189, 113, 100, .55); color: #d88b7e; }
-    .status-pill.offline::before { background: #d88b7e; }
-    .table-muted { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; font-weight: 400; }
-    .copy-id { display:inline-flex; align-items:center; flex:none; margin-left:6px; padding:2px 6px; border:1px solid var(--control-border); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; }
-    .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); }
-    .unknown-value { color: var(--warm); }
-    .data-panel { min-height: 0; padding: 12px 16px; }
-    .section-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
-    .section-title { margin: 0; color: var(--accent); font: 700 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    table { width: 100%; table-layout: fixed; border-collapse: collapse; margin-top: 2px; }
-    th, td { padding: 7px 0; border-bottom: 1px solid var(--line); text-align: left; }
-    th { color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    th:first-child, td:first-child { width: 60%; }
-    th:nth-child(2), td:nth-child(2) { width: 18%; }
-    th:last-child, td:last-child { width: 22%; }
-    td:first-child { min-width: 0; color: var(--text); font-weight: 600; }
-    .row-name { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
-    .row-name > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .row-icon { display: block; flex: 0 0 17px; width: 17px; height: 17px; object-fit: contain; image-rendering: pixelated; }
-    .pixel-glyph { display: grid; flex: 0 0 17px; width: 17px; height: 17px; grid-template: repeat(5, 2px) / repeat(5, 2px); place-content: center; gap: 1px; border: 1px solid var(--glyph-edge); border-radius: 3px; background: #11130f; image-rendering: pixelated; }
-    .pixel-glyph i { display: block; width: 2px; height: 2px; background: transparent; }
-    .pixel-glyph i.dim { background: var(--glyph-dim); }
-    .pixel-glyph i.on { background: var(--glyph); }
-    .pixel-glyph.palette-0 { --glyph: #a995d3; --glyph-dim: #382f49; --glyph-edge: #5f5076; }
-    .pixel-glyph.palette-1 { --glyph: #7fa7c5; --glyph-dim: #293c4a; --glyph-edge: #49677b; }
-    .pixel-glyph.palette-2 { --glyph: #9bbba0; --glyph-dim: #2e4232; --glyph-edge: #536f58; }
-    .pixel-glyph.palette-3 { --glyph: #d2a477; --glyph-dim: #493724; --glyph-edge: #795c3c; }
-    .project-glyph, .machine-glyph { border-color: transparent; border-radius: 0; background: transparent; }
-    .project-glyph i.dim, .machine-glyph i.dim { background: var(--glyph-edge); }
-    th:not(:first-child), td:not(:first-child) { padding-left: 6px; text-align: right; white-space: nowrap; }
-    td:nth-child(2), td:last-child { overflow: hidden; text-overflow: ellipsis; }
-    td:last-child { color: var(--warm); font-weight: 700; }
-    .empty-row td { padding: 26px 0 8px; color: var(--faint); font-size: 13px; font-weight: 400; }
-    .section-link { color: var(--faint); font: 10px/1.2 var(--font-data); }
-    .section-link:hover, .section-link:focus-visible { color: var(--accent); }
-    /* The fixed 60/24/16 split above is for the three-column breakdown cards;
-       the wide health and session tables size columns to their content. */
-    .health-table, .sessions-table { table-layout: auto; }
-    .health-table { min-width: 860px; }
-    .sessions-table { min-width: 1060px; }
-    .health-table :is(th, td), .sessions-table :is(th, td) { width: auto; padding: 10px 0 10px 18px; vertical-align: top; }
-    .health-table :is(th, td):first-child, .sessions-table :is(th, td):first-child { width: 100%; padding-left: 0; }
-    .health-table th, .sessions-table th { padding-top: 8px; padding-bottom: 8px; vertical-align: bottom; }
-    .health-table td:last-child, .sessions-table td:last-child { overflow: visible; color: var(--muted); font-weight: 400; }
-    .health-table td.sync-error { color: var(--warm); font-weight: 700; }
-    .source-health { display: block; margin-top: 4px; }
-    .source-health-line { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; }
-    .source-health-line .status-pill { vertical-align: middle; }
-    .source-health-line .sync-error { color: var(--warm); font-weight: 700; }
-    .source-details { margin-top: 5px; max-width: 340px; margin-left: auto; text-align: left; white-space: normal; overflow-wrap: anywhere; }
-    .source-details-summary { cursor: pointer; color: var(--accent); font: 700 10px/1.3 var(--font-data); }
-    .source-details-summary:hover, .source-details-summary:focus-visible { color: var(--text); }
-    .source-details-list { display: grid; gap: 3px; margin-top: 4px; padding-left: 8px; border-left: 1px solid var(--line-bright); }
-    .source-detail-line { display: block; color: var(--faint); font-size: 10px; line-height: 1.35; }
-    .source-detail-line .status-pill { vertical-align: middle; }
-    .source-detail-line .sync-error { color: var(--warm); font-weight: 700; }
-    .sessions-table td:nth-child(3) { color: var(--text); }
-    .first-run { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 16px; padding: 18px 22px; border: 1px solid rgba(155, 187, 160, .24); border-radius: 10px; background: linear-gradient(100deg, rgba(155, 187, 160, .08), rgba(155, 187, 160, .025)); }
-    .first-run h2 { margin: 0 0 4px; color: var(--text); font-family: var(--font-display); font-size: 14px; font-weight: 600; letter-spacing: .01em; text-transform: none; }
-    .first-run p { max-width: 560px; color: var(--muted); font-size: 13px; }
-    .command { padding: 10px 12px; border: 1px solid var(--line-bright); border-radius: 7px; background: #11130f; color: var(--accent); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
-    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
-    @media (max-width: 1050px) {
-      .stat-grid { grid-template-columns: repeat(3, 1fr); }
-      .content-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 1240px) and (min-width: 821px) {
-      .power-value { column-gap: 2px; }
-      .odometer-reel { flex-basis: .8em; }
-      .odometer-separator { flex-basis: .18em; }
-    }
-    @media (max-width: 820px) {
-      main { width: min(100% - 20px, 620px); margin: 10px auto; padding: 10px; }
-      .topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-      .nav { order: 3; width: 100%; justify-content: center; gap: 4px; }
-      .settings-link { margin-left: auto; }
-      .hero, .content-grid { grid-template-columns: 1fr; }
-      .power-panel, .creature-panel { min-height: 0; }
-      .power-panel { min-height: 350px; }
-      .stat-grid { grid-template-columns: repeat(2, 1fr); }
-      .stat-grid > .stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
-      .activity-panel { padding: 18px; }
-      .context-grid { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 640px) {
-      /* Phones stack each health and session row into a labelled card. */
-      .health-table, .sessions-table { min-width: 0; }
-      .health-table thead, .sessions-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
-      .health-table tbody tr, .sessions-table tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
-      .health-table td, .sessions-table td { display: block; width: auto; padding: 0; border: 0; text-align: left; white-space: normal; }
-      .health-table td:first-child, .sessions-table td:first-child, .empty-row td { grid-column: 1 / -1; }
-      .sessions-table td:nth-child(4), .sessions-table td:nth-child(5) { display: none; }
-      .health-table td[data-label]::before, .sessions-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-      .source-details { max-width: none; margin-left: 0; }
-    }
-    @media (max-width: 500px) {
-      main { width: min(100% - 12px, 420px); margin: 6px auto; padding: 6px; border-radius: 8px; }
-      .nav-link { padding: 6px 7px; font-size: 10px; }
-      /* The topbar cannot fit two uppercase text buttons beside the brand,
-         gear, and logout: the refresh controls become icon-only. The visible
-         glyph takes over from the text label; the announced name stays on
-         aria-label, which tracks the pause state. Touch targets keep their
-         32x32 minimum. */
-      .refresh-btn { width: 32px; height: 32px; min-width: 32px; min-height: 32px; padding: 0; display: inline-grid; place-items: center; }
-      .refresh-glyph { display: inline; font-size: 16px; line-height: 1; }
-      .refresh-label { display: none; }
-      .hero { padding-top: 14px; }
-      .creature-panel { padding: 16px; }
-      .power-panel, .data-panel { padding: 18px; }
-      .activity-panel { padding: 16px; }
-      .stat { grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 10px; }
-      .stat-icon { width: 30px; height: 30px; }
-      .power-value { column-gap: 2px; font-size: clamp(26px, 9vw, 48px); }
-      .odometer-reel { flex-basis: .8em; }
-      .odometer-separator { flex-basis: .18em; }
-      .first-run { align-items: start; flex-direction: column; gap: 14px; }
-      .command { width: 100%; overflow: auto; }
-      footer { flex-direction: column; gap: 4px; }
-    }
-    @media (max-width: 420px) { .composition-primary { grid-template-columns: 1fr; gap: 10px; } }
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
-      .odometer-strip { transition: none; }
-    }
-  </style>
-</head>
-<body>
-<a class="skip-link" href="#main-content">Skip to content</a>
-<main id="main-content">
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview">
-      <img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34">
-      <span class="brand-name">TOKEMON</span>
-    </a>
-    <nav class="nav" aria-label="Primary navigation">
-      <a class="nav-link active" href="/" aria-current="page">Overview</a>
-      <a class="nav-link" href="/analytics">Analytics</a>
-      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
-      <a class="nav-link" href="/sessions">Sessions</a>
-    </nav>
-    <div class="topbar-actions">
-      <div class="refresh-control">
-        <button type="button" id="refresh-now" class="refresh-btn" aria-label="Refresh now"><span class="refresh-glyph" aria-hidden="true">&#8635;</span><span class="refresh-label">Refresh now</span></button>
-        <button type="button" id="auto-refresh-toggle" class="refresh-btn" aria-pressed="false"><span class="refresh-glyph" aria-hidden="true">&#9208;</span><span class="refresh-label">Pause auto-refresh</span></button>
-      </div>
-      <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
-    </div>
-  </header>
-
-  <section class="hero" aria-labelledby="hero-title">
-    <h1 id="hero-title" class="sr-only">Current Tokemon and lifetime usage</h1>
-    <article class="panel creature-panel" data-stage="{{.Evolution.Stage}}">
-      <div class="creature-art-wrap">
-        <img class="creature-art" src="{{assetPath .Evolution.Stage}}" alt="{{.Evolution.FormName}}, stage {{.Evolution.Stage}}" width="{{assetWidth .Evolution.Stage}}" height="{{assetHeight .Evolution.Stage}}" fetchpriority="high" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
-        <div class="creature-fallback" hidden>STAGE {{.Evolution.Stage}}</div>
-      </div>
-      <div class="creature-caption">
-        <div class="form-name">{{.Evolution.FormName}}</div>
-        <div class="stage-chip">FORM / {{printf "%02d" .Evolution.Stage}}</div>
-      </div>
-    </article>
-
-    <article class="panel power-panel">
-      <div class="power-kicker">Lifetime tokens</div>
-      <div class="power-value odometer" id="lifetime-counter" data-display="{{commas .LifetimeTokens}}" data-label="Lifetime tokens" aria-label="Lifetime tokens: {{commas .LifetimeTokens}}"><span class="odometer-static">{{commas .LifetimeTokens}}</span></div>
-      {{$comp := .Composition}}{{$compTotal := compositionTotal $comp}}
-      <div class="power-composition" id="token-composition" aria-label="Token mix">
-        <div class="composition-meter" id="live-composition-meter" aria-hidden="true">
-          <span class="composition-segment uncached" id="live-uncached-segment"{{if eq $comp.UncachedInputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.UncachedInputTokens $compTotal}}%"></span>
-          <span class="composition-segment cached" id="live-cached-segment"{{if eq $comp.CachedInputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.CachedInputTokens $compTotal}}%"></span>
-          <span class="composition-segment output" id="live-output-segment"{{if eq $comp.OutputTokens 0}} hidden{{end}} style="width: {{compositionWidth $comp.OutputTokens $compTotal}}%"></span>
-        </div>
-        <div class="composition-primary">
-          <span class="composition-item input" id="live-input" data-tooltip-kind="composition" data-tooltip="{{compositionTooltip "Input" $comp.InputTokens}}" aria-label="Input: {{commas $comp.InputTokens}} tokens" tabindex="0"><span class="composition-label"><span><i class="composition-swatch input" aria-hidden="true"></i>Input</span><span class="composition-share" id="live-input-share">{{compositionShare $comp.InputTokens $compTotal}}</span></span><strong class="mini-odometer" id="live-input-tokens" data-display="{{commas $comp.InputTokens}}"><span class="odometer-static">{{commas $comp.InputTokens}}</span></strong></span>
-          <span class="composition-item output" id="live-output" data-tooltip-kind="composition" data-tooltip="{{compositionTooltip "Output" $comp.OutputTokens}}" aria-label="Output: {{commas $comp.OutputTokens}} tokens" tabindex="0"><span class="composition-label"><span><i class="composition-swatch output" aria-hidden="true"></i>Output</span><span class="composition-share" id="live-output-share">{{compositionShare $comp.OutputTokens $compTotal}}</span></span><strong class="mini-odometer" id="live-output-tokens" data-display="{{commas $comp.OutputTokens}}"><span class="odometer-static">{{commas $comp.OutputTokens}}</span></strong></span>
-        </div>
-      </div>
-      <div class="progress-block">
-        <div class="progress-row"><span>Next evolution</span>{{if .Evolution.NextThreshold}}<strong>{{compactPtr .Evolution.NextThreshold}} lifetime target</strong>{{else}}<strong>Maximum stage</strong>{{end}}</div>
-        <div class="progress-value"><strong id="live-remaining-copy">{{if .Evolution.TokensRemaining}}{{compactPtr .Evolution.TokensRemaining}} <small>to go</small>{{else}}Final form{{end}}</strong><strong id="live-progress-label">{{printf "%.0f" (mul .Evolution.Progress 100)}}%</strong></div>
-        <div class="progress" id="live-progress" role="progressbar" aria-label="Evolution progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{percent .Evolution.Progress}}"><span></span></div>
-      </div>
-    </article>
-  </section>
-
-  <section class="stat-grid" aria-label="Usage summary">
-    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/top-machine.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Top machine</div>{{if .ByMachine}}<div class="stat-value" title="{{(index .ByMachine 0).Machine}}">{{machineDisplayName $.MachineAliases (index .ByMachine 0).Machine}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/api-cost.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Est. API cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div><small class="stat-detail">{{compact .EstimatedCost.PricedTokens}} priced{{if .EstimatedCost.UnpricedTokens}} · {{compact .EstimatedCost.UnpricedTokens}} unpriced{{end}}</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/cache-hit.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div><small class="stat-detail">{{compact .Cache.CachedTokens}} cached · {{compact (cacheUncached .Cache)}} uncached</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/threads.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Threads}}</div></div></article>
-    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/active-days.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Activity.ActiveDays}}</div></div></article>
-  </section>
-
-  <section class="context-grid" aria-label="Today and week usage">
-    <article class="context-card"><h2>Today <span class="status-pill {{.Freshness.Class}}" title="Newest stored event: {{.Freshness.Age}}">{{.Freshness.State}} · {{.Freshness.Age}}</span></h2><div class="context-value">{{commas .Today.Tokens}} tokens</div><div class="context-detail">{{commas .Today.Events}} events · {{commas .Today.InputTokens}} input · {{commas .Today.OutputTokens}} output{{if .Today.UnknownTokens}} · {{commas .Today.UnknownTokens}} unknown totals{{end}}</div></article>
-    <article class="context-card"><h2>This week</h2><div class="context-value">{{commas .Week.Tokens}} tokens</div><div class="context-detail">{{commas .Week.Events}} events · {{commas .Week.InputTokens}} input · {{commas .Week.OutputTokens}} output{{if .Week.UnknownTokens}} · {{commas .Week.UnknownTokens}} unknown totals{{end}}</div></article>
-  </section>
-
-  <section class="panel activity-panel" aria-labelledby="activity-title">
-    <div class="section-head">
-      <h2 class="section-title" id="activity-title">Token activity</h2>
-      {{if .Activity.ActiveDays}}<div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>{{end}}
-    </div>
-    <div class="activity-shell">
-      <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
-      <div class="activity-scroll" tabindex="0" role="region" aria-label="Daily token activity, scrollable">
-        <div class="activity-grid" role="grid" aria-label="Daily token activity for the last 53 weeks">
-          {{$initialTab := activityInitialTab .Activity}}
-          {{range .Activity.Weeks}}
-          <div class="activity-week" role="row">
-            <span class="activity-month" role="presentation">{{.MonthLabel}}</span>
-            {{range .Days}}<span class="activity-cell level-{{.Level}}{{if .UnknownTokens}} unknown{{end}}{{if .Future}} future{{end}}" role="gridcell" {{if .Future}}aria-hidden="true"{{else}}data-tooltip="{{activityTooltip .}}" aria-label="{{activityTooltip .}}" tabindex="{{activityTabStop . $initialTab}}"{{end}}></span>{{end}}
-          </div>
-          {{end}}
-        </div>
-      </div>
-    </div>
-    {{if not .Activity.ActiveDays}}
-    <div class="activity-empty">No token activity in this field yet. Your Tokemon is waiting for its first training session.</div>
-    {{end}}
-  </section>
-
-  <section class="content-grid" aria-labelledby="breakdowns-title">
-    <h2 id="breakdowns-title" class="sr-only">Usage breakdowns</h2>
-    <article class="panel data-panel">
-      <div class="section-head"><h2 class="section-title">Projects</h2></div>
-      <table aria-label="Project token usage"><caption class="sr-only">Project token usage</caption><thead><tr><th scope="col">Project</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topProjects .ByProject}}<tr><td><span class="row-name">{{with projectGlyph .Project}}<span class="pixel-glyph project-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if .Project}}<span title="{{.Project}}">{{.Project}}</span>{{else}}<span class="unknown-value">Unknown project</span>{{end}}</span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No project usage yet.</td></tr>{{end}}</tbody></table>
-    </article>
-    <article class="panel data-panel">
-      <div class="section-head"><h2 class="section-title">Harnesses</h2></div>
-      <table aria-label="Harness token usage"><caption class="sr-only">Harness token usage</caption><thead><tr><th scope="col">Harness</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topTools .ByTool}}<tr><td><span class="row-name">{{with harnessGlyph .Tool}}<span class="pixel-glyph harness-glyph preset-{{.Preset}} palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{harnessName .Tool}}">{{harnessName .Tool}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No harness usage yet.</td></tr>{{end}}</tbody></table>
-    </article>
-    <article class="panel data-panel">
-      <div class="section-head"><h2 class="section-title">Models</h2></div>
-      <table aria-label="Model token usage"><caption class="sr-only">Model token usage</caption><thead><tr><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range topModels .ByModel}}<tr><td><span class="row-name">{{with modelGlyph .Model}}<span class="pixel-glyph model-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}{{if eq .Model "unknown"}}<span class="unknown-value" title="{{.Model}}">Unknown model</span>{{else}}<span title="{{.Model}}">{{modelDisplayName $.ModelAliases .Model}}</span>{{end}}</span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No model usage yet.</td></tr>{{end}}</tbody></table>
-    </article>
-    <article class="panel data-panel">
-      <div class="section-head"><h2 class="section-title">Machines</h2></div>
-      <table aria-label="Machine token usage"><caption class="sr-only">Machine token usage</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th></tr></thead><tbody>{{range .ByMachine}}<tr><td><span class="row-name">{{with machineGlyph .Machine}}<span class="pixel-glyph machine-glyph palette-{{.Palette}}" aria-hidden="true">{{range .Cells}}<i class="{{glyphCell .}}"></i>{{end}}</span>{{end}}<span title="{{.Machine}}">{{machineDisplayName $.MachineAliases .Machine}}</span></span></td><td title="{{commas .Tokens}} tokens" aria-label="{{commas .Tokens}} tokens">{{compact .Tokens}}</td><td>{{share .Tokens $.LifetimeTokens}}</td></tr>{{else}}<tr class="empty-row"><td colspan="3">No machines yet.</td></tr>{{end}}</tbody></table>
-    </article>
-  </section>
-
-  <section class="panel health-panel" aria-labelledby="health-title">
-    <div class="section-head"><h2 class="section-title" id="health-title">Machine health</h2><a class="section-link" href="/api/v1/machines">Read API</a></div>
-    <div class="health-scroll" tabindex="0" role="region" aria-label="Machine health table, scrollable"><table class="health-table" aria-label="Machine health"><caption class="sr-only">Machine health</caption><thead><tr><th scope="col">Machine</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col">Today</th><th scope="col">Week</th><th scope="col">Lifetime</th><th scope="col">Sync context</th></tr></thead><tbody>{{range .Machines}}<tr><td>{{machineDisplayName $.MachineAliases .Name}}<span class="table-muted">{{.OperatingSystem}} · {{.Architecture}} · {{if .DetectedAdapters}}{{joinAdapters .DetectedAdapters}}{{else}}no adapters reported{{end}}</span></td><td data-label="Status"><span class="status-pill {{statusClass .Status}}">{{.Status}}</span></td><td data-label="Last seen">{{analyticsTime .LastSeenAt}}</td><td data-label="Today">{{commas .TodayTokens}}</td><td data-label="Week">{{commas .WeekTokens}}</td><td data-label="Lifetime">{{commas .LifetimeTokens}}</td><td data-label="Sync context"{{if .SourceErrorCount}} class="sync-error"{{end}}>{{.SyncContext}}{{if .SourceErrorCount}}<span class="table-muted">of {{.SourceCount}} source{{if ne .SourceCount 1}}s{{end}}</span>{{end}}{{if .Sources}}{{$summary := machineSourceGroups .Sources}}<span class="source-health">{{range $summary.Groups}}{{if eq .Count 1}}<span class="source-health-line" title="{{.SingleSourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}} · {{.SingleAge}}</span>{{else}}<span class="source-health-line"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}} · {{.Summary}}{{if .ErrorSummary}} · <span class="sync-error">{{.ErrorSummary}}</span>{{end}}</span>{{end}}{{end}}{{if $summary.HasDetails}}<details class="source-details"><summary class="source-details-summary">{{if $summary.ProblemCount}}{{$summary.ProblemCount}} stale or errored ({{$summary.TotalSources}} total){{else}}{{$summary.TotalSources}} sources across {{len $summary.Groups}} adapter{{if ne (len $summary.Groups) 1}}s{{end}}{{end}}</summary><div class="source-details-list">{{if $summary.ProblemSources}}{{range $summary.ProblemSources}}<span class="source-detail-line" title="{{.SourceHash}}"><span class="status-pill {{sourceStateClass .State}}">{{.State}}</span> {{.Adapter}}{{if .LastErrorClass}} · <span class="sync-error">{{.LastErrorClass}}</span>{{end}} · {{.Age}}</span>{{end}}{{if $summary.OmittedProblems}}<span class="source-detail-line">+ {{$summary.OmittedProblems}} more stale or errored sources</span>{{end}}{{else}}{{range $summary.Groups}}<span class="source-detail-line">{{.Adapter}}: {{.Summary}}</span>{{end}}{{end}}</div></details>{{end}}</span>{{end}}</td></tr>{{else}}<tr class="empty-row"><td colspan="7">No machine heartbeats yet.</td></tr>{{end}}</tbody></table></div>
-  </section>
-
-  <section class="panel sessions-panel" aria-labelledby="sessions-title">
-    <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><a class="section-link" href="/sessions">Open session timeline</a></div>
-    <div class="sessions-scroll" tabindex="0" role="region" aria-label="Recent sessions table, scrollable"><table class="sessions-table" aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Duration</th><th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="table-muted">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="table-muted">{{harnessName .Tool}}</span></td><td data-label="Input">{{tokenValue .InputTokens}}</td><td data-label="Output">{{tokenValue .OutputTokens}}</td><td data-label="Total">{{tokenValue .TotalTokens}}</td><td data-label="Cost">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions in the selected window.</td></tr>{{end}}</tbody></table></div>
-  </section>
-
-  {{if eq .LifetimeTokens 0}}
-  <section class="first-run" aria-label="Getting started">
-    <div><h2>The egg is waiting for its first token.</h2><p>Run the agent on a machine with Claude Code, Codex, GitHub Copilot CLI, or a configured JSONL source. Tokemon only sends usage metadata.</p></div>
-    <code class="command">tokemon agent --server …</code>
-  </section>
-  {{end}}
-
-  <footer><span>Local-first · no conversation content</span><span>Just for fun · not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company.</span></footer>
-</main>
-{{copyIDScript}}
-<script>
-(() => {
-  // odometerAriaLabel names the value for screen readers. Odometers without a
-  // data-label keep announcing the bare display string; the lifetime counter
-  // supplies "Lifetime tokens" so it reads as "Lifetime tokens: 1,234".
-  const odometerAriaLabel = (odometer, display) => {
-    const label = odometer.dataset.label || '';
-    return label ? label + ': ' + display : display;
-  };
-
-  const renderOdometer = (odometer, display, animate = true) => {
-    odometer.dataset.display = display;
-    odometer.setAttribute('role', 'img');
-    odometer.setAttribute('aria-label', odometerAriaLabel(odometer, display));
-    odometer.replaceChildren();
-    const fallback = document.createElement('span');
-    fallback.className = 'odometer-static';
-    fallback.textContent = display;
-    odometer.append(fallback);
-    const fit = () => {
-      const width = odometer.getBoundingClientRect().width;
-      const mini = odometer.classList.contains('mini-odometer');
-      const spacing = mini ? Math.max(display.length - 1, 0) : 0;
-      const scale = mini ? .95 : .82;
-      const size = Math.max(mini ? 10 : 28, Math.min(mini ? 28 : 80, Math.max(width - spacing, 1) / Math.max(display.length * scale, 1)));
-      odometer.style.fontSize = size + 'px';
-    };
-    fit();
-
-    const visual = document.createDocumentFragment();
-    let digitIndex = 0;
-    Array.from(display).forEach((character) => {
-      if (!/\d/.test(character)) {
-        const separator = document.createElement('span');
-        separator.className = 'odometer-separator';
-        separator.textContent = character;
-        visual.append(separator);
-        return;
-      }
-
-      const digit = Number(character);
-      const turns = 2 + (digitIndex % 3);
-      const reel = document.createElement('span');
-      reel.className = 'odometer-reel';
-      reel.dataset.value = String(digit);
-      const strip = document.createElement('span');
-      strip.className = 'odometer-strip';
-      strip.style.transitionDelay = (digitIndex * 55) + 'ms';
-      for (let turn = 0; turn < turns; turn += 1) {
-        for (let value = 0; value < 10; value += 1) {
-          const item = document.createElement('span');
-          item.className = 'odometer-digit';
-          item.textContent = value;
-          strip.append(item);
-        }
-      }
-      const final = document.createElement('span');
-      final.className = 'odometer-digit';
-      final.textContent = digit;
-      strip.append(final);
-      reel.append(strip);
-      visual.append(reel);
-
-      if (animate) {
-        requestAnimationFrame(() => {
-          strip.style.transform = 'translateY(-' + (turns * 10) + 'em)';
-        });
-      } else {
-        strip.style.transition = 'none';
-        strip.style.transform = 'translateY(-' + (turns * 10) + 'em)';
-      }
-      digitIndex += 1;
-    });
-    odometer.append(visual);
-    odometer.classList.add('is-ready');
-    fit();
-  };
-
-  const rollOdometerReel = (reel, digit, delay) => {
-    const previous = Number(reel.dataset.value || 0);
-    if (previous === digit) return;
-    reel.dataset.value = String(digit);
-    const strip = document.createElement('span');
-    strip.className = 'odometer-strip';
-    strip.style.transitionDelay = delay + 'ms';
-    const steps = ((digit - previous + 10) % 10) || 10;
-    for (let step = 0; step <= steps; step += 1) {
-      const item = document.createElement('span');
-      item.className = 'odometer-digit';
-      item.textContent = (previous + step) % 10;
-      strip.append(item);
-    }
-    reel.replaceChildren(strip);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      strip.style.transform = 'translateY(-' + steps + 'em)';
-    }));
-
-    let settled = false;
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      const final = document.createElement('span');
-      final.className = 'odometer-digit';
-      final.textContent = digit;
-      reel.replaceChildren(final);
-    };
-    strip.addEventListener('transitionend', settle, { once: true });
-    window.setTimeout(settle, 1600 + delay);
-  };
-
-  const updateOdometer = (odometer, display) => {
-    const previous = odometer.dataset.display || '';
-    const sameStructure = previous.length === display.length && Array.from(display).every((character, index) => {
-      return /\d/.test(character) === /\d/.test(previous[index]);
-    });
-    if (!sameStructure) {
-      renderOdometer(odometer, display, true);
-      return;
-    }
-
-    odometer.dataset.display = display;
-    odometer.setAttribute('aria-label', odometerAriaLabel(odometer, display));
-    const fallback = odometer.querySelector('.odometer-static');
-    if (fallback) fallback.textContent = display;
-    const reels = Array.from(odometer.querySelectorAll('.odometer-reel'));
-    const changed = [];
-    let digitIndex = 0;
-    Array.from(display).forEach((character, index) => {
-      if (!/\d/.test(character)) return;
-      if (character !== previous[index]) {
-        changed.push({ reel: reels[digitIndex], digit: Number(character) });
-      }
-      digitIndex += 1;
-    });
-    changed.reverse().forEach((item, index) => {
-      rollOdometerReel(item.reel, item.digit, index * 45);
-    });
-  };
-
-    document.querySelectorAll('.odometer, .mini-odometer').forEach((odometer) => {
-      renderOdometer(odometer, odometer.dataset.display || '', true);
-    });
-    window.addEventListener('resize', () => {
-      document.querySelectorAll('.odometer, .mini-odometer').forEach((odometer) => {
-        const display = odometer.dataset.display || '';
-        const width = odometer.getBoundingClientRect().width;
-        const mini = odometer.classList.contains('mini-odometer');
-        const spacing = mini ? Math.max(display.length - 1, 0) : 0;
-        const scale = mini ? .95 : .82;
-        odometer.style.fontSize = Math.max(mini ? 10 : 28, Math.min(mini ? 28 : 80, Math.max(width - spacing, 1) / Math.max(display.length * scale, 1))) + 'px';
-      });
-  }, { passive: true });
-
-  const number = new Intl.NumberFormat('en-US');
-  const counter = document.getElementById('lifetime-counter');
-  let lifetimeTokens = Number((counter.dataset.display || '0').replaceAll(',', ''));
-  let currentStage = Number(document.querySelector('.creature-panel').dataset.stage);
-  let polling = false;
-
-  const updateComposition = (composition) => {
-    const input = Math.max(0, Number(composition.input_tokens) || 0);
-    const uncached = Math.max(0, Number(composition.uncached_input_tokens) || 0);
-    const cached = Math.max(0, Number(composition.cached_input_tokens) || 0);
-    const output = Math.max(0, Number(composition.output_tokens) || 0);
-    const total = input + output;
-    const segments = [
-      ['live-uncached-segment', uncached],
-      ['live-cached-segment', cached],
-      ['live-output-segment', output],
-    ];
-    segments.forEach(([id, value]) => {
-      const segment = document.getElementById(id);
-      segment.hidden = value === 0;
-      segment.style.width = total === 0 ? '0%' : (value / total * 100) + '%';
-    });
-    const setTooltip = (id, title, value, details) => {
-      const item = document.getElementById(id);
-      const exact = number.format(value) + ' tokens';
-      item.dataset.tooltip = [title, exact, ...details].join('\n');
-      const accessibleDetails = details.length ? '. ' + details.map((detail) => detail.trim().replace(' · ', ': ')).join('. ') : '';
-      item.setAttribute('aria-label', title + ': ' + exact + accessibleDetails);
-    };
-    updateOdometer(document.getElementById('live-input-tokens'), number.format(input));
-    updateOdometer(document.getElementById('live-output-tokens'), number.format(output));
-    const percent = (value) => total === 0 ? '—' : new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 }).format(value / total);
-    document.getElementById('live-input-share').textContent = percent(input);
-    document.getElementById('live-output-share').textContent = percent(output);
-    setTooltip('live-input', 'Input', input, []);
-    setTooltip('live-output', 'Output', output, []);
-  };
-
-  // Auto-refresh replaces the old 60s meta refresh: a client timer drives a
-  // server re-render, pausable from the topbar, never firing while a copy or
-  // selection is in progress, and restoring keyboard focus across the reload.
-  const AUTO_REFRESH_MS = 60000;
-  const AUTO_REFRESH_KEY = 'tokemon-auto-refresh';
-  const FOCUS_KEY = 'tokemon-restore-focus';
-  const autoPaused = () => { try { return sessionStorage.getItem(AUTO_REFRESH_KEY) === 'paused'; } catch (_) { return false; } };
-  const setAutoPaused = (paused) => { try { sessionStorage.setItem(AUTO_REFRESH_KEY, paused ? 'paused' : 'on'); } catch (_) {} };
-
-  const pollLifetime = async () => {
-    if (polling || document.hidden || autoPaused()) return;
-    polling = true;
-    try {
-      const response = await fetch('/api/v1/evolution', { cache: 'no-store', headers: { Accept: 'application/json' } });
-      if (!response.ok) throw new Error('live counter unavailable');
-      const snapshot = await response.json();
-      const composition = snapshot.composition || {};
-      updateComposition(composition);
-      if (snapshot.stage !== currentStage) {
-        location.reload();
-        return;
-      }
-      if (snapshot.lifetime_tokens === lifetimeTokens) return;
-      lifetimeTokens = snapshot.lifetime_tokens;
-      const display = number.format(lifetimeTokens);
-      updateOdometer(counter, display);
-      const remaining = document.getElementById('live-remaining-copy');
-      remaining.replaceChildren();
-      if (snapshot.tokens_remaining == null) {
-        remaining.textContent = 'Final form';
-      } else {
-        remaining.append(new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(snapshot.tokens_remaining) + ' ');
-        const suffix = document.createElement('small');
-        suffix.textContent = 'to go';
-        remaining.append(suffix);
-      }
-      document.getElementById('live-progress-label').textContent = Math.round(snapshot.progress * 100) + '%';
-      const progress = document.getElementById('live-progress');
-      progress.setAttribute('aria-valuenow', String(snapshot.progress * 100));
-      progress.firstElementChild.style.width = (snapshot.progress * 100) + '%';
-    } catch (_) {
-    } finally {
-      polling = false;
-    }
-  };
-  pollLifetime();
-  window.setInterval(pollLifetime, 2000);
-  document.addEventListener('visibilitychange', pollLifetime);
-
-  const autoToggle = document.getElementById('auto-refresh-toggle');
-  const renderAutoToggle = () => {
-    const paused = autoPaused();
-    const label = paused ? 'Resume auto-refresh' : 'Pause auto-refresh';
-    autoToggle.setAttribute('aria-pressed', String(paused));
-    // The announced name and the glyphs track the state so the phone layout
-    // can show an icon-only control without losing the accessible name.
-    autoToggle.setAttribute('aria-label', label);
-    autoToggle.querySelector('.refresh-glyph').textContent = paused ? '\u25B6' : '\u23F8';
-    autoToggle.querySelector('.refresh-label').textContent = label;
-  };
-  renderAutoToggle();
-  autoToggle.addEventListener('click', () => {
-    const paused = !autoPaused();
-    setAutoPaused(paused);
-    renderAutoToggle();
-    autoToggle.focus();
-    if (!paused) pollLifetime();
-  });
-  document.getElementById('refresh-now').addEventListener('click', () => location.reload());
-
-  const focusSelector = (el) => {
-    if (el.id) return '#' + CSS.escape(el.id);
-    if (el.matches('a[href]')) return 'a[href="' + el.getAttribute('href') + '"]';
-    const label = el.getAttribute('aria-label') || el.getAttribute('data-tooltip') || el.getAttribute('title');
-    if (label) return el.tagName.toLowerCase() + '[aria-label="' + label.replace(/"/g, '\\"') + '"]';
-    return null;
-  };
-  const stashFocus = () => {
-    const el = document.activeElement;
-    if (!el || el === document.body) return;
-    const selector = focusSelector(el);
-    if (!selector) return;
-    try { sessionStorage.setItem(FOCUS_KEY, JSON.stringify({ selector: selector, at: Date.now() })); } catch (_) {}
-  };
-  const restoreFocus = () => {
-    let stashed = null;
-    try { stashed = JSON.parse(sessionStorage.getItem(FOCUS_KEY) || 'null'); } catch (_) {}
-    if (!stashed) return;
-    try { sessionStorage.removeItem(FOCUS_KEY); } catch (_) {}
-    if (Date.now() - stashed.at > 5000) return;
-    const el = document.querySelector(stashed.selector);
-    if (el) el.focus({ preventScroll: true });
-  };
-  restoreFocus();
-
-  const autoRefreshTick = () => {
-    if (autoPaused() || document.hidden) return;
-    if (String(window.getSelection ? window.getSelection() : '').length > 0) return;
-    stashFocus();
-    location.reload();
-  };
-  window.setInterval(autoRefreshTick, AUTO_REFRESH_MS);
-
-  const tooltip = document.createElement('div');
-  tooltip.className = 'activity-tooltip';
-  tooltip.setAttribute('role', 'tooltip');
-  tooltip.hidden = true;
-  document.body.append(tooltip);
-
-  let activeCell = null;
-  const addTooltipText = (className, text) => {
-    const node = document.createElement('div');
-    node.className = className;
-    node.textContent = text;
-    tooltip.append(node);
-    return node;
-  };
-
-  const renderTooltip = (cell) => {
-    tooltip.replaceChildren();
-    const lines = (cell.dataset.tooltip || '').split('\n');
-    addTooltipText('activity-tooltip-date', lines.shift() || '');
-    addTooltipText('activity-tooltip-summary', lines.shift() || '');
-    if (cell.dataset.tooltipKind === 'composition') {
-      lines.forEach((line) => {
-        const row = document.createElement('div');
-        row.className = 'activity-tooltip-row';
-        const separator = line.indexOf(' · ');
-        const name = separator >= 0 ? line.slice(2, separator) : line.trim();
-        const tokens = separator >= 0 ? line.slice(separator + 3) : '';
-        const nameNode = document.createElement('span');
-        nameNode.textContent = name;
-        const tokenNode = document.createElement('span');
-        tokenNode.textContent = tokens;
-        row.append(nameNode, tokenNode);
-        tooltip.append(row);
-      });
-      return;
-    }
-    let section = null;
-    lines.forEach((line) => {
-      if (line === 'Some token totals unavailable') {
-        addTooltipText('activity-tooltip-note', line);
-        return;
-      }
-      if (line === 'BY MODEL' || line === 'BY PROVIDER') {
-        section = document.createElement('div');
-        section.className = 'activity-tooltip-section';
-        const heading = document.createElement('div');
-        heading.className = 'activity-tooltip-section-title';
-        heading.textContent = line;
-        section.append(heading);
-        tooltip.append(section);
-        return;
-      }
-      if (!section || !line.startsWith('  ')) {
-        return;
-      }
-      const row = document.createElement('div');
-      row.className = 'activity-tooltip-row';
-      const separator = line.indexOf(' · ');
-      const name = separator >= 0 ? line.slice(2, separator) : line.trim();
-      const tokens = separator >= 0 ? line.slice(separator + 3) : '';
-      const nameNode = document.createElement('span');
-      nameNode.textContent = name;
-      const tokenNode = document.createElement('span');
-      tokenNode.textContent = tokens;
-      row.append(nameNode, tokenNode);
-      section.append(row);
-    });
-  };
-
-  const positionTooltip = () => {
-    if (!activeCell || tooltip.hidden) {
-      return;
-    }
-    const cell = activeCell.getBoundingClientRect();
-    const margin = 12;
-    const width = tooltip.offsetWidth;
-    const height = tooltip.offsetHeight;
-    let left = cell.left + (cell.width / 2) - (width / 2);
-    let top = cell.top - height - margin;
-    if (top < margin) {
-      top = cell.bottom + margin;
-    }
-    left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
-    top = Math.max(margin, Math.min(top, window.innerHeight - height - margin));
-    tooltip.style.left = left + 'px';
-    tooltip.style.top = top + 'px';
-  };
-
-  const showTooltip = (cell) => {
-    activeCell = cell;
-    renderTooltip(cell);
-    tooltip.hidden = false;
-    positionTooltip();
-    requestAnimationFrame(positionTooltip);
-  };
-
-  const hideTooltip = () => {
-    activeCell = null;
-    tooltip.hidden = true;
-  };
-
-  document.querySelectorAll('.activity-cell[data-tooltip], .composition-item[data-tooltip-kind]').forEach((cell) => {
-    cell.addEventListener('pointerenter', () => showTooltip(cell));
-    cell.addEventListener('pointerleave', hideTooltip);
-    cell.addEventListener('focus', () => showTooltip(cell));
-    cell.addEventListener('blur', hideTooltip);
-  });
-  window.addEventListener('resize', positionTooltip, { passive: true });
-  window.addEventListener('scroll', positionTooltip, { passive: true, capture: true });
-})();
-
-// Roving tabindex for the activity grid (role="grid" promises arrow-key cell
-// navigation): exactly one cell is in the tab order — the server renders the
-// most recent active day — and the arrow keys move focus by day and week,
-// carrying the tab stop with them. Future and aria-hidden cells are skipped.
-(() => {
-  const grid = document.querySelector('.activity-grid');
-  if (!grid) return;
-  const navigable = (cell) => !cell.classList.contains('future') && cell.getAttribute('aria-hidden') !== 'true';
-  const rows = () => Array.from(grid.querySelectorAll('.activity-week'));
-  // makeTabStop moves the single tab stop to cell. The arrows call it
-  // directly: an unfocused window (headless scans, background tabs) fires no
-  // focus events, so the tab stop must not depend on receiving them.
-  const makeTabStop = (cell) => {
-    for (const other of grid.querySelectorAll('.activity-cell[tabindex="0"]')) {
-      if (other !== cell) other.tabIndex = -1;
-    }
-    cell.tabIndex = 0;
-  };
-  // Focus moving into a cell — by tab, click, or the arrows below — makes it
-  // the one tab stop.
-  grid.addEventListener('focusin', (event) => {
-    const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
-    if (!cell || !navigable(cell)) return;
-    makeTabStop(cell);
-  });
-  grid.addEventListener('keydown', (event) => {
-    const cell = event.target.closest ? event.target.closest('.activity-cell') : null;
-    if (!cell || !navigable(cell)) return;
-    const row = cell.closest('.activity-week');
-    if (!row) return;
-    const allRows = rows();
-    const rowIndex = allRows.indexOf(row);
-    const rowCells = Array.from(row.querySelectorAll('.activity-cell'));
-    const column = rowCells.indexOf(cell);
-    const at = (candidateRow, index) => {
-      const cells = Array.from(candidateRow.querySelectorAll('.activity-cell'));
-      return index >= 0 && index < cells.length && navigable(cells[index]) ? cells[index] : null;
-    };
-    let target = null;
-    switch (event.key) {
-      case 'ArrowLeft':
-        for (let index = column - 1; index >= 0 && !target; index--) target = at(row, index);
-        break;
-      case 'ArrowRight':
-        for (let index = column + 1; index < rowCells.length && !target; index++) target = at(row, index);
-        break;
-      case 'ArrowUp':
-        for (let index = rowIndex - 1; index >= 0 && !target; index--) target = at(allRows[index], column);
-        break;
-      case 'ArrowDown':
-        for (let index = rowIndex + 1; index < allRows.length && !target; index++) target = at(allRows[index], column);
-        break;
-      case 'Home':
-        for (let index = 0; index < rowCells.length && !target; index++) target = at(row, index);
-        break;
-      case 'End':
-        for (let index = rowCells.length - 1; index >= 0 && !target; index--) target = at(row, index);
-        break;
-      default:
-        return;
-    }
-    if (!target || target === cell) return;
-    event.preventDefault();
-    makeTabStop(target);
-    target.focus();
-  });
-})();
-</script>
-</body>
-</html>`
 
 // activityInitialTab picks the date the heatmap's roving tabindex starts on:
 // the most recent active day, so keyboard users land at the newest end of the
@@ -4979,1116 +4063,3 @@ func twoDigits(value int) string {
 	}
 	return strconv.FormatInt(int64(value/10), 10) + strconv.FormatInt(int64(value%10), 10)
 }
-
-const settingsTemplate = `{{define "settings"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
-  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
-  <title>Tokemon · Settings</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #10110f;
-      --surface: #171916;
-      --text: #f0ede5;
-      --muted: #a2a69b;
-      --faint: #a5ad9c;
-      --line: #30352d;
-      --line-bright: #485044;
-      --control-border: #66705f;
-      --accent: #9bbba0;
-      --warm: #d2a477;
-      --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif;
-      --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
-    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
-    * { box-sizing: border-box; }
-    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
-    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
-    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
-    a { color: inherit; text-decoration: none; }
-    button, input { font: inherit; }
-    main { width: min(1408px, calc(100% - 28px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
-    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-mark { display: block; width: 34px; height: 34px; image-rendering: pixelated; }
-    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
-    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
-    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--control-border); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible, .settings-link.active { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .settings-body { max-width: 920px; padding: 0 10px 4px; }
-    .eyebrow { margin-top: 26px; color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    h1, h2 { margin: 0; font-family: var(--font-data); }
-    h1 { margin-top: 8px; color: var(--text); font: 700 clamp(28px, 4vw, 42px)/1 var(--font-display); }
-    h2 { margin-top: 24px; padding-bottom: 8px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
-    .intro { margin: 14px 0 0; color: var(--muted); }
-    .notice { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-data); font-size: 12px; }
-    .alias-list { display: grid; gap: 8px; margin-top: 10px; }
-    .alias-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, .7fr); align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); background: var(--surface); }
-    .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 700 12px/1.25 var(--font-data); }
-    .default-name { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 10px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
-    input:focus { border-color: var(--accent); }
-    input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-    .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
-    button { padding: 9px 14px; border: 1px solid var(--warm); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 11px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    button:hover, button:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
-    .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
-    .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
-    footer { margin-top: 20px; color: var(--faint); font-size: 10px; }
-    @media (max-width: 700px) {
-      /* The Tokedex nav link makes the middle topbar column too wide for the
-         three-column grid just above the 620px reflow; wrap like 620px does. */
-      .topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-      .nav { order: 3; width: 100%; justify-content: center; }
-      .settings-link { margin-left: auto; }
-    }
-    @media (max-width: 620px) {
-      main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; }
-      .topbar { display: flex; align-items: center; flex-wrap: wrap; }
-      .nav { order: 3; width: 100%; justify-content: center; }
-      .nav-link { padding: 6px 7px; font-size: 10px; }
-      .settings-link { margin-left: auto; }
-      .settings-body { padding: 0 6px 4px; }
-      .alias-row { grid-template-columns: 1fr; gap: 8px; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
-    }
-  </style>
-</head>
-<body>
-<a class="skip-link" href="#main-content">Skip to content</a>
-<main id="main-content">
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
-    <nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav>
-    <a class="settings-link active" href="/settings" aria-label="Settings" title="Settings" aria-current="page">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
-  </header>
-  <div class="settings-body">
-  <div class="eyebrow">Display names</div>
-  <h1>Settings</h1>
-  <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
-  <p class="intro">Auth mode: <strong>{{.AuthMode}}</strong> · Dashboard token: <strong>{{.TokenSource}}</strong>.</p>
-  {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
-  {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
-  <form action="/settings/aliases" method="post" aria-label="Display name aliases">
-    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-    <h2 id="settings-form-title">Models</h2>
-    {{if .Models}}
-    <div class="alias-list">
-      {{range $index, $row := .Models}}
-      <div class="alias-row">
-        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
-        <input id="model-alias-{{$index}}" name="model_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
-        <input type="hidden" name="model_identity" value="{{$row.Identity}}">
-      </div>
-      {{end}}
-    </div>
-    {{else}}<p class="empty">No models recorded yet.</p>{{end}}
-    <h2 id="machines-title">Machines</h2>
-    {{if .Machines}}
-    <div class="alias-list">
-      {{range $index, $row := .Machines}}
-      <div class="alias-row">
-        <div><div class="identity" title="{{$row.Identity}}">{{$row.Identity}}</div><span class="default-name">Default: {{$row.Default}}</span></div>
-        <input id="machine-alias-{{$index}}" name="machine_alias" value="{{$row.Alias}}" placeholder="{{$row.Default}}" maxlength="48" aria-label="Alias for {{$row.Identity}}">
-        <input type="hidden" name="machine_identity" value="{{$row.Identity}}">
-      </div>
-      {{end}}
-    </div>
-    {{else}}<p class="empty">No machines recorded yet.</p>{{end}}
-    <div class="actions"><button type="submit">Save aliases</button></div>
-  </form>
-  <footer>Aliases affect dashboard presentation only; usage records and analytics identifiers remain unchanged.</footer>
-  </div>
-</main>
-</body>
-</html>{{end}}`
-
-const catalogTemplate = `{{define "catalog"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
-  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
-  <title>Tokemon · Tokedex</title>
-  <style>
-    :root { color-scheme: dark; --bg:#10110f; --surface:#171916; --surface-raised:#1d201b; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
-    * { box-sizing:border-box; } [hidden] { display:none !important; }
-    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
-    a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; }
-    .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); }
-    .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; }
-    .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--control-border); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .heading { padding:26px 10px 14px; } .eyebrow,.section-title,.model-meta,.label { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; color:var(--text); font:700 clamp(28px,4vw,44px)/1 var(--font-display); } .heading p { max-width:780px; margin:10px 0 0; color:var(--muted); }
-    .tier { margin-top:12px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-head { display:flex; align-items:center; justify-content:space-between; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .tier-head h2 { margin:0; color:var(--warm); font:700 13px/1 var(--font-data); letter-spacing:.12em; text-transform:uppercase; } .catalog-help { color:var(--accent); text-decoration:underline; text-underline-offset:2px; } .catalog-help:hover,.catalog-help:focus-visible { color:var(--text); }
-    .tier-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; padding:12px 16px 16px; } .model-card { min-width:0; padding:13px; border:1px solid var(--line); border-radius:6px; background:var(--surface-raised); } .model-name { margin:7px 0 0; overflow:hidden; color:var(--text); font:700 18px/1.15 var(--font-display); text-overflow:ellipsis; white-space:nowrap; } .model-name-row { display:flex; align-items:center; gap:6px; } .model-name-text { overflow:hidden; min-width:0; text-overflow:ellipsis; } .model-id { margin-top:4px; display:flex; align-items:center; gap:6px; color:var(--faint); font:10px var(--font-data); } .model-id-text { overflow:hidden; min-width:0; text-overflow:ellipsis; white-space:nowrap; }
-    .model-context { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); color:var(--muted); font:11px/1.35 var(--font-data); } .model-context strong { color:var(--text); } .aliases { margin-top:10px; color:var(--faint); font:10px/1.35 var(--font-data); } .aliases code { color:var(--muted); }
-    .pricing { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 10px; margin-top:10px; color:var(--muted); font:10px var(--font-data); } .pricing span:nth-child(even) { color:var(--text); text-align:right; }
-    .tier-legend { margin-top:12px; padding:12px 16px 14px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .tier-legend h2 { margin:0; } .legend-source { margin:8px 0 0; color:var(--muted); font-size:12px; } .legend-source code { color:var(--faint); font-family:var(--font-data); font-size:11px; } .legend-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:6px 20px; margin:10px 0 0; } .legend-row { display:flex; gap:8px; } .legend-row dt { flex:none; width:66px; color:var(--warm); font:700 11px/1.5 var(--font-data); text-transform:uppercase; } .legend-row dd { margin:0; color:var(--muted); font:11px/1.5 var(--font-data); } .pricing-unknown { margin:10px 0 0; padding-top:10px; border-top:1px solid var(--line); color:var(--warm); font:10px/1.35 var(--font-data); } .empty-note { margin:14px 16px 16px; color:var(--faint); font:12px/1.5 var(--font-data); } .empty { margin:12px 10px 0; color:var(--faint); font:12px/1.5 var(--font-data); }
-    .filter-panel { margin-top:12px; padding:14px 16px; border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-form { display:grid; grid-template-columns:minmax(0,1.6fr) repeat(4,minmax(0,1fr)) auto; align-items:end; gap:10px; } .filter-form label { display:grid; gap:7px; color:var(--faint); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } .filter-form input[type="search"],.filter-form select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--control-border); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } .filter-form input[type="search"]:focus-visible,.filter-form select:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); outline-offset:2px; } .filter-form input::placeholder { color:var(--faint); opacity:1; } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions a { display:inline-flex; align-items:center; min-height:36px; padding:9px 11px; border:1px solid var(--control-border); border-radius:4px; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions a:hover,.filter-actions a:focus-visible { border-color:var(--accent); color:var(--accent); } .filter-status { margin:10px 0 0; color:var(--faint); font:11px/1.4 var(--font-data); } .filter-note { margin:8px 0 0; color:var(--warm); font:11px/1.4 var(--font-data); }
-    footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; }
-    .copy-id { display:inline-flex; align-items:center; flex:none; padding:2px 6px; border:1px solid var(--control-border); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); }
-    @media (max-width:900px) { .tier-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-form { grid-template-columns:repeat(3,minmax(0,1fr)); } .filter-form label:first-child { grid-column:1 / -1; } .filter-actions { grid-column:span 3; } }
-    @media (max-width:700px) { .topbar { display:flex; align-items:center; flex-wrap:wrap; gap:12px; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } } @media (max-width:620px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:center; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } .nav-link { padding:6px 7px; font-size:10px; } .tier-grid { grid-template-columns:1fr; padding:10px; } .filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-actions { grid-column:span 2; } footer { flex-direction:column; gap:4px; } }
-    @media (max-width:420px) { .filter-form { grid-template-columns:1fr; } .filter-form label:first-child { grid-column:auto; } .filter-actions { grid-column:auto; } }
-    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
-  </style>
-</head>
-<body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
-  <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
-  {{if .ModelCount}}<section class="panel filter-panel" aria-label="Catalog filters"><form class="filter-form" method="get" action="/tokedex" role="search" aria-label="Filter and sort catalog models" data-tokedex-filters><label for="tokedex-search">Search<input id="tokedex-search" name="q" type="search" placeholder="Name or alias" autocomplete="off" spellcheck="false"></label><label for="tokedex-sort">Sort<select id="tokedex-sort" name="sort"><option value="catalog">Catalog order</option><option value="tokens">Tokens (high to low)</option><option value="events">Events (high to low)</option><option value="name">Name (A–Z)</option></select></label><label for="tokedex-tier">Tier<select id="tokedex-tier" name="tier"><option value="">All tiers</option>{{range .Tiers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{if .Uncataloged}}<option value="Uncataloged">Uncataloged</option>{{end}}</select></label><label for="tokedex-provider">Provider<select id="tokedex-provider" name="provider"><option value="">All providers</option>{{range .Providers}}<option value="{{.}}">{{.}}</option>{{end}}</select></label><label for="tokedex-pricing">Pricing<select id="tokedex-pricing" name="pricing"><option value="">All pricing</option><option value="priced">Priced</option><option value="unknown">Unknown</option></select></label><div class="filter-actions"><a href="/tokedex" data-filter-reset>Reset</a></div></form><p class="filter-status" role="status" data-filter-status>Showing all {{.ModelCount}} model{{if ne .ModelCount 1}}s{{end}}.</p><noscript><p class="filter-note">Sorting, filtering, and search need JavaScript. The full catalog is listed below.</p></noscript></section>{{end}}
-  {{if .TierLegend}}<section class="tier-legend" aria-labelledby="tier-legend-title"><h2 class="section-title" id="tier-legend-title">Tier legend</h2><p class="legend-source">Tiers are editorial groupings from the bundled <code>catalog/models.yaml</code> — a maintainer judgment, not measured model quality. They say nothing about your measured usage or spend.</p><dl class="legend-list">{{range .TierLegend}}<div class="legend-row"><dt>{{.Name}}</dt><dd>{{.Description}}</dd></div>{{end}}</dl></section>{{end}}
-  {{range .Tiers}}<section class="tier" aria-labelledby="tier-{{.Name}}" data-filter-section><div class="tier-head"><h2 id="tier-{{.Name}}">Tier {{.Name}}</h2><span class="model-meta" data-tier-count data-total="{{len .Models}}">{{len .Models}} model{{if ne (len .Models) 1}}s{{end}}</span></div><div class="tier-grid" data-card-grid>{{range .Models}}<article class="model-card" data-model-card data-name="{{.DisplayName}}" data-search="{{.DisplayName}}{{range .Aliases}} {{.}}{{end}}" data-tier="{{.Tier}}" data-provider="{{.Provider}}" data-pricing="{{if pricingKnown .Pricing}}priced{{else}}unknown{{end}}" data-tokens="{{.UsageTokens}}" data-events="{{.UsageEvents}}"><p class="label">{{.Provider}}</p><h3 class="model-name" title="{{.ID}}">{{.DisplayName}}</h3><div class="model-id"><span class="model-id-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context">{{if .UsageEvents}}<strong>{{commas .UsageTokens}}</strong> tokens · {{commas .UsageEvents}} events<br>{{.Context}}{{else}}No usage recorded yet{{end}}</div><div class="aliases"><span class="label">Aliases</span><br>{{range $index, $alias := .Aliases}}{{if $index}} · {{end}}<code>{{$alias}}</code>{{end}}</div>{{if pricingKnown .Pricing}}<div class="pricing"><span>Input</span><span>{{priceValue .Pricing.InputPricePerMillion}}</span><span>Cached</span><span>{{priceValue .Pricing.CacheReadPricePerMillion}}</span><span>Output</span><span>{{priceValue .Pricing.OutputPricePerMillion}}</span></div>{{else}}<p class="pricing-unknown">Rates not published yet · cost estimates stay Unknown, not zero{{if .Pricing.VerifiedAt}} · status checked {{.Pricing.VerifiedAt}}{{end}}</p>{{end}}</article>{{end}}</div></section>{{else}}<p class="empty-note">No catalog models are configured. Add entries to <code>catalog/models.yaml</code> to populate the Tokedex.</p>{{end}}
-  {{if .ModelCount}}<p class="empty-note" data-filter-empty hidden>No models match these filters. Clear or adjust the controls above.</p>{{end}}
-  {{if .Uncataloged}}<section class="tier" aria-labelledby="uncataloged-title" data-filter-section><div class="tier-head"><h2 id="uncataloged-title" class="unknown-value">Uncataloged models</h2><span class="model-meta">seen in usage · no pricing available · <a class="catalog-help" href="https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md#16-model-catalog-and-tokedex" target="_blank" rel="noopener">how to add a model to catalog/models.yaml</a></span></div><div class="tier-grid" data-card-grid>{{range .Uncataloged}}<article class="model-card" data-model-card data-name="{{.ID}}" data-search="{{.ID}}" data-tier="Uncataloged" data-provider="" data-pricing="unknown" data-tokens="{{.Tokens}}" data-events="{{.Events}}"><div class="model-name model-name-row" title="{{.ID}}"><span class="model-name-text">{{.ID}}</span>{{copyID .ID "model"}}</div><div class="model-context"><strong>{{commas .Tokens}}</strong> tokens · {{commas .Events}} event{{if ne .Events 1}}s{{end}}<br>Not in the bundled catalog: usage counts toward totals but contributes no cost estimate.</div></article>{{end}}</div></section>{{else}}<p class="empty-note">{{if .ObservedTokens}}Every observed model resolves to a bundled catalog entry; nothing is uncataloged.{{else}}No usage has been observed yet, so there is nothing to reconcile against the catalog.{{end}}</p>{{end}}
-  <footer><span>Static YAML-backed catalog · metadata only</span><span>Unknown pricing stays Unknown, never zero · <a href="/api/v1/catalog">Catalog JSON</a> · <a href="/api/v1/models">Models JSON</a></span></footer>
-</main>{{copyIDScript}}
-{{if .ModelCount}}<script>
-  (() => {
-    'use strict';
-    const form = document.querySelector('[data-tokedex-filters]');
-    if (!form) return;
-    const search = document.getElementById('tokedex-search');
-    const sort = document.getElementById('tokedex-sort');
-    const tier = document.getElementById('tokedex-tier');
-    const provider = document.getElementById('tokedex-provider');
-    const pricing = document.getElementById('tokedex-pricing');
-    const status = document.querySelector('[data-filter-status]');
-    const empty = document.querySelector('[data-filter-empty]');
-    const reset = document.querySelector('[data-filter-reset]');
-    const sections = Array.from(document.querySelectorAll('[data-filter-section]'));
-    const cards = Array.from(document.querySelectorAll('[data-model-card]'));
-    if (!search || !sort || !tier || !provider || !pricing || cards.length === 0) return;
-    // Catalog order is the server-rendered order; keep it so the default
-    // sort can restore the page exactly as it was delivered.
-    const originalOrder = new Map(cards.map((card, index) => [card, index]));
-    const normalize = (value) => (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    const searchTerms = () => normalize(search.value).split(' ').filter(Boolean);
-    const matches = (card, terms) => {
-      if (tier.value && card.dataset.tier !== tier.value) return false;
-      if (provider.value && card.dataset.provider !== provider.value) return false;
-      if (pricing.value && card.dataset.pricing !== pricing.value) return false;
-      if (terms.length === 0) return true;
-      const haystack = normalize(card.dataset.search);
-      return terms.every((term) => haystack.includes(term));
-    };
-    const compare = (a, b) => {
-      if (sort.value === 'tokens' || sort.value === 'events') {
-        const key = sort.value === 'tokens' ? 'tokens' : 'events';
-        const delta = Number(b.dataset[key]) - Number(a.dataset[key]);
-        if (delta !== 0) return delta;
-        return a.dataset.name.localeCompare(b.dataset.name);
-      }
-      if (sort.value === 'name') return a.dataset.name.localeCompare(b.dataset.name);
-      return originalOrder.get(a) - originalOrder.get(b);
-    };
-    let statusTimer = 0;
-    const announce = (text) => {
-      if (!status || status.textContent === text) return;
-      window.clearTimeout(statusTimer);
-      statusTimer = window.setTimeout(() => { status.textContent = text; }, 200);
-    };
-    const apply = () => {
-      const terms = searchTerms();
-      let visible = 0;
-      for (const section of sections) {
-        const sectionCards = Array.from(section.querySelectorAll('[data-model-card]'));
-        let shown = 0;
-        for (const card of sectionCards) {
-          const match = matches(card, terms);
-          card.hidden = !match;
-          if (match) shown += 1;
-        }
-        section.hidden = shown === 0;
-        const count = section.querySelector('[data-tier-count]');
-        if (count) {
-          const total = Number(count.dataset.total);
-          count.textContent = shown === total ? total + ' model' + (total === 1 ? '' : 's') : shown + ' of ' + total + ' models';
-        }
-        visible += shown;
-        const grid = section.querySelector('[data-card-grid]');
-        if (grid) sectionCards.sort(compare).forEach((card) => grid.append(card));
-      }
-      if (empty) empty.hidden = visible !== 0;
-      const filtered = terms.length > 0 || tier.value !== '' || provider.value !== '' || pricing.value !== '';
-      const sortLabels = { tokens: 'tokens', events: 'events', name: 'name' };
-      const suffix = sortLabels[sort.value] ? ' · sorted by ' + sortLabels[sort.value] + ' within each tier' : '';
-      announce((filtered ? 'Showing ' + visible + ' of ' + cards.length + ' models.' : 'Showing all ' + cards.length + ' models.') + suffix);
-    };
-    const resetAll = () => {
-      search.value = '';
-      sort.value = 'catalog';
-      tier.value = '';
-      provider.value = '';
-      pricing.value = '';
-      apply();
-    };
-    form.addEventListener('submit', (event) => event.preventDefault());
-    search.addEventListener('input', apply);
-    [sort, tier, provider, pricing].forEach((control) => control.addEventListener('change', apply));
-    if (reset) reset.addEventListener('click', (event) => { event.preventDefault(); resetAll(); search.focus(); });
-    apply();
-  })();
-</script>{{end}}</body></html>{{end}}`
-
-const loginTemplate = `{{define "login"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}"><link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin><title>Tokemon · Sign in</title>
-  <style>
-    :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
-    * { box-sizing:border-box; } body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; padding:20px; }
-    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; }
-    .login-card { width:min(360px,100%); padding:26px 24px; border:1px solid var(--line-bright); border-radius:12px; background:var(--surface); }
-    .brand-row { display:flex; align-items:center; gap:10px; margin-bottom:6px; } .brand-mark { width:30px; height:30px; image-rendering:pixelated; } .brand-name { font:700 15px/1 var(--font-display); letter-spacing:.08em; color:var(--text); }
-    .login-lead { margin:0 0 18px; color:var(--muted); font-size:13px; }
-    label { display:grid; gap:6px; margin-top:12px; color:var(--faint); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; }
-    input { width:100%; padding:10px 11px; border:1px solid var(--control-border); border-radius:4px; background:#11130f; color:var(--text); font:13px var(--font-data); }
-    input:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); outline-offset:2px; }
-    button { width:100%; margin-top:16px; min-height:40px; border:1px solid var(--accent); border-radius:5px; background:transparent; color:var(--accent); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; cursor:pointer; }
-    button:hover,button:focus-visible { background:rgba(155,187,160,.12); outline:2px solid var(--accent); outline-offset:2px; }
-    .login-error { margin:0 0 4px; padding:9px 11px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:12px/1.4 var(--font-data); }
-    .login-note { margin:16px 0 0; color:var(--faint); font-size:10px; }
-    @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms !important; transition-duration:.01ms !important; } }
-  </style>
-</head>
-<body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content" class="login-card">
-  <div class="brand-row"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="30" height="30"><span class="brand-name">TOKEMON</span></div>
-  <h1 class="sr-only">Sign in</h1>
-  <p class="login-lead">Sign in to the usage dashboard.</p>
-  {{if .Error}}<p class="login-error" role="alert">{{.Error}}</p>{{end}}
-  <form method="post" action="/login">
-    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-    <input type="hidden" name="next" value="{{.Next}}">
-    <label for="login-username">Username</label>
-    <input id="login-username" name="username" type="text" autocomplete="username" required>
-    <label for="login-password">Password</label>
-    <input id="login-password" name="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Sign in</button>
-  </form>
-  <p class="login-note">Local-first · metadata only · no conversation content</p>
-</main></body></html>{{end}}`
-
-const sessionsTemplate = `{{define "sessions"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}"><link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin><title>Tokemon · Sessions</title>
-  <style>
-    :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
-    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--control-border); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .heading { display:flex; align-items:end; justify-content:space-between; gap:20px; padding:25px 10px 15px; } .heading-actions { display:flex; align-items:center; gap:10px; } .eyebrow,.section-title,label,th { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; font:700 clamp(28px,4vw,42px)/1 var(--font-display); } .heading-copy { margin:9px 0 0; color:var(--muted); } .action { display:inline-flex; align-items:center; min-height:38px; padding:10px 13px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; white-space:nowrap; }
-    .panel { border:1px solid var(--line-bright); border-radius:8px; background:var(--surface); } .filter-panel { padding:14px 16px; } .filter-form { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); align-items:end; gap:10px; } label { display:grid; gap:7px; color:var(--faint); } select { width:100%; min-width:0; padding:9px 10px; border:1px solid var(--control-border); border-radius:4px; background:#11130f; color:var(--text); font:12px var(--font-data); } select:focus-visible { border-color:var(--accent); outline:2px solid var(--accent); } .filter-actions { display:flex; align-items:end; gap:8px; } .filter-actions button,.filter-actions a { min-height:36px; padding:9px 11px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; } .filter-actions .apply { border-color:var(--accent); color:var(--accent); }
-    .session-panel { margin-top:10px; overflow:hidden; } .section-head { display:flex; align-items:start; justify-content:space-between; gap:14px; padding:13px 16px 10px; border-bottom:1px solid var(--line); } .section-meta { color:var(--faint); font:10px var(--font-data); } .table-scroll { overflow-x:auto; padding:0 16px 12px; } .session-sort { color:var(--muted); } .session-sort:hover,.session-sort:focus-visible { color:var(--accent); text-decoration:underline; text-underline-offset:2px; } th[aria-sort] .session-sort { color:var(--accent); } table { width:100%; min-width:1060px; border-collapse:collapse; table-layout:auto; } th,td { padding:10px 0; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th:first-child,td:first-child { width:100%; overflow-wrap:anywhere; } th { color:var(--faint); } td { color:var(--muted); font:12px/1.25 var(--font-data); } th:not(:first-child),td:not(:first-child) { padding-left:18px; text-align:right; white-space:nowrap; } td:nth-child(3) { color:var(--text); } td:first-child { color:var(--text); font-weight:600; } td:nth-child(2),td:nth-child(3) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .subline { display:block; margin-top:4px; overflow:hidden; color:var(--faint); font-size:10px; font-weight:400; text-overflow:ellipsis; white-space:nowrap; } .copy-id { display:inline-flex; align-items:center; flex:none; margin-left:6px; padding:2px 6px; border:1px solid var(--control-border); border-radius:3px; background:transparent; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .copy-id:hover,.copy-id:focus-visible,.copy-id.copied { border-color:var(--accent); color:var(--accent); } .unknown { color:var(--warm); } .empty-row td { padding:32px 0; color:var(--faint); text-align:left; }
-    footer { display:flex; justify-content:space-between; gap:16px; padding:14px 4px 0; color:var(--faint); font-size:10px; } @media (max-width:900px) { .filter-form { grid-template-columns:repeat(3,minmax(0,1fr)); } .filter-actions { grid-column:span 3; } } @media (max-width:700px) { .heading, .heading-actions { flex-wrap:wrap; } .topbar { display:flex; align-items:center; flex-wrap:wrap; gap:12px; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } } @media (max-width:640px) { main { width:min(100% - 12px,620px); margin:6px auto; padding:6px; } .topbar { display:flex; align-items:center; flex-wrap:wrap; } .nav { order:3; width:100%; justify-content:center; } .settings-link { margin-left:auto; } .nav-link { padding:6px 7px; font-size:10px; } .heading { align-items:start; flex-direction:column; padding:20px 8px 14px; } .action { width:100%; justify-content:center; } .filter-form { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-actions { grid-column:span 2; } footer { flex-direction:column; gap:4px; } table { min-width:0; } thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); } tbody tr { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px 14px; padding:12px 0; border-bottom:1px solid var(--line); } tbody td,tbody td:not(:first-child) { display:block; width:auto; padding:0; border:0; text-align:left; white-space:normal; } tbody td:first-child,.empty-row td { grid-column:1 / -1; } td[data-label]::before { content:attr(data-label); display:block; margin-bottom:4px; color:var(--faint); font:700 9px/1.2 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } } @media (max-width:420px) { .filter-form { grid-template-columns:1fr; } .filter-actions { grid-column:auto; } } @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; } }
-  </style>
-</head>
-<body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
-  <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><div class="heading-actions"><a class="action" download href="{{sessionsExportURL .Filter "json"}}">Export sessions JSON</a><a class="action" download href="{{sessionsExportURL .Filter "csv"}}">Export sessions CSV</a></div></section>
-  <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
-  <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll" tabindex="0" role="region" aria-label="Session timeline table, scrollable"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
-  <footer><span>Filters never change global lifetime evolution totals.</span><span>Unknown fields remain unavailable, not zero.</span></footer>
-</main>{{copyIDScript}}</body></html>{{end}}`
-
-const analyticsTemplate = `{{define "analytics"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
-  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
-  <title>Tokemon · Analytics</title>
-  <style>
-    @font-face {
-      font-family: "Pixelify Sans";
-      font-style: normal;
-      font-weight: 400 700;
-      font-display: swap;
-      src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2");
-    }
-    :root {
-      color-scheme: dark;
-      --bg: #10110f;
-      --surface: #171916;
-      --surface-raised: #1d201b;
-      --text: #f0ede5;
-      --muted: #a2a69b;
-      --faint: #a5ad9c;
-      --line: #30352d;
-      --line-bright: #485044;
-      --control-border: #66705f;
-      --accent: #9bbba0;
-      --accent-dim: #607864;
-      --warm: #d2a477;
-      --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif;
-      --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
-    * { box-sizing: border-box; }
-    [hidden] { display: none !important; }
-    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
-    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
-    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
-    a { color: inherit; text-decoration: none; }
-    button, select { font: inherit; }
-    main { width: min(1408px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
-    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; }
-    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
-    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
-    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
-    .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--control-border); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .analytics-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
-    .eyebrow, .section-title, .stat-label, label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    h2.section-title { margin: 0; }
-    h1 { margin: 7px 0 0; color: var(--text); font-family: var(--font-display); font-size: clamp(28px, 4vw, 42px); line-height: 1; }
-    .heading-copy { max-width: 700px; margin: 9px 0 0; color: var(--muted); }
-    .heading-actions { display: flex; align-items: center; gap: 10px; }
-    .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
-    .window-link { min-width: 42px; padding: 8px 9px; border-radius: 3px; color: var(--faint); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-align: center; }
-    .window-link:hover { color: var(--text); }
-    .window-link:focus-visible { color: var(--text); outline: 2px solid var(--accent); outline-offset: 1px; }
-    .window-link.active { background: var(--accent); color: var(--bg); }
-    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 10px 13px; border: 1px solid var(--warm); border-radius: 5px; background: transparent; color: var(--warm); font: 700 11px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .action:hover { background: rgba(210, 164, 119, .1); }
-    .action:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
-    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); }
-    .filter-panel { padding: 14px 16px; }
-    .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
-    label { display: grid; gap: 7px; color: var(--faint); }
-    select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
-    select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
-    .filter-actions { display: flex; align-items: end; gap: 8px; }
-    .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--control-border); color: var(--muted); }
-    .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
-    .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-    .insights-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-top: 10px; }
-    .insight { min-width: 0; padding: 11px 14px; border: 1px dashed var(--line-bright); border-radius: 7px; background: transparent; }
-    .insight-value { margin-top: 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; color: var(--text); font: 700 17px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .insight-detail { margin-top: 6px; color: var(--muted); font: 11px/1.4 var(--font-data); }
-    .quota-panel { margin-top: 10px; padding: 12px 16px; }
-    .quota-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
-    .quota { min-width: 0; padding: 11px 13px; border: 1px dashed var(--line-bright); border-radius: 7px; }
-    .quota-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-    .quota-head strong { color: var(--text); font: 700 12px/1.2 var(--font-data); }
-    .quota-figures { overflow: hidden; color: var(--muted); font: 11px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .quota-track { margin-top: 8px; height: 10px; overflow: hidden; background: var(--line); border-radius: 999px; }
-    .quota-fill { height: 100%; background: var(--accent-dim); transition: width 300ms cubic-bezier(.2, .75, .25, 1); }
-    .quota-fill.over { background: #d88b7e; }
-    .stat { min-width: 0; min-height: 94px; padding: 13px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); animation: stat-in 300ms both; }
-    .stat:nth-child(2) { animation-delay: 25ms; }
-    .stat:nth-child(3) { animation-delay: 50ms; }
-    .stat:nth-child(4) { animation-delay: 75ms; }
-    .stat:nth-child(5) { animation-delay: 100ms; }
-    .stat-value { margin-top: 9px; overflow: hidden; color: var(--text); font: 700 clamp(18px, 2.3vw, 26px)/1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .stat-value.muted { color: var(--muted); font-size: 16px; }
-    .stat-meta { margin-top: 7px; overflow: hidden; color: var(--faint); font: 10px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .comparison { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
-    .comparison strong { color: var(--text); font-weight: 700; }
-    .comparison.up strong { color: var(--accent); }
-    .comparison.down strong { color: var(--warm); }
-    .note { margin-top: 10px; padding: 9px 12px; border: 1px solid rgba(210, 164, 119, .45); color: var(--warm); font: 11px/1.3 var(--font-data); }
-    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(360px, .8fr); align-items: start; gap: 10px; margin-top: 10px; }
-    .section-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding: 13px 16px 10px; border-bottom: 1px solid var(--line); }
-    .section-meta { color: var(--faint); font: 10px/1.2 var(--font-data); text-align: right; }
-    .trend-legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
-    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
-    .legend-swatch { width: 9px; height: 9px; border-radius: 2px; background: var(--accent-dim); }
-    .legend-swatch.cached { background: var(--accent); }
-    .legend-swatch.output { background: var(--warm); }
-    .legend-swatch.unknown { border: 1px solid var(--warm); background: transparent; }
-    .trend-readout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 50px; margin: 12px 16px 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-raised); }
-    .readout-kicker { color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .09em; text-transform: uppercase; }
-    .readout-value { overflow: hidden; color: var(--text); font: 700 15px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
-    .readout-mix { overflow: hidden; color: var(--muted); font: 10px/1.2 var(--font-data); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-    .trend-visual { position: relative; border-bottom: 1px solid var(--line); }
-    .trend-y-axis { position: absolute; z-index: 2; top: 18px; bottom: 31px; left: 8px; width: 44px; pointer-events: none; }
-    .trend-axis-unit { position: absolute; top: -13px; right: 0; color: var(--faint); font: 700 8px/1 var(--font-data); letter-spacing: .08em; }
-    .trend-y-tick { position: absolute; right: 0; color: var(--faint); font: 9px/1 var(--font-data); transform: translateY(50%); white-space: nowrap; }
-    .trend-plot { position: relative; min-width: 0; margin-left: 58px; }
-    .trend-grid { position: absolute; z-index: 0; inset: 18px 16px 31px 0; pointer-events: none; }
-    .trend-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .44); }
-    .trend-chart { position: relative; z-index: 1; display: flex; min-height: 252px; align-items: end; gap: 4px; margin-top: 8px; padding: 12px 16px 16px 0; overflow-x: auto; }
-    .trend-column { position: relative; display: flex; min-width: 12px; flex: 1 0 12px; flex-direction: column; justify-content: end; min-height: 220px; padding: 0 0 18px; border: 0; background: transparent; color: inherit; cursor: crosshair; }
-    .trend-column:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: 2px; }
-    .trend-column.selected .trend-bar { border-color: var(--text); box-shadow: 0 0 0 1px rgba(240, 237, 229, .16); }
-    .trend-column.unknown::after { position: absolute; right: 0; bottom: 19px; left: 0; height: 3px; border: 1px solid var(--warm); background: transparent; content: ""; }
-    .trend-track { position: relative; display: flex; height: 190px; align-items: end; }
-    .trend-bar { display: flex; width: 100%; min-height: 2px; flex-direction: column-reverse; overflow: hidden; border: 1px solid var(--line-bright); border-radius: 2px 2px 0 0; background: #20251e; transform-origin: bottom; animation: chart-rise 460ms cubic-bezier(.2, .75, .25, 1) both; animation-delay: calc(var(--index) * 6ms); }
-    .trend-column.unknown .trend-bar { border-color: var(--warm); }
-    .trend-part { display: block; min-height: 0; }
-    .trend-part.input { background: var(--accent-dim); }
-    .trend-part.cached { background: var(--accent); }
-    .trend-part.output { background: var(--warm); }
-    .trend-label { position: absolute; bottom: 1px; left: 50%; width: max-content; color: var(--muted); font: 10px/1 var(--font-data); opacity: 0; transform: translateX(-50%); white-space: nowrap; }
-    .trend-column.tick .trend-label { opacity: 1; }
-    .trend-column.tick-start .trend-label { left: 0; transform: none; }
-    .trend-column.tick-end .trend-label { right: 0; left: auto; transform: none; }
-    .trend-annotation { position: absolute; z-index: 3; top: 0; left: 50%; display: grid; min-width: 58px; gap: 2px; padding: 3px 5px; border: 1px solid var(--warm); border-radius: 3px; background: var(--surface); color: var(--warm); font: 700 8px/1 var(--font-data); letter-spacing: .06em; text-align: center; transform: translateX(-50%); white-space: nowrap; }
-    .trend-annotation strong { color: var(--text); font-size: 9px; letter-spacing: 0; }
-    .share-panel { position: relative; min-width: 0; margin-top: 10px; overflow: hidden; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
-    .share-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 10px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
-    .share-legend .legend-item strong { color: var(--text); font-weight: 600; }
-    .share-swatch { width: 9px; height: 9px; border: 1px solid rgba(240, 237, 229, .2); border-radius: 2px; background: var(--series-color); }
-    .series-0 { --series-color: #77a57e; }
-    .series-1 { --series-color: #8fba94; }
-    .series-2 { --series-color: #bfd1ab; }
-    .series-3 { --series-color: #b19570; }
-    .series-4 { --series-color: #d1a975; }
-    .series-5 { --series-color: #5d6a63; }
-    .share-legend .legend-item.other { color: var(--faint); }
-    .share-legend .legend-item.other strong { color: var(--muted); }
-    .share-legend .legend-item.other .share-swatch { opacity: .62; }
-    .share-visual { position: relative; min-height: 226px; border-bottom: 1px solid var(--line); }
-    .share-y-axis { position: absolute; z-index: 3; top: 14px; bottom: 30px; left: 8px; width: 42px; pointer-events: none; }
-    .share-y-axis span { position: absolute; right: 0; color: var(--faint); font: 9px/1 var(--font-data); transform: translateY(50%); }
-    .share-scroll { margin-left: 58px; overflow-x: auto; }
-    .share-chart { position: relative; min-width: 620px; height: 226px; margin-right: 16px; }
-    .share-grid { position: absolute; z-index: 0; inset: 14px 0 30px; }
-    .share-grid i { position: absolute; right: 0; left: 0; border-top: 1px solid rgba(72, 80, 68, .42); }
-    .share-bars { position: absolute; z-index: 1; inset: 14px 0 30px; display: grid; grid-template-columns: repeat(var(--points), minmax(10px, 1fr)); gap: 4px; pointer-events: none; }
-    .share-column { min-width: 0; height: 100%; }
-    .share-stack { display: flex; width: calc(100% - 2px); height: 100%; flex-direction: column-reverse; margin: 0 auto; overflow: hidden; border: 1px solid rgba(240, 237, 229, .18); border-radius: 3px 3px 1px 1px; background: rgba(32, 37, 30, .76); }
-    .share-column.empty .share-stack { border-style: dashed; border-color: var(--line-bright); background: repeating-linear-gradient(135deg, rgba(240, 237, 229, .035) 0 2px, transparent 2px 6px); }
-    .share-segment { display: block; width: 100%; min-height: 0; flex: 0 0 auto; background: var(--series-color); box-shadow: inset 0 1px rgba(16, 21, 17, .34); transform-origin: bottom; animation: share-rise 420ms cubic-bezier(.2, .75, .25, 1) both; }
-    .share-segment.series-5 { opacity: .62; }
-    .share-tooltip { position: absolute; z-index: 5; top: 8px; left: 50%; display: grid; width: min(250px, calc(100% - 16px)); padding: 10px 11px; border: 1px solid var(--accent-dim); border-radius: 5px; background: var(--surface-raised); box-shadow: 0 8px 24px rgba(0, 0, 0, .28); pointer-events: none; transform: translateX(-50%); }
-    .share-tooltip::before { position: absolute; top: 100%; left: var(--share-tooltip-anchor, 50%); width: 1px; height: 14px; background: var(--accent-dim); content: ""; }
-    .share-tooltip::after { position: absolute; bottom: -4px; left: var(--share-tooltip-anchor, 50%); width: 7px; height: 7px; border-right: 1px solid var(--accent-dim); border-bottom: 1px solid var(--accent-dim); background: var(--surface-raised); content: ""; transform: translateX(-50%) rotate(45deg); }
-    .share-tooltip-date { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .06em; }
-    .share-tooltip-total { margin-top: 5px; color: var(--text); font: 700 14px/1.1 var(--font-data); }
-    .share-tooltip-warning { margin-top: 5px; color: var(--warm); font: 10px/1.2 var(--font-data); }
-    .share-tooltip-series { display: grid; gap: 4px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); }
-    .share-tooltip-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: baseline; gap: 6px; color: var(--muted); font: 10px/1.2 var(--font-data); }
-    .share-tooltip-row strong { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-    .share-tooltip-value { white-space: nowrap; }
-    .share-tooltip-swatch { width: 8px; height: 8px; border-radius: 2px; background: var(--series-color); }
-    .share-hit-grid { position: absolute; z-index: 2; inset: 14px 0 0; display: grid; grid-template-columns: repeat(var(--points), minmax(10px, 1fr)); }
-    .share-point { position: relative; min-width: 0; padding: 0 0 22px; border: 0; background: transparent; color: inherit; cursor: crosshair; }
-    .share-point::before { position: absolute; top: 0; bottom: 30px; left: 50%; border-left: 1px solid transparent; content: ""; }
-    .share-point:hover, .share-point:focus-visible { background: rgba(240, 237, 229, .025); }
-    .share-point:focus-visible { border-radius: 3px; outline: 2px solid var(--accent); outline-offset: -2px; }
-    .share-point:hover::before, .share-point:focus-visible::before, .share-point.active::before { border-left-color: var(--text); }
-    .share-point.unknown::after { position: absolute; right: 1px; bottom: 29px; left: 1px; height: 3px; border: 1px solid var(--warm); content: ""; }
-    .share-label { position: absolute; right: auto; bottom: 6px; left: 50%; width: max-content; color: var(--muted); font: 10px/1 var(--font-data); opacity: 0; transform: translateX(-50%); white-space: nowrap; }
-    .share-point.tick .share-label { opacity: 1; }
-    .share-point.tick-start .share-label { left: 0; transform: none; }
-    .share-point.tick-end .share-label { right: 0; left: auto; transform: none; }
-    .share-point-data { display: none; }
-    .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
-    .trend-panel, .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
-    .sessions-panel { margin-top: 10px; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
-    .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
-    .dimension-link { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font: 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
-    .dimension-link.active { border-color: var(--accent); color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
-    .table-scroll { overflow-x: auto; padding: 0 16px 12px; }
-    .breakdown-scroll { max-height: 350px; overflow-y: auto; scrollbar-color: var(--line-bright) transparent; }
-    table { width: 100%; min-width: 430px; border-collapse: collapse; table-layout: fixed; }
-    th, td { padding: 8px 0; border-bottom: 1px solid var(--line); text-align: left; }
-    th { color: var(--faint); font-size: 9px; }
-    .breakdown-scroll th { position: sticky; z-index: 2; top: 0; background: var(--surface); }
-    td { color: var(--muted); font: 12px/1.25 var(--font-data); }
-    th:first-child, td:first-child { width: 42%; }
-    th:not(:first-child), td:not(:first-child) { padding-left: 9px; text-align: right; white-space: nowrap; }
-    td:first-child { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-    tbody tr { transition: background-color 140ms ease; }
-    tbody tr:hover { background: rgba(155, 187, 160, .035); }
-    .breakdown-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .breakdown-meter { display: block; height: 2px; margin-top: 5px; overflow: hidden; background: var(--line); }
-    .breakdown-meter span { display: block; width: var(--share); height: 100%; background: var(--accent-dim); animation: meter-grow 680ms cubic-bezier(.2, .75, .25, 1) both; }
-    .empty-row td { padding: 30px 0 12px; color: var(--faint); text-align: left; }
-    .session-project { display: block; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
-    .session-machine { display: block; margin-top: 3px; overflow: hidden; color: var(--faint); font-size: 10px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
-    .unknown-flag { display: inline-grid; width: 14px; height: 14px; place-items: center; margin-left: 4px; border: 1px solid var(--warm); border-radius: 50%; color: var(--warm); font-size: 9px; }
-    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
-    @keyframes chart-rise { from { opacity: .65; transform: scaleY(.12); } to { opacity: 1; transform: scaleY(1); } }
-    @keyframes share-rise { from { opacity: .35; transform: scaleY(.1); } to { opacity: 1; transform: scaleY(1); } }
-    @keyframes meter-grow { from { width: 0; } }
-    @keyframes stat-in { from { opacity: .72; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
-    @media (max-width: 1080px) {
-      .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .filter-actions { grid-column: span 3; }
-      .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .analytics-grid { grid-template-columns: minmax(0, 1fr); }
-    }
-    @media (max-width: 860px) {
-      /* The export buttons never shrink (white-space: nowrap), so below this
-         width the heading row could not fit and pushed the document 41px wide
-         at 768. Wrapping keeps the actions on their own line instead of
-         overflowing; the desktop row at 1280 is untouched. */
-      .analytics-heading { flex-wrap: wrap; }
-      .heading-actions { flex-wrap: wrap; }
-    }
-    @media (max-width: 700px) {
-      main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; }
-      .topbar { display: flex; align-items: center; flex-wrap: wrap; }
-      .nav { order: 3; width: 100%; justify-content: center; } .settings-link { margin-left: auto; }
-      .nav-link { padding: 6px 7px; font-size: 10px; }
-      .analytics-heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; }
-      .heading-actions { width: 100%; align-items: stretch; flex-direction: column; }
-      .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); }
-      .action { width: 100%; }
-      .filter-panel { padding: 13px 12px; }
-      .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .filter-actions { grid-column: span 2; }
-      .filter-actions .action { width: auto; }
-      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .section-head { align-items: start; flex-direction: column; }
-      .section-meta { text-align: left; }
-      .trend-readout { grid-template-columns: 1fr; gap: 5px; }
-      .readout-mix { text-align: left; white-space: normal; }
-      .trend-y-axis { width: 39px; }
-      .trend-plot { margin-left: 51px; }
-      footer { flex-direction: column; gap: 4px; }
-    }
-    @media (max-width: 430px) {
-      .filter-form, .stats { grid-template-columns: 1fr; }
-      .filter-actions { grid-column: auto; }
-      .filter-actions .action { flex: 1; }
-    }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-delay: 0ms !important; } }
-  </style>
-</head>
-<body>
-<a class="skip-link" href="#main-content">Skip to content</a>
-<main id="main-content">
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview">
-      <img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34">
-      <span class="brand-name">TOKEMON</span>
-    </a>
-    <nav class="nav" aria-label="Primary navigation">
-      <a class="nav-link" href="/">Overview</a>
-      <a class="nav-link active" href="/analytics" aria-current="page">Analytics</a>
-      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
-      <a class="nav-link" href="/sessions">Sessions</a>
-    </nav>
-    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
-  </header>
-
-  <section class="analytics-heading">
-    <div>
-      <div class="eyebrow">Detailed usage</div>
-      <h1>Analytics</h1>
-      <p class="heading-copy">Explore token volume over time and see which projects, harnesses, models, and machines are carrying the load.</p>
-    </div>
-    <div class="heading-actions">
-      <nav class="window-nav" aria-label="Time window">
-        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{analyticsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
-        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
-        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
-        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
-        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
-      </nav>
-      <a class="action" download href="{{.ExportURL}}">Export analytics JSON</a><a class="action" download href="{{.CSVURL}}">Export analytics CSV</a>
-    </div>
-  </section>
-
-  <section class="panel filter-panel" aria-label="Analytics filters">
-    <form class="filter-form" method="get" action="/analytics">
-      <input type="hidden" name="period" value="{{.Filter.Period}}">
-      <label for="dimension-filter">Breakdown
-        <select id="dimension-filter" name="dimension">
-          <option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option>
-          <option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option>
-          <option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option>
-          <option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option>
-          <option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option>
-        </select>
-      </label>
-      <label for="machine-filter">Machine
-        <select id="machine-filter" name="machine">
-          <option value="">All machines</option>
-          {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
-        </select>
-      </label>
-      <label for="provider-filter">Provider
-        <select id="provider-filter" name="provider">
-          <option value="">All providers</option>
-          {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
-        </select>
-      </label>
-      <label for="model-filter">Model
-        <select id="model-filter" name="model">
-          <option value="">All models</option>
-          {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
-        </select>
-      </label>
-      <label for="harness-filter">Harness
-        <select id="harness-filter" name="tool">
-          <option value="">All harnesses</option>
-          {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
-        </select>
-      </label>
-      <div class="filter-actions">
-        <button class="action apply" type="submit">Apply filters</button>
-        <a class="action" href="/analytics">Reset</a>
-      </div>
-    </form>
-  </section>
-
-  <section class="stats" aria-label="Period summary">
-    <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value" data-count="{{.Summary.Tokens}}">{{commas .Summary.Tokens}}</div>{{if .Comparison}}{{if .Comparison.TokenChangePercent}}<div class="stat-meta comparison {{analyticsChangeClass .Comparison.TokenChangePercent}}"><strong>{{analyticsChange .Comparison.TokenChangePercent}}</strong><span>vs previous window</span></div>{{else}}<div class="stat-meta">No earlier baseline</div>{{end}}{{else}}<div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div>{{end}}</article>
-    <article class="stat"><div class="stat-label">Active days</div><div class="stat-value" data-count="{{.Summary.ActiveDays}}">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">{{.StartDate}} → {{.EndDate}}</div></article>
-    <article class="stat"><div class="stat-label">Average thread</div><div class="stat-value" data-count="{{.AverageThread}}">{{commas .AverageThread}}</div><div class="stat-meta">Across {{commas .Summary.Threads}} thread{{if ne .Summary.Threads 1}}s{{end}}</div></article>
-    <article class="stat"><div class="stat-label">Cache hit</div>{{if .Summary.Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (percent .Summary.Cache.HitRate)}}</div><div class="stat-meta">{{commas .Summary.Cache.CachedTokens}} cached tokens</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No eligible input tokens</div>{{end}}</article>
-    <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}{{if .Summary.EstimatedCost.UnpricedTokens}} · unpriced: {{commas .Summary.EstimatedCost.UnpricedTokens}}{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens{{if .Summary.EstimatedCost.UnpricedTokens}} · {{commas .Summary.EstimatedCost.UnpricedTokens}} unpriced{{end}}</div>{{end}}</article>
-  </section>
-  {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
-
-  {{if .Insights}}<section class="insights-strip" aria-label="Usage insights">{{range .Insights}}<article class="insight"><div class="stat-label">{{.Label}}</div><div class="insight-value">{{.Value}}{{if .State}}<span class="comparison {{.State}}"><strong aria-hidden="true">{{if eq .State "up"}}▲{{else if eq .State "down"}}▼{{else}}—{{end}}</strong><span class="sr-only">{{if eq .State "up"}}rising{{else if eq .State "down"}}falling{{else}}flat{{end}}</span></span>{{end}}</div><div class="insight-detail">{{.Detail}}</div></article>{{end}}</section>{{end}}
-
-  {{if .Quotas}}<section class="panel quota-panel" aria-labelledby="quota-title">
-    <div class="section-head"><h2 class="section-title" id="quota-title">Quota</h2><div class="section-meta">Config-defined budgets · current period</div></div>
-    <div class="quota-list">{{range .Quotas}}<div class="quota">
-      <div class="quota-head"><strong>{{.DisplayLabel}}</strong><span class="quota-figures">{{.UsedLabel}} / {{.BudgetLabel}}</span></div>
-      <div class="quota-track" role="img" aria-label="{{.DisplayLabel}}: {{printf "%.0f" .Percent}} percent of the quota used"><div class="quota-fill{{if .Over}} over{{end}}" style="width: {{printf "%.1f" .Fill}}%"></div></div>
-      <div class="insight-detail">{{.Detail}}</div>
-    </div>{{end}}</div>
-  </section>{{end}}
-
-  <section class="analytics-grid">
-    <article class="panel trend-panel" aria-labelledby="trend-title">
-      <div class="section-head"><h2 class="section-title" id="trend-title">Token trend</h2><div class="section-meta">{{if eq .Bucket "month"}}Monthly{{else if eq .Bucket "hour"}}Hourly{{else}}Daily{{end}} buckets · {{commas .Summary.Events}} events</div></div>
-      <div class="trend-legend" aria-label="Token trend legend"><span class="legend-item"><i class="legend-swatch"></i>Input</span><span class="legend-item"><i class="legend-swatch cached"></i>Cached</span><span class="legend-item"><i class="legend-swatch output"></i>Output</span><span class="legend-item"><i class="legend-swatch unknown"></i>Unknown total</span></div>
-      {{if .Points}}
-      <div class="trend-readout" aria-live="polite">
-        <span class="readout-kicker" id="trend-readout-kicker">Peak bucket</span>
-        <strong class="readout-value" id="trend-readout-value">{{.PeakPoint.Label}} · {{commas .PeakPoint.Tokens}} tokens</strong>
-        <span class="readout-mix" id="trend-readout-mix">Input {{commas .PeakPoint.InputTokens}} · Cached {{commas .PeakPoint.CachedTokens}} · Output {{commas .PeakPoint.OutputTokens}}</span>
-      </div>
-      <div class="trend-visual">
-        <div class="trend-y-axis" aria-label="Token scale"><span class="trend-axis-unit">TOKENS</span>{{range .AxisTicks}}<span class="trend-y-tick" style="bottom: {{.Position}}%">{{compact .Value}}</span>{{end}}</div>
-        <div class="trend-plot">
-          <div class="trend-grid" aria-hidden="true">{{range .AxisTicks}}<i style="bottom: {{.Position}}%"></i>{{end}}</div>
-          {{/* Roving tabindex: the buckets are data-duplicated in the sr-only table, so only one is a Tab stop — the first peak bucket (or the first bucket when there is no peak); the rest join via arrow keys. */}}
-          {{$trendStop := -1}}
-          {{range $index, $point := .Points}}{{if and (lt $trendStop 0) (gt $.PeakPoint.Tokens 0) (eq $point.Tokens $.PeakPoint.Tokens)}}{{$trendStop = $index}}{{end}}{{end}}
-          {{if lt $trendStop 0}}{{$trendStop = 0}}{{end}}
-          <div class="trend-chart period-{{.Filter.Period}}" tabindex="0" role="region" aria-label="Token volume over the selected window">
-            {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
-              {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
-              <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
-              <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
-            </button>
-            {{end}}
-          </div>
-        </div>
-      </div>
-      {{else}}<div class="empty-chart">No token activity in this window.</div>{{end}}
-    </article>
-
-    <article class="panel breakdown-panel" aria-labelledby="breakdown-title">
-      <div class="section-head"><h2 class="section-title" id="breakdown-title">{{if eq .Filter.Dimension "projects"}}Projects{{else if eq .Filter.Dimension "harnesses"}}Harnesses{{else if eq .Filter.Dimension "providers"}}Providers{{else if eq .Filter.Dimension "models"}}Models{{else}}Machines{{end}}</h2><div class="section-meta">Token share · {{len .Breakdown}} rows</div></div>
-      <nav class="dimension-nav" tabindex="0" aria-label="Breakdown dimension">
-        <a class="dimension-link{{if eq .Filter.Dimension "projects"}} active{{end}}" href="{{analyticsURL .Filter "projects"}}"{{if eq .Filter.Dimension "projects"}} aria-current="page"{{end}}>Projects</a>
-        <a class="dimension-link{{if eq .Filter.Dimension "harnesses"}} active{{end}}" href="{{analyticsURL .Filter "harnesses"}}"{{if eq .Filter.Dimension "harnesses"}} aria-current="page"{{end}}>Harnesses</a>
-        <a class="dimension-link{{if eq .Filter.Dimension "providers"}} active{{end}}" href="{{analyticsURL .Filter "providers"}}"{{if eq .Filter.Dimension "providers"}} aria-current="page"{{end}}>Providers</a>
-        <a class="dimension-link{{if eq .Filter.Dimension "models"}} active{{end}}" href="{{analyticsURL .Filter "models"}}"{{if eq .Filter.Dimension "models"}} aria-current="page"{{end}}>Models</a>
-        <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}"{{if eq .Filter.Dimension "machines"}} aria-current="page"{{end}}>Machines</a>
-      </nav>
-      <div class="table-scroll breakdown-scroll" tabindex="0" aria-label="Analytics breakdown table, scrollable">
-        <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
-          {{range .Breakdown}}
-          <tr><td title="{{.Name}}"><span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span><span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
-          {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
-        </tbody></table>
-      </div>
-    </article>
-  </section>
-
-  <section class="panel share-panel" aria-labelledby="share-title">
-    <div class="section-head"><h2 class="section-title" id="share-title">Usage share</h2><div class="section-meta">{{dimensionLabel .Filter.Dimension}} · top 5{{if gt (len .ShareSeries) 5}} + Other{{end}} · {{if eq .Bucket "month"}}monthly{{else if eq .Bucket "hour"}}hourly{{else}}daily{{end}}</div></div>
-    {{if .SharePoints}}
-    <div class="share-legend" aria-label="Usage share legend">
-      {{range $index, $series := .ShareSeries}}<span class="legend-item{{if eq $series.Name "Other"}} other{{end}}"><i class="share-swatch series-{{$index}}"></i><strong>{{if isUnknownName $series.Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases $series.Name}}{{end}}</strong> {{printf "%.1f%%" (mul $series.Share 100)}}</span>{{end}}
-    </div>
-    <div class="share-visual">
-      <div class="share-y-axis" aria-label="Share scale"><span style="bottom: 100%">100%</span><span style="bottom: 50%">50%</span><span style="bottom: 0">0%</span></div>
-      <div class="share-scroll" tabindex="0" role="region" aria-label="Usage share chart, scrollable">
-        <div class="share-chart" style="--points: {{len .SharePoints}}">
-          <div class="share-grid" aria-hidden="true"><i style="bottom: 100%"></i><i style="bottom: 50%"></i><i style="bottom: 0"></i></div>
-          <div class="share-bars" aria-hidden="true">
-            {{range $index, $point := .SharePoints}}<div class="share-column{{if eq .Tokens 0}} empty{{end}}{{if .UnknownEvents}} unknown{{end}}" style="--index: {{$index}}">
-              <div class="share-stack">
-                {{range $seriesIndex, $value := .Values}}<span class="share-segment series-{{$seriesIndex}}" style="height: {{mul $value.Share 100}}%"></span>{{end}}
-              </div>
-            </div>{{end}}
-          </div>
-          <div class="share-tooltip" id="share-tooltip" role="tooltip" aria-live="polite" aria-atomic="true" hidden>
-            <div class="share-tooltip-date" data-share-tooltip-date></div>
-            <div class="share-tooltip-total" data-share-tooltip-total></div>
-            <div class="share-tooltip-warning" data-share-tooltip-warning hidden>Unknown totals present</div>
-            <div class="share-tooltip-series" data-share-tooltip-series role="list"></div>
-          </div>
-          <div class="share-hit-grid">
-            {{/* Same roving tabindex as the trend chart, tracked independently: the first bucket is the Tab stop, the rest join via arrow keys. */}}
-            {{range $index, $point := .SharePoints}}
-            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
-              {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
-              <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
-            </button>
-            {{end}}
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="sr-only" id="share-data-table">
-      <table aria-label="Usage share data table"><caption>Usage share data by date</caption><thead><tr><th scope="col">Date</th><th scope="col">Tokens</th>{{range .ShareSeries}}{{if isUnknownName .Name}}<th scope="col">{{unknownLabel $.Filter.Dimension}} share</th>{{else}}<th scope="col">{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}} share</th>{{end}}{{end}}</tr></thead><tbody>
-        {{range .SharePoints}}<tr><th scope="row">{{.Label}}</th><td>{{commas .Tokens}}</td>{{range .Values}}<td>{{printf "%.1f%%" (mul .Share 100)}}</td>{{end}}</tr>{{end}}
-      </tbody></table>
-    </div>
-    {{else}}<div class="empty-chart">No token totals to compare in this window.</div>{{end}}
-  </section>
-
-  <section class="panel sessions-panel" aria-labelledby="sessions-title">
-    <div class="section-head"><h2 class="section-title" id="sessions-title">Recent sessions</h2><div class="section-meta">Metadata only · latest 12</div></div>
-    <div class="table-scroll" tabindex="0" role="region" aria-label="Recent sessions table, scrollable">
-      <table aria-label="Recent sessions"><caption class="sr-only">Recent sessions</caption><thead><tr><th scope="col">When</th><th scope="col">Project / machine</th><th scope="col">Model</th><th scope="col">Harness</th><th scope="col">Tokens</th></tr></thead><tbody>
-        {{range .Sessions}}
-        <tr><td>{{analyticsTime .Timestamp}}</td><td><span class="session-project">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}</span><span class="session-machine">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td title="{{.Model}}"><span class="session-project">{{modelDisplayName $.ModelAliases .Model}}</span><span class="session-machine">{{.Provider}}</span></td><td>{{harnessName .Tool}}</td><td>{{commas .Tokens}}{{if .UnknownEvents}}<span class="unknown-flag" title="Some token totals unavailable">?</span>{{end}}</td></tr>
-        {{else}}<tr class="empty-row"><td colspan="5">No sessions match these filters.</td></tr>{{end}}
-      </tbody></table>
-    </div>
-  </section>
-
-  <footer><span>Local-first · metadata only</span><span>Export contains analytics metadata, not prompts, responses, source code, or repository contents.</span></footer>
-</main>
-<script>
-  (() => {
-    const number = new Intl.NumberFormat('en-US');
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (!reducedMotion) {
-      document.querySelectorAll('[data-count]').forEach((node) => {
-        const target = Number(node.dataset.count);
-        if (!Number.isFinite(target) || target <= 0) return;
-        const start = target * .92;
-        const started = performance.now();
-        const tick = (now) => {
-          const progress = Math.min(1, (now - started) / 520);
-          const eased = 1 - Math.pow(1 - progress, 3);
-          node.textContent = number.format(Math.round(start + (target - start) * eased));
-          if (progress < 1) requestAnimationFrame(tick);
-        };
-        requestAnimationFrame(tick);
-      });
-    }
-
-    const value = document.getElementById('trend-readout-value');
-    const mix = document.getElementById('trend-readout-mix');
-    const kicker = document.getElementById('trend-readout-kicker');
-    const showPoint = (column) => {
-      if (!value || !mix) return;
-      document.querySelectorAll('.trend-column.selected').forEach((selected) => selected.classList.remove('selected'));
-      column.classList.add('selected');
-      if (kicker) kicker.textContent = column.classList.contains('peak') ? 'Peak bucket' : 'Selected bucket';
-      value.textContent = column.dataset.label + ' · ' + number.format(Number(column.dataset.tokens)) + ' tokens';
-      mix.textContent = 'Input ' + number.format(Number(column.dataset.input)) + ' · Cached ' + number.format(Number(column.dataset.cached)) + ' · Output ' + number.format(Number(column.dataset.output));
-    };
-    document.querySelectorAll('.trend-column').forEach((column, index, columns) => {
-      column.addEventListener('mouseenter', () => showPoint(column));
-      column.addEventListener('focus', () => {
-        showPoint(column);
-        // Roving tabindex: focus — via Tab, click, or the arrow keys below —
-        // makes the focused bucket the chart's single Tab stop.
-        columns.forEach((button) => button.setAttribute('tabindex', button === column ? '0' : '-1'));
-      });
-      column.addEventListener('click', () => showPoint(column));
-      column.addEventListener('keydown', (event) => {
-        let target = null;
-        if (event.key === 'ArrowRight') target = columns[index + 1] || columns[columns.length - 1];
-        else if (event.key === 'ArrowLeft') target = columns[index - 1] || columns[0];
-        else if (event.key === 'Home') target = columns[0];
-        else if (event.key === 'End') target = columns[columns.length - 1];
-        if (target) {
-          // The focus listener moves the roving stop and updates the readout.
-          event.preventDefault();
-          target.focus();
-        }
-      });
-    });
-
-    const shareTooltip = document.getElementById('share-tooltip');
-    const shareTooltipDate = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-date]');
-    const shareTooltipTotal = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-total]');
-    const shareTooltipWarning = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-warning]');
-    const shareTooltipSeries = shareTooltip && shareTooltip.querySelector('[data-share-tooltip-series]');
-    const positionShareTooltip = (point) => {
-      if (!shareTooltip) return;
-      const chart = point.closest('.share-chart');
-      if (!chart) return;
-      const tooltipWidth = shareTooltip.offsetWidth || 250;
-      const center = point.offsetLeft + point.offsetWidth / 2;
-      const minimum = tooltipWidth / 2 + 8;
-      const maximum = chart.clientWidth - tooltipWidth / 2 - 8;
-      const left = maximum < minimum ? chart.clientWidth / 2 : Math.max(minimum, Math.min(maximum, center));
-      shareTooltip.style.left = left + 'px';
-      shareTooltip.style.setProperty('--share-tooltip-anchor', center - left + 'px');
-    };
-    const hideShareTooltip = () => {
-      if (!shareTooltip) return;
-      shareTooltip.hidden = true;
-      document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
-    };
-    const showSharePoint = (point) => {
-      if (!shareTooltip || !shareTooltipDate || !shareTooltipTotal || !shareTooltipSeries) return;
-      document.querySelectorAll('.share-point.active').forEach((active) => active.classList.remove('active'));
-      point.classList.add('active');
-      shareTooltipDate.textContent = point.dataset.label;
-      shareTooltipTotal.textContent = number.format(Number(point.dataset.tokens)) + ' tokens';
-      const unknownEvents = Number(point.dataset.unknown);
-      if (shareTooltipWarning) {
-        shareTooltipWarning.hidden = unknownEvents <= 0;
-        shareTooltipWarning.textContent = unknownEvents > 0 ? number.format(unknownEvents) + ' event' + (unknownEvents === 1 ? '' : 's') + ' with unknown total' + (unknownEvents === 1 ? '' : 's') : '';
-      }
-      shareTooltipSeries.replaceChildren(...Array.from(point.querySelectorAll('[data-share-value]')).map((item) => {
-        const row = document.createElement('div');
-        row.className = 'share-tooltip-row';
-        row.setAttribute('role', 'listitem');
-        const swatch = document.createElement('i');
-        swatch.className = 'share-tooltip-swatch series-' + item.dataset.series;
-        const name = document.createElement('strong');
-        name.textContent = item.dataset.name;
-        const value = document.createElement('span');
-        value.className = 'share-tooltip-value';
-        value.textContent = number.format(Number(item.dataset.tokens)) + ' · ' + item.dataset.share + '%';
-        row.append(swatch, name, value);
-        return row;
-      }));
-      shareTooltip.hidden = false;
-      positionShareTooltip(point);
-    };
-    document.querySelectorAll('.share-point').forEach((point, index, points) => {
-      point.addEventListener('pointerenter', () => showSharePoint(point));
-      point.addEventListener('focus', () => {
-        showSharePoint(point);
-        // Roving tabindex, tracked independently of the trend chart.
-        points.forEach((button) => button.setAttribute('tabindex', button === point ? '0' : '-1'));
-      });
-      point.addEventListener('click', () => showSharePoint(point));
-      point.addEventListener('pointerleave', (event) => {
-        if (event.pointerType === 'mouse' && !point.matches(':focus')) hideShareTooltip();
-      });
-      point.addEventListener('blur', () => {
-        if (!point.matches(':hover')) hideShareTooltip();
-      });
-      point.addEventListener('keydown', (event) => {
-        let target = null;
-        if (event.key === 'ArrowRight') target = points[index + 1] || points[points.length - 1];
-        else if (event.key === 'ArrowLeft') target = points[index - 1] || points[0];
-        else if (event.key === 'Home') target = points[0];
-        else if (event.key === 'End') target = points[points.length - 1];
-        if (target) {
-          // The focus listener moves the roving stop and shows the tooltip.
-          event.preventDefault();
-          target.focus();
-        }
-      });
-    });
-    window.addEventListener('resize', () => {
-      const active = document.querySelector('.share-point.active');
-      if (active && shareTooltip && !shareTooltip.hidden) positionShareTooltip(active);
-    });
-  })();
-</script>
-</body>
-</html>{{end}}`
-
-const insightsTemplate = `{{define "insights"}}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
-  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
-  <title>Tokemon · Insights</title>
-  <style>
-    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
-    :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #a5ad9c; --line: #30352d; --line-bright: #485044; --control-border: #66705f; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-    * { box-sizing: border-box; }
-    [hidden] { display: none !important; }
-    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
-    .skip-link:focus-visible { transform: translateY(0); outline: 3px solid var(--warm); outline-offset: 2px; }
-    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
-    a { color: inherit; text-decoration: none; }
-    button, select { font: inherit; }
-    main { width: min(1200px, calc(100% - 40px)); margin: 20px auto; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
-    .topbar { display: grid; align-items: center; grid-template-columns: 1fr auto 1fr; gap: 24px; padding: 0 10px 14px; border-bottom: 1px solid var(--line); }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-mark { display: block; width: 34px; height: 34px; object-fit: contain; image-rendering: pixelated; }
-    .brand-name { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: .08em; }
-    .nav { display: flex; align-items: center; grid-column: 2; gap: 18px; }
-    .nav-link { padding: 7px 11px 6px; border-bottom: 2px solid transparent; color: var(--muted); font: 12px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .nav-link.active { border-bottom-color: var(--accent); color: var(--accent); }
-    .settings-link { display: grid; width: 28px; height: 28px; place-items: center; justify-self: end; border: 1px solid var(--control-border); border-radius: 50%; color: var(--muted); font-size: 16px; line-height: 1; }
-    .settings-link:hover, .settings-link:focus-visible { border-color: var(--accent); color: var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
-    .heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 24px 10px 16px; }
-    .eyebrow, .label { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    h1 { margin: 8px 0 0; font: 700 clamp(27px, 4vw, 42px)/1 var(--font-display); letter-spacing: .01em; }
-    h2, h3 { margin: 0; }
-    .heading-copy { max-width: 670px; margin: 9px 0 0; color: var(--muted); }
-    .privacy-boundary { display: grid; gap: 4px; max-width: 670px; margin-top: 13px; padding: 9px 11px; border: 1px solid rgba(155, 187, 160, .36); border-radius: 5px; background: rgba(155, 187, 160, .045); color: var(--muted); font-size: 12px; }
-    .privacy-boundary strong { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    .heading-actions { display: flex; align-items: end; flex-direction: column; gap: 9px; }
-    .window-nav { display: inline-flex; align-items: center; padding: 3px; border: 1px solid var(--line-bright); border-radius: 5px; background: var(--surface); }
-    .window-link { padding: 7px 10px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .08em; }
-    .window-link:hover, .window-link.active { background: var(--surface-raised); color: var(--accent); }
-    .window-link:focus-visible { background: var(--surface-raised); color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
-    .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
-    .filter-panel { padding: 13px 14px; }
-    .filter-form { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); align-items: end; gap: 9px; }
-    .filter-form label { display: grid; gap: 5px; color: var(--faint); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
-    select:focus-visible, a:focus-visible, button:focus-visible, summary:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
-    .filter-actions { display: flex; justify-content: end; gap: 7px; grid-column: span 5; }
-    .action { display: inline-flex; align-items: center; justify-content: center; min-height: 31px; padding: 8px 11px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .action:hover { border-color: var(--accent); color: var(--accent); }
-    .action:focus-visible { border-color: var(--accent); color: var(--accent); outline: 2px solid var(--warm); outline-offset: 2px; }
-    .action.apply { border-color: var(--warm); color: var(--warm); }
-    .quality { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; padding: 10px 13px; color: var(--muted); font: 11px var(--font-data); }
-    .quality strong { color: var(--text); }
-    .quality .confidence { color: var(--accent); text-transform: uppercase; }
-    .state { margin-top: 10px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-size: 12px; }
-    .state.unknown { border-color: rgba(210, 164, 119, .52); color: var(--warm); }
-    .state.baseline { border-color: rgba(155, 187, 160, .36); color: var(--accent); }
-    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 12px 14px 9px; border-bottom: 1px solid var(--line); }
-    .section-title { color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    .section-meta { color: var(--faint); font: 10px var(--font-data); }
-    .insight-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-    .insight-card { min-width: 0; padding: 14px 15px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
-    .insight-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
-    .card-category { color: var(--warm); font: 700 9px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
-    .insight-card h2 { margin-top: 7px; color: var(--text); font: 700 18px/1.15 var(--font-display); }
-    .narrative { margin: 8px 0 0; color: var(--muted); }
-    .observation { margin: 11px 0 0; color: var(--text); font: 700 12px/1.35 var(--font-data); }
-    .insight-card details { margin-top: 13px; border-top: 1px solid var(--line); }
-    .insight-card summary { padding: 10px 0 3px; color: var(--accent); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .08em; list-style-position: inside; text-transform: uppercase; }
-    .evidence { display: grid; gap: 7px; padding: 6px 0 1px 17px; color: var(--muted); font-size: 12px; }
-    .evidence p { margin: 0; }
-    .evidence strong { color: var(--text); font: 700 10px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
-    .qualifiers { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; padding: 0; list-style: none; }
-    .qualifiers li { padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font: 10px var(--font-data); }
-    .analytics-deep-link { display: inline-block; margin-top: 3px; color: var(--accent); font: 700 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .analytics-deep-link:hover { color: var(--warm); }
-    .analytics-deep-link:focus-visible { color: var(--warm); outline: 2px solid var(--accent); outline-offset: 2px; }
-    .empty-cards { margin-top: 10px; padding: 30px 15px; text-align: center; }
-    .empty-cards strong { display: block; color: var(--text); font: 700 17px/1.2 var(--font-display); }
-    .empty-cards span { display: block; margin-top: 7px; color: var(--faint); font-size: 12px; }
-    .distribution-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 10px; margin-top: 10px; }
-    .distribution { min-width: 0; }
-    .histogram { display: grid; grid-template-columns: repeat(24, minmax(8px, 1fr)); align-items: end; gap: 3px; min-height: 148px; padding: 18px 13px 8px; }
-    .hour { display: grid; min-width: 0; grid-template-rows: 112px 14px; align-items: end; gap: 5px; }
-    .hour-track { display: flex; height: 112px; align-items: end; justify-content: center; }
-    .hour-bar { display: block; width: min(100%, 18px); min-height: 2px; border: 1px solid var(--accent-dim); border-bottom-color: var(--accent); border-radius: 2px 2px 0 0; background: var(--accent-dim); }
-    .hour-label { overflow: hidden; color: var(--faint); font: 8px/1 var(--font-data); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
-    .weekday-list { display: grid; gap: 7px; padding: 14px; }
-    .weekday-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) 44px; align-items: center; gap: 8px; color: var(--muted); font: 10px var(--font-data); }
-    .weekday-track { height: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 2px; background: #11130f; }
-    .weekday-bar { display: block; height: 100%; min-width: 2px; background: var(--warm); }
-    .weekday-value { color: var(--text); text-align: right; white-space: nowrap; }
-    .peak-note { padding: 0 14px 13px; color: var(--faint); font: 10px var(--font-data); }
-    .peak-note strong { color: var(--warm); }
-    .ai-recap { margin-top: 10px; }
-    .ai-recap-body { padding: 13px 14px; color: var(--muted); font-size: 12px; }
-    .ai-recap-body p { margin: 0; }
-    .ai-status { color: var(--faint); font: 10px var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-    .ai-status.generated { color: var(--accent); }
-    .ai-status.unavailable { color: var(--warm); }
-    footer { display: flex; justify-content: space-between; gap: 16px; padding: 14px 4px 0; color: var(--faint); font-size: 10px; }
-    @media (max-width: 900px) { .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); } .filter-actions { grid-column: span 3; } .distribution-grid { grid-template-columns: 1fr; } }
-    @media (max-width: 700px) { main { width: min(100% - 12px, 620px); margin: 6px auto; padding: 6px; border-radius: 8px; } .topbar { display: flex; align-items: center; flex-wrap: wrap; } .nav { order: 3; width: 100%; justify-content: center; } .nav-link { padding: 6px 7px; font-size: 10px; } .settings-link { margin-left: auto; } .heading { align-items: start; flex-direction: column; padding: 18px 8px 14px; } .heading-actions { width: 100%; align-items: stretch; } .window-nav { display: grid; grid-template-columns: repeat(5, 1fr); } .window-link { text-align: center; } .filter-panel { padding: 12px; } .filter-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .filter-actions { grid-column: span 2; } .filter-actions .action { flex: 1; } .insight-cards { grid-template-columns: 1fr; } .insight-card:last-child:nth-child(odd) { grid-column: auto; } .quality { align-items: start; flex-direction: column; gap: 5px; } footer { flex-direction: column; gap: 4px; } }
-    @media (max-width: 430px) { .filter-form { grid-template-columns: 1fr; } .filter-actions { grid-column: auto; } .histogram { padding-inline: 7px; gap: 2px; } .hour-label { font-size: 7px; } }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-delay: 0ms !important; } }
-  </style>
-</head>
-<body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
-    <nav class="nav" aria-label="Primary navigation">
-      <a class="nav-link" href="/">Overview</a>
-      <a class="nav-link" href="/analytics">Analytics</a>
-      {{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}
-      <a class="nav-link" href="/sessions">Sessions</a>
-    </nav>
-    <a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
-  </header>
-
-  <section class="heading">
-    <div>
-      <div class="eyebrow">Aggregate signals</div>
-      <h1>Insights</h1>
-      <p class="heading-copy">A quiet readout of recurring token patterns for the selected window and filters.</p>
-      <aside class="privacy-boundary" aria-label="Privacy boundary"><strong>Privacy boundary</strong><span>Metadata only: prompts, responses, source code, source paths, repository contents, conversation titles, and session IDs never appear in Insights.</span></aside>
-    </div>
-    <div class="heading-actions">
-      <nav class="window-nav" aria-label="Time window">
-        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{insightsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
-        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{insightsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
-        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{insightsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
-        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{insightsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
-        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{insightsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
-      </nav>
-    </div>
-  </section>
-
-  <section class="panel filter-panel" aria-label="Insights filters">
-    <form class="filter-form" method="get" action="/insights">
-      <input type="hidden" name="period" value="{{.Filter.Period}}">
-      <label>Breakdown<select name="dimension"><option value="projects"{{if eq .Filter.Dimension "projects"}} selected{{end}}>Projects</option><option value="harnesses"{{if eq .Filter.Dimension "harnesses"}} selected{{end}}>Harnesses</option><option value="providers"{{if eq .Filter.Dimension "providers"}} selected{{end}}>Providers</option><option value="models"{{if eq .Filter.Dimension "models"}} selected{{end}}>Models</option><option value="machines"{{if eq .Filter.Dimension "machines"}} selected{{end}}>Machines</option></select></label>
-      <label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label>
-      <label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label>
-      <label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label>
-      <label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label>
-      <div class="filter-actions"><button class="action apply" type="submit">Apply filters</button><a class="action" href="/insights">Reset</a></div>
-    </form>
-  </section>
-
-  <section class="panel quality" aria-label="Insight data quality"><span><strong>{{commas .DataQuality.KnownEvents}}</strong> events</span><span><strong>{{commas .DataQuality.KnownTokens}}</strong> tokens</span><span>Event-total coverage <strong>{{insightCoverage .DataQuality.EventCoverage}}</strong></span><span class="confidence">{{if .DataQuality.Confidence}}{{.DataQuality.Confidence}}{{else}}Unknown confidence{{end}}</span></section>
-  {{if .DataQuality.UnknownEvents}}<div class="state unknown" role="status">{{commas .DataQuality.UnknownEvents}} event{{if ne .DataQuality.UnknownEvents 1}}s{{end}} have unknown token totals. They remain unknown and are not treated as zero.</div>{{end}}
-  {{if eq .Filter.Period "all"}}<div class="state baseline" role="status">No comparable baseline for the all-time window; growth signals are intentionally omitted.</div>{{end}}
-
-  {{if .Cards}}
-  <section class="insight-cards" role="list" aria-label="Evidence-backed insights">
-    {{range .Cards}}
-    <article class="insight-card" role="listitem"><div class="card-category">{{.Category}}</div><h2>{{.Title}}</h2><p class="narrative">{{.Narrative}}</p>{{if .Observation}}<p class="observation">{{.Observation}}</p>{{end}}<details><summary>Why this?</summary><div class="evidence"><p><strong>Evidence</strong> {{.Evidence}}</p><p><strong>Basis</strong> {{.Basis}}</p>{{if .Qualifiers}}<ul class="qualifiers" aria-label="Qualifiers">{{range .Qualifiers}}<li>{{.}}</li>{{end}}</ul>{{end}}{{if .AnalyticsURL}}<a class="analytics-deep-link" href="{{.AnalyticsURL}}">Open this slice in Analytics →</a>{{end}}</div></details></article>
-    {{end}}
-  </section>
-  {{else}}
-  <section class="panel empty-cards" role="status"><strong>No strong signals in this window.</strong><span>{{if .DataQuality.KnownEvents}}There is not enough metadata to form a deterministic card yet. Try a wider window or different filters.{{else}}No token metadata matches these filters yet. Insights will appear after usage is recorded.{{end}}</span></section>
-  {{end}}
-
-  <section class="distribution-grid" aria-label="Usage rhythm">
-    <article class="panel distribution"><div class="section-head"><h2 class="section-title">24-hour rhythm</h2><span class="section-meta">Local time · {{.Timezone}}</span></div>{{if .Hourly}}<div class="histogram" role="img" aria-label="Tokens by hour">{{range .Hourly}}<div class="hour" title="{{.Label}} · {{commas .Tokens}} tokens"><span class="hour-track"><span class="hour-bar" style="height: {{insightBar .Tokens $.HourlyMax}}%"></span></span><span class="hour-label">{{.Label}}</span></div>{{end}}</div><div class="peak-note">Peak hour <strong>{{if .PeakHour}}{{.PeakHour}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No hourly rhythm to show yet.</div>{{end}}</article>
-    <article class="panel distribution"><div class="section-head"><h2 class="section-title">Weekday distribution</h2><span class="section-meta">Tokens</span></div>{{if .Weekdays}}<div class="weekday-list">{{range .Weekdays}}<div class="weekday-row"><span>{{.Label}}</span><span class="weekday-track"><span class="weekday-bar" style="width: {{insightBar .Tokens $.WeekdayMax}}%"></span></span><span class="weekday-value">{{printf "%.1f%%" (mul .Share 100)}}</span></div>{{end}}</div><div class="peak-note">Peak weekday <strong>{{if .PeakWeekday}}{{.PeakWeekday}}{{else}}—{{end}}</strong></div>{{else}}<div class="empty-cards">No weekday distribution to show yet.</div>{{end}}</article>
-  </section>
-
-  <section class="panel ai-recap" aria-labelledby="ai-recap-title" data-ai-status="{{.Recap.Status}}"><div class="section-head"><h2 class="section-title" id="ai-recap-title">AI recap</h2><span class="ai-status {{.Recap.Status}}">{{insightRecapLabel .Recap.Status}}</span></div><div class="ai-recap-body">{{if eq .Recap.Status "generated"}}<p class="ai-status generated">Optional AI interpretation of aggregate evidence</p><p>{{.Recap.Text}}</p>{{else if eq .Recap.Status "unavailable"}}<p>The recap service is temporarily unavailable. Deterministic Insights remain available.</p>{{else}}<p>AI recap is disabled or unconfigured. This page uses deterministic aggregate signals only.</p>{{end}}</div></section>
-
-  <footer><span>Local-first · metadata only</span><span>No prompts, responses, source paths, repository contents, or session IDs are used.</span></footer>
-</main>
-</body>
-</html>{{end}}`

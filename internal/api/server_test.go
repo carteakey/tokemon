@@ -3864,3 +3864,45 @@ func TestDashboardReflectsUpdatedAliasesImmediatelyAfterWarm(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthenticatedPagesShareChromeTopbarActionsAndCAR205(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/chrome.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := passwordAccountServer(t, store)
+	defer func() { _ = server.Close() }()
+
+	navInsightsPattern := regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`)
+	wantStylesheet := `<link rel="stylesheet" href="/static/tokemon/base.css?v=` + server.assetVersion + `">`
+
+	for _, path := range []string{"/", "/analytics", "/tokedex", "/sessions", "/settings", "/insights"} {
+		body := renderAccessiblePage(t, server, path)
+		for _, want := range []string{
+			wantStylesheet,
+			`<a class="skip-link" href="#main-content">Skip to content</a>`,
+			`<main id="main-content">`,
+			`<header class="topbar">`,
+			`<div class="topbar-actions">`,
+			`<form class="logout-form" method="post" action="/logout">`,
+			`<footer>`,
+			`</main>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s missing shared chrome contract %q", path, want)
+			}
+		}
+		if navInsightsPattern.MatchString(body) {
+			t.Errorf("%s exposes /insights in primary navigation (CAR-205 violation)", path)
+		}
+		if path == "/" {
+			if !strings.Contains(body, `id="refresh-now"`) || !strings.Contains(body, `id="auto-refresh-toggle"`) {
+				t.Errorf("/ missing topbar refresh controls")
+			}
+		} else if strings.Contains(body, `id="refresh-now"`) {
+			t.Errorf("%s unexpectedly renders overview refresh controls", path)
+		}
+	}
+}

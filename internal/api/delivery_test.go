@@ -74,6 +74,7 @@ func TestGzipMiddlewareCompressesHTMLJSONCSVAndStaticJSON(t *testing.T) {
 		{path: "/api/v1/sessions/export?format=csv", wantCT: "text/csv", wantBody: "gzip-sess-1"},
 		{path: "/api/v1/analytics/export?format=csv", wantCT: "text/csv", wantBody: "gzip-project"},
 		{path: "/static/tokemon/manifest.json", wantCT: "application/json", wantBody: `"schema_version"`},
+		{path: "/static/tokemon/base.css?v=" + server.assetVersion, wantCT: "text/css", wantBody: ":root"},
 		{path: "/static/tokemon/does-not-exist.txt", wantCT: "text/plain", wantBody: "404 page not found"},
 	}
 
@@ -480,6 +481,7 @@ func TestStaticAssetVersioningDeterminismAndCacheHeaders(t *testing.T) {
 	for _, path := range []string{
 		"/static/tokemon/stage-00.png?v=" + server.assetVersion,
 		"/static/tokemon/fonts/pixelify-sans-latin.woff2?v=" + server.assetVersion,
+		"/static/tokemon/base.css?v=" + server.assetVersion,
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
@@ -523,6 +525,7 @@ func TestAllSevenTemplatesServeVersionedStaticURLsFontPreloadLCPAndContentVisibi
 	wantFontURL := "/static/tokemon/fonts/pixelify-sans-latin.woff2?v=" + server.assetVersion
 	wantPreload := `<link rel="preload" as="font" type="font/woff2" href="` + wantFontURL + `" crossorigin>`
 	wantFontFace := `url("` + wantFontURL + `") format("woff2")`
+	wantBaseCSS := `<link rel="stylesheet" href="/static/tokemon/base.css?v=` + server.assetVersion + `">`
 	staticRefPattern := regexp.MustCompile(`/static/[^\s"')]+`)
 
 	for _, path := range []string{"/", "/analytics", "/sessions", "/settings", "/insights", "/tokedex", "/login"} {
@@ -535,6 +538,9 @@ func TestAllSevenTemplatesServeVersionedStaticURLsFontPreloadLCPAndContentVisibi
 		}
 		if !strings.Contains(body, wantFontFace) {
 			t.Fatalf("%s @font-face src does not match preload URL %q", path, wantFontFace)
+		}
+		if !strings.Contains(body, wantBaseCSS) {
+			t.Fatalf("%s missing base.css stylesheet link %q", path, wantBaseCSS)
 		}
 		refs := staticRefPattern.FindAllString(body, -1)
 		if len(refs) == 0 {
