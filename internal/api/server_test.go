@@ -601,9 +601,14 @@ func TestDashboardRendersPopulatedEmptyAndBoundaryEvolutionStages(t *testing.T) 
 				t.Fatalf("dashboard status = %d, want 200: %s", response.Code, response.Body.String())
 			}
 			body := response.Body.String()
+			wantWidth, wantHeight := 640, 640
+			if test.stage == 9 {
+				wantWidth, wantHeight = 568, 640
+			}
 			for _, want := range []string{
 				fmt.Sprintf(`data-stage="%d"`, test.stage),
-				fmt.Sprintf(`src="/static/tokemon/stage-%02d.png"`, test.stage),
+				fmt.Sprintf(`src="/static/tokemon/stage-%02d.png?v=%s"`, test.stage, server.assetVersion),
+				fmt.Sprintf(`width="%d" height="%d" fetchpriority="high"`, wantWidth, wantHeight),
 				fmt.Sprintf(`alt="%s, stage %d"`, test.label, test.stage),
 				fmt.Sprintf(`<div class="stage-chip">FORM / %02d</div>`, test.stage),
 			} {
@@ -1408,7 +1413,13 @@ func TestDashboardRendersCacheHitAndThreads(t *testing.T) {
 	response := httptest.NewRecorder()
 	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := response.Body.Bytes()
-	for _, want := range []string{"Cache hit", "80.0%", "Threads", "/static/tokemon/icons/cache-hit.png", "/static/tokemon/icons/threads.png"} {
+	for _, want := range []string{
+		"Cache hit",
+		"80.0%",
+		"Threads",
+		"/static/tokemon/icons/cache-hit.png?v=" + server.assetVersion,
+		"/static/tokemon/icons/threads.png?v=" + server.assetVersion,
+	} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("dashboard does not contain %q: %s", want, response.Body.String())
 		}

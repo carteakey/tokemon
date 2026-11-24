@@ -733,6 +733,84 @@ const freshnessInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+// creatureArtInvariantJS verifies the hero .creature-art LCP image loads with
+// explicit manifest dimensions, fetchpriority="high", and zero aspect-ratio
+// distortion across all gated viewports (both 640x640 and stage-09 568x640).
+const creatureArtInvariantJS = `(() => {
+	const problems = [];
+	const img = document.querySelector('img.creature-art');
+	if (!img) {
+		return JSON.stringify(['missing img.creature-art']);
+	}
+	if (img.getAttribute('fetchpriority') !== 'high') {
+		problems.push('creature-art fetchpriority=' + JSON.stringify(img.getAttribute('fetchpriority')) + ', want "high"');
+	}
+	if (!img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) {
+		problems.push('creature-art failed to load: complete=' + img.complete + ' natural=' + img.naturalWidth + 'x' + img.naturalHeight);
+		return JSON.stringify(problems);
+	}
+	const attrW = Number(img.getAttribute('width'));
+	const attrH = Number(img.getAttribute('height'));
+	if (attrW !== img.naturalWidth || attrH !== img.naturalHeight) {
+		problems.push('creature-art HTML dimensions ' + attrW + 'x' + attrH + ' != natural ' + img.naturalWidth + 'x' + img.naturalHeight);
+	}
+	const rect = img.getBoundingClientRect();
+	if (rect.width <= 0 || rect.height <= 0) {
+		problems.push('creature-art rendered box is empty: ' + rect.width + 'x' + rect.height);
+	} else {
+		const renderedRatio = rect.width / rect.height;
+		const naturalRatio = img.naturalWidth / img.naturalHeight;
+		if (Math.abs(renderedRatio - naturalRatio) >= 0.02) {
+			problems.push('creature-art aspect ratio distorted: rendered=' + renderedRatio.toFixed(4) + ' natural=' + naturalRatio.toFixed(4));
+		}
+	}
+	return JSON.stringify(problems);
+})()`
+
+// checkBelowFoldPanels verifies content-visibility: auto is applied to the
+// listed below-the-fold panel selectors and that keyboard focus reaches
+// interactive/tabbable descendants inside each skipped subtree.
+func belowFoldReachabilityJS(selectors ...string) string {
+	quoted := make([]string, len(selectors))
+	for i, sel := range selectors {
+		quoted[i] = fmt.Sprintf("%q", sel)
+	}
+	return `(() => {
+		const problems = [];
+		const selectors = [` + strings.Join(quoted, ",") + `];
+		for (const sel of selectors) {
+			const panel = document.querySelector(sel);
+			if (!panel) {
+				problems.push('missing below-the-fold panel ' + sel);
+				continue;
+			}
+			const cv = getComputedStyle(panel).contentVisibility;
+			if (cv !== 'auto') {
+				problems.push(sel + ' content-visibility=' + JSON.stringify(cv) + ', want "auto"');
+			}
+			const target = panel.querySelector('a[href], button:not([disabled]), [tabindex="0"]');
+			if (!target) {
+				problems.push(sel + ' has no keyboard-reachable descendant');
+				continue;
+			}
+			target.focus();
+			if (document.activeElement !== target) {
+				problems.push('focus could not reach ' + sel + ' descendant ' + target.tagName);
+			} else {
+				const rect = target.getBoundingClientRect();
+				if (rect.height <= 0) {
+					problems.push(sel + ' focused descendant has zero height');
+				}
+			}
+		}
+		if (document.activeElement && document.activeElement !== document.body) {
+			document.activeElement.blur();
+		}
+		window.scrollTo(0, 0);
+		return JSON.stringify(problems);
+	})()`
+}
+
 const sortInvariantJS = `(() => {
 	const problems = [];
 	const sorted = document.querySelectorAll('th[aria-sort]');
@@ -816,8 +894,20 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		path       string
 		invariants []string
 	}{
-		{path: "/", invariants: []string{freshnessInvariantJS, sourceHealthInvariantJS, refreshControlInvariantJS, activityGridInvariantJS}},
-		{path: "/analytics?period=7d&dimension=models", invariants: []string{exportInvariantJS, quotaAbsentInvariantJS, chartRovingInvariantJS}},
+		{path: "/", invariants: []string{
+			freshnessInvariantJS,
+			sourceHealthInvariantJS,
+			refreshControlInvariantJS,
+			activityGridInvariantJS,
+			creatureArtInvariantJS,
+			belowFoldReachabilityJS(".health-panel", ".sessions-panel"),
+		}},
+		{path: "/analytics?period=7d&dimension=models", invariants: []string{
+			exportInvariantJS,
+			quotaAbsentInvariantJS,
+			belowFoldReachabilityJS(".share-panel", ".sessions-panel"),
+			chartRovingInvariantJS,
+		}},
 		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS}},
 		{path: "/insights"},
@@ -840,6 +930,40 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 	t.Run("/login", func(t *testing.T) {
 		passwordURL := startSeededPasswordServer(t)
 		assertPageAtViewports(t, ctx, passwordURL, "/login", nil)
+	})
+	if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
+		t.Fatalf("could not restore the desktop viewport: %v", err)
+	}
+
+	// Stage 9 (token-titan, stage-09.png) has natural dimensions 568x640
+	// instead of 640x640; verify its explicit width/height attributes and
+	// distortion-free rendering across all gated viewports.
+	t.Run("creature-art-stage9", func(t *testing.T) {
+		stage9Store, err := database.Open(filepath.Join(t.TempDir(), "stage9.db"), smokeCatalog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { stage9Store.Close() })
+		if _, err := stage9Store.Ingest(context.Background(), []usage.Event{{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "smoke-stage9-event",
+			Timestamp:     time.Now().UTC().Add(-time.Minute),
+			MachineID:     "smoke-laptop",
+			Project:       "smoke-project",
+			Provider:      "anthropic",
+			Model:         "claude-sonnet-4",
+			Tool:          "claude-code",
+			InputTokens:   usage.Int64(1_000_000_000),
+			OutputTokens:  usage.Int64(999_999_999),
+			TotalTokens:   usage.Int64(1_999_999_999),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "claude-code", AdapterVersion: "smoke"},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		stage9URL := serveStore(t, stage9Store, false)
+		assertPageAtViewports(t, ctx, stage9URL, "/", []string{creatureArtInvariantJS})
 	})
 	if _, err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 800)); err != nil {
 		t.Fatalf("could not restore the desktop viewport: %v", err)
@@ -934,6 +1058,15 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 				assertNoProblems(t, ctx, collapsedProblems)
 				assertAxeAllowlist(t, ctx, "/")
 
+				// .health-panel uses content-visibility: auto; scrolling it into
+				// view and waiting a render frame lets Chrome unlock hit-testing
+				// for the previously offscreen subtree before clicking.
+				if _, err := chromedp.Run(ctx, chromedp.ScrollIntoView("summary.source-details-summary")); err != nil {
+					t.Fatalf("could not scroll source-details at %s: %v", viewport.name, err)
+				}
+				if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))`, chromedp.EvalAwaitPromise)); err != nil {
+					t.Fatalf("could not await render frame at %s: %v", viewport.name, err)
+				}
 				if _, err := chromedp.Run(ctx, chromedp.Click("summary.source-details-summary")); err != nil {
 					t.Fatalf("could not expand source-details at %s: %v", viewport.name, err)
 				}

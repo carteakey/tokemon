@@ -40,6 +40,7 @@ type Server struct {
 	loginThrottle        *loginThrottle
 	template             *template.Template
 	static               http.Handler
+	assetVersion         string
 	recapProvider        InsightsRecapProvider
 	evolutionMu          sync.Mutex
 	evolutionCache       *evolutionCacheEntry
@@ -1756,6 +1757,12 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if err != nil {
 		return nil, err
 	}
+	staticFiles, err := fs.Sub(web.StaticFS, "static")
+	if err != nil {
+		return nil, err
+	}
+	assetVersion := embeddedStaticVersion()
+	artDims := loadArtDimensions(staticFiles)
 	page, err := template.New("dashboard").Funcs(template.FuncMap{
 		"tokedexEnabled":     func() bool { return config.EnableTokedex },
 		"commas":             commas,
@@ -1891,7 +1898,22 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"harnessGlyph": glyphForHarness,
 		"modelGlyph":   glyphForModel,
 		"machineGlyph": glyphForMachine,
-		"assetPath":    func(stage int) string { return "/static/tokemon/stage-" + twoDigits(stage) + ".png" },
+		"staticURL":    func(path string) string { return staticAssetURL(path, assetVersion) },
+		"assetPath": func(stage int) string {
+			return staticAssetURL("/static/tokemon/stage-"+twoDigits(stage)+".png", assetVersion)
+		},
+		"assetWidth": func(stage int) int {
+			if dims, ok := artDims[stage]; ok && dims[0] > 0 {
+				return dims[0]
+			}
+			return 640
+		},
+		"assetHeight": func(stage int) int {
+			if dims, ok := artDims[stage]; ok && dims[1] > 0 {
+				return dims[1]
+			}
+			return 640
+		},
 	}).Parse(dashboardTemplate)
 	if err != nil {
 		return nil, err
@@ -1914,10 +1936,6 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if _, err := page.Parse(insightsTemplate); err != nil {
 		return nil, err
 	}
-	staticFiles, err := fs.Sub(web.StaticFS, "static")
-	if err != nil {
-		return nil, err
-	}
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	return &Server{
 		store:                store,
@@ -1930,6 +1948,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		loginThrottle:        newLoginThrottle(),
 		template:             page,
 		static:               http.FileServer(http.FS(staticFiles)),
+		assetVersion:         assetVersion,
 		recapProvider:        recap,
 		bgCtx:                bgCtx,
 		bgCancel:             bgCancel,
@@ -1975,7 +1994,7 @@ func (s *Server) Close() error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", s.withDeadline(s.config.HealthTimeout, http.HandlerFunc(s.health)))
-	mux.Handle("GET /static/", http.StripPrefix("/static/", s.static))
+	mux.Handle("GET /static/", staticCacheHeaders(http.StripPrefix("/static/", s.static)))
 	dashboard := func(handler http.Handler) http.Handler {
 		return s.withDeadline(s.config.RequestTimeout, s.dashboardAuth(handler))
 	}
@@ -2007,7 +2026,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/analytics/timeline", dashboard(http.HandlerFunc(s.timelineAPI)))
 	mux.Handle("GET /api/v1/analytics/export", dashboard(http.HandlerFunc(s.analyticsExport)))
 	mux.Handle("GET /metrics", dashboard(http.HandlerFunc(s.metricsHandler)))
-	return s.requestLogging(securityHeaders(mux))
+	return s.requestLogging(securityHeaders(gzipMiddleware(mux)))
 }
 
 func (s *Server) withDeadline(timeout time.Duration, next http.Handler) http.Handler {
@@ -3876,7 +3895,8 @@ const dashboardTemplate = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
   <title>Tokemon · Overview</title>
   <style>
     @font-face {
@@ -3884,7 +3904,7 @@ const dashboardTemplate = `<!doctype html>
       font-style: normal;
       font-weight: 400 700;
       font-display: swap;
-      src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2");
+      src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2");
     }
     :root {
       color-scheme: dark;
@@ -3940,7 +3960,7 @@ const dashboardTemplate = `<!doctype html>
     .panel { border: 1px solid var(--line-bright); border-radius: 8px; background: var(--surface); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .012); }
     .creature-panel { position: relative; min-height: 360px; overflow: hidden; padding: 14px 16px; background: radial-gradient(circle at 50% 40%, rgba(155, 187, 160, .11), transparent 48%), var(--surface); }
     .creature-art-wrap { display: grid; min-height: 252px; place-items: center; padding: 2px 20px 0; }
-    .creature-art { width: min(100%, 278px); max-height: 252px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 20px 24px rgba(0, 0, 0, .22)); transition: transform .35s ease, filter .35s ease; }
+    .creature-art { width: auto; max-width: min(100%, 278px); height: auto; max-height: 252px; object-fit: contain; image-rendering: pixelated; filter: drop-shadow(0 20px 24px rgba(0, 0, 0, .22)); transition: transform .35s ease, filter .35s ease; }
     .creature-art:hover { transform: translateY(-5px) scale(1.02); filter: drop-shadow(0 25px 30px rgba(0, 0, 0, .32)); }
     .creature-fallback { display: grid; width: 220px; height: 220px; place-items: center; border: 1px dashed var(--line-bright); border-radius: 50%; color: var(--accent); font: 700 30px ui-monospace, SFMono-Regular, Menlo, monospace; }
     .creature-fallback[hidden] { display: none; }
@@ -4034,7 +4054,7 @@ const dashboardTemplate = `<!doctype html>
     .context-card h2 { margin: 0; color: var(--accent); font: 700 11px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
     .context-value { margin-top: 9px; color: var(--text); font: 700 24px/1 var(--font-data); }
     .context-detail { margin-top: 6px; color: var(--muted); font: 10px/1.3 var(--font-data); }
-    .health-panel, .sessions-panel { padding: 12px 16px; }
+    .health-panel, .sessions-panel { padding: 12px 16px; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
     .health-table, .sessions-table { min-width: 700px; overflow-wrap: anywhere; }
     .health-scroll, .sessions-scroll { overflow-x: auto; }
     .status-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--line-bright); border-radius: 999px; font: 700 9px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
@@ -4175,7 +4195,7 @@ const dashboardTemplate = `<!doctype html>
 <main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
-      <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
+      <img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34">
       <span class="brand-name">TOKEMON</span>
     </a>
     <nav class="nav" aria-label="Primary navigation">
@@ -4197,7 +4217,7 @@ const dashboardTemplate = `<!doctype html>
     <h1 id="hero-title" class="sr-only">Current Tokemon and lifetime usage</h1>
     <article class="panel creature-panel" data-stage="{{.Evolution.Stage}}">
       <div class="creature-art-wrap">
-        <img class="creature-art" src="{{assetPath .Evolution.Stage}}" alt="{{.Evolution.FormName}}, stage {{.Evolution.Stage}}" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+        <img class="creature-art" src="{{assetPath .Evolution.Stage}}" alt="{{.Evolution.FormName}}, stage {{.Evolution.Stage}}" width="{{assetWidth .Evolution.Stage}}" height="{{assetHeight .Evolution.Stage}}" fetchpriority="high" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
         <div class="creature-fallback" hidden>STAGE {{.Evolution.Stage}}</div>
       </div>
       <div class="creature-caption">
@@ -4230,11 +4250,11 @@ const dashboardTemplate = `<!doctype html>
   </section>
 
   <section class="stat-grid" aria-label="Usage summary">
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/top-machine.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Top machine</div>{{if .ByMachine}}<div class="stat-value" title="{{(index .ByMachine 0).Machine}}">{{machineDisplayName $.MachineAliases (index .ByMachine 0).Machine}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/api-cost.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Est. API cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div><small class="stat-detail">{{compact .EstimatedCost.PricedTokens}} priced{{if .EstimatedCost.UnpricedTokens}} · {{compact .EstimatedCost.UnpricedTokens}} unpriced{{end}}</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/cache-hit.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div><small class="stat-detail">{{compact .Cache.CachedTokens}} cached · {{compact (cacheUncached .Cache)}} uncached</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/threads.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Threads}}</div></div></article>
-    <article class="stat"><img class="stat-icon" src="/static/tokemon/icons/active-days.png" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Activity.ActiveDays}}</div></div></article>
+    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/top-machine.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Top machine</div>{{if .ByMachine}}<div class="stat-value" title="{{(index .ByMachine 0).Machine}}">{{machineDisplayName $.MachineAliases (index .ByMachine 0).Machine}}</div>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
+    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/api-cost.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Est. API cost</div>{{if .EstimatedCost.PricedTokens}}<div class="stat-value">{{money .EstimatedCost.Amount}}</div><small class="stat-detail">{{compact .EstimatedCost.PricedTokens}} priced{{if .EstimatedCost.UnpricedTokens}} · {{compact .EstimatedCost.UnpricedTokens}} unpriced{{end}}</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
+    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/cache-hit.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Cache hit</div>{{if .Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (mul .Cache.HitRate 100)}}</div><small class="stat-detail">{{compact .Cache.CachedTokens}} cached · {{compact (cacheUncached .Cache)}} uncached</small>{{else}}<div class="stat-value muted">—</div>{{end}}</div></article>
+    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/threads.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Threads</div><div class="stat-value">{{commas .Threads}}</div></div></article>
+    <article class="stat"><img class="stat-icon" src="{{staticURL "/static/tokemon/icons/active-days.png"}}" alt="" width="36" height="36"><div class="stat-copy"><div class="stat-label">Active days</div><div class="stat-value">{{commas .Activity.ActiveDays}}</div></div></article>
   </section>
 
   <section class="context-grid" aria-label="Today and week usage">
@@ -4966,7 +4986,8 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
   <title>Tokemon · Settings</title>
   <style>
     :root {
@@ -4984,7 +5005,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
       --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif;
       --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
-    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
     * { box-sizing: border-box; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     .skip-link { position: absolute; z-index: 50; top: 8px; left: 8px; padding: 8px 10px; border: 2px solid var(--accent); background: var(--surface); color: var(--text); transform: translateY(-160%); }
@@ -5047,7 +5068,7 @@ const settingsTemplate = `{{define "settings"}}<!doctype html>
 <a class="skip-link" href="#main-content">Skip to content</a>
 <main id="main-content">
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
+    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
     <nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav>
     <a class="settings-link active" href="/settings" aria-label="Settings" title="Settings" aria-current="page">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}
   </header>
@@ -5098,11 +5119,12 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
   <title>Tokemon · Tokedex</title>
   <style>
     :root { color-scheme: dark; --bg:#10110f; --surface:#171916; --surface-raised:#1d201b; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
     * { box-sizing:border-box; } [hidden] { display:none !important; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
     a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; }
@@ -5125,7 +5147,7 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link active" href="/tokedex" aria-current="page">Tokedex</a>{{end}}<a class="nav-link" href="/sessions">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div class="eyebrow">Model catalog</div><h1>Tokedex</h1><p>Bundled model tiers, aliases, pricing provenance, and observed usage context. The catalog is read-only; raw usage metadata remains unchanged.</p>{{if .ObservedTokens}}<p class="model-meta">Pricing coverage: {{compact .PricedTokens}} of {{compact .ObservedTokens}} observed tokens priced{{if .CatalogedUnknownTokens}} · {{compact .CatalogedUnknownTokens}} in cataloged models with unpublished rates{{end}}{{if .Uncataloged}} · {{if .UncatalogedModels}}{{.UncatalogedModels}} uncataloged model{{if ne .UncatalogedModels 1}}s{{end}} below{{else}}non-model identifiers disclosed below{{end}}{{end}}</p>{{end}}</section>
   {{if .ModelCount}}<section class="panel filter-panel" aria-label="Catalog filters"><form class="filter-form" method="get" action="/tokedex" role="search" aria-label="Filter and sort catalog models" data-tokedex-filters><label for="tokedex-search">Search<input id="tokedex-search" name="q" type="search" placeholder="Name or alias" autocomplete="off" spellcheck="false"></label><label for="tokedex-sort">Sort<select id="tokedex-sort" name="sort"><option value="catalog">Catalog order</option><option value="tokens">Tokens (high to low)</option><option value="events">Events (high to low)</option><option value="name">Name (A–Z)</option></select></label><label for="tokedex-tier">Tier<select id="tokedex-tier" name="tier"><option value="">All tiers</option>{{range .Tiers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{if .Uncataloged}}<option value="Uncataloged">Uncataloged</option>{{end}}</select></label><label for="tokedex-provider">Provider<select id="tokedex-provider" name="provider"><option value="">All providers</option>{{range .Providers}}<option value="{{.}}">{{.}}</option>{{end}}</select></label><label for="tokedex-pricing">Pricing<select id="tokedex-pricing" name="pricing"><option value="">All pricing</option><option value="priced">Priced</option><option value="unknown">Unknown</option></select></label><div class="filter-actions"><a href="/tokedex" data-filter-reset>Reset</a></div></form><p class="filter-status" role="status" data-filter-status>Showing all {{.ModelCount}} model{{if ne .ModelCount 1}}s{{end}}.</p><noscript><p class="filter-note">Sorting, filtering, and search need JavaScript. The full catalog is listed below.</p></noscript></section>{{end}}
   {{if .TierLegend}}<section class="tier-legend" aria-labelledby="tier-legend-title"><h2 class="section-title" id="tier-legend-title">Tier legend</h2><p class="legend-source">Tiers are editorial groupings from the bundled <code>catalog/models.yaml</code> — a maintainer judgment, not measured model quality. They say nothing about your measured usage or spend.</p><dl class="legend-list">{{range .TierLegend}}<div class="legend-row"><dt>{{.Name}}</dt><dd>{{.Description}}</dd></div>{{end}}</dl></section>{{end}}
@@ -5225,10 +5247,10 @@ const catalogTemplate = `{{define "catalog"}}<!doctype html>
 const loginTemplate = `{{define "login"}}<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="/static/tokemon/token-dex.png"><title>Tokemon · Sign in</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}"><link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin><title>Tokemon · Sign in</title>
   <style>
     :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
     * { box-sizing:border-box; } body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; padding:20px; }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; }
     .login-card { width:min(360px,100%); padding:26px 24px; border:1px solid var(--line-bright); border-radius:12px; background:var(--surface); }
@@ -5245,7 +5267,7 @@ const loginTemplate = `{{define "login"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content" class="login-card">
-  <div class="brand-row"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="30" height="30"><span class="brand-name">TOKEMON</span></div>
+  <div class="brand-row"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="30" height="30"><span class="brand-name">TOKEMON</span></div>
   <h1 class="sr-only">Sign in</h1>
   <p class="login-lead">Sign in to the usage dashboard.</p>
   {{if .Error}}<p class="login-error" role="alert">{{.Error}}</p>{{end}}
@@ -5264,10 +5286,10 @@ const loginTemplate = `{{define "login"}}<!doctype html>
 const sessionsTemplate = `{{define "sessions"}}<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="/static/tokemon/token-dex.png"><title>Tokemon · Sessions</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#10110f"><link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}"><link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin><title>Tokemon · Sessions</title>
   <style>
     :root { color-scheme:dark; --bg:#10110f; --surface:#171916; --text:#f0ede5; --muted:#a2a69b; --faint:#a5ad9c; --line:#30352d; --line-bright:#485044; --control-border:#66705f; --accent:#9bbba0; --warm:#d2a477; --font-display:"Pixelify Sans",ui-sans-serif,system-ui,sans-serif; --font-data:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    @font-face { font-family:"Pixelify Sans"; font-style:normal; font-weight:400 700; font-display:swap; src:url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; } .skip-link { position:absolute; z-index:50; top:8px; left:8px; padding:8px 10px; border:2px solid var(--accent); background:var(--surface); color:var(--text); transform:translateY(-160%); } .skip-link:focus-visible { transform:translateY(0); outline:3px solid var(--warm); outline-offset:2px; } :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; } a { color:inherit; text-decoration:none; } main { width:min(1408px,calc(100% - 28px)); margin:20px auto; padding:14px; border:1px solid var(--line); border-radius:12px; } .topbar { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:24px; padding:0 10px 14px; border-bottom:1px solid var(--line); } .brand { display:flex; align-items:center; gap:12px; } .brand-mark { width:34px; height:34px; image-rendering:pixelated; } .brand-name { font-family:var(--font-display); font-size:16px; font-weight:700; letter-spacing:.08em; } .nav { display:flex; grid-column:2; gap:18px; } .nav-link { padding:7px 11px 6px; border-bottom:2px solid transparent; color:var(--muted); font:12px/1 var(--font-data); letter-spacing:.08em; text-transform:uppercase; } .nav-link.active { border-bottom-color:var(--accent); color:var(--accent); } .settings-link { display:grid; width:28px; height:28px; place-items:center; justify-self:end; border:1px solid var(--control-border); border-radius:50%; color:var(--muted); font-size:16px; line-height:1; } .settings-link:hover,.settings-link:focus-visible,.settings-link.active { border-color:var(--accent); color:var(--accent); } .logout-form { display:inline-block; } .logout-button { padding:6px 10px; border:1px solid var(--control-border); border-radius:4px; background:transparent; color:var(--muted); font:700 10px/1 var(--font-data); letter-spacing:.06em; text-transform:uppercase; cursor:pointer; } .logout-button:hover,.logout-button:focus-visible { border-color:var(--accent); color:var(--accent); }
     .heading { display:flex; align-items:end; justify-content:space-between; gap:20px; padding:25px 10px 15px; } .heading-actions { display:flex; align-items:center; gap:10px; } .eyebrow,.section-title,label,th { color:var(--accent); font:700 10px/1 var(--font-data); letter-spacing:.1em; text-transform:uppercase; } h1 { margin:8px 0 0; font:700 clamp(28px,4vw,42px)/1 var(--font-display); } .heading-copy { margin:9px 0 0; color:var(--muted); } .action { display:inline-flex; align-items:center; min-height:38px; padding:10px 13px; border:1px solid var(--warm); border-radius:5px; color:var(--warm); font:700 11px/1 var(--font-data); letter-spacing:.07em; text-transform:uppercase; white-space:nowrap; }
@@ -5277,7 +5299,7 @@ const sessionsTemplate = `{{define "sessions"}}<!doctype html>
   </style>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
-  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
+  <header class="topbar"><a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a><nav class="nav" aria-label="Primary navigation"><a class="nav-link" href="/">Overview</a><a class="nav-link" href="/analytics">Analytics</a>{{if tokedexEnabled}}<a class="nav-link" href="/tokedex">Tokedex</a>{{end}}<a class="nav-link active" href="/sessions" aria-current="page">Sessions</a></nav><a class="settings-link" href="/settings" aria-label="Settings" title="Settings">⚙</a>{{if .CanLogout}}<form class="logout-form" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button class="logout-button" type="submit">Log out</button></form>{{end}}</header>
   <section class="heading"><div><div class="eyebrow">Metadata-only timeline</div><h1>Sessions</h1><p class="heading-copy">Inspect normalized usage metadata without prompts, responses, titles, source code, or repository paths.</p></div><div class="heading-actions"><a class="action" download href="{{sessionsExportURL .Filter "json"}}">Export sessions JSON</a><a class="action" download href="{{sessionsExportURL .Filter "csv"}}">Export sessions CSV</a></div></section>
   <section class="panel filter-panel" aria-label="Session filters"><form class="filter-form" method="get" action="/sessions"><label>Time range<select name="period"><option value="24h"{{if eq .Filter.Period "24h"}} selected{{end}}>24H</option><option value="7d"{{if eq .Filter.Period "7d"}} selected{{end}}>7D</option><option value="30d"{{if eq .Filter.Period "30d"}} selected{{end}}>30D</option><option value="all"{{if eq .Filter.Period "all"}} selected{{end}}>All</option></select></label><label>Machine<select name="machine"><option value="">All machines</option>{{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}</select></label><label>Provider<select name="provider"><option value="">All providers</option>{{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}</select></label><label>Model<select name="model"><option value="">All models</option>{{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}</select></label><label>Harness<select name="tool"><option value="">All harnesses</option>{{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}</select></label><div class="filter-actions"><button class="apply" type="submit">Apply filters</button><a href="/sessions">Reset</a></div></form></section>
   <section class="panel session-panel" aria-labelledby="sessions-table-title"><div class="section-head"><h2 class="section-title" id="sessions-table-title">Session timeline</h2><div class="section-meta">{{len .Sessions}} rows · {{.Filter.Period}}</div></div><div class="table-scroll" tabindex="0" role="region" aria-label="Session timeline table, scrollable"><table aria-label="Session timeline"><caption class="sr-only">Session timeline</caption><thead><tr><th scope="col">Session / project</th>{{sortableHeader .Sorts "when"}}<th scope="col">Provider / model</th><th scope="col">Input</th><th scope="col">Output</th>{{sortableHeader .Sorts "tokens"}}{{sortableHeader .Sorts "cost"}}{{sortableHeader .Sorts "duration"}}<th scope="col">Accuracy</th></tr></thead><tbody>{{range .Sessions}}<tr><td title="{{.SessionID}}"><span class="session-name">{{sessionDisplayName .SessionID}}</span>{{copyID .SessionID "session"}}<span class="subline">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}} · {{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Provider / model">{{.Provider}} / {{modelDisplayName $.ModelAliases .Model}}<span class="subline">{{harnessName .Tool}}</span></td><td data-label="Input" class="{{if not .InputTokens}}unknown{{end}}">{{tokenValue .InputTokens}}</td><td data-label="Output" class="{{if not .OutputTokens}}unknown{{end}}">{{tokenValue .OutputTokens}}</td><td data-label="Total" class="{{if not .TotalTokens}}unknown{{end}}">{{tokenValue .TotalTokens}}</td><td data-label="Cost" class="{{if not .Cost}}unknown{{end}}">{{costValue .Cost .CostEstimated}}</td><td data-label="Duration" class="{{if not .DurationMS}}unknown{{end}}">{{durationValue .DurationMS}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>{{else}}<tr class="empty-row"><td colspan="9">No sessions match these filters.</td></tr>{{end}}</tbody></table></div></section>
@@ -5290,7 +5312,8 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
   <title>Tokemon · Analytics</title>
   <style>
     @font-face {
@@ -5298,7 +5321,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
       font-style: normal;
       font-weight: 400 700;
       font-display: swap;
-      src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2");
+      src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2");
     }
     :root {
       color-scheme: dark;
@@ -5424,7 +5447,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .trend-column.tick-end .trend-label { right: 0; left: auto; transform: none; }
     .trend-annotation { position: absolute; z-index: 3; top: 0; left: 50%; display: grid; min-width: 58px; gap: 2px; padding: 3px 5px; border: 1px solid var(--warm); border-radius: 3px; background: var(--surface); color: var(--warm); font: 700 8px/1 var(--font-data); letter-spacing: .06em; text-align: center; transform: translateX(-50%); white-space: nowrap; }
     .trend-annotation strong { color: var(--text); font-size: 9px; letter-spacing: 0; }
-    .share-panel { position: relative; min-width: 0; margin-top: 10px; overflow: hidden; }
+    .share-panel { position: relative; min-width: 0; margin-top: 10px; overflow: hidden; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
     .share-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 10px 16px 0; color: var(--muted); font: 10px/1 var(--font-data); }
     .share-legend .legend-item strong { color: var(--text); font-weight: 600; }
     .share-swatch { width: 9px; height: 9px; border: 1px solid rgba(240, 237, 229, .2); border-radius: 2px; background: var(--series-color); }
@@ -5475,7 +5498,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
     .share-point-data { display: none; }
     .empty-chart { display: grid; min-height: 220px; place-items: center; color: var(--faint); font: 12px var(--font-data); }
     .trend-panel, .breakdown-panel, .sessions-panel { min-width: 0; overflow: hidden; }
-    .sessions-panel { margin-top: 10px; }
+    .sessions-panel { margin-top: 10px; content-visibility: auto; contain-intrinsic-size: auto none auto 320px; }
     .dimension-nav { display: flex; gap: 6px; padding: 12px 16px 0; overflow-x: auto; }
     .dimension-link { padding: 7px 9px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font: 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
     .dimension-link.active { border-color: var(--accent); color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
@@ -5552,7 +5575,7 @@ const analyticsTemplate = `{{define "analytics"}}<!doctype html>
 <main id="main-content">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Tokemon overview">
-      <img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34">
+      <img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34">
       <span class="brand-name">TOKEMON</span>
     </a>
     <nav class="nav" aria-label="Primary navigation">
@@ -5899,10 +5922,11 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10110f">
-  <link rel="icon" type="image/png" href="/static/tokemon/token-dex.png">
+  <link rel="icon" type="image/png" href="{{staticURL "/static/tokemon/token-dex.png"}}">
+  <link rel="preload" as="font" type="font/woff2" href="{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}" crossorigin>
   <title>Tokemon · Insights</title>
   <style>
-    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("/static/tokemon/fonts/pixelify-sans-latin.woff2") format("woff2"); }
+    @font-face { font-family: "Pixelify Sans"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("{{staticURL "/static/tokemon/fonts/pixelify-sans-latin.woff2"}}") format("woff2"); }
     :root { color-scheme: dark; --bg: #10110f; --surface: #171916; --surface-raised: #1d201b; --text: #f0ede5; --muted: #a2a69b; --faint: #a5ad9c; --line: #30352d; --line-bright: #485044; --control-border: #66705f; --accent: #9bbba0; --accent-dim: #607864; --warm: #d2a477; --danger: #bd7164; --font-display: "Pixelify Sans", ui-sans-serif, system-ui, sans-serif; --font-data: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
@@ -6003,7 +6027,7 @@ const insightsTemplate = `{{define "insights"}}<!doctype html>
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><main id="main-content">
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="/static/tokemon/token-dex.png" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
+    <a class="brand" href="/" aria-label="Tokemon overview"><img class="brand-mark" src="{{staticURL "/static/tokemon/token-dex.png"}}" alt="" width="34" height="34"><span class="brand-name">TOKEMON</span></a>
     <nav class="nav" aria-label="Primary navigation">
       <a class="nav-link" href="/">Overview</a>
       <a class="nav-link" href="/analytics">Analytics</a>
