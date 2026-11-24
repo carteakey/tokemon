@@ -3064,3 +3064,123 @@ func TestPurgeBeforeSubsecondMidnightAndNonZOffsets(t *testing.T) {
 		t.Fatalf("remaining event IDs = %v, want %v", remaining, wantRemaining)
 	}
 }
+
+func TestIngestAntigravityBackfillRefreshesAndReplacesLegacyUUID(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "tokemon.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	tsModern := time.Date(2026, 11, 24, 14, 0, 0, 123456000, time.UTC)
+	tsLegacy := time.Date(2026, 6, 16, 3, 32, 45, 497045000, time.UTC)
+	modernID := usage.DeterministicID("mac", "antigravity", "id-modern", 0, tsModern.Format(time.RFC3339Nano), "sha256:modern")
+	legacyOldID := usage.DeterministicID("mac", "antigravity", "id-legacy", 0, tsLegacy.Format(time.RFC3339Nano), "13ba20ec-b4b2-4c9a-9631-f3db17b86315")
+	legacyNewID := usage.DeterministicID("mac", "antigravity", "id-legacy", 0, tsLegacy.Format(time.RFC3339Nano), "sha256:legacy")
+
+	// Seed pre-0.3.0 events: one sha256 session (missing cache_read_tokens)
+	// and one legacy raw-UUID session (missing cache_read_tokens + ceiling output).
+	if _, err := store.Ingest(ctx, []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       modernID,
+			Timestamp:     tsModern,
+			MachineID:     "mac",
+			SessionID:     "sha256:modern",
+			Provider:      "google",
+			Model:         "gemini-4-hydrogen-tiered-high",
+			Tool:          "antigravity",
+			InputTokens:   usage.Int64(3487),
+			OutputTokens:  usage.Int64(332),
+			TotalTokens:   usage.Int64(3819),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "antigravity", AdapterVersion: "0.2.0"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       legacyOldID,
+			Timestamp:     tsLegacy,
+			MachineID:     "mac",
+			SessionID:     "13ba20ec-b4b2-4c9a-9631-f3db17b86315",
+			Provider:      "google",
+			Model:         "gemini-3-flash-agent",
+			Tool:          "antigravity",
+			InputTokens:   usage.Int64(9405),
+			OutputTokens:  usage.Int64(1132),
+			TotalTokens:   usage.Int64(10537),
+			Currency:      "USD",
+			TokenAccuracy: usage.AccuracyReported,
+			Source:        usage.Source{Adapter: "antigravity", AdapterVersion: "0.2.0"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-ingest v0.3.0 events with cache_read_tokens and reasoning_tokens.
+	res, err := store.Ingest(ctx, []usage.Event{
+		{
+			SchemaVersion:   usage.SchemaVersion,
+			EventID:         modernID,
+			Timestamp:       tsModern,
+			MachineID:       "mac",
+			SessionID:       "sha256:modern",
+			Provider:        "google",
+			Model:           "gemini-4-hydrogen-tiered-high",
+			Tool:            "antigravity",
+			InputTokens:     usage.Int64(3487),
+			OutputTokens:    usage.Int64(332),
+			CacheReadTokens: usage.Int64(346516),
+			ReasoningTokens: usage.Int64(289),
+			TotalTokens:     usage.Int64(350335),
+			Currency:        "USD",
+			TokenAccuracy:   usage.AccuracyReported,
+			Source:          usage.Source{Adapter: "antigravity", AdapterVersion: "0.3.0"},
+		},
+		{
+			SchemaVersion:   usage.SchemaVersion,
+			EventID:         legacyNewID,
+			Timestamp:       tsLegacy,
+			MachineID:       "mac",
+			SessionID:       "sha256:legacy",
+			Provider:        "google",
+			Model:           "gemini-3-flash-agent",
+			Tool:            "antigravity",
+			InputTokens:     usage.Int64(9405),
+			OutputTokens:    usage.Int64(605),
+			CacheReadTokens: usage.Int64(4048),
+			ReasoningTokens: usage.Int64(503),
+			TotalTokens:     usage.Int64(14058),
+			Currency:        "USD",
+			TokenAccuracy:   usage.AccuracyReported,
+			Source:          usage.Source{Adapter: "antigravity", AdapterVersion: "0.3.0"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Accepted != 1 || res.Duplicates != 1 {
+		t.Fatalf("backfill ingest result = %+v, want Accepted=1 Duplicates=1", res)
+	}
+
+	var count int
+	if err := store.readHandle().QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("usage_events count = %d, want 2 (no double-counting)", count)
+	}
+	wantTotal := int64(350335 + 14058)
+	if res.CurrentTotal != wantTotal {
+		t.Fatalf("CurrentTotal = %d, want %d", res.CurrentTotal, wantTotal)
+	}
+	overview, err := store.Overview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCached := int64(346516 + 4048)
+	if overview.Cache.CachedTokens != wantCached {
+		t.Fatalf("Cache.CachedTokens = %d, want %d", overview.Cache.CachedTokens, wantCached)
+	}
+}

@@ -421,3 +421,161 @@ CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);`); err !
 		t.Fatalf("unchanged step source was reparsed: %+v, error: %v", repeated, err)
 	}
 }
+
+func TestParseGenerationStepsCacheReadReasoningAndIncrementalCursor(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "cached-steps.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := message(bytesField(3, message(bytesField(28, []byte("gemini-4-hydrogen-tiered-high")))))
+	// Cold turn: field 5 omitted -> CacheReadTokens = 0.
+	stepCold := message(
+		bytesField(1, message(varintField(1, 1793760100), varintField(2, 0))),
+		bytesField(9, message(varintField(1, 1535), varintField(2, 12000), varintField(3, 500), varintField(9, 200), varintField(10, 300))),
+	)
+	// Warm turn: field 5 = 346516 cache read, field 2 = 3487 uncached input,
+	// field 3 = 332 total output (field 9 = 289 thinking + field 10 = 43 text).
+	stepWarm := message(
+		bytesField(1, message(varintField(1, 1793760200), varintField(2, 0))),
+		bytesField(9, message(varintField(1, 1535), varintField(2, 3487), varintField(3, 332), varintField(5, 346516), varintField(9, 289), varintField(10, 43))),
+	)
+	if _, err := db.Exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, metadata BLOB);
+CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, 0)`, generation); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?), (2, 15, ?)`, stepCold, stepWarm); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	caps := adapter.Capabilities()
+	if !caps.CacheTokens || !caps.ReasoningTokens {
+		t.Fatalf("capabilities = %+v, want CacheTokens and ReasoningTokens enabled", caps)
+	}
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(first.Events) != 2 {
+		t.Fatalf("first parse = %d events, error: %v", len(first.Events), err)
+	}
+	cold := first.Events[0]
+	if cold.CacheReadTokens == nil || *cold.CacheReadTokens != 0 || cold.ReasoningTokens == nil || *cold.ReasoningTokens != 200 || cold.TotalTokens == nil || *cold.TotalTokens != 12500 {
+		t.Fatalf("cold step tokens = %+v", cold)
+	}
+	warm := first.Events[1]
+	if warm.InputTokens == nil || *warm.InputTokens != 3487 || warm.CacheReadTokens == nil || *warm.CacheReadTokens != 346516 || warm.OutputTokens == nil || *warm.OutputTokens != 332 || warm.ReasoningTokens == nil || *warm.ReasoningTokens != 289 || warm.TotalTokens == nil || *warm.TotalTokens != 350335 {
+		t.Fatalf("warm step tokens = %+v", warm)
+	}
+	if err := usage.ValidateOutboundBatch(first.Events); err != nil {
+		t.Fatalf("step batch failed validation: %v", err)
+	}
+
+	// Upgrading from an older v0.2.0 cursor re-reads from offset 0 with the
+	// exact same deterministic EventIDs so Store.Ingest updates rows in place.
+	oldCursor := adapters.Cursor{
+		Identity: adapters.HashIdentity(adapterID + "\x00" + "0.2.0" + "\x00" + sources[0].Path),
+		Offset:   2,
+	}
+	upgraded, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: oldCursor})
+	if err != nil || len(upgraded.Events) != 2 {
+		t.Fatalf("v0.2.0 upgrade parse = %d events, error: %v", len(upgraded.Events), err)
+	}
+	if upgraded.Events[0].EventID != cold.EventID || upgraded.Events[1].EventID != warm.EventID {
+		t.Fatalf("upgrade changed deterministic event IDs")
+	}
+
+	// Appending a third step and parsing with the v0.3.0 cursor emits only the new step.
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepThird := message(
+		bytesField(1, message(varintField(1, 1793760300), varintField(2, 0))),
+		bytesField(9, message(varintField(1, 1535), varintField(2, 1000), varintField(3, 150), varintField(5, 350000), varintField(9, 50), varintField(10, 100))),
+	)
+	if _, err := db.Exec(`INSERT INTO steps (idx, step_type, metadata) VALUES (3, 15, ?)`, stepThird); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inc, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil || len(inc.Events) != 1 {
+		t.Fatalf("incremental parse = %d events, error: %v", len(inc.Events), err)
+	}
+	if inc.Events[0].TotalTokens == nil || *inc.Events[0].TotalTokens != 351150 || inc.Cursor.Offset != 3 {
+		t.Fatalf("incremental event = %+v, cursor = %+v", inc.Events[0], inc.Cursor)
+	}
+}
+
+func TestParseLegacyGenerationMetadataUsesActualOutputAndCacheRead(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "legacy-cache.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Field 1 (1132) is the ceiling; field 3 (605) is actual output;
+	// field 2 (9405) is uncached input; field 5 (4048) is cache read; field 9 (503) is reasoning.
+	stats := message(
+		varintField(1, 1132),
+		varintField(2, 9405),
+		varintField(3, 605),
+		varintField(5, 4048),
+		varintField(9, 503),
+		varintField(10, 102),
+	)
+	timestamp := message(varintField(1, uint64(time.Date(2026, 6, 16, 3, 32, 45, 497045000, time.UTC).Unix())), varintField(2, 497045000))
+	generation := message(bytesField(4, stats), bytesField(9, bytesField(4, timestamp)), bytesField(19, []byte("gemini-3-flash-agent")))
+	record := message(bytesField(1, generation))
+
+	if _, err := db.Exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?);`, record, len(record)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 1 {
+		t.Fatalf("sources = %d, error: %v", len(sources), err)
+	}
+	res, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(res.Events) != 1 {
+		t.Fatalf("legacy parse = %d events, error: %v", len(res.Events), err)
+	}
+	ev := res.Events[0]
+	if ev.InputTokens == nil || *ev.InputTokens != 9405 ||
+		ev.OutputTokens == nil || *ev.OutputTokens != 605 ||
+		ev.CacheReadTokens == nil || *ev.CacheReadTokens != 4048 ||
+		ev.ReasoningTokens == nil || *ev.ReasoningTokens != 503 ||
+		ev.TotalTokens == nil || *ev.TotalTokens != 14058 {
+		t.Fatalf("unexpected legacy tokens: %+v", ev)
+	}
+}

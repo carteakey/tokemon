@@ -1036,6 +1036,22 @@ AND input_tokens IS NULL AND output_tokens IS NULL AND cache_read_tokens IS NULL
 				facetsNeedInvalidate = true
 			}
 		}
+		if event.Source.Adapter == "antigravity" && strings.HasPrefix(event.SessionID, "sha256:") && event.CacheReadTokens != nil && event.TotalTokens != nil {
+			// Upgraded Antigravity events (v0.3.0+) include cache_read_tokens
+			// and hash the session path. Remove any superseded pre-hash UUID
+			// row recorded at the exact same instant so backfilling historical
+			// conversations cannot double-count them.
+			res, err := tx.ExecContext(ctx, `DELETE FROM usage_events
+WHERE machine_id = ? AND adapter = 'antigravity' AND timestamp = ?
+AND session_id IS NOT NULL AND session_id NOT LIKE 'sha256:%'
+AND cache_read_tokens IS NULL`, event.MachineID, event.Timestamp.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"))
+			if err != nil {
+				return result, err
+			}
+			if deleted, err := res.RowsAffected(); err == nil && deleted > 0 {
+				facetsNeedInvalidate = true
+			}
+		}
 		canonicalModel := event.CanonicalModel
 		var estimatedCost *float64
 		if canonicalModel == "" && s.catalog != nil {

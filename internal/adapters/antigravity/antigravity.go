@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ import (
 
 const (
 	adapterID      = "antigravity"
-	adapterVersion = "0.2.0"
+	adapterVersion = "0.3.0"
 )
 
 type fileSignature struct {
@@ -83,7 +84,7 @@ func (a *Adapter) NormalizeModel(raw string) string {
 }
 
 func (a *Adapter) Capabilities() adapters.Capabilities {
-	return adapters.Capabilities{InputTokens: true, OutputTokens: true, SessionID: true}
+	return adapters.Capabilities{InputTokens: true, OutputTokens: true, CacheTokens: true, ReasoningTokens: true, SessionID: true}
 }
 
 func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
@@ -271,25 +272,28 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 			nextOffset = idx + 1
 		}
 		metadata, ok := decodeGenerationMetadata(data)
-		if !ok || metadata.InputTokens+metadata.OutputTokens <= 0 || metadata.Timestamp.IsZero() {
+		total, totalOK := metadataTotalTokens(metadata)
+		if !ok || !totalOK || total <= 0 || metadata.Timestamp.IsZero() {
 			continue
 		}
 		events = append(events, usage.Event{
-			SchemaVersion: usage.SchemaVersion,
-			EventID:       usage.DeterministicID(request.MachineID, adapterID, eventIdentity, idx, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
-			Timestamp:     metadata.Timestamp,
-			MachineID:     request.MachineID,
-			SessionID:     sessionID,
-			Project:       project,
-			Provider:      providerForModel(metadata.Model),
-			Model:         a.NormalizeModel(metadata.Model),
-			Tool:          "antigravity",
-			InputTokens:   usage.Int64(metadata.InputTokens),
-			OutputTokens:  usage.Int64(metadata.OutputTokens),
-			TotalTokens:   usage.Int64(metadata.InputTokens + metadata.OutputTokens),
-			Currency:      "USD",
-			TokenAccuracy: usage.AccuracyReported,
-			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: idx},
+			SchemaVersion:   usage.SchemaVersion,
+			EventID:         usage.DeterministicID(request.MachineID, adapterID, eventIdentity, idx, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
+			Timestamp:       metadata.Timestamp,
+			MachineID:       request.MachineID,
+			SessionID:       sessionID,
+			Project:         project,
+			Provider:        providerForModel(metadata.Model),
+			Model:           a.NormalizeModel(metadata.Model),
+			Tool:            "antigravity",
+			InputTokens:     usage.Int64(metadata.InputTokens),
+			OutputTokens:    usage.Int64(metadata.OutputTokens),
+			CacheReadTokens: optionalInt64(metadata.CacheReadTokens, metadata.HasCacheRead),
+			ReasoningTokens: optionalInt64(metadata.ReasoningTokens, metadata.HasReasoning),
+			TotalTokens:     usage.Int64(total),
+			Currency:        "USD",
+			TokenAccuracy:   usage.AccuracyReported,
+			Source:          usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: idx},
 		})
 	}
 	result := adapters.ParseResult{Events: events, Cursor: adapters.Cursor{Identity: identity, Offset: nextOffset}}
@@ -345,23 +349,20 @@ func generationStepsStart(ctx context.Context, db *sql.DB, cursorOffset int64) (
 	if !hasStepType || !hasMetadata {
 		return 0, false, nil
 	}
-	var first, last []byte
-	err = db.QueryRowContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC LIMIT 1`).Scan(&first)
+	var last []byte
+	err = db.QueryRowContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 1`).Scan(&last)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
 	if err != nil {
 		return 0, false, err
 	}
-	if err := db.QueryRowContext(ctx, `SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 1`).Scan(&last); err != nil {
-		return 0, false, err
-	}
 	if _, ok := decodeGenerationMetadata(last); ok {
 		return 0, false, nil
 	}
-	start := int64(0)
-	if _, ok := decodeGenerationMetadata(first); ok {
-		start = cursorOffset
+	start := cursorOffset
+	if start < 0 {
+		start = 0
 	}
 	var steps int64
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE step_type = 15 AND metadata IS NOT NULL`).Scan(&steps); err != nil {
@@ -376,6 +377,13 @@ func generationStepsStart(ctx context.Context, db *sql.DB, cursorOffset int64) (
 // decodeStepMetadata reads the timestamp and usage counters Antigravity stores
 // on an assistant step. Only these scalar fields are touched; step_payload and
 // the transcript tables are never queried.
+//
+// Antigravity's usage protobuf (field 9 of steps.metadata) encodes:
+//   - field 1: model output ceiling (constant per conversation; ignored)
+//   - field 2: uncached input tokens
+//   - field 3: total output tokens (field 9 thinking + field 10 visible text)
+//   - field 5: cache-read input tokens (omitted on cold turns -> 0)
+//   - field 9: reasoning/thinking output tokens (subset of field 3)
 func decodeStepMetadata(data []byte) (generationMetadata, bool) {
 	timestampMessage, ok := protobufBytesField(data, 1)
 	if !ok {
@@ -390,19 +398,32 @@ func decodeStepMetadata(data []byte) (generationMetadata, bool) {
 	if !ok {
 		return generationMetadata{}, false
 	}
-	input, ok := protobufVarintField(usageMessage, 2)
-	if !ok {
+	inputRaw, ok := protobufVarintField(usageMessage, 2)
+	if !ok || inputRaw > math.MaxInt64 {
 		return generationMetadata{}, false
 	}
 	// Field 1 is the model's configured output ceiling and is constant for a
 	// conversation; field 3 is the generated output for this step.
-	output, ok := protobufVarintField(usageMessage, 3)
-	if !ok {
+	outputRaw, ok := protobufVarintField(usageMessage, 3)
+	if !ok || outputRaw > math.MaxInt64 {
 		return generationMetadata{}, false
 	}
+	cacheReadRaw, _ := protobufVarintField(usageMessage, 5)
+	if cacheReadRaw > math.MaxInt64 {
+		return generationMetadata{}, false
+	}
+	reasoningRaw, hasReasoning := protobufVarintField(usageMessage, 9)
+	if hasReasoning && reasoningRaw > outputRaw {
+		reasoningRaw = outputRaw
+	}
 	return generationMetadata{
-		InputTokens: int64(input), OutputTokens: int64(output),
-		Timestamp: time.Unix(int64(seconds), int64(nanos)).UTC(),
+		InputTokens:     int64(inputRaw),
+		OutputTokens:    int64(outputRaw),
+		CacheReadTokens: int64(cacheReadRaw),
+		HasCacheRead:    true,
+		ReasoningTokens: int64(reasoningRaw),
+		HasReasoning:    hasReasoning,
+		Timestamp:       time.Unix(int64(seconds), int64(nanos)).UTC(),
 	}, true
 }
 
@@ -448,25 +469,28 @@ func (a *Adapter) parseGenerationSteps(ctx context.Context, db *sql.DB, request 
 			continue
 		}
 		metadata, ok := decodeStepMetadata(data)
-		if !ok || metadata.InputTokens+metadata.OutputTokens <= 0 {
+		total, totalOK := metadataTotalTokens(metadata)
+		if !ok || !totalOK || total <= 0 {
 			continue
 		}
 		events = append(events, usage.Event{
-			SchemaVersion: usage.SchemaVersion,
-			EventID:       usage.DeterministicID(request.MachineID, adapterID, eventIdentity, current, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
-			Timestamp:     metadata.Timestamp,
-			MachineID:     request.MachineID,
-			SessionID:     sessionID,
-			Project:       project,
-			Provider:      providerForModel(model),
-			Model:         a.NormalizeModel(model),
-			Tool:          "antigravity",
-			InputTokens:   usage.Int64(metadata.InputTokens),
-			OutputTokens:  usage.Int64(metadata.OutputTokens),
-			TotalTokens:   usage.Int64(metadata.InputTokens + metadata.OutputTokens),
-			Currency:      "USD",
-			TokenAccuracy: usage.AccuracyReported,
-			Source:        usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: current},
+			SchemaVersion:   usage.SchemaVersion,
+			EventID:         usage.DeterministicID(request.MachineID, adapterID, eventIdentity, current, metadata.Timestamp.Format(time.RFC3339Nano), sessionID),
+			Timestamp:       metadata.Timestamp,
+			MachineID:       request.MachineID,
+			SessionID:       sessionID,
+			Project:         project,
+			Provider:        providerForModel(model),
+			Model:           a.NormalizeModel(model),
+			Tool:            "antigravity",
+			InputTokens:     usage.Int64(metadata.InputTokens),
+			OutputTokens:    usage.Int64(metadata.OutputTokens),
+			CacheReadTokens: optionalInt64(metadata.CacheReadTokens, metadata.HasCacheRead),
+			ReasoningTokens: optionalInt64(metadata.ReasoningTokens, metadata.HasReasoning),
+			TotalTokens:     usage.Int64(total),
+			Currency:        "USD",
+			TokenAccuracy:   usage.AccuracyReported,
+			Source:          usage.Source{Adapter: adapterID, AdapterVersion: adapterVersion, Identity: eventIdentity, Offset: current},
 		})
 	}
 	return events, rank, rows.Err()
@@ -541,13 +565,39 @@ func providerForModel(model string) string {
 // generationMetadata contains only fields Tokemon is allowed to retain. The
 // Antigravity schema is internal protobuf, so decoding is intentionally narrow:
 // the outer generation record's field 1 contains generation stats; its field 4
-// contains output/input counters, field 9 contains a protobuf timestamp, and
-// field 19 contains the model ID. Unknown fields are skipped.
+// contains uncached input (2), output (3, with legacy fallback 1), cache-read
+// input (5), and reasoning output (9); field 9 contains a protobuf timestamp;
+// and field 19 contains the model ID. Unknown fields are skipped.
 type generationMetadata struct {
-	InputTokens  int64
-	OutputTokens int64
-	Model        string
-	Timestamp    time.Time
+	InputTokens     int64
+	OutputTokens    int64
+	CacheReadTokens int64
+	HasCacheRead    bool
+	ReasoningTokens int64
+	HasReasoning    bool
+	Model           string
+	Timestamp       time.Time
+}
+
+func optionalInt64(value int64, present bool) *int64 {
+	if !present {
+		return nil
+	}
+	return usage.Int64(value)
+}
+
+func metadataTotalTokens(metadata generationMetadata) (int64, bool) {
+	if metadata.InputTokens < 0 || metadata.OutputTokens < 0 || metadata.CacheReadTokens < 0 {
+		return 0, false
+	}
+	if metadata.InputTokens > math.MaxInt64-metadata.CacheReadTokens {
+		return 0, false
+	}
+	sum := metadata.InputTokens + metadata.CacheReadTokens
+	if sum > math.MaxInt64-metadata.OutputTokens {
+		return 0, false
+	}
+	return sum + metadata.OutputTokens, true
 }
 
 func decodeGenerationMetadata(data []byte) (generationMetadata, bool) {
@@ -559,8 +609,22 @@ func decodeGenerationMetadata(data []byte) (generationMetadata, bool) {
 	if !ok {
 		return generationMetadata{}, false
 	}
-	output, _ := protobufVarintField(stats, 1)
-	input, _ := protobufVarintField(stats, 2)
+	// Field 3 is the step's actual output count (matching steps.metadata).
+	// Field 1 is the conversation's output ceiling on real Antigravity records
+	// and is kept only as a fallback when field 3 is absent.
+	outputRaw, hasRealOutput := protobufVarintField(stats, 3)
+	if !hasRealOutput {
+		outputRaw, _ = protobufVarintField(stats, 1)
+	}
+	inputRaw, _ := protobufVarintField(stats, 2)
+	cacheReadRaw, hasCacheField := protobufVarintField(stats, 5)
+	if inputRaw > math.MaxInt64 || outputRaw > math.MaxInt64 || cacheReadRaw > math.MaxInt64 {
+		return generationMetadata{}, false
+	}
+	reasoningRaw, hasReasoning := protobufVarintField(stats, 9)
+	if hasReasoning && reasoningRaw > outputRaw {
+		reasoningRaw = outputRaw
+	}
 	model, _ := protobufBytesField(outer, 19)
 	timestampMessage, _ := protobufBytesField(outer, 9)
 	seconds, _ := protobufVarintField(timestampMessage, 4, 1)
@@ -569,8 +633,14 @@ func decodeGenerationMetadata(data []byte) (generationMetadata, bool) {
 		return generationMetadata{}, false
 	}
 	return generationMetadata{
-		InputTokens: int64(input), OutputTokens: int64(output), Model: string(model),
-		Timestamp: time.Unix(int64(seconds), int64(nanos)).UTC(),
+		InputTokens:     int64(inputRaw),
+		OutputTokens:    int64(outputRaw),
+		CacheReadTokens: int64(cacheReadRaw),
+		HasCacheRead:    hasRealOutput || hasCacheField,
+		ReasoningTokens: int64(reasoningRaw),
+		HasReasoning:    hasReasoning,
+		Model:           string(model),
+		Timestamp:       time.Unix(int64(seconds), int64(nanos)).UTC(),
 	}, true
 }
 
