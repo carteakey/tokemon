@@ -1073,3 +1073,46 @@ func TestQuotaCRUDImmediateCacheInvalidationAndRace(t *testing.T) {
 		t.Fatalf("QuotaStatus after final delete = %+v, want nil", st3)
 	}
 }
+
+func TestQuotaStatusWarmupInvalidationDoesNotStallFirstIngest(t *testing.T) {
+	budget := int64(100_000)
+	store, err := OpenWithLocation(
+		filepath.Join(t.TempDir(), "tokemon.db"),
+		catalog.Empty(),
+		time.UTC,
+		quota.Quota{Label: "Cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+	// Startup warmup populates quotaCache on an empty DB.
+	warm := store.QuotaStatus(WithWarmupContext(ctx), now)
+	if len(warm) != 1 || warm[0].TokensUsed != 0 {
+		t.Fatalf("warmup QuotaStatus = %+v", warm)
+	}
+
+	// First ingest arrives before any client read: unserved warmup entry is dropped,
+	// so the first client read observes fresh data immediately with no 2s stall.
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("warm-first", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5", 10_000),
+	})
+	first := store.QuotaStatus(ctx, now)
+	if len(first) != 1 || first[0].TokensUsed != 10_000 {
+		t.Fatalf("first QuotaStatus after warmup+ingest = %+v, want tokens_used=10000", first)
+	}
+
+	// Once a real caller has observed the entry, subsequent ingests inside the
+	// coalescing window preserve normal SWR stale-serving behavior.
+	ingestQuotaEvents(t, store, []usage.Event{
+		quotaUsageEvent("warm-second", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "openai", "gpt-5", 5_000),
+	})
+	inside := store.QuotaStatus(ctx, now)
+	if len(inside) != 1 || inside[0].TokensUsed != 10_000 {
+		t.Fatalf("inside-window QuotaStatus after real read = %+v, want stale 10000", inside)
+	}
+}

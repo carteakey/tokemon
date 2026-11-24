@@ -237,6 +237,36 @@ func TestM5BSettingsQuotaCRUDBackupAgeAndOverviewPaceBar(t *testing.T) {
 		t.Fatalf("invalid quota POST = %d, want 400 with role=alert", badRec.Code)
 	}
 
+	// 4b. Duplicate collision via action=create rejects YAML and SQLite collisions (case-insensitive) with 409 + role="alert".
+	for _, tc := range []struct {
+		name     string
+		provider string
+		model    string
+		wantText string
+	}{
+		{name: "yaml_collision_case_insensitive", provider: "Anthropic", model: "", wantText: "YAML Anthropic"},
+	} {
+		dupForm := url.Values{
+			"csrf_token":       {server.csrfToken()},
+			"action":           {"create"},
+			"provider":         {tc.provider},
+			"model":            {tc.model},
+			"label":            {"Duplicate Attempt"},
+			"reset_day":        {"1"},
+			"tokens_per_month": {"999"},
+		}
+		dupReq := httptest.NewRequest(http.MethodPost, "/settings/quotas", strings.NewReader(dupForm.Encode()))
+		dupReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		dupRec := httptest.NewRecorder()
+		handler.ServeHTTP(dupRec, dupReq)
+		if dupRec.Code != http.StatusConflict || !strings.Contains(dupRec.Body.String(), `role="alert"`) {
+			t.Fatalf("%s POST /settings/quotas = %d, want 409 with role=alert", tc.name, dupRec.Code)
+		}
+		if !strings.Contains(dupRec.Body.String(), tc.wantText) {
+			t.Fatalf("%s POST /settings/quotas did not preserve existing %q", tc.name, tc.wantText)
+		}
+	}
+
 	// 5. Override YAML quota in SQLite -> 303 redirect, drops overview HTML cache, updates / immediately.
 	overrideForm := url.Values{
 		"csrf_token":       {server.csrfToken()},
@@ -259,11 +289,12 @@ func TestM5BSettingsQuotaCRUDBackupAgeAndOverviewPaceBar(t *testing.T) {
 		t.Fatal("/ did not drop overview HTML cache after quota override")
 	}
 
-	// 6. Add SQLite-only quota and check settings badges.
+	// 6. Add SQLite-only quota via action=create and check settings badges + SQLite collision rejection.
 	addForm := url.Values{
 		"csrf_token":       {server.csrfToken()},
-		"action":           {"upsert"},
+		"action":           {"create"},
 		"provider":         {"openai"},
+		"model":            {"gpt-5.4"},
 		"label":            {"UI OpenAI Cap"},
 		"reset_day":        {"1"},
 		"tokens_per_month": {"1000000"},
@@ -274,6 +305,25 @@ func TestM5BSettingsQuotaCRUDBackupAgeAndOverviewPaceBar(t *testing.T) {
 	handler.ServeHTTP(addRec, addReq)
 	if addRec.Code != http.StatusSeeOther || addRec.Header().Get("Location") != "/settings?quota_saved=1" {
 		t.Fatalf("add quota POST = %d loc=%q", addRec.Code, addRec.Header().Get("Location"))
+	}
+	dupSQLiteForm := url.Values{
+		"csrf_token":       {server.csrfToken()},
+		"action":           {"create"},
+		"provider":         {"OpenAI"},
+		"model":            {"GPT-5.4"},
+		"label":            {"Duplicate SQLite"},
+		"reset_day":        {"1"},
+		"tokens_per_month": {"2000000"},
+	}
+	dupSQLiteReq := httptest.NewRequest(http.MethodPost, "/settings/quotas", strings.NewReader(dupSQLiteForm.Encode()))
+	dupSQLiteReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	dupSQLiteRec := httptest.NewRecorder()
+	handler.ServeHTTP(dupSQLiteRec, dupSQLiteReq)
+	if dupSQLiteRec.Code != http.StatusConflict || !strings.Contains(dupSQLiteRec.Body.String(), `role="alert"`) {
+		t.Fatalf("sqlite collision POST /settings/quotas = %d, want 409 with role=alert", dupSQLiteRec.Code)
+	}
+	if !strings.Contains(dupSQLiteRec.Body.String(), "UI OpenAI Cap") {
+		t.Fatal("sqlite collision overwrote UI OpenAI Cap")
 	}
 	setAfterAdd := httptest.NewRecorder()
 	handler.ServeHTTP(setAfterAdd, httptest.NewRequest(http.MethodGet, "/settings", nil))

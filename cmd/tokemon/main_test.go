@@ -46,6 +46,39 @@ func TestServeHTTPGracefulShutdown(t *testing.T) {
 	}
 }
 
+func TestServeHTTPShutdownClosesIdleStateNewConnectionsPromptly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.NotFoundHandler()}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveHTTP(ctx, server, listener, 10*time.Second)
+	}()
+
+	// Open a raw TCP connection without sending any HTTP bytes (StateNew on server).
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial %s: %v", listener.Addr().String(), err)
+	}
+	defer conn.Close()
+
+	// Ensure server has accepted and registered the connection in StateNew.
+	time.Sleep(30 * time.Millisecond)
+
+	started := time.Now()
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("serveHTTP shutdown with StateNew conn: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("serveHTTP shutdown took %v with idle StateNew conn; expected prompt close (<2s)", elapsed)
+	}
+}
+
 func TestRunArtValidate(t *testing.T) {
 	path := filepath.Join("..", "..", "web", "static", "tokemon")
 	if err := run([]string{"art", "validate", "--dir", path}); err != nil {

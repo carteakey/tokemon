@@ -246,6 +246,22 @@ const (
 	quotaMinRefreshInterval = 2 * time.Second
 )
 
+type warmupContextKey struct{}
+
+// WithWarmupContext marks a context as originating from startup cache warmup
+// rather than an external request. Unserved warmup entries are dropped on the
+// first ingest invalidation so post-startup requests never observe stale-zero
+// startup snapshots.
+func WithWarmupContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, warmupContextKey{}, true)
+}
+
+// IsWarmupContext reports whether ctx came from startup cache warmup.
+func IsWarmupContext(ctx context.Context) bool {
+	v, _ := ctx.Value(warmupContextKey{}).(bool)
+	return v
+}
+
 type cachedQuotaBucket struct {
 	configured  quota.Quota
 	start       time.Time
@@ -260,6 +276,7 @@ type quotaCacheEntry struct {
 	buckets    []cachedQuotaBucket
 	fetched    time.Time
 	refreshDue time.Time
+	fromWarmup bool
 }
 
 // QuotaPoint is one day's cumulative usage inside the quota period, in the
@@ -319,6 +336,9 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 	for {
 		s.quotaMu.Lock()
 		if cached := s.quotaCache; cached != nil && cached.localDay == localDay {
+			if !IsWarmupContext(ctx) {
+				cached.fromWarmup = false
+			}
 			stale := time.Since(cached.fetched) >= quotaCacheTTL ||
 				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
 			if stale && s.quotaReady == nil {
@@ -357,6 +377,7 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 
 		s.quotaMu.Lock()
 		if ok && s.quotaGeneration == generation {
+			entry.fromWarmup = IsWarmupContext(ctx)
 			s.quotaCache = entry
 		}
 		s.quotaReady = nil
@@ -403,11 +424,15 @@ func (s *Store) invalidateQuotaCache() {
 	s.quotaMu.Lock()
 	s.quotaGeneration++
 	if s.quotaCache != nil {
-		due := now
-		if windowEnd := s.quotaCache.fetched.Add(quotaMinRefreshInterval); windowEnd.After(now) {
-			due = windowEnd
+		if s.quotaCache.fromWarmup {
+			s.quotaCache = nil
+		} else {
+			due := now
+			if windowEnd := s.quotaCache.fetched.Add(quotaMinRefreshInterval); windowEnd.After(now) {
+				due = windowEnd
+			}
+			s.quotaCache.refreshDue = due
 		}
-		s.quotaCache.refreshDue = due
 	}
 	s.quotaMu.Unlock()
 }

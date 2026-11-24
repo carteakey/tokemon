@@ -216,6 +216,16 @@ func (c Client) Overview(ctx context.Context) (database.Overview, error) {
 	return overview, nil
 }
 
+// OverviewFresh requests an uncached overview snapshot so single-shot status
+// reads observe recently ingested events without waiting on SWR refresh.
+func (c Client) OverviewFresh(ctx context.Context) (database.Overview, error) {
+	var overview database.Overview
+	if err := c.getJSON(ctx, "/api/v1/analytics/overview?fresh=1", &overview); err != nil {
+		return database.Overview{}, err
+	}
+	return overview, nil
+}
+
 // Health verifies that the hub is reachable before the agent performs an
 // expensive local collection pass. Offline hubs therefore trigger the normal
 // failure backoff without repeatedly parsing unchanged provider histories.

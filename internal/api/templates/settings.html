@@ -201,7 +201,7 @@
     {{end}}
     <form class="quota-add-form" action="/settings/quotas" method="post" aria-label="Add or override quota">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-      <input type="hidden" name="action" value="upsert">
+      <input type="hidden" name="action" value="create">
       <label for="quota-new-provider">Provider<input id="quota-new-provider" name="provider" maxlength="128" placeholder="All providers (blank)"></label>
       <label for="quota-new-model">Model<input id="quota-new-model" name="model" maxlength="256" placeholder="All models (blank)"></label>
       <label for="quota-new-label">Label<input id="quota-new-label" name="label" maxlength="128" placeholder="Optional display label"></label>

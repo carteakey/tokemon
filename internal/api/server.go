@@ -93,6 +93,7 @@ type evolutionCacheEntry struct {
 	err        error
 	fetched    time.Time
 	refreshDue time.Time
+	fromWarmup bool
 }
 
 type catalogCacheEntry struct {
@@ -136,8 +137,9 @@ type overviewCacheEntry struct {
 	// has not run or failed. Keeping it on the entry means a reader served this
 	// overview is also served exactly the page built from it: the two can never
 	// be stitched from different entries.
-	html []byte
-	etag string
+	html       []byte
+	etag       string
+	fromWarmup bool
 }
 
 // analyticsCacheEntry caches one filter combination's full Analytics result.
@@ -163,6 +165,7 @@ type analyticsCacheEntry struct {
 	// of ingest invalidations into one refresh; see
 	// analyticsMinRefreshInterval for the staleness it trades.
 	refreshDue time.Time
+	fromWarmup bool
 }
 
 type evolutionResponse struct {
@@ -3259,6 +3262,9 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 	for {
 		s.evolutionMu.Lock()
 		if cached := s.evolutionCache; cached != nil {
+			if !database.IsWarmupContext(ctx) {
+				cached.fromWarmup = false
+			}
 			stale := time.Since(cached.fetched) >= evolutionCacheTTL ||
 				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
 			if stale && s.evolutionReady == nil {
@@ -3291,7 +3297,12 @@ func (s *Server) cachedEvolution(ctx context.Context) (evolutionResponse, error)
 		ready := s.evolutionReady
 		s.evolutionReady = nil
 		if s.evolutionGeneration == generation && !clientGone(err) {
-			s.evolutionCache = &evolutionCacheEntry{result: result, err: err, fetched: time.Now()}
+			s.evolutionCache = &evolutionCacheEntry{
+				result:     result,
+				err:        err,
+				fetched:    time.Now(),
+				fromWarmup: database.IsWarmupContext(ctx),
+			}
 		}
 		s.evolutionMu.Unlock()
 		close(ready)
@@ -3344,11 +3355,15 @@ func (s *Server) invalidateEvolutionCache() {
 	s.evolutionMu.Lock()
 	s.evolutionGeneration++
 	if s.evolutionCache != nil {
-		due := now
-		if windowEnd := s.evolutionCache.fetched.Add(evolutionMinRefreshInterval); windowEnd.After(now) {
-			due = windowEnd
+		if s.evolutionCache.fromWarmup {
+			s.evolutionCache = nil
+		} else {
+			due := now
+			if windowEnd := s.evolutionCache.fetched.Add(evolutionMinRefreshInterval); windowEnd.After(now) {
+				due = windowEnd
+			}
+			s.evolutionCache.refreshDue = due
 		}
-		s.evolutionCache.refreshDue = due
 	}
 	s.evolutionMu.Unlock()
 }
@@ -3373,6 +3388,9 @@ func (s *Server) cachedOverviewEntry(ctx context.Context) overviewCacheEntry {
 	for {
 		s.overviewMu.Lock()
 		if cached := s.overviewCache; cached != nil {
+			if !database.IsWarmupContext(ctx) {
+				cached.fromWarmup = false
+			}
 			// Stale-while-revalidate: serve whatever we have immediately and
 			// refresh in the background when it is past the TTL. A reader never
 			// waits on a recompute, even right after an ingest invalidated it.
@@ -3409,12 +3427,51 @@ func (s *Server) cachedOverviewEntry(ctx context.Context) overviewCacheEntry {
 		fetched := time.Time{}
 		if s.overviewGeneration == generation && !clientGone(err) {
 			fetched = time.Now()
-			s.overviewCache = &overviewCacheEntry{result: result, err: err, fetched: fetched}
+			s.overviewCache = &overviewCacheEntry{
+				result:     result,
+				err:        err,
+				fetched:    fetched,
+				fromWarmup: database.IsWarmupContext(ctx),
+			}
 		}
 		s.overviewMu.Unlock()
 		close(ready)
 		return overviewCacheEntry{result: result, err: err, fetched: fetched}
 	}
+}
+
+func (s *Server) freshOverview(ctx context.Context) (database.Overview, error) {
+	s.overviewMu.Lock()
+	generation := s.overviewGeneration
+	s.overviewMu.Unlock()
+
+	computeCtx, cancel := detachedComputeContext(ctx)
+	result, err := s.store.Overview(computeCtx)
+	cancel()
+	if err != nil {
+		return database.Overview{}, err
+	}
+
+	s.overviewMu.Lock()
+	if s.overviewGeneration == generation {
+		s.overviewCache = &overviewCacheEntry{result: result, fetched: time.Now()}
+	}
+	s.overviewMu.Unlock()
+	return result, nil
+}
+
+func (s *Server) overviewForSettings(ctx context.Context) (database.Overview, error) {
+	s.overviewMu.Lock()
+	cached := s.overviewCache
+	fresh := cached != nil && !cached.fetched.IsZero() && time.Since(cached.fetched) < overviewCacheTTL
+	if fresh {
+		cached.fromWarmup = false
+		result, err := cached.result, cached.err
+		s.overviewMu.Unlock()
+		return result, err
+	}
+	s.overviewMu.Unlock()
+	return s.freshOverview(ctx)
 }
 
 // startOverviewRefreshLocked starts one background overview refresh. The
@@ -3486,10 +3543,13 @@ func (s *Server) WarmCaches(_ context.Context) {
 	defer s.bgWG.Done()
 	computeCtx, cancel := context.WithTimeout(s.backgroundContext(), sharedComputeTimeout)
 	defer cancel()
+	computeCtx = database.WithWarmupContext(computeCtx)
 	if result, fetched, err := s.cachedOverview(computeCtx); err != nil {
 		s.logger.Debug("warmup_overview_failed", "error", err.Error())
-	} else if _, err := s.buildDashboardHTML(computeCtx, result, fetched); err != nil {
-		s.logger.Debug("warmup_dashboard_failed", "error", err.Error())
+	} else if !fetched.IsZero() {
+		if _, err := s.buildDashboardHTML(computeCtx, result, fetched); err != nil {
+			s.logger.Debug("warmup_dashboard_failed", "error", err.Error())
+		}
 	}
 	query := database.AnalyticsQuery{Period: "30d", Dimension: "projects", Now: time.Now().UTC()}
 	if _, err := s.cachedAnalytics(computeCtx, query); err != nil {
@@ -3504,11 +3564,17 @@ func (s *Server) invalidateOverviewCache() {
 	s.overviewMu.Lock()
 	s.overviewGeneration++
 	if s.overviewCache != nil {
-		// Keep the last good result so readers are served immediately; the
-		// zero fetched time marks it stale and the next request refreshes it.
-		// The rendered page rides along on the entry, so the stale overview and
-		// its page stay a pair until the refresh replaces both.
-		s.overviewCache.fetched = time.Time{}
+		if s.overviewCache.fromWarmup {
+			// Unserved startup warmup entry: drop it so single-shot consumers
+			// never observe stale-zero startup state after an ingest.
+			s.overviewCache = nil
+		} else {
+			// Keep the last good result so readers are served immediately; the
+			// zero fetched time marks it stale and the next request refreshes it.
+			// The rendered page rides along on the entry, so the stale overview and
+			// its page stay a pair until the refresh replaces both.
+			s.overviewCache.fetched = time.Time{}
+		}
 	}
 	s.overviewMu.Unlock()
 }
@@ -3562,6 +3628,9 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 			}
 		}
 		if entry, ok := s.analyticsCache[key]; ok && entry.hasResult {
+			if !database.IsWarmupContext(ctx) {
+				entry.fromWarmup = false
+			}
 			// Stale-while-revalidate: serve whatever we have immediately and
 			// refresh in the background when it is past the TTL or past the
 			// coalescing deadline an ingest set. A reader never waits on a
@@ -3591,7 +3660,15 @@ func (s *Server) cachedAnalytics(ctx context.Context, query database.AnalyticsQu
 
 		s.analyticsMu.Lock()
 		if s.analyticsGeneration == generation && !clientGone(err) {
-			s.analyticsCache[key] = &analyticsCacheEntry{query: query, result: result, err: err, fetched: time.Now(), hasResult: true, lastUse: time.Now()}
+			s.analyticsCache[key] = &analyticsCacheEntry{
+				query:      query,
+				result:     result,
+				err:        err,
+				fetched:    time.Now(),
+				hasResult:  true,
+				lastUse:    time.Now(),
+				fromWarmup: database.IsWarmupContext(ctx),
+			}
 		} else {
 			delete(s.analyticsCache, key)
 		}
@@ -3677,8 +3754,12 @@ func (s *Server) invalidateAnalyticsCache() {
 	now := time.Now()
 	s.analyticsMu.Lock()
 	s.analyticsGeneration++
-	for _, entry := range s.analyticsCache {
+	for key, entry := range s.analyticsCache {
 		if entry.ready != nil {
+			continue
+		}
+		if entry.fromWarmup {
+			delete(s.analyticsCache, key)
 			continue
 		}
 		due := now
@@ -3692,7 +3773,15 @@ func (s *Server) invalidateAnalyticsCache() {
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	result, _, err := s.cachedOverview(r.Context())
+	var (
+		result database.Overview
+		err    error
+	)
+	if r.URL.Query().Get("fresh") == "1" {
+		result, err = s.freshOverview(r.Context())
+	} else {
+		result, _, err = s.cachedOverview(r.Context())
+	}
 	s.metrics.observeDB(started)
 	if err != nil {
 		if clientGone(err) {
@@ -4820,7 +4909,7 @@ func (s *Server) settingsBackupStatus() settingsBackupInfo {
 
 func (s *Server) buildSettingsPage(ctx context.Context, saved bool, quotaNotice, errMsg string) (settingsPage, error) {
 	started := time.Now()
-	result, _, err := s.cachedOverview(ctx)
+	result, err := s.overviewForSettings(ctx)
 	s.metrics.observeDB(started)
 	if err != nil {
 		return settingsPage{}, err
@@ -4963,20 +5052,34 @@ func (s *Server) saveQuota(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	normalized := quota.Normalize(candidate)
+	if err := quota.Validate(normalized); err != nil {
+		s.renderSettingsError(w, r, http.StatusBadRequest, "Could not save quota: "+err.Error())
+		return
+	}
+
 	existing, err := s.store.Quotas(r.Context())
+	if err != nil {
+		s.renderSettingsError(w, r, http.StatusInternalServerError, "Could not verify existing quotas.")
+		return
+	}
+	key := quota.Key(normalized.Provider, normalized.Model)
 	isYAMLOverride := false
-	if err == nil {
-		key := quota.Key(candidate.Provider, candidate.Model)
-		for _, item := range existing {
-			if quota.Key(item.Provider, item.Model) == key && (item.Source == database.QuotaSourceYAML || item.OverridesYAML) {
-				isYAMLOverride = true
-				break
-			}
+	for _, item := range existing {
+		if quota.Key(item.Provider, item.Model) != key {
+			continue
+		}
+		if action == "create" {
+			s.renderSettingsError(w, r, http.StatusConflict, "A quota for that provider and model already exists. Edit or override the existing rule above instead.")
+			return
+		}
+		if item.Source == database.QuotaSourceYAML || item.OverridesYAML {
+			isYAMLOverride = true
 		}
 	}
 
 	started := time.Now()
-	if err := s.store.UpsertQuota(r.Context(), candidate); err != nil {
+	if err := s.store.UpsertQuota(r.Context(), normalized); err != nil {
 		s.metrics.observeDB(started)
 		s.renderSettingsError(w, r, http.StatusBadRequest, "Could not save quota: "+err.Error())
 		return

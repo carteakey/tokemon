@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -102,6 +103,22 @@ func TestM3CAnalyticsFilterPillsAndStatMeta(t *testing.T) {
 		}
 		if strings.Contains(body, `not-a-date →`) || strings.Contains(body, `→ bad`) || strings.Contains(body, `2099-01-01 →`) {
 			t.Fatalf("/analytics?%s leaked raw malformed range in .stat-meta", q)
+		}
+
+		apiRec := httptest.NewRecorder()
+		handler.ServeHTTP(apiRec, httptest.NewRequest(http.MethodGet, "/api/v1/analytics?"+q, nil))
+		if apiRec.Code != http.StatusOK {
+			t.Fatalf("GET /api/v1/analytics?%s = %d", q, apiRec.Code)
+		}
+		var payload database.Analytics
+		if err := json.Unmarshal(apiRec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode /api/v1/analytics?%s: %v", q, err)
+		}
+		if payload.StartDate != "" || payload.EndDate != "" {
+			t.Fatalf("/api/v1/analytics?%s = (%q, %q), want empty start_date/end_date", q, payload.StartDate, payload.EndDate)
+		}
+		if payload.Summary.Events != 0 || len(payload.Points) != 0 {
+			t.Fatalf("/api/v1/analytics?%s returned non-empty data: events=%d points=%d", q, payload.Summary.Events, len(payload.Points))
 		}
 	}
 

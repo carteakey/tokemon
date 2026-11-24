@@ -29,17 +29,42 @@ func TestValidateOutboundRejectsPathsAndSensitiveMetadataWithoutMutation(t *test
 func TestValidateOutboundRejectsCredentialOrPathLikeIdentifiers(t *testing.T) {
 	base := Event{SchemaVersion: SchemaVersion, EventID: "event", Timestamp: time.Unix(1, 0).UTC(), MachineID: "machine", Provider: "provider", Model: "model", Tool: "tool"}
 	for name, mutate := range map[string]func(*Event){
-		"model path":          func(event *Event) { event.Model = "/private/repository/model" },
-		"provider credential": func(event *Event) { event.Provider = "sk-private-token" },
-		"session path":        func(event *Event) { event.SessionID = `C:\\Users\\private` },
-		"session title":       func(event *Event) { event.SessionID = "private session title" },
-		"session relative":    func(event *Event) { event.SessionID = "../private-session" },
-		"session credential":  func(event *Event) { event.SessionID = "ghp_private-token" },
+		"model path":                 func(event *Event) { event.Model = "/private/repository/model" },
+		"provider credential":        func(event *Event) { event.Provider = "sk-private-token" },
+		"session path":               func(event *Event) { event.SessionID = `C:\\Users\\private` },
+		"session title":              func(event *Event) { event.SessionID = "private session title" },
+		"session relative":           func(event *Event) { event.SessionID = "../private-session" },
+		"session credential":         func(event *Event) { event.SessionID = "ghp_private-token" },
+		"session sk prefix":          func(event *Event) { event.SessionID = "sk-private-token" },
+		"session sk after separator": func(event *Event) { event.SessionID = "prefix_sk-secret-key" },
+		"session sk after hyphen":    func(event *Event) { event.SessionID = "prefix-sk-secret-key" },
+		"event id sk after slash":    func(event *Event) { event.EventID = "foo/sk-secret" },
 	} {
 		event := base
 		mutate(&event)
 		if err := ValidateOutbound(event); err == nil || !strings.Contains(err.Error(), "disallowed sensitive content") {
 			t.Errorf("%s error = %v", name, err)
+		}
+	}
+}
+
+func TestValidateOutboundAllowsDeskAndTaskSessionIdentifiers(t *testing.T) {
+	base := Event{
+		SchemaVersion: SchemaVersion,
+		EventID:       "event-desk-1",
+		Timestamp:     time.Unix(1, 0).UTC(),
+		MachineID:     "machine",
+		Provider:      "anthropic",
+		Model:         "claude-sonnet-4-5",
+		Tool:          "claude-desktop",
+		TokenAccuracy: AccuracyReported,
+		Source:        Source{Adapter: "claude-code", AdapterVersion: "1"},
+	}
+	for _, sid := range []string{"claude-desk-001", "af-desk-1", "task-42", "disk-check-9"} {
+		event := base
+		event.SessionID = sid
+		if err := ValidateOutbound(event); err != nil {
+			t.Errorf("ValidateOutbound(%q) unexpectedly rejected: %v", sid, err)
 		}
 	}
 }

@@ -1763,10 +1763,7 @@ func (s *Store) Analytics(ctx context.Context, query AnalyticsQuery) (Analytics,
 		result.Bucket = "month"
 	}
 	result.LifetimeTokens, _ = s.LifetimeTokens(ctx)
-	if query.invalidRange {
-		result.StartDate = query.From
-		result.EndDate = query.To
-	} else {
+	if !query.invalidRange {
 		result.EndDate = s.dateOnly(end.Add(-time.Nanosecond)).Format("2006-01-02")
 		result.StartDate = result.EndDate
 		if !start.IsZero() {

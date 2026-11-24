@@ -115,7 +115,7 @@ func TestAnalyticsQueryFromToDSTOffsetsSubsecAndSearch(t *testing.T) {
 		t.Fatalf("mar8 analytics = tokens=%d events=%d, want 50/1", mar8.Summary.Tokens, mar8.Summary.Events)
 	}
 
-	// Inverted range (From > To) returns 0 rows.
+	// Inverted range (From > To) returns 0 rows and leaves StartDate/EndDate empty while preserving Filter.
 	inverted, err := store.Analytics(ctx, AnalyticsQuery{From: "2026-11-05", To: "2026-11-01"})
 	if err != nil {
 		t.Fatal(err)
@@ -123,14 +123,20 @@ func TestAnalyticsQueryFromToDSTOffsetsSubsecAndSearch(t *testing.T) {
 	if inverted.Summary.Events != 0 || len(inverted.Points) != 0 {
 		t.Fatalf("inverted range returned events=%d points=%d, want 0", inverted.Summary.Events, len(inverted.Points))
 	}
+	if inverted.StartDate != "" || inverted.EndDate != "" || inverted.Filter.From != "2026-11-05" || inverted.Filter.To != "2026-11-01" {
+		t.Fatalf("inverted range dates = (%q, %q) filter=(%q, %q), want empty dates with preserved filter", inverted.StartDate, inverted.EndDate, inverted.Filter.From, inverted.Filter.To)
+	}
 
-	// Invalid date returns 0 rows without error.
+	// Invalid date returns 0 rows without error and leaves StartDate/EndDate empty.
 	invalid, err := store.Analytics(ctx, AnalyticsQuery{From: "2026-02-30", To: "2026-03-01"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if invalid.Summary.Events != 0 {
 		t.Fatalf("invalid date returned events=%d, want 0", invalid.Summary.Events)
+	}
+	if invalid.StartDate != "" || invalid.EndDate != "" || invalid.Filter.From != "2026-02-30" || invalid.Filter.To != "2026-03-01" {
+		t.Fatalf("invalid range dates = (%q, %q) filter=(%q, %q), want empty dates with preserved filter", invalid.StartDate, invalid.EndDate, invalid.Filter.From, invalid.Filter.To)
 	}
 
 	// Project filter and LIKE escaping for %, _, \.

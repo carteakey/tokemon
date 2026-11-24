@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // ErrSensitiveContent is returned before a payload is handed to an HTTP
@@ -113,13 +114,32 @@ func identifierContainsSensitiveValue(value string) bool {
 	if value == "" {
 		return false
 	}
-	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "Bearer ") || strings.Contains(value, "sk-") || strings.Contains(value, "ghp_") {
+	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "Bearer ") || containsCredentialPrefix(value, "sk-") || strings.Contains(value, "ghp_") {
 		return true
 	}
 	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\\`) {
 		return true
 	}
 	return len(value) >= 3 && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
+}
+
+func containsCredentialPrefix(value, prefix string) bool {
+	offset := 0
+	for {
+		idx := strings.Index(value[offset:], prefix)
+		if idx < 0 {
+			return false
+		}
+		abs := offset + idx
+		if abs == 0 {
+			return true
+		}
+		prev, _ := utf8.DecodeLastRuneInString(value[:abs])
+		if !unicode.IsLetter(prev) && !unicode.IsDigit(prev) {
+			return true
+		}
+		offset = abs + len(prefix)
+	}
 }
 
 // ValidateOutboundBatch rejects the whole batch before the first HTTP
@@ -183,7 +203,7 @@ func validateMetadataValue(key string, value any) error {
 		return nil
 	case string:
 		lower := strings.ToLower(typed)
-		if strings.ContainsAny(typed, "\r\n/\\") || strings.Contains(typed, "Bearer ") || strings.Contains(typed, "sk-") || strings.Contains(typed, "ghp_") {
+		if strings.ContainsAny(typed, "\r\n/\\") || strings.Contains(typed, "Bearer ") || containsCredentialPrefix(typed, "sk-") || strings.Contains(typed, "ghp_") {
 			return fmt.Errorf("%w: metadata value for %q resembles sensitive content", ErrSensitiveContent, key)
 		}
 		for _, sensitive := range []string{"prompt", "response", "source", "path", "title", "secret", "credential", "repository", "repo", "code", "message", "conversation", "command", "cwd", "http:", "https:"} {

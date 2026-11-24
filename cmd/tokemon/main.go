@@ -1059,7 +1059,64 @@ func applyServerTimeoutConfig(flags *flag.FlagSet, values map[string]string, rea
 	}
 }
 
+const newConnShutdownGrace = 250 * time.Millisecond
+
+// registerNewConnShutdown closes TCP connections that remain in StateNew
+// (accepted, 0 request bytes read) shortly after graceful shutdown begins, so
+// speculative client pool dials or browser preconnect sockets do not stall
+// net/http.(*Server).Shutdown for Go's built-in 5-6s StateNew grace window.
+func registerNewConnShutdown(server *http.Server, shutdownTimeout time.Duration) func() {
+	grace := newConnShutdownGrace
+	if shutdownTimeout > 0 && grace > shutdownTimeout/2 {
+		grace = shutdownTimeout / 2
+	}
+	var (
+		mu       sync.Mutex
+		newConns = make(map[net.Conn]struct{})
+		done     = make(chan struct{})
+		doneOnce sync.Once
+	)
+	prevConnState := server.ConnState
+	server.ConnState = func(c net.Conn, state http.ConnState) {
+		mu.Lock()
+		if state == http.StateNew {
+			newConns[c] = struct{}{}
+		} else {
+			delete(newConns, c)
+		}
+		mu.Unlock()
+		if prevConnState != nil {
+			prevConnState(c, state)
+		}
+	}
+	server.RegisterOnShutdown(func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-done:
+			return
+		}
+		mu.Lock()
+		conns := make([]net.Conn, 0, len(newConns))
+		for c := range newConns {
+			conns = append(conns, c)
+		}
+		mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return func() {
+		doneOnce.Do(func() {
+			close(done)
+		})
+	}
+}
+
 func serveHTTP(ctx context.Context, server *http.Server, listener net.Listener, shutdownTimeout time.Duration) error {
+	stopNewConnShutdown := registerNewConnShutdown(server, shutdownTimeout)
+	defer stopNewConnShutdown()
 	result := make(chan error, 1)
 	go func() {
 		result <- server.Serve(listener)
@@ -1281,7 +1338,7 @@ func runStatusWithOutput(args []string, out io.Writer) error {
 		Token:          resolvedToken,
 		RequestTimeout: *timeout,
 	}
-	overview, err := client.Overview(context.Background())
+	overview, err := client.OverviewFresh(context.Background())
 	if err != nil {
 		return formatStatusError(err)
 	}
