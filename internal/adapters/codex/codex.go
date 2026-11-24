@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/usage"
 )
@@ -102,10 +103,48 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 	return sources, nil
 }
 
+func isZstdLog(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".jsonl.zst")
+}
+
+func isLogSource(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".jsonl") || isZstdLog(path)
+}
+
+type zstdReadCloser struct {
+	dec  *zstd.Decoder
+	file *os.File
+}
+
+func (r zstdReadCloser) Read(p []byte) (int, error) {
+	return r.dec.Read(p)
+}
+
+func (r zstdReadCloser) Close() error {
+	r.dec.Close()
+	return r.file.Close()
+}
+
+func openLogReader(path string) (io.ReadCloser, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if !isZstdLog(path) {
+		return file, nil
+	}
+	dec, err := zstd.NewReader(file, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return zstdReadCloser{dec: dec, file: file}, nil
+}
+
 func (a *Adapter) discoverLogs(ctx context.Context) ([]adapters.Source, error) {
 	var sources []adapters.Source
 	for _, root := range []string{filepath.Join(a.root, "sessions"), filepath.Join(a.root, "archived_sessions")} {
-		paths, err := a.directories.Paths(ctx, root, ".jsonl")
+		paths, err := a.directories.Paths(ctx, root, ".jsonl", ".jsonl.zst")
 		if err != nil && !os.IsNotExist(err) {
 			return nil, err
 		}
@@ -121,7 +160,7 @@ func (a *Adapter) Parse(ctx context.Context, source adapters.Source, request ada
 	if strings.TrimSpace(request.MachineID) == "" {
 		return adapters.ParseResult{}, fmt.Errorf("machine ID is required")
 	}
-	if strings.EqualFold(filepath.Ext(source.Path), ".jsonl") {
+	if isLogSource(source.Path) {
 		return a.parseLog(ctx, source, request)
 	}
 	return a.parseThreadSnapshots(ctx, source, request)
@@ -266,7 +305,7 @@ func subtractInheritedPrefix(value normalizedTokenUsage, remaining *normalizedTo
 }
 
 func readSessionMetadata(ctx context.Context, path string) (sessionMetadata, bool, error) {
-	file, err := os.Open(path)
+	file, err := openLogReader(path)
 	if err != nil {
 		return sessionMetadata{}, false, err
 	}
@@ -379,7 +418,7 @@ func (a *Adapter) inheritedCumulativeUsage(ctx context.Context, path, forkTimest
 	if err != nil {
 		return normalizedTokenUsage{}, false, nil
 	}
-	file, err := os.Open(path)
+	file, err := openLogReader(path)
 	if err != nil {
 		return normalizedTokenUsage{}, false, err
 	}
@@ -484,6 +523,8 @@ type codexParseState struct {
 	ForkResolved          bool                  `json:"fork_resolved,omitempty"`
 	ForkPrefixPending     bool                  `json:"fork_prefix_pending,omitempty"`
 	RemainingForkPrefix   *normalizedTokenUsage `json:"remaining_fork_prefix,omitempty"`
+	CompressedSize        int64                 `json:"compressed_size,omitempty"`
+	CompressedModTime     int64                 `json:"compressed_mod_time,omitempty"`
 }
 
 func encodeCodexParseState(state codexParseState) string {
@@ -519,42 +560,64 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 	if err != nil {
 		return adapters.ParseResult{}, err
 	}
-	file, err := os.Open(source.Path)
-	if err != nil {
-		return adapters.ParseResult{}, err
-	}
-	defer file.Close()
-
+	compressed := isZstdLog(source.Path)
 	expectedIdentity := adapters.HashIdentity(source.Path)
 	// Resume from the parse state stored in the cursor so an append-only
 	// session log is read incrementally. The full parse stays the correctness
 	// baseline: missing or undecodable state, truncation, or an identity
 	// change all reset to it.
 	state, resume := decodeCodexParseState(request.Cursor.State)
-	if resume && (request.Cursor.Offset <= 0 || request.Cursor.Line <= 0 || request.Cursor.Offset > info.Size()) {
+	if compressed {
+		// Zstd streams do not support arbitrary uncompressed byte-offset
+		// seeking. Skip unchanged archived files using compressed size + mtime
+		// (even across cold-cache restarts); re-parse from byte 0 if changed.
+		if resume &&
+			request.Cursor.Identity == expectedIdentity &&
+			state.CacheIdentity == cacheIdentity &&
+			state.CompressedSize == info.Size() &&
+			state.CompressedModTime == info.ModTime().UnixNano() {
+			return adapters.ParseResult{Cursor: request.Cursor}, nil
+		}
 		resume = false
-	}
-	if resume && state.CacheIdentity != cacheIdentity {
-		// The fork-relevant environment changed since the state was written
-		// (for example a fork parent appearing late); already-parsed lines may
-		// now interpret differently, so re-parse from the beginning.
-		resume = false
-	}
-	if resume && request.Cursor.Identity != "" && request.Cursor.Identity != expectedIdentity {
-		resume = false
-	}
-	if !resume {
 		state = codexParseState{}
+	} else {
+		if resume && (request.Cursor.Offset <= 0 || request.Cursor.Line <= 0 || request.Cursor.Offset > info.Size()) {
+			resume = false
+		}
+		if resume && state.CacheIdentity != cacheIdentity {
+			// The fork-relevant environment changed since the state was written
+			// (for example a fork parent appearing late); already-parsed lines may
+			// now interpret differently, so re-parse from the beginning.
+			resume = false
+		}
+		if resume && request.Cursor.Identity != "" && request.Cursor.Identity != expectedIdentity {
+			resume = false
+		}
+		if !resume {
+			state = codexParseState{}
+		}
 	}
+
+	logReader, err := openLogReader(source.Path)
+	if err != nil {
+		return adapters.ParseResult{}, err
+	}
+	defer logReader.Close()
 
 	offset, lineNumber := request.Cursor.Offset, request.Cursor.Line
 	if !resume {
 		offset, lineNumber = 0, 0
 	}
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return adapters.ParseResult{}, err
+	if !compressed && offset > 0 {
+		seeker, ok := logReader.(io.Seeker)
+		if !ok {
+			return adapters.ParseResult{}, fmt.Errorf("log reader for %q is not seekable", source.Path)
+		}
+		if _, err := seeker.Seek(offset, io.SeekStart); err != nil {
+			return adapters.ParseResult{}, err
+		}
 	}
-	reader := bufio.NewReaderSize(file, 64*1024)
+	reader := bufio.NewReaderSize(logReader, 64*1024)
 	position := offset
 
 	provider, model, project := "openai", "unknown", ""
@@ -733,9 +796,16 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 			})
 		}
 	}
+	cursorOffset := position
+	var compressedSize, compressedModTime int64
+	if compressed {
+		cursorOffset = info.Size()
+		compressedSize = info.Size()
+		compressedModTime = info.ModTime().UnixNano()
+	}
 	return adapters.ParseResult{Events: events, Cursor: adapters.Cursor{
 		Identity: expectedIdentity,
-		Offset:   position,
+		Offset:   cursorOffset,
 		Line:     lineNumber,
 		State: encodeCodexParseState(codexParseState{
 			CacheIdentity:         cacheIdentity,
@@ -750,6 +820,8 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 			ForkResolved:          forkResolved,
 			ForkPrefixPending:     forkPrefixPending,
 			RemainingForkPrefix:   &remainingForkPrefix,
+			CompressedSize:        compressedSize,
+			CompressedModTime:     compressedModTime,
 		}),
 	}}, nil
 }

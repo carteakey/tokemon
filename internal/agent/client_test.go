@@ -274,3 +274,57 @@ func TestClientDowngradesImpossibleProviderTotalInsteadOfBlockingBatch(t *testin
 		t.Fatal("caller's event was mutated")
 	}
 }
+
+func TestClientOverviewDecodesResponseAndSendsHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/analytics/overview" {
+			t.Fatalf("overview request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Accept") != "application/json" {
+			t.Fatalf("Accept header = %q, want application/json", r.Header.Get("Accept"))
+		}
+		if r.Header.Get("Authorization") != "Bearer secret-dash-token" {
+			t.Fatalf("Authorization header = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lifetime_tokens":12345,"timezone":"America/Toronto","today":{"tokens":500,"events":4},"week":{"tokens":2500,"events":12},"evolution":{"stage":3,"form":"sprout","form_name":"Sprout"}}`))
+	}))
+	defer server.Close()
+
+	overview, err := (Client{ServerURL: server.URL, Token: "secret-dash-token"}).Overview(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.LifetimeTokens != 12345 || overview.Today.Tokens != 500 || overview.Week.Events != 12 || overview.Evolution.Stage != 3 || overview.Evolution.FormName != "Sprout" {
+		t.Fatalf("unexpected overview = %+v", overview)
+	}
+}
+
+func TestClientOverviewStatusErrorsAndTimeout(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "denied", code)
+			}))
+			defer server.Close()
+
+			_, err := (Client{ServerURL: server.URL, Token: "super-secret-token"}).Overview(t.Context())
+			var statusErr *StatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != code {
+				t.Fatalf("Overview error = %v, want *StatusError(%d)", err, code)
+			}
+			if strings.Contains(err.Error(), "super-secret-token") {
+				t.Fatalf("error leaked bearer token: %v", err)
+			}
+		})
+	}
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	_, err := (Client{ServerURL: slow.URL, RequestTimeout: 20 * time.Millisecond}).Overview(t.Context())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("slow Overview error = %v, want context.DeadlineExceeded", err)
+	}
+}

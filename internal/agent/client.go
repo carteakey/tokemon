@@ -26,6 +26,20 @@ type Client struct {
 	RequestTimeout time.Duration
 }
 
+// StatusError is returned when the Tokemon server responds with a non-2xx HTTP status.
+type StatusError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("server returned %s", e.Status)
+	}
+	return fmt.Sprintf("server returned %s: %s", e.Status, e.Body)
+}
+
 type batchRequest struct {
 	Events []usage.Event `json:"events"`
 }
@@ -194,6 +208,14 @@ func (c Client) Heartbeat(ctx context.Context, heartbeat HeartbeatRequest) error
 	return c.postJSON(ctx, "/api/v1/agents/heartbeat", heartbeat, nil)
 }
 
+func (c Client) Overview(ctx context.Context) (database.Overview, error) {
+	var overview database.Overview
+	if err := c.getJSON(ctx, "/api/v1/analytics/overview", &overview); err != nil {
+		return database.Overview{}, err
+	}
+	return overview, nil
+}
+
 // Health verifies that the hub is reachable before the agent performs an
 // expensive local collection pass. Offline hubs therefore trigger the normal
 // failure backoff without repeatedly parsing unchanged provider histories.
@@ -260,6 +282,46 @@ func (c Client) postJSON(ctx context.Context, path string, payload any, result a
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return fmt.Errorf("server returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	if result == nil {
+		return nil
+	}
+	if err := json.NewDecoder(response.Body).Decode(result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+func (c Client) getJSON(ctx context.Context, path string, result any) error {
+	if strings.TrimSpace(c.ServerURL) == "" {
+		return fmt.Errorf("server URL is required")
+	}
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, strings.TrimRight(c.ServerURL, "/")+path, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+	if c.Token != "" {
+		request.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return &StatusError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			Body:       strings.TrimSpace(string(body)),
+		}
 	}
 	if result == nil {
 		return nil

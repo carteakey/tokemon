@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"io"
 	"log/slog"
@@ -11,9 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/tokemon/tokemon/internal/catalog"
+	"github.com/tokemon/tokemon/internal/database"
+	"github.com/tokemon/tokemon/internal/usage"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -86,6 +92,10 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 	t.Setenv("TOKEMON_INGEST_TOKEN", "")
 	t.Setenv("TOKEMON_MODEL_CATALOG", "")
 	t.Setenv("TOKEMON_ANALYTICS_TIMEZONE", "")
+	t.Setenv("TOKEMON_QUOTAS", "")
+	t.Setenv("TOKEMON_BACKUP_DIR", "")
+	t.Setenv("TOKEMON_BACKUP_RETENTION", "")
+	t.Setenv("TOKEMON_BACKUP_INTERVAL", "")
 
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", ":8080", "")
@@ -93,6 +103,10 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 	ingestToken := flags.String("ingest-token", "", "")
 	catalogPath := flags.String("catalog", "catalog/models.yaml", "")
 	timezone := flags.String("timezone", "UTC", "")
+	quotasPath := flags.String("quotas", "", "")
+	backupDir := flags.String("backup-dir", "", "")
+	backupRetention := flags.Int("backup-retention", defaultBackupRetention, "")
+	backupInterval := flags.Duration("backup-interval", defaultBackupInterval, "")
 	if err := flags.Parse([]string{}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,17 +116,57 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 		"TOKEMON_INGEST_TOKEN":       "file-token",
 		"TOKEMON_MODEL_CATALOG":      "/tmp/models.yaml",
 		"TOKEMON_ANALYTICS_TIMEZONE": "America/Toronto",
-	}, addr, databasePath, ingestToken, catalogPath, timezone)
-	if *addr != "0.0.0.0:18080" || *databasePath != "/tmp/tokemon.db" || *ingestToken != "file-token" || *catalogPath != "/tmp/models.yaml" || *timezone != "America/Toronto" {
-		t.Fatalf("config values not applied: addr=%q database=%q token=%q catalog=%q timezone=%q", *addr, *databasePath, *ingestToken, *catalogPath, *timezone)
+		"TOKEMON_QUOTAS":             "/tmp/quotas.yaml",
+		"TOKEMON_BACKUP_DIR":         "/tmp/backups",
+		"TOKEMON_BACKUP_RETENTION":   "14",
+		"TOKEMON_BACKUP_INTERVAL":    "12h",
+	}, addr, databasePath, ingestToken, catalogPath, timezone, quotasPath, backupDir, backupRetention, backupInterval)
+	if *addr != "0.0.0.0:18080" || *databasePath != "/tmp/tokemon.db" || *ingestToken != "file-token" || *catalogPath != "/tmp/models.yaml" || *timezone != "America/Toronto" || *quotasPath != "/tmp/quotas.yaml" || *backupDir != "/tmp/backups" || *backupRetention != 14 || *backupInterval != 12*time.Hour {
+		t.Fatalf("config values not applied: addr=%q database=%q token=%q catalog=%q timezone=%q quotas=%q backupDir=%q retention=%d interval=%v",
+			*addr, *databasePath, *ingestToken, *catalogPath, *timezone, *quotasPath, *backupDir, *backupRetention, *backupInterval)
 	}
 
+	// Environment variables override server.env.
+	t.Setenv("TOKEMON_QUOTAS", "/env/quotas.yaml")
+	t.Setenv("TOKEMON_BACKUP_INTERVAL", "0")
+	flags2 := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr2 := flags2.String("addr", ":8080", "")
+	databasePath2 := flags2.String("database", "tokemon.db", "")
+	ingestToken2 := flags2.String("ingest-token", "", "")
+	catalogPath2 := flags2.String("catalog", "catalog/models.yaml", "")
+	timezone2 := flags2.String("timezone", "UTC", "")
+	quotasPath2 := flags2.String("quotas", envOr("TOKEMON_QUOTAS", ""), "")
+	backupDir2 := flags2.String("backup-dir", "", "")
+	backupRetention2 := flags2.Int("backup-retention", configIntEnv("TOKEMON_BACKUP_RETENTION", defaultBackupRetention), "")
+	backupInterval2 := flags2.Duration("backup-interval", configDurationEnv("TOKEMON_BACKUP_INTERVAL", defaultBackupInterval), "")
+	if err := flags2.Parse([]string{}); err != nil {
+		t.Fatal(err)
+	}
+	applyServerConfig(flags2, map[string]string{
+		"TOKEMON_QUOTAS":          "/tmp/quotas.yaml",
+		"TOKEMON_BACKUP_INTERVAL": "12h",
+	}, addr2, databasePath2, ingestToken2, catalogPath2, timezone2, quotasPath2, backupDir2, backupRetention2, backupInterval2)
+	if *quotasPath2 != "/env/quotas.yaml" || *backupInterval2 != 0 {
+		t.Fatalf("env did not override config file: quotas=%q interval=%v", *quotasPath2, *backupInterval2)
+	}
+
+	// Explicit CLI flags override both env and server.env.
 	if err := flags.Set("addr", "127.0.0.1:9999"); err != nil {
 		t.Fatal(err)
 	}
-	applyServerConfig(flags, map[string]string{"TOKEMON_SERVER_ADDR": "0.0.0.0:18080"}, addr, databasePath, ingestToken, catalogPath, timezone)
-	if *addr != "127.0.0.1:9999" {
-		t.Fatalf("explicit flag was overwritten: %q", *addr)
+	if err := flags.Set("quotas", "/flag/quotas.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	if err := flags.Set("backup-retention", "5"); err != nil {
+		t.Fatal(err)
+	}
+	applyServerConfig(flags, map[string]string{
+		"TOKEMON_SERVER_ADDR":      "0.0.0.0:18080",
+		"TOKEMON_QUOTAS":           "/tmp/quotas.yaml",
+		"TOKEMON_BACKUP_RETENTION": "14",
+	}, addr, databasePath, ingestToken, catalogPath, timezone, quotasPath, backupDir, backupRetention, backupInterval)
+	if *addr != "127.0.0.1:9999" || *quotasPath != "/flag/quotas.yaml" || *backupRetention != 5 {
+		t.Fatalf("explicit flags were overwritten: addr=%q quotas=%q retention=%d", *addr, *quotasPath, *backupRetention)
 	}
 }
 
@@ -545,5 +599,365 @@ func TestAgentLogLevel(t *testing.T) {
 		if got := agentLogLevel(); got != want {
 			t.Fatalf("agentLogLevel(%q) = %v, want %v", value, got, want)
 		}
+	}
+}
+
+func TestNormalizeServerURL(t *testing.T) {
+	cases := map[string]string{
+		":8080":                       "http://127.0.0.1:8080",
+		"0.0.0.0:18787":               "http://127.0.0.1:18787",
+		"[::]:18787":                  "http://127.0.0.1:18787",
+		"127.0.0.1:18787":             "http://127.0.0.1:18787",
+		"http://0.0.0.0:18787/":       "http://127.0.0.1:18787",
+		"https://[::]:8443/":          "https://127.0.0.1:8443",
+		"https://hub.example.test///": "https://hub.example.test",
+		"":                            "",
+	}
+	for input, want := range cases {
+		if got := normalizeServerURL(input); got != want {
+			t.Errorf("normalizeServerURL(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestResolveStatusConfigPrecedenceAndIsolation(t *testing.T) {
+	dir := t.TempDir()
+	agentEnv := filepath.Join(dir, "agent.env")
+	serverEnv := filepath.Join(dir, "server.env")
+	if err := os.WriteFile(agentEnv, []byte("TOKEMON_SERVER_URL=http://agent.local:9000\nTOKEMON_INGEST_TOKEN=agent-ingest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(serverEnv, []byte("TOKEMON_SERVER_ADDR=0.0.0.0:18787\nTOKEMON_DASHBOARD_TOKEN=server-dash\nTOKEMON_INGEST_TOKEN=server-ingest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	clearEnv := func() {
+		for _, k := range []string{"TOKEMON_AGENT_CONFIG", "TOKEMON_SERVER_CONFIG", "TOKEMON_SERVER_URL", "TOKEMON_SERVER_ADDR", "TOKEMON_DASHBOARD_TOKEN", "TOKEMON_INGEST_TOKEN"} {
+			t.Setenv(k, "")
+		}
+	}
+	clearEnv()
+
+	// 1. Explicit --server-config isolates from default agent.env and falls back TOKEMON_DASHBOARD_TOKEN -> TOKEMON_INGEST_TOKEN.
+	t.Setenv("HOME", dir) // no ~/.config/tokemon files here, but check explicit isolation with fake agent.env at default path
+	defaultAgent := filepath.Join(dir, ".config", "tokemon", "agent.env")
+	if err := os.MkdirAll(filepath.Dir(defaultAgent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultAgent, []byte("TOKEMON_SERVER_URL=http://should-not-win:9999\nTOKEMON_DASHBOARD_TOKEN=should-not-win\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	cfg := flags.String("config", "", "")
+	srvCfg := flags.String("server-config", "", "")
+	srv := flags.String("server", "", "")
+	tok := flags.String("token", "", "")
+	if err := flags.Parse([]string{"--server-config", serverEnv}); err != nil {
+		t.Fatal(err)
+	}
+	gotURL, gotTok, err := resolveStatusConfig(flags, *cfg, *srvCfg, *srv, *tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "http://127.0.0.1:18787" || gotTok != "server-dash" {
+		t.Fatalf("server-config isolated = (%q, %q), want (http://127.0.0.1:18787, server-dash)", gotURL, gotTok)
+	}
+
+	// 2. Explicit --config isolates from server.env and uses ingest fallback.
+	clearEnv()
+	flags = flag.NewFlagSet("status", flag.ContinueOnError)
+	cfg = flags.String("config", "", "")
+	srvCfg = flags.String("server-config", "", "")
+	srv = flags.String("server", "", "")
+	tok = flags.String("token", "", "")
+	if err := flags.Parse([]string{"--config", agentEnv}); err != nil {
+		t.Fatal(err)
+	}
+	gotURL, gotTok, err = resolveStatusConfig(flags, *cfg, *srvCfg, *srv, *tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "http://agent.local:9000" || gotTok != "agent-ingest" {
+		t.Fatalf("agent-config isolated = (%q, %q), want (http://agent.local:9000, agent-ingest)", gotURL, gotTok)
+	}
+
+	// 3. CLI --server and --token override env and files.
+	t.Setenv("TOKEMON_SERVER_URL", "http://env.local:8080")
+	t.Setenv("TOKEMON_DASHBOARD_TOKEN", "env-dash")
+	flags = flag.NewFlagSet("status", flag.ContinueOnError)
+	cfg = flags.String("config", "", "")
+	srvCfg = flags.String("server-config", "", "")
+	srv = flags.String("server", "", "")
+	tok = flags.String("token", "", "")
+	if err := flags.Parse([]string{"--config", agentEnv, "--server", "0.0.0.0:9191", "--token", "cli-token"}); err != nil {
+		t.Fatal(err)
+	}
+	gotURL, gotTok, err = resolveStatusConfig(flags, *cfg, *srvCfg, *srv, *tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "http://127.0.0.1:9191" || gotTok != "cli-token" {
+		t.Fatalf("CLI override = (%q, %q)", gotURL, gotTok)
+	}
+}
+
+func TestRunStatusOutputsDefaultShortAndJSON(t *testing.T) {
+	now := time.Now().UTC().Add(-4 * time.Minute)
+	next := int64(2_000_000)
+	rem := int64(500_000)
+	const secretToken = "tok-secret-never-print"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/analytics/overview" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+secretToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"lifetime_tokens": 1_500_000,
+			"timezone":        "America/Toronto",
+			"today":           map[string]any{"tokens": 45_000, "events": 12},
+			"week":            map[string]any{"tokens": 300_000, "events": 80},
+			"evolution": map[string]any{
+				"stage": 4, "form": "sapling", "form_name": "Sapling",
+				"lower_threshold": 1_000_000, "next_threshold": next, "tokens_remaining": rem, "progress": 0.5,
+			},
+			"newest_event": now.Format(time.RFC3339Nano),
+			"machines": []map[string]any{
+				{
+					"id": "m1", "name": "macbook", "status": "Connected", "last_seen_at": now.Format(time.RFC3339Nano),
+					"today_tokens": 45_000, "week_tokens": 300_000, "lifetime_tokens": 1_500_000,
+					"source_count": 3, "source_error_count": 0, "sync_context": "/private/home/secret",
+					"sources": []map[string]any{{"adapter": "codex", "identity_hash": "sha256:secret"}},
+				},
+			},
+			"by_project": []map[string]any{{"project": "secret-project-name", "tokens": 1_500_000}},
+		})
+	}))
+	defer server.Close()
+
+	// Default multi-line output.
+	var defOut bytes.Buffer
+	if err := runStatusWithOutput([]string{"--server", server.URL, "--token", secretToken}, &defOut); err != nil {
+		t.Fatal(err)
+	}
+	defStr := defOut.String()
+	for _, want := range []string{"Stage 04 Sapling", "1,500,000", "45,000", "Fresh", "1 connected", "macbook"} {
+		if !strings.Contains(defStr, want) {
+			t.Fatalf("default status missing %q:\n%s", want, defStr)
+		}
+	}
+	for _, forbidden := range []string{secretToken, "secret-project-name", "/private/home/secret", "sha256:secret"} {
+		if strings.Contains(defStr, forbidden) {
+			t.Fatalf("default status leaked %q:\n%s", forbidden, defStr)
+		}
+	}
+
+	// --short single-line output.
+	var shortOut bytes.Buffer
+	if err := runStatusWithOutput([]string{"--server", server.URL, "--token", secretToken, "--short"}, &shortOut); err != nil {
+		t.Fatal(err)
+	}
+	shortStr := shortOut.String()
+	if strings.Count(shortStr, "\n") != 1 || !strings.Contains(shortStr, "Stage 04 Sapling") || !strings.Contains(shortStr, "1/1 online") {
+		t.Fatalf("unexpected --short output: %q", shortStr)
+	}
+
+	// --json privacy-safe output.
+	var jsonOut bytes.Buffer
+	if err := runStatusWithOutput([]string{"--server", server.URL, "--token", secretToken, "--json"}, &jsonOut); err != nil {
+		t.Fatal(err)
+	}
+	jsonStr := jsonOut.String()
+	for _, forbidden := range []string{secretToken, "secret-project-name", "by_project", "/private/home/secret", "sha256:secret", `"sources"`} {
+		if strings.Contains(jsonStr, forbidden) {
+			t.Fatalf("--json status leaked %q:\n%s", forbidden, jsonStr)
+		}
+	}
+	var decoded statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &decoded); err != nil {
+		t.Fatalf("invalid --json output: %v\n%s", err, jsonStr)
+	}
+	if decoded.Stage != 4 || decoded.LifetimeTokens != 1_500_000 || decoded.Machines.Connected != 1 {
+		t.Fatalf("unexpected decoded statusReport: %+v", decoded)
+	}
+}
+
+func TestRunStatusErrorExitPaths(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		want string
+	}{
+		{http.StatusUnauthorized, "401"},
+		{http.StatusForbidden, "403"},
+		{http.StatusInternalServerError, "500"},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "err", tc.code)
+		}))
+		var out bytes.Buffer
+		err := runStatusWithOutput([]string{"--server", server.URL, "--token", "secret-token"}, &out)
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("status %d err = %v, want %q", tc.code, err, tc.want)
+		}
+		if strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("error leaked token: %v", err)
+		}
+	}
+
+	// Unreachable server.
+	dead := httptest.NewServer(http.NewServeMux())
+	dead.Close()
+	if err := runStatusWithOutput([]string{"--server", dead.URL, "--timeout", "1s"}, io.Discard); err == nil {
+		t.Fatal("unreachable server unexpectedly succeeded")
+	}
+
+	// Invalid flags.
+	if err := runStatusWithOutput([]string{"--short", "--json"}, io.Discard); err == nil {
+		t.Fatal("--short --json unexpectedly succeeded")
+	}
+	if err := runStatusWithOutput([]string{"--timeout", "0s"}, io.Discard); err == nil {
+		t.Fatal("--timeout 0s unexpectedly succeeded")
+	}
+	if err := runStatusWithOutput([]string{"extra-arg"}, io.Discard); err == nil {
+		t.Fatal("extra positional arg unexpectedly succeeded")
+	}
+}
+
+func TestAutomatedBackupsStartupAndSchedule(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tokemon.db")
+	store, err := database.Open(dbPath, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "auto-backup-1",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "m1",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		TotalTokens:   usage.Int64(123),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+
+	// 1. Interval 0 disables backups.
+	disabledDir := filepath.Join(dir, "disabled")
+	var wg sync.WaitGroup
+	ctx0, cancel0 := context.WithCancel(context.Background())
+	startAutomatedBackups(ctx0, &wg, slog.New(slog.NewTextHandler(io.Discard, nil)), dbPath, disabledDir, 10, 0)
+	cancel0()
+	wg.Wait()
+	if _, err := os.Stat(disabledDir); !os.IsNotExist(err) {
+		t.Fatalf("disabled automated backups created directory: %v", err)
+	}
+
+	// 2. Startup skips when latest backup is fresh (age < interval), creates when stale/missing, preserves migration snapshots, and prunes to retention.
+	backupDir := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	migration := filepath.Join(backupDir, "tokemon-v3-before-v4-20260810T000000.000000000Z.db")
+	if err := os.WriteFile(migration, []byte("migration"), 0o600); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	// Create an old backup (older than 24h) so startup triggers immediately.
+	if _, err := database.CreateBackup(context.Background(), database.BackupOptions{
+		DatabasePath:   dbPath,
+		DestinationDir: backupDir,
+		Retention:      10,
+		Now:            time.Now().UTC().Add(-48 * time.Hour),
+	}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startAutomatedBackups(ctx, &wg, slog.New(slog.NewTextHandler(io.Discard, nil)), dbPath, backupDir, 2, 24*time.Hour)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, infoErr := database.LatestBackupInfo(dbPath, backupDir)
+		if infoErr == nil && info.Exists && info.Count == 2 && info.Age < time.Minute {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			wg.Wait()
+			store.Close()
+			t.Fatalf("startup automated backup did not run in time: info=%+v err=%v", info, infoErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	wg.Wait()
+
+	// Fresh backup skips on next startup.
+	ctxFresh, cancelFresh := context.WithCancel(context.Background())
+	startAutomatedBackups(ctxFresh, &wg, slog.New(slog.NewTextHandler(io.Discard, nil)), dbPath, backupDir, 2, 24*time.Hour)
+	time.Sleep(50 * time.Millisecond)
+	cancelFresh()
+	wg.Wait()
+	freshInfo, err := database.LatestBackupInfo(dbPath, backupDir)
+	if err != nil || freshInfo.Count != 2 {
+		store.Close()
+		t.Fatalf("fresh startup should not have created a 3rd backup: %+v, err=%v", freshInfo, err)
+	}
+	if _, err := os.Stat(migration); err != nil {
+		store.Close()
+		t.Fatalf("migration snapshot was touched: %v", err)
+	}
+
+	// 3. Periodic tick runs and prunes to retention.
+	tickDir := filepath.Join(dir, "tick-backups")
+	ctxTick, cancelTick := context.WithCancel(context.Background())
+	startAutomatedBackups(ctxTick, &wg, slog.New(slog.NewTextHandler(io.Discard, nil)), dbPath, tickDir, 2, 40*time.Millisecond)
+	var firstTickPath string
+	tickDeadline := time.Now().Add(5 * time.Second)
+	for {
+		info, infoErr := database.LatestBackupInfo(dbPath, tickDir)
+		if infoErr == nil && info.Exists {
+			if firstTickPath == "" {
+				firstTickPath = info.Path
+			} else if info.Path != firstTickPath && info.Count <= 2 {
+				break
+			}
+		}
+		if time.Now().After(tickDeadline) {
+			cancelTick()
+			wg.Wait()
+			store.Close()
+			t.Fatalf("periodic automated backup did not tick in time: info=%+v err=%v", info, infoErr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	cancelTick()
+	wg.Wait()
+
+	// 4. Failure path (backupDir is a regular file) does not panic and exits cleanly.
+	fileTarget := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(fileTarget, []byte("x"), 0o600); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	ctxErr, cancelErr := context.WithCancel(context.Background())
+	startAutomatedBackups(ctxErr, &wg, slog.New(slog.NewTextHandler(io.Discard, nil)), dbPath, fileTarget, 2, 24*time.Hour)
+	time.Sleep(50 * time.Millisecond)
+	cancelErr()
+	wg.Wait()
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -286,6 +286,7 @@ type transcriptRecord struct {
 	Timestamp    string         `json:"timestamp"`
 	SessionID    string         `json:"sessionId"`
 	SessionIDAlt string         `json:"session_id"`
+	Entrypoint   string         `json:"entrypoint"`
 	CWD          string         `json:"cwd"`
 	DurationMS   *int64         `json:"durationMs"`
 	Message      *messageRecord `json:"message"`
@@ -335,6 +336,10 @@ func normalize(record transcriptRecord, raw *tokenUsage, machineID, identity str
 	if model == "" {
 		model = "unknown"
 	}
+	tool := "claude-code"
+	if strings.EqualFold(strings.TrimSpace(record.Entrypoint), "claude-desktop") {
+		tool = "claude-desktop"
+	}
 	return usage.Event{
 		SchemaVersion:    usage.SchemaVersion,
 		EventID:          usage.DeterministicID(machineID, adapterID, identity, lineNumber, timestamp.UTC().Format(time.RFC3339Nano), sessionID),
@@ -343,7 +348,7 @@ func normalize(record transcriptRecord, raw *tokenUsage, machineID, identity str
 		SessionID:        sessionID,
 		Provider:         "anthropic",
 		Model:            model,
-		Tool:             "claude-code",
+		Tool:             tool,
 		InputTokens:      raw.InputTokens,
 		OutputTokens:     raw.OutputTokens,
 		CacheReadTokens:  raw.CacheReadTokens,

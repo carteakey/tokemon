@@ -1528,19 +1528,23 @@ func TestSemanticGlyphsAreStableAndKeepTheirSilhouettes(t *testing.T) {
 	}
 
 	for tool, preset := range map[string]string{
-		"codex":        "codex",
-		"claude-code":  "claude",
-		"copilot-cli":  "copilot",
-		"opencode":     "opencode",
-		"antigravity":  "gemini",
-		"openclaw":     "openclaw",
-		"hermes-agent": "hermes",
-		"zcode":        "zcode",
+		"codex":          "codex",
+		"claude-code":    "claude",
+		"claude-desktop": "claude-desktop",
+		"copilot-cli":    "copilot",
+		"opencode":       "opencode",
+		"antigravity":    "gemini",
+		"openclaw":       "openclaw",
+		"hermes-agent":   "hermes",
+		"zcode":          "zcode",
 	} {
 		glyph := glyphForHarness(tool)
 		if glyph.Kind != "harness" || glyph.Preset != preset {
 			t.Fatalf("harness %q uses glyph kind %q preset %q", tool, glyph.Kind, glyph.Preset)
 		}
+	}
+	if got := harnessName("claude-desktop"); got != "Claude Desktop" {
+		t.Fatalf("Claude Desktop harness label = %q", got)
 	}
 	if got := harnessName("copilot-cli"); got != "GitHub Copilot CLI" {
 		t.Fatalf("Copilot harness label = %q", got)
@@ -1565,7 +1569,8 @@ func TestDashboardRendersFriendlyHarnessNames(t *testing.T) {
 	}
 
 	events := []usage.Event{
-		{SchemaVersion: usage.SchemaVersion, EventID: "claude", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(60), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "claude", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "anthropic", Model: "model", Tool: "claude-code", TotalTokens: usage.Int64(50), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
+		{SchemaVersion: usage.SchemaVersion, EventID: "claude-desktop", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "anthropic", Model: "model", Tool: "claude-desktop", TotalTokens: usage.Int64(10), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "claude-code", AdapterVersion: "test"}},
 		{SchemaVersion: usage.SchemaVersion, EventID: "codex", Timestamp: time.Now().UTC(), MachineID: "machine", Provider: "openai", Model: "model", Tool: "codex", TotalTokens: usage.Int64(40), TokenAccuracy: usage.AccuracyReported, Source: usage.Source{Adapter: "codex", AdapterVersion: "test"}},
 	}
 	if _, err := store.Ingest(context.Background(), events); err != nil {
@@ -1574,7 +1579,7 @@ func TestDashboardRendersFriendlyHarnessNames(t *testing.T) {
 
 	response := httptest.NewRecorder()
 	testHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	for _, want := range []string{"Harnesses", "Claude Code", "Codex", "preset-claude", "preset-codex", "60.0%", "40.0%"} {
+	for _, want := range []string{"Harnesses", "Claude Code", "Claude Desktop", "Codex", "preset-claude", "preset-claude-desktop", "preset-codex", "50.0%", "40.0%", "10.0%"} {
 		if !bytes.Contains(response.Body.Bytes(), []byte(want)) {
 			t.Fatalf("dashboard does not contain harness breakdown %q: %s", want, response.Body.String())
 		}

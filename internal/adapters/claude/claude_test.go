@@ -353,3 +353,42 @@ func TestParseReportsProjectFromCWDFallsBackToFolder(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSeparatesClaudeDesktopEntrypoint(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "desktop.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Join([]string{
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"s1","entrypoint":"claude-desktop","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:02Z","sessionId":"s1","entrypoint":" CLAUDE-DESKTOP ","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:03Z","sessionId":"s1","entrypoint":"cli","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:04Z","sessionId":"s1","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:05Z","sessionId":"s1","entrypoint":"/Users/alice/claude-desktop","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := New(home).Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTools := []string{"claude-desktop", "claude-desktop", "claude-code", "claude-code", "claude-code"}
+	if len(result.Events) != len(wantTools) {
+		t.Fatalf("events = %d, want %d", len(result.Events), len(wantTools))
+	}
+	for i, wantTool := range wantTools {
+		event := result.Events[i]
+		if event.Tool != wantTool {
+			t.Fatalf("event %d tool = %q, want %q", i, event.Tool, wantTool)
+		}
+		if event.Source.Adapter != adapterID {
+			t.Fatalf("event %d adapter = %q, want %q", i, event.Source.Adapter, adapterID)
+		}
+		if err := usage.ValidateOutbound(event); err != nil {
+			t.Fatalf("event %d failed ValidateOutbound: %v", i, err)
+		}
+	}
+}

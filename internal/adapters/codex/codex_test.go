@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/agent"
 	"github.com/tokemon/tokemon/internal/usage"
@@ -913,5 +914,224 @@ func BenchmarkDiscoverSessionIndexCold(b *testing.B) {
 		if _, err := adapter.Discover(context.Background()); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func writeZstdFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := zstd.NewWriter(file)
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if _, err := enc.Write([]byte(content)); err != nil {
+		enc.Close()
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseArchivedZstdRolloutAndColdRestartCursor(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".codex", "archived_sessions", "2026", "07", "rollout-archived.jsonl.zst")
+	log := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"archived-session-1","model_provider":"openai","cwd":"/private/repos/SecretProject"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-luna","cwd":"/private/repos/SecretProject"}}`,
+		`{"timestamp":"2026-07-12T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}`,
+	}, "\n") + "\n"
+	writeZstdFile(t, path, log)
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].Path != path {
+		t.Fatalf("discovered sources = %+v, want [%s]", sources, path)
+	}
+	first, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(first.Events))
+	}
+	event := first.Events[0]
+	if event.InputTokens == nil || *event.InputTokens != 40 || *event.CacheReadTokens != 60 || *event.OutputTokens != 20 || *event.ReasoningTokens != 5 || *event.TotalTokens != 120 {
+		t.Fatalf("unexpected token breakdown: %+v", event)
+	}
+	if event.Project != "secretproject" || event.Model != "gpt-5.6-luna" || event.SessionID != "archived-session-1" {
+		t.Fatalf("unexpected event metadata: %+v", event)
+	}
+	if err := usage.ValidateOutbound(event); err != nil {
+		t.Fatalf("ValidateOutbound failed: %v", err)
+	}
+
+	// Same adapter (SnapshotCache) and cold-cache new adapter both skip re-parsing unchanged .jsonl.zst.
+	warmRepeat, err := adapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil || len(warmRepeat.Events) != 0 || warmRepeat.Cursor != first.Cursor {
+		t.Fatalf("warm repeat = %+v, err=%v", warmRepeat, err)
+	}
+	coldAdapter := New(home)
+	coldRepeat, err := coldAdapter.Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil || len(coldRepeat.Events) != 0 || coldRepeat.Cursor != first.Cursor {
+		t.Fatalf("cold repeat = %+v, err=%v", coldRepeat, err)
+	}
+
+	// If the compressed archive changes, full stream re-parse picks up new lines.
+	updatedLog := log + `{"timestamp":"2026-07-12T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":5,"total_tokens":180}}}}` + "\n"
+	writeZstdFile(t, path, updatedLog)
+	reparsed, err := New(home).Parse(context.Background(), sources[0], adapters.ParseRequest{MachineID: "machine", Cursor: first.Cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reparsed.Events) != 2 {
+		t.Fatalf("reparsed events = %d, want 2", len(reparsed.Events))
+	}
+	if reparsed.Events[0].EventID != event.EventID {
+		t.Fatalf("first event ID changed on archive rewrite: got %q want %q", reparsed.Events[0].EventID, event.EventID)
+	}
+}
+
+func TestArchivedZstdDeduplicatesWithUncompressedSessionLog(t *testing.T) {
+	home := t.TempDir()
+	log := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"moved-session","model_provider":"openai","cwd":"/private/repos/App"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}`,
+		`{"timestamp":"2026-07-12T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}}`,
+	}, "\n") + "\n"
+
+	activePath := filepath.Join(home, ".codex", "sessions", "2026", "07", "12", "rollout.jsonl")
+	if err := os.MkdirAll(filepath.Dir(activePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activePath, []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activeResult, err := New(home).Parse(context.Background(), adapters.Source{Path: activePath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(activeResult.Events) != 1 {
+		t.Fatalf("active parse = %+v, err=%v", activeResult, err)
+	}
+
+	if err := os.Remove(activePath); err != nil {
+		t.Fatal(err)
+	}
+	archivedPath := filepath.Join(home, ".codex", "archived_sessions", "rollout.jsonl.zst")
+	writeZstdFile(t, archivedPath, log)
+	archivedResult, err := New(home).Parse(context.Background(), adapters.Source{Path: archivedPath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(archivedResult.Events) != 1 {
+		t.Fatalf("archived parse = %+v, err=%v", archivedResult, err)
+	}
+
+	if archivedResult.Events[0].EventID != activeResult.Events[0].EventID {
+		t.Fatalf("event ID diverged across archive: active=%q archived=%q", activeResult.Events[0].EventID, archivedResult.Events[0].EventID)
+	}
+	if archivedResult.Events[0].Source.Identity != activeResult.Events[0].Source.Identity {
+		t.Fatalf("source identity diverged across archive: active=%q archived=%q", activeResult.Events[0].Source.Identity, archivedResult.Events[0].Source.Identity)
+	}
+}
+
+func TestForkedSessionSubtractsArchivedZstdParentBaseline(t *testing.T) {
+	home := t.TempDir()
+	parentPath := filepath.Join(home, ".codex", "archived_sessions", "parent.jsonl.zst")
+	parentLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"parent-session","model_provider":"openai","cwd":"/private/repos/App"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30,"total_tokens":130}}}}`,
+	}, "\n") + "\n"
+	writeZstdFile(t, parentPath, parentLog)
+
+	childPath := filepath.Join(home, ".codex", "sessions", "2026", "07", "12", "child.jsonl")
+	if err := os.MkdirAll(filepath.Dir(childPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	childLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:05:00Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","model_provider":"openai","cwd":"/private/repos/App","timestamp":"2026-07-12T12:05:00Z"}}`,
+		`{"timestamp":"2026-07-12T12:05:01Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}`,
+		`{"timestamp":"2026-07-12T12:05:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30,"total_tokens":130}}}}`,
+		`{"timestamp":"2026-07-12T12:05:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":40,"output_tokens":45,"total_tokens":195}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(childPath, []byte(childLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("sources = %d, want 2", len(sources))
+	}
+	result, err := adapter.Parse(context.Background(), adapters.Source{Path: childPath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 2 {
+		t.Fatalf("child events = %d, want 2: %+v", len(result.Events), result.Events)
+	}
+	if result.Events[0].TotalTokens == nil || *result.Events[0].TotalTokens != 0 {
+		t.Fatalf("copied prefix was not zeroed: %+v", result.Events[0])
+	}
+	event := result.Events[1]
+	if *event.TotalTokens != 65 || *event.InputTokens != 30 || *event.CacheReadTokens != 20 || *event.OutputTokens != 15 {
+		t.Fatalf("fork child delta tokens = %+v, want input=30 cache=20 output=15 total=65", event)
+	}
+}
+
+func TestArchivedZstdEdgeAndErrorCases(t *testing.T) {
+	home := t.TempDir()
+	archivedDir := filepath.Join(home, ".codex", "archived_sessions")
+	if err := os.MkdirAll(archivedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 0-byte .jsonl.zst file parses cleanly with 0 events.
+	zeroPath := filepath.Join(archivedDir, "zero.jsonl.zst")
+	if err := os.WriteFile(zeroPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resZero, err := New(home).Parse(context.Background(), adapters.Source{Path: zeroPath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(resZero.Events) != 0 {
+		t.Fatalf("zero-byte zstd parse = %+v, err=%v", resZero, err)
+	}
+
+	// 2. Valid empty zstd frame parses cleanly with 0 events.
+	emptyFramePath := filepath.Join(archivedDir, "empty-frame.jsonl.zst")
+	writeZstdFile(t, emptyFramePath, "")
+	resEmpty, err := New(home).Parse(context.Background(), adapters.Source{Path: emptyFramePath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil || len(resEmpty.Events) != 0 {
+		t.Fatalf("empty frame zstd parse = %+v, err=%v", resEmpty, err)
+	}
+
+	// 3. Corrupt / truncated zstd stream returns an error without panicking.
+	corruptPath := filepath.Join(archivedDir, "corrupt.jsonl.zst")
+	if err := os.WriteFile(corruptPath, []byte("not a valid zstd stream"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(home).Parse(context.Background(), adapters.Source{Path: corruptPath}, adapters.ParseRequest{MachineID: "machine"}); err == nil {
+		t.Fatal("corrupt zstd stream unexpectedly succeeded")
+	}
+
+	// 4. Context cancellation aborts cleanly.
+	canceledPath := filepath.Join(archivedDir, "canceled.jsonl.zst")
+	writeZstdFile(t, canceledPath, `{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"s1"}}`+"\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := New(home).Parse(ctx, adapters.Source{Path: canceledPath}, adapters.ParseRequest{MachineID: "machine"}); err == nil {
+		t.Fatal("canceled context unexpectedly succeeded")
 	}
 }

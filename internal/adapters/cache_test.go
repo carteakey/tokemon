@@ -109,3 +109,40 @@ func TestDirectoryCacheAvoidsUnchangedRecursiveWalks(t *testing.T) {
 		t.Fatalf("changed recursive walks = %d, want 2", walks)
 	}
 }
+
+func TestDirectoryCachePathsMatchesMultiPartSuffixesWithoutCrossMatch(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "archived_sessions")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(root, "active.jsonl")
+	zstPath := filepath.Join(root, "archived.JSONL.ZST")
+	plainZstPath := filepath.Join(root, "other.zst")
+	for _, p := range []string{jsonlPath, zstPath, plainZstPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cache := NewDirectoryCache()
+	onlyJSONL, err := cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyJSONL) != 1 || onlyJSONL[0] != jsonlPath {
+		t.Fatalf(".jsonl paths = %v, want [%s]", onlyJSONL, jsonlPath)
+	}
+
+	both, err := cache.Paths(context.Background(), root, ".jsonl", ".jsonl.zst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(both) != 2 || both[0] != jsonlPath || both[1] != zstPath {
+		t.Fatalf("combined paths = %v, want [%s %s]", both, jsonlPath, zstPath)
+	}
+
+	none, err := cache.Paths(context.Background(), root)
+	if err != nil || len(none) != 0 {
+		t.Fatalf("empty extensions = %v, err=%v; want nil, nil", none, err)
+	}
+}

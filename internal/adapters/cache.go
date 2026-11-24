@@ -130,12 +130,16 @@ func NewDirectoryCache() *DirectoryCache {
 	return &DirectoryCache{entries: make(map[string]directoryCacheEntry), walk: filepath.WalkDir}
 }
 
-// Paths returns regular files with the requested extension under root.
-func (c *DirectoryCache) Paths(ctx context.Context, root, extension string) ([]string, error) {
+// Paths returns regular files matching any requested extension suffix under root.
+func (c *DirectoryCache) Paths(ctx context.Context, root string, extensions ...string) ([]string, error) {
 	if c == nil {
 		return nil, nil
 	}
-	key := root + "\x00" + strings.ToLower(extension)
+	normalized := normalizeExtensions(extensions)
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+	key := root + "\x00" + strings.Join(normalized, "\x00")
 	c.mu.Lock()
 	cached, ok := c.entries[key]
 	c.mu.Unlock()
@@ -179,7 +183,7 @@ func (c *DirectoryCache) Paths(ctx context.Context, root, extension string) ([]s
 			directories[path] = FileSignature{Size: info.Size(), ModTime: info.ModTime().UnixNano()}
 			return nil
 		}
-		if entry.Type().IsRegular() && strings.EqualFold(filepath.Ext(path), extension) {
+		if entry.Type().IsRegular() && hasAnyExtension(path, normalized) {
 			paths = append(paths, path)
 		}
 		return nil
@@ -196,6 +200,37 @@ func (c *DirectoryCache) Paths(ctx context.Context, root, extension string) ([]s
 	c.entries[key] = entry
 	c.mu.Unlock()
 	return paths, nil
+}
+
+func normalizeExtensions(extensions []string) []string {
+	if len(extensions) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(extensions))
+	normalized := make([]string, 0, len(extensions))
+	for _, ext := range extensions {
+		ext = strings.ToLower(strings.TrimSpace(ext))
+		if ext == "" {
+			continue
+		}
+		if _, exists := seen[ext]; exists {
+			continue
+		}
+		seen[ext] = struct{}{}
+		normalized = append(normalized, ext)
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func hasAnyExtension(path string, extensions []string) bool {
+	base := filepath.Base(path)
+	for _, ext := range extensions {
+		if len(base) >= len(ext) && strings.EqualFold(base[len(base)-len(ext):], ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func directoriesUnchanged(ctx context.Context, directories map[string]FileSignature) (bool, error) {

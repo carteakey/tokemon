@@ -597,6 +597,8 @@ func glyphForHarness(tool string) pixelGlyph {
 		return glyphFromRows("harness", "codex", 1, ".odo.", "od.do", "d.o.d", "od.do", ".odo.")
 	case "claude", "claude-code":
 		return glyphFromRows("harness", "claude", 3, "o.d.o", ".ooo.", "doood", ".ooo.", "o.d.o")
+	case "claude-desktop":
+		return glyphFromRows("harness", "claude-desktop", 3, "ooooo", "o.d.o", "doood", "o.d.o", "ooooo")
 	case "opencode":
 		return glyphFromRows("harness", "opencode", 2, "ddddd", "o...d", "d.ood", "d...o", "ddddd")
 	case "copilot-cli", "github-copilot":
@@ -635,9 +637,11 @@ func topTools(values []database.ToolTotal) []database.ToolTotal {
 }
 
 func harnessName(tool string) string {
-	switch tool {
+	switch strings.ToLower(strings.TrimSpace(tool)) {
 	case "claude-code":
 		return "Claude Code"
+	case "claude-desktop":
+		return "Claude Desktop"
 	case "codex":
 		return "Codex"
 	case "opencode":

@@ -381,6 +381,87 @@ func TestRepresentativeScaleBackupRestore(t *testing.T) {
 	}
 }
 
+func TestLatestBackupInfo(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tokemon.db")
+	missingDir := filepath.Join(dir, "missing-backups")
+
+	// Missing directory returns Exists: false, Count: 0, nil error.
+	info, err := latestBackupInfoAt(dbPath, missingDir, time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC))
+	if err != nil || info.Exists || info.Count != 0 {
+		t.Fatalf("missing dir = %+v, err=%v", info, err)
+	}
+
+	backupDir := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Non-scheduled artifacts (-wal, -shm, migration snapshots, pre-restore, unrelated) are ignored.
+	ignored := []string{
+		"tokemon-v3-before-v4-20260810T110000.000000000Z.db",
+		"tokemon-before-restore-v4-20260810T110000.000000000Z.db",
+		"tokemon-backup-v4-20260810T110000.000000000Z.db-wal",
+		"tokemon-backup-v4-20260810T110000.000000000Z.db-shm",
+		"other-backup-v4-20260810T110000.000000000Z.db",
+		"tokemon-backup-v0-20260810T110000.000000000Z.db",
+	}
+	for _, name := range ignored {
+		if err := os.WriteFile(filepath.Join(backupDir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info, err = latestBackupInfoAt(dbPath, "", time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC))
+	if err != nil || info.Exists || info.Count != 0 {
+		t.Fatalf("only ignored files = %+v, err=%v", info, err)
+	}
+
+	// Scheduled backups with UTC filename timestamps (and collision suffix) override OS ModTime.
+	older := filepath.Join(backupDir, "tokemon-backup-v4-20260810T010000.000000000Z.db")
+	newer := filepath.Join(backupDir, "tokemon-backup-v4-20260810T100000.000000000Z.db")
+	newerSeq := filepath.Join(backupDir, "tokemon-backup-v4-20260810T100000.000000000Z-1.db")
+	for _, p := range []string{older, newer, newerSeq} {
+		if err := os.WriteFile(p, []byte("db"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Make older file have a newer OS ModTime to verify filename UTC timestamp takes precedence.
+	_ = os.Chtimes(older, time.Date(2026, 8, 10, 11, 59, 0, 0, time.UTC), time.Date(2026, 8, 10, 11, 59, 0, 0, time.UTC))
+
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	info, err = latestBackupInfoAt(dbPath, "", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Exists || info.Count != 3 || info.Path != newerSeq || info.Age != 2*time.Hour {
+		t.Fatalf("latest backup = %+v, want count=3 path=%s age=2h", info, newerSeq)
+	}
+
+	// ModTime fallback when filename lacks a valid timestamp.
+	manualDir := filepath.Join(dir, "manual-backups")
+	if err := os.MkdirAll(manualDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manual := filepath.Join(manualDir, "tokemon-backup-v4-manual.db")
+	if err := os.WriteFile(manual, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	modTime := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	_ = os.Chtimes(manual, modTime, modTime)
+	manualInfo, err := latestBackupInfoAt(dbPath, manualDir, now)
+	if err != nil || !manualInfo.Exists || manualInfo.Count != 1 || manualInfo.Age != 3*time.Hour {
+		t.Fatalf("manual ModTime fallback = %+v, err=%v", manualInfo, err)
+	}
+
+	// Backup path being a regular file surfaces an error.
+	notDir := filepath.Join(dir, "file-not-dir")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LatestBackupInfo(dbPath, notDir); err == nil {
+		t.Fatal("expected error when backupDir is a file")
+	}
+}
+
 func backupTestEvent(id string, timestamp time.Time, tokens int64) usage.Event {
 	return usage.Event{
 		SchemaVersion: usage.SchemaVersion, EventID: id, Timestamp: timestamp,

@@ -9,14 +9,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	_ "time/tzdata"
@@ -45,6 +48,10 @@ const (
 	defaultWriteTimeout      = 30 * time.Second
 	defaultIdleTimeout       = 60 * time.Second
 	defaultShutdownTimeout   = 10 * time.Second
+	defaultBackupRetention   = 10
+	defaultBackupInterval    = 24 * time.Hour
+	defaultStatusTimeout     = 10 * time.Second
+	automatedBackupTimeout   = 5 * time.Minute
 )
 
 func main() {
@@ -56,11 +63,13 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("command required; try: tokemon serve, agent, import, export, inspect, discover, catalog, art, version, purge, or backup")
+		return errors.New("command required; try: tokemon serve, agent, status, import, export, inspect, discover, catalog, art, version, purge, or backup")
 	}
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:])
+	case "status":
+		return runStatus(args[1:])
 	case "import":
 		return runImport(args[1:])
 	case "export":
@@ -158,6 +167,9 @@ func runServe(args []string) error {
 	catalogPath := flags.String("catalog", envOr("TOKEMON_MODEL_CATALOG", "catalog/models.yaml"), "model catalog YAML path")
 	timezone := flags.String("timezone", envOr("TOKEMON_ANALYTICS_TIMEZONE", "UTC"), "IANA timezone used for calendar bucketing")
 	quotasPath := flags.String("quotas", envOr("TOKEMON_QUOTAS", ""), "usage quotas YAML path (optional; no file disables quota tracking)")
+	backupDir := flags.String("backup-dir", envOr("TOKEMON_BACKUP_DIR", ""), "directory for automated SQLite backups (defaults to <database-dir>/backups)")
+	backupRetention := flags.Int("backup-retention", configIntEnv("TOKEMON_BACKUP_RETENTION", defaultBackupRetention), "number of automated backups to retain")
+	backupInterval := flags.Duration("backup-interval", configDurationEnv("TOKEMON_BACKUP_INTERVAL", defaultBackupInterval), "automated backup interval (0 disables automated backups)")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -173,7 +185,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone)
+	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone, quotasPath, backupDir, backupRetention, backupInterval)
 	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	dashboardTokenBefore := *dashboardToken
 	*dashboardToken = applyDashboardTokenFallback(*dashboardToken, *ingestToken, flags)
@@ -181,6 +193,15 @@ func runServe(args []string) error {
 	applyServerTimeoutConfig(flags, configValues, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout, shutdownTimeout)
 	if *readTimeout <= 0 || *readHeaderTimeout <= 0 || *writeTimeout <= 0 || *idleTimeout <= 0 || *shutdownTimeout <= 0 {
 		return errors.New("server timeouts must be positive")
+	}
+	if *backupInterval < 0 {
+		return errors.New("backup interval must be non-negative")
+	}
+	if *backupInterval > 0 && *backupRetention < 1 {
+		return errors.New("backup retention must be at least 1")
+	}
+	if strings.TrimSpace(*backupDir) == "" && isFileBackedDB(*databasePath) {
+		*backupDir = filepath.Join(filepath.Dir(*databasePath), "backups")
 	}
 	if err := api.ValidateServeConfig(*addr, *ingestToken, *devLoopback); err != nil {
 		return err
@@ -214,6 +235,7 @@ func runServe(args []string) error {
 			BaseURL: configuredValue(configValues, "TOKEMON_INSIGHTS_OPENAI_BASE_URL"),
 		})
 	}
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	server, err := api.NewWithConfigAndInsightsAI(store, api.Config{
 		IngestToken:            *ingestToken,
 		DashboardToken:         *dashboardToken,
@@ -223,12 +245,16 @@ func runServe(args []string) error {
 		AllowLoopbackDev:       *devLoopback,
 		EnableTokedex:          *enableTokedex,
 		TrustedProxyCIDRs:      splitConfiguredPaths(*trustedProxyCIDRs),
-		Logger:                 slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		Logger:                 logger,
 	}, insightsSynthesizer)
 	if err != nil {
 		return err
 	}
 	defer server.Close()
+
+	var backupWG sync.WaitGroup
+	defer backupWG.Wait()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// Warm the dashboard and default analytics while the listener and server
@@ -239,6 +265,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	startAutomatedBackups(ctx, &backupWG, logger, *databasePath, *backupDir, *backupRetention, *backupInterval)
 	fmt.Printf("Tokemon listening on http://%s\n", listener.Addr().String())
 	httpServer := &http.Server{
 		Handler:           server.Handler(),
@@ -884,7 +911,7 @@ func applyAgentRequestTimeoutConfig(flags *flag.FlagSet, values map[string]strin
 	}
 }
 
-func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath, timezone *string) {
+func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, databasePath, ingestToken, catalogPath, timezone, quotasPath, backupDir *string, backupRetention *int, backupInterval *time.Duration) {
 	if !flagWasSet(flags, "addr") && os.Getenv("TOKEMON_SERVER_ADDR") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_SERVER_ADDR"]); value != "" {
 			*addr = value
@@ -908,6 +935,30 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 	if !flagWasSet(flags, "timezone") && os.Getenv("TOKEMON_ANALYTICS_TIMEZONE") == "" {
 		if value := strings.TrimSpace(values["TOKEMON_ANALYTICS_TIMEZONE"]); value != "" {
 			*timezone = value
+		}
+	}
+	if quotasPath != nil && !flagWasSet(flags, "quotas") && os.Getenv("TOKEMON_QUOTAS") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_QUOTAS"]); value != "" {
+			*quotasPath = value
+		}
+	}
+	if backupDir != nil && !flagWasSet(flags, "backup-dir") && os.Getenv("TOKEMON_BACKUP_DIR") == "" {
+		if value := strings.TrimSpace(values["TOKEMON_BACKUP_DIR"]); value != "" {
+			*backupDir = value
+		}
+	}
+	if backupRetention != nil && !flagWasSet(flags, "backup-retention") && strings.TrimSpace(os.Getenv("TOKEMON_BACKUP_RETENTION")) == "" {
+		if value := strings.TrimSpace(values["TOKEMON_BACKUP_RETENTION"]); value != "" {
+			if parsed, err := strconv.Atoi(value); err == nil {
+				*backupRetention = parsed
+			}
+		}
+	}
+	if backupInterval != nil && !flagWasSet(flags, "backup-interval") && strings.TrimSpace(os.Getenv("TOKEMON_BACKUP_INTERVAL")) == "" {
+		if value := strings.TrimSpace(values["TOKEMON_BACKUP_INTERVAL"]); value != "" {
+			if parsed, err := time.ParseDuration(value); err == nil {
+				*backupInterval = parsed
+			}
 		}
 	}
 }
@@ -1049,6 +1100,491 @@ func configDurationEnv(name string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
+func configIntEnv(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func isFileBackedDB(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	return trimmed != "" && !strings.HasPrefix(trimmed, ":") && !strings.HasPrefix(trimmed, "file:")
+}
+
+func startAutomatedBackups(ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger, databasePath, backupDir string, retention int, interval time.Duration) {
+	if interval <= 0 || strings.TrimSpace(backupDir) == "" || !isFileBackedDB(databasePath) {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runOnce := func() {
+			if ctx.Err() != nil {
+				return
+			}
+			backupCtx, cancel := context.WithTimeout(ctx, automatedBackupTimeout)
+			defer cancel()
+			result, err := database.CreateBackup(backupCtx, database.BackupOptions{
+				DatabasePath:   databasePath,
+				DestinationDir: backupDir,
+				Retention:      retention,
+			})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				logger.Warn("automated_backup_failed", "error", err.Error())
+				return
+			}
+			logger.Info("automated_backup_completed", "path", result.Path, "events", result.EventCount, "tokens", result.LifetimeTokens)
+		}
+
+		nextWait := interval
+		info, err := database.LatestBackupInfo(databasePath, backupDir)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Warn("automated_backup_inspect_failed", "error", err.Error())
+			runOnce()
+		} else if !info.Exists || info.Age >= interval {
+			runOnce()
+		} else {
+			nextWait = interval - info.Age
+			if nextWait < time.Millisecond {
+				nextWait = time.Millisecond
+			}
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+		timer := time.NewTimer(nextWait)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				runOnce()
+				timer.Reset(interval)
+			}
+		}
+	}()
+}
+
+type statusFreshness struct {
+	State       string     `json:"state"`
+	Age         string     `json:"age"`
+	NewestEvent *time.Time `json:"newest_event,omitempty"`
+}
+
+type statusMachine struct {
+	Name             string `json:"name"`
+	Status           string `json:"status"`
+	LastSeenAt       string `json:"last_seen_at,omitempty"`
+	TodayTokens      int64  `json:"today_tokens"`
+	WeekTokens       int64  `json:"week_tokens"`
+	LifetimeTokens   int64  `json:"lifetime_tokens"`
+	SourceCount      int    `json:"source_count"`
+	SourceErrorCount int    `json:"source_error_count"`
+}
+
+type statusMachinesSummary struct {
+	Total        int             `json:"total"`
+	Connected    int             `json:"connected"`
+	Stale        int             `json:"stale"`
+	Offline      int             `json:"offline"`
+	SourceErrors int             `json:"source_errors"`
+	Items        []statusMachine `json:"items"`
+}
+
+type statusReport struct {
+	Stage           int                   `json:"stage"`
+	Form            string                `json:"form"`
+	FormName        string                `json:"form_name"`
+	Progress        float64               `json:"progress"`
+	NextThreshold   *int64                `json:"next_threshold,omitempty"`
+	TokensRemaining *int64                `json:"tokens_remaining,omitempty"`
+	LifetimeTokens  int64                 `json:"lifetime_tokens"`
+	TodayTokens     int64                 `json:"today_tokens"`
+	TodayEvents     int64                 `json:"today_events"`
+	WeekTokens      int64                 `json:"week_tokens"`
+	WeekEvents      int64                 `json:"week_events"`
+	Timezone        string                `json:"timezone"`
+	Freshness       statusFreshness       `json:"freshness"`
+	Machines        statusMachinesSummary `json:"machines"`
+}
+
+func runStatus(args []string) error {
+	return runStatusWithOutput(args, os.Stdout)
+}
+
+func runStatusWithOutput(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	configPath := flags.String("config", envOr("TOKEMON_AGENT_CONFIG", ""), "agent dotenv config path (defaults to ~/.config/tokemon/agent.env)")
+	serverConfigPath := flags.String("server-config", envOr("TOKEMON_SERVER_CONFIG", ""), "server dotenv config path (defaults to ~/.config/tokemon/server.env)")
+	serverURL := flags.String("server", "", "Tokemon server URL")
+	token := flags.String("token", "", "authentication token")
+	short := flags.Bool("short", false, "print a compact single-line summary")
+	jsonOut := flags.Bool("json", false, "print structured JSON output")
+	timeout := flags.Duration("timeout", configDurationEnv("TOKEMON_STATUS_TIMEOUT", defaultStatusTimeout), "request timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: tokemon status [--config PATH] [--server-config PATH] [--server URL] [--token TOKEN] [--short|--json] [--timeout DURATION]")
+	}
+	if *timeout <= 0 {
+		return errors.New("--timeout must be positive")
+	}
+	if *short && *jsonOut {
+		return errors.New("--short and --json cannot be used together")
+	}
+	resolvedURL, resolvedToken, err := resolveStatusConfig(flags, *configPath, *serverConfigPath, *serverURL, *token)
+	if err != nil {
+		return err
+	}
+	client := localagent.Client{
+		ServerURL:      resolvedURL,
+		Token:          resolvedToken,
+		RequestTimeout: *timeout,
+	}
+	overview, err := client.Overview(context.Background())
+	if err != nil {
+		return formatStatusError(err)
+	}
+	report := buildStatusReport(overview, time.Now().UTC())
+	return writeStatusReport(out, report, *short, *jsonOut)
+}
+
+func resolveStatusConfig(flags *flag.FlagSet, configPath, serverConfigPath, serverURL, token string) (string, string, error) {
+	agentExplicit := flagWasSet(flags, "config") || strings.TrimSpace(os.Getenv("TOKEMON_AGENT_CONFIG")) != ""
+	serverExplicit := flagWasSet(flags, "server-config") || strings.TrimSpace(os.Getenv("TOKEMON_SERVER_CONFIG")) != ""
+
+	readAgent := !serverExplicit || agentExplicit
+	readServer := !agentExplicit || serverExplicit
+
+	needHome := (readAgent && strings.TrimSpace(configPath) == "") || (readServer && strings.TrimSpace(serverConfigPath) == "")
+	home := ""
+	if needHome {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	agentValues := map[string]string{}
+	if readAgent {
+		if strings.TrimSpace(configPath) == "" {
+			configPath = localagent.DefaultConfigPath(home)
+		}
+		var err error
+		agentValues, err = localagent.ReadEnvFile(configPath)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	serverValues := map[string]string{}
+	if readServer {
+		if strings.TrimSpace(serverConfigPath) == "" {
+			serverConfigPath = localagent.DefaultServerConfigPath(home)
+		}
+		var err error
+		serverValues, err = localagent.ReadEnvFile(serverConfigPath)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	var resolvedURL string
+	switch {
+	case flagWasSet(flags, "server"):
+		resolvedURL = normalizeServerURL(serverURL)
+		if resolvedURL == "" {
+			return "", "", errors.New("--server must not be empty")
+		}
+	case strings.TrimSpace(os.Getenv("TOKEMON_SERVER_URL")) != "":
+		resolvedURL = normalizeServerURL(os.Getenv("TOKEMON_SERVER_URL"))
+	case strings.TrimSpace(agentValues["TOKEMON_SERVER_URL"]) != "":
+		resolvedURL = normalizeServerURL(agentValues["TOKEMON_SERVER_URL"])
+	case strings.TrimSpace(os.Getenv("TOKEMON_SERVER_ADDR")) != "":
+		resolvedURL = normalizeServerURL(os.Getenv("TOKEMON_SERVER_ADDR"))
+	case strings.TrimSpace(serverValues["TOKEMON_SERVER_ADDR"]) != "":
+		resolvedURL = normalizeServerURL(serverValues["TOKEMON_SERVER_ADDR"])
+	default:
+		resolvedURL = "http://127.0.0.1:8080"
+	}
+
+	var resolvedToken string
+	switch {
+	case flagWasSet(flags, "token"):
+		resolvedToken = token
+	case os.Getenv("TOKEMON_DASHBOARD_TOKEN") != "":
+		resolvedToken = os.Getenv("TOKEMON_DASHBOARD_TOKEN")
+	case agentValues["TOKEMON_DASHBOARD_TOKEN"] != "":
+		resolvedToken = agentValues["TOKEMON_DASHBOARD_TOKEN"]
+	case serverValues["TOKEMON_DASHBOARD_TOKEN"] != "":
+		resolvedToken = serverValues["TOKEMON_DASHBOARD_TOKEN"]
+	case os.Getenv("TOKEMON_INGEST_TOKEN") != "":
+		resolvedToken = os.Getenv("TOKEMON_INGEST_TOKEN")
+	case agentValues["TOKEMON_INGEST_TOKEN"] != "":
+		resolvedToken = agentValues["TOKEMON_INGEST_TOKEN"]
+	case serverValues["TOKEMON_INGEST_TOKEN"] != "":
+		resolvedToken = serverValues["TOKEMON_INGEST_TOKEN"]
+	}
+
+	return resolvedURL, resolvedToken, nil
+}
+
+func normalizeServerURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.Contains(trimmed, "://") {
+		if host, port, err := net.SplitHostPort(trimmed); err == nil {
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = "127.0.0.1"
+			}
+			return "http://" + net.JoinHostPort(host, port)
+		}
+		return "http://" + trimmed
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return trimmed
+	}
+	hostname := parsed.Hostname()
+	if hostname == "0.0.0.0" || hostname == "::" {
+		if port := parsed.Port(); port != "" {
+			parsed.Host = net.JoinHostPort("127.0.0.1", port)
+		} else {
+			parsed.Host = "127.0.0.1"
+		}
+	}
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func buildStatusReport(overview database.Overview, now time.Time) statusReport {
+	freshness := statusFreshnessFor(overview.NewestEvent, now)
+	machines := statusMachinesSummary{
+		Total: len(overview.Machines),
+		Items: make([]statusMachine, 0, len(overview.Machines)),
+	}
+	for _, m := range overview.Machines {
+		switch m.Status {
+		case "Connected":
+			machines.Connected++
+		case "Stale":
+			machines.Stale++
+		default:
+			machines.Offline++
+		}
+		machines.SourceErrors += m.SourceErrorCount
+		machines.Items = append(machines.Items, statusMachine{
+			Name:             m.Name,
+			Status:           m.Status,
+			LastSeenAt:       m.LastSeenAt,
+			TodayTokens:      m.TodayTokens,
+			WeekTokens:       m.WeekTokens,
+			LifetimeTokens:   m.LifetimeTokens,
+			SourceCount:      m.SourceCount,
+			SourceErrorCount: m.SourceErrorCount,
+		})
+	}
+	return statusReport{
+		Stage:           overview.Evolution.Stage,
+		Form:            overview.Evolution.Form,
+		FormName:        overview.Evolution.FormName,
+		Progress:        overview.Evolution.Progress,
+		NextThreshold:   overview.Evolution.NextThreshold,
+		TokensRemaining: overview.Evolution.TokensRemaining,
+		LifetimeTokens:  overview.LifetimeTokens,
+		TodayTokens:     overview.Today.Tokens,
+		TodayEvents:     overview.Today.Events,
+		WeekTokens:      overview.Week.Tokens,
+		WeekEvents:      overview.Week.Events,
+		Timezone:        overview.Timezone,
+		Freshness:       freshness,
+		Machines:        machines,
+	}
+}
+
+func statusFreshnessFor(newest *time.Time, now time.Time) statusFreshness {
+	if newest == nil {
+		return statusFreshness{State: "Unknown", Age: "no events yet"}
+	}
+	age := now.Sub(*newest)
+	if age < 0 {
+		age = 0
+	}
+	state := "Stale"
+	if age <= 30*time.Minute {
+		state = "Fresh"
+	}
+	utcNewest := newest.UTC()
+	return statusFreshness{
+		State:       state,
+		Age:         statusDurationLabel(age.Milliseconds()) + " ago",
+		NewestEvent: &utcNewest,
+	}
+}
+
+func writeStatusReport(out io.Writer, report statusReport, short, jsonOut bool) error {
+	if jsonOut {
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(report)
+	}
+	formName := report.FormName
+	if strings.TrimSpace(formName) == "" {
+		formName = "Unknown"
+	}
+	if short {
+		machineSummary := "0 machines"
+		if report.Machines.Total > 0 {
+			machineSummary = fmt.Sprintf("%d/%d online", report.Machines.Connected, report.Machines.Total)
+		}
+		_, err := fmt.Fprintf(out, "Stage %02d %s · %s total · %s today · %s (%s) · %s\n",
+			report.Stage, formName,
+			formatCompactTokens(report.LifetimeTokens),
+			formatCompactTokens(report.TodayTokens),
+			report.Freshness.State, report.Freshness.Age,
+			machineSummary,
+		)
+		return err
+	}
+
+	stageLine := fmt.Sprintf("Stage %02d %s", report.Stage, formName)
+	if report.NextThreshold != nil && report.TokensRemaining != nil {
+		stageLine += fmt.Sprintf(" (%.0f%% · %s to %s)", math.Round(report.Progress*100), formatCompactTokens(*report.TokensRemaining), formatCompactTokens(*report.NextThreshold))
+	} else {
+		stageLine += " (max stage)"
+	}
+	if _, err := fmt.Fprintln(out, stageLine); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "Lifetime: %s (%s)\n", formatCommas(report.LifetimeTokens), formatCompactTokens(report.LifetimeTokens)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "Today:    %s (%s, %s events)\n", formatCommas(report.TodayTokens), formatCompactTokens(report.TodayTokens), formatCommas(report.TodayEvents)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "Week:     %s (%s, %s events)\n", formatCommas(report.WeekTokens), formatCompactTokens(report.WeekTokens), formatCommas(report.WeekEvents)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "Data:     %s · %s\n", report.Freshness.State, report.Freshness.Age); err != nil {
+		return err
+	}
+	if report.Machines.Total == 0 {
+		_, err := fmt.Fprintln(out, "Machines: 0")
+		return err
+	}
+	machineLine := fmt.Sprintf("Machines: %d connected, %d stale, %d offline", report.Machines.Connected, report.Machines.Stale, report.Machines.Offline)
+	if report.Machines.SourceErrors > 0 {
+		machineLine += fmt.Sprintf(" (%d source errors)", report.Machines.SourceErrors)
+	}
+	if _, err := fmt.Fprintln(out, machineLine); err != nil {
+		return err
+	}
+	for _, m := range report.Machines.Items {
+		if _, err := fmt.Fprintf(out, "  - %s: %s · %s today · %s total\n", m.Name, m.Status, formatCompactTokens(m.TodayTokens), formatCompactTokens(m.LifetimeTokens)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formatStatusError(err error) error {
+	var statusErr *localagent.StatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusUnauthorized:
+			return errors.New("authentication failed (401 Unauthorized): check --token, TOKEMON_DASHBOARD_TOKEN, or TOKEMON_INGEST_TOKEN")
+		case http.StatusForbidden:
+			return errors.New("access forbidden (403 Forbidden): check token or proxy authorization")
+		case http.StatusTooManyRequests:
+			return errors.New("rate limited (429 Too Many Requests): try again shortly")
+		default:
+			if statusErr.StatusCode >= http.StatusInternalServerError {
+				return fmt.Errorf("server error (%s)", statusErr.Status)
+			}
+			return fmt.Errorf("request failed (%s)", statusErr.Status)
+		}
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("request failed: %w", urlErr.Err)
+	}
+	return fmt.Errorf("request failed: %w", err)
+}
+
+func formatCommas(value int64) string {
+	text := strconv.FormatInt(value, 10)
+	start := 0
+	if strings.HasPrefix(text, "-") {
+		start = 1
+	}
+	first := (len(text) - start) % 3
+	if first == 0 {
+		first = 3
+	}
+	var builder strings.Builder
+	builder.WriteString(text[:start+first])
+	for index := start + first; index < len(text); index += 3 {
+		builder.WriteByte(',')
+		builder.WriteString(text[index : index+3])
+	}
+	return builder.String()
+}
+
+func formatCompactTokens(value int64) string {
+	abs := float64(value)
+	if abs < 0 {
+		abs = -abs
+	}
+	for _, unit := range []struct {
+		threshold float64
+		suffix    string
+	}{
+		{1_000_000_000_000, "T"},
+		{1_000_000_000, "B"},
+		{1_000_000, "M"},
+		{1_000, "K"},
+	} {
+		if abs >= unit.threshold {
+			return strings.TrimSuffix(fmt.Sprintf("%.1f", float64(value)/unit.threshold), ".0") + unit.suffix
+		}
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func statusDurationLabel(ms int64) string {
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.1fs", float64(ms)/1000)
+	}
+	seconds := (ms + 500) / 1000
+	if seconds < 3600 {
+		return fmt.Sprintf("%dm %02ds", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%dh %02dm", seconds/3600, seconds%3600/60)
+}
+
 func splitConfiguredList(value string) []string {
 	var result []string
 	for _, item := range strings.FieldsFunc(value, func(r rune) bool {
@@ -1165,6 +1701,7 @@ func printUsage() {
 Commands:
   serve       start the HTTP API and dashboard
   agent       scan local provider usage and upload metadata
+  status      check server health, evolution stage, and token totals
   passwd      generate a bcrypt hash for the dashboard login password (at most 72 bytes)
   version     print build and platform identity
   import      ingest normalized JSONL into SQLite
@@ -1179,6 +1716,7 @@ Commands:
 Examples:
   tokemon serve --config ~/.config/tokemon/server.env
   tokemon agent --server http://127.0.0.1:8080 --adapters claude-code,codex --once
+  tokemon status --short
   tokemon version
   tokemon import --database ./data/tokemon.db usage.jsonl
   tokemon backup create --database ./data/tokemon.db --destination /mnt/off-host/tokemon

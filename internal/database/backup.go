@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,131 @@ type VerifyResult struct {
 	EventCount     int64  `json:"event_count"`
 	LifetimeTokens int64  `json:"lifetime_tokens"`
 	SHA256         string `json:"sha256"`
+}
+
+// BackupInfo describes the scheduled backups present for a database.
+type BackupInfo struct {
+	Exists    bool          `json:"exists"`
+	Path      string        `json:"path,omitempty"`
+	Timestamp time.Time     `json:"timestamp,omitempty"`
+	Age       time.Duration `json:"age,omitempty"`
+	Count     int           `json:"count"`
+}
+
+// LatestBackupInfo inspects backupDir (defaulting to <database-dir>/backups)
+// for scheduled backups matching <base>-backup-v<schema>-*.db, returning the
+// newest backup's path, timestamp, age, and total count.
+func LatestBackupInfo(databasePath, backupDir string) (BackupInfo, error) {
+	return latestBackupInfoAt(databasePath, backupDir, time.Now().UTC())
+}
+
+func latestBackupInfoAt(databasePath, backupDir string, now time.Time) (BackupInfo, error) {
+	databasePath = strings.TrimSpace(databasePath)
+	backupDir = strings.TrimSpace(backupDir)
+	if backupDir == "" {
+		if databasePath == "" || !isFileBackedDatabase(databasePath) {
+			return BackupInfo{}, nil
+		}
+		backupDir = filepath.Join(filepath.Dir(databasePath), "backups")
+	}
+	base := "tokemon"
+	if databasePath != "" && isFileBackedDatabase(databasePath) {
+		if stem := strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath)); stem != "" {
+			base = stem
+		}
+	}
+	prefix := base + backupFilePrefix + "v"
+
+	entries, err := os.ReadDir(backupDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return BackupInfo{}, nil
+	}
+	if err != nil {
+		return BackupInfo{}, fmt.Errorf("read backup directory: %w", err)
+	}
+
+	var (
+		count    int
+		hasBest  bool
+		bestName string
+		bestTS   time.Time
+		bestSeq  int
+	)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		rest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".db")
+		versionStr, stampPart, ok := strings.Cut(rest, "-")
+		if !ok || stampPart == "" {
+			continue
+		}
+		if schemaVer, err := strconv.Atoi(versionStr); err != nil || schemaVer <= 0 {
+			continue
+		}
+		ts, seq, ok := parseBackupFilenameTimestamp(stampPart)
+		if !ok {
+			info, infoErr := entry.Info()
+			if errors.Is(infoErr, os.ErrNotExist) {
+				continue
+			}
+			if infoErr != nil {
+				return BackupInfo{}, fmt.Errorf("stat backup %q: %w", name, infoErr)
+			}
+			ts = info.ModTime().UTC()
+			seq = -1
+		}
+		count++
+		if !hasBest || ts.After(bestTS) || (ts.Equal(bestTS) && (seq > bestSeq || (seq == bestSeq && name > bestName))) {
+			hasBest = true
+			bestName = name
+			bestTS = ts.UTC()
+			bestSeq = seq
+		}
+	}
+	if !hasBest {
+		return BackupInfo{}, nil
+	}
+	age := now.UTC().Sub(bestTS)
+	if age < 0 {
+		age = 0
+	}
+	return BackupInfo{
+		Exists:    true,
+		Path:      filepath.Join(backupDir, bestName),
+		Timestamp: bestTS,
+		Age:       age,
+		Count:     count,
+	}, nil
+}
+
+func parseBackupFilenameTimestamp(stampPart string) (time.Time, int, bool) {
+	zIdx := strings.IndexByte(stampPart, 'Z')
+	if zIdx <= 0 {
+		return time.Time{}, 0, false
+	}
+	seq := 0
+	if suffix := stampPart[zIdx+1:]; suffix != "" {
+		if !strings.HasPrefix(suffix, "-") {
+			return time.Time{}, 0, false
+		}
+		parsedSeq, err := strconv.Atoi(suffix[1:])
+		if err != nil || parsedSeq <= 0 {
+			return time.Time{}, 0, false
+		}
+		seq = parsedSeq
+	}
+	rawStamp := stampPart[:zIdx+1]
+	for _, layout := range []string{"20060102T150405.000000000Z", "20060102T150405.999999999Z", "20060102T150405Z"} {
+		if parsed, err := time.Parse(layout, rawStamp); err == nil {
+			return parsed.UTC(), seq, true
+		}
+	}
+	return time.Time{}, 0, false
 }
 
 // CreateBackup creates a standalone SQLite snapshot using VACUUM INTO. This
