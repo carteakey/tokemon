@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log/slog"
@@ -76,6 +77,109 @@ func TestServeHTTPShutdownClosesIdleStateNewConnectionsPromptly(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed >= 2*time.Second {
 		t.Fatalf("serveHTTP shutdown took %v with idle StateNew conn; expected prompt close (<2s)", elapsed)
+	}
+}
+
+func TestServeHTTPShutdownAllowsInFlightStateActiveRequestToFinish(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(inHandler)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("completed"))
+	})}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveHTTP(ctx, server, listener, 2*time.Second)
+	}()
+
+	respCh := make(chan *http.Response, 1)
+	reqErrCh := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + listener.Addr().String() + "/work")
+		if err != nil {
+			reqErrCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	<-inHandler
+	// Begin graceful shutdown while the StateActive request is in flight.
+	cancel()
+	// Hold past newConnShutdownGrace (250ms) so we prove StateActive is NOT killed by registerNewConnShutdown.
+	time.Sleep(350 * time.Millisecond)
+	close(release)
+
+	select {
+	case err := <-reqErrCh:
+		t.Fatalf("in-flight StateActive request aborted: %v", err)
+	case resp := <-respCh:
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || string(body) != "completed" {
+			t.Fatalf("in-flight response = %d %q, want 200 completed", resp.StatusCode, string(body))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for in-flight response")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("serveHTTP shutdown returned error: %v", err)
+	}
+}
+
+func TestServeHTTPShutdownDeadlineExceededForcesClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inHandler := make(chan struct{})
+	unblock := make(chan struct{})
+	defer close(unblock)
+
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(inHandler)
+		// Deliberately ignore r.Context() to simulate a stuck handler.
+		<-unblock
+	})}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveHTTP(ctx, server, listener, 80*time.Millisecond)
+	}()
+
+	reqDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + listener.Addr().String() + "/stuck")
+		if err == nil {
+			resp.Body.Close()
+		}
+		reqDone <- err
+	}()
+
+	<-inHandler
+	cancel()
+
+	serveErr := <-errCh
+	if !errors.Is(serveErr, context.DeadlineExceeded) {
+		t.Fatalf("serveHTTP error = %v, want context.DeadlineExceeded", serveErr)
+	}
+	select {
+	case err := <-reqDone:
+		if err == nil {
+			t.Fatal("expected stuck client request to fail after server.Close()")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stuck client request was not closed by server.Close()")
 	}
 }
 

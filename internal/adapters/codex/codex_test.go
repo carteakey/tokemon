@@ -15,6 +15,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/tokemon/tokemon/internal/adapters"
 	"github.com/tokemon/tokemon/internal/agent"
+	"github.com/tokemon/tokemon/internal/catalog"
+	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/usage"
 	_ "modernc.org/sqlite"
 )
@@ -1134,4 +1136,157 @@ func TestArchivedZstdEdgeAndErrorCases(t *testing.T) {
 	if _, err := New(home).Parse(ctx, adapters.Source{Path: canceledPath}, adapters.ParseRequest{MachineID: "machine"}); err == nil {
 		t.Fatal("canceled context unexpectedly succeeded")
 	}
+
+	// 5. Valid .jsonl.zst without trailing newline processes the final record normally.
+	noNewlinePath := filepath.Join(archivedDir, "no-trailing-newline.jsonl.zst")
+	noNewlineLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"no-nl-sess","model_provider":"openai","cwd":"/private/repos/App"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}}`,
+	}, "\n") // intentionally no trailing \n
+	writeZstdFile(t, noNewlinePath, noNewlineLog)
+	resNoNL, err := New(home).Parse(context.Background(), adapters.Source{Path: noNewlinePath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatalf("no-trailing-newline zstd parse error: %v", err)
+	}
+	if len(resNoNL.Events) != 1 || *resNoNL.Events[0].TotalTokens != 30 || resNoNL.Events[0].SessionID != "no-nl-sess" {
+		t.Fatalf("no-trailing-newline zstd events = %+v, want 1 event with 30 tokens", resNoNL.Events)
+	}
+
+	// 6. Multi-frame concatenated .jsonl.zst decodes all frames seamlessly.
+	multiFramePath := filepath.Join(archivedDir, "multi-frame.jsonl.zst")
+	frame1 := encodeZstdBytes(t, `{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"multi-sess","model_provider":"openai"}}`+"\n")
+	frame2 := encodeZstdBytes(t, `{"timestamp":"2026-07-12T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}}`+"\n")
+	if err := os.WriteFile(multiFramePath, append(frame1, frame2...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resMulti, err := New(home).Parse(context.Background(), adapters.Source{Path: multiFramePath}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatalf("multi-frame zstd parse error: %v", err)
+	}
+	if len(resMulti.Events) != 1 || *resMulti.Events[0].TotalTokens != 15 || resMulti.Events[0].SessionID != "multi-sess" {
+		t.Fatalf("multi-frame zstd events = %+v, want 1 event with 15 tokens", resMulti.Events)
+	}
+
+	// 7. Truncated second zstd frame after valid line 1 returns an error (never silent partial success).
+	truncFramePath := filepath.Join(archivedDir, "truncated-after-line1.jsonl.zst")
+	validLine1 := encodeZstdBytes(t, `{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"trunc-sess","model_provider":"openai"}}`+"\n")
+	truncatedFrame2 := encodeZstdBytes(t, `{"timestamp":"2026-07-12T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}}`+"\n")
+	if len(truncatedFrame2) > 4 {
+		truncatedFrame2 = truncatedFrame2[:len(truncatedFrame2)-4]
+	}
+	if err := os.WriteFile(truncFramePath, append(validLine1, truncatedFrame2...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(home).Parse(context.Background(), adapters.Source{Path: truncFramePath}, adapters.ParseRequest{MachineID: "machine"}); err == nil {
+		t.Fatal("truncated second zstd frame unexpectedly succeeded")
+	}
+
+	// 8. Symlink .jsonl.zst is excluded by Discover, and unreadable .jsonl.zst returns permission error on Parse.
+	symlinkHome := t.TempDir()
+	symlinkArchivedDir := filepath.Join(symlinkHome, ".codex", "archived_sessions")
+	if err := os.MkdirAll(symlinkArchivedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targetFile := filepath.Join(t.TempDir(), "outside.jsonl.zst")
+	writeZstdFile(t, targetFile, `{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"sym-sess"}}`+"\n")
+	if err := os.Symlink(targetFile, filepath.Join(symlinkArchivedDir, "link.jsonl.zst")); err != nil {
+		t.Fatal(err)
+	}
+	discovered, err := New(symlinkHome).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovered) != 0 {
+		t.Fatalf("Discover included symlink .jsonl.zst: %+v", discovered)
+	}
+
+	if os.Geteuid() != 0 {
+		unreadablePath := filepath.Join(symlinkArchivedDir, "unreadable.jsonl.zst")
+		writeZstdFile(t, unreadablePath, `{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"unreadable-sess"}}`+"\n")
+		if err := os.Chmod(unreadablePath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(unreadablePath, 0o600) })
+		if _, err := New(symlinkHome).Parse(context.Background(), adapters.Source{Path: unreadablePath}, adapters.ParseRequest{MachineID: "machine"}); err == nil {
+			t.Fatal("unreadable .jsonl.zst unexpectedly parsed without error")
+		}
+	}
+}
+
+func TestSimultaneousJSONLAndZstdWithShiftedLinesZeroDoubleCount(t *testing.T) {
+	home := t.TempDir()
+	activePath := filepath.Join(home, ".codex", "sessions", "2026", "07", "12", "rollout.jsonl")
+	if err := os.MkdirAll(filepath.Dir(activePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	activeLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"dup-sess","model_provider":"openai","cwd":"/private/repos/App"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}`,
+		`{"timestamp":"2026-07-12T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(activePath, []byte(activeLog), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Archived copy has an extra benign event line before token_count, shifting its line number from 3 to 4.
+	archivedPath := filepath.Join(home, ".codex", "archived_sessions", "rollout.jsonl.zst")
+	archivedLog := strings.Join([]string{
+		`{"timestamp":"2026-07-12T12:00:00Z","type":"session_meta","payload":{"id":"dup-sess","model_provider":"openai","cwd":"/private/repos/App"}}`,
+		`{"timestamp":"2026-07-12T12:00:00.500Z","type":"event_msg","payload":{"type":"agent_reasoning"}}`,
+		`{"timestamp":"2026-07-12T12:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}`,
+		`{"timestamp":"2026-07-12T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}}`,
+	}, "\n") + "\n"
+	writeZstdFile(t, archivedPath, archivedLog)
+
+	adapter := New(home)
+	sources, err := adapter.Discover(context.Background())
+	if err != nil || len(sources) != 2 {
+		t.Fatalf("Discover = %+v, err=%v (want 2)", sources, err)
+	}
+	var allEvents []usage.Event
+	for _, src := range sources {
+		res, err := adapter.Parse(context.Background(), src, adapters.ParseRequest{MachineID: "machine"})
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", src.Path, err)
+		}
+		allEvents = append(allEvents, res.Events...)
+	}
+	if len(allEvents) != 2 || allEvents[0].EventID == allEvents[1].EventID {
+		t.Fatalf("expected 2 events with shifted line EventIDs, got %+v", allEvents)
+	}
+
+	store, err := database.Open(filepath.Join(t.TempDir(), "tokemon.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	res, err := store.Ingest(context.Background(), allEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Accepted != 1 || res.Duplicates != 1 {
+		t.Fatalf("Ingest result = %+v, want accepted=1 duplicates=1", res)
+	}
+	total, err := store.LifetimeTokens(context.Background())
+	if err != nil || total != 60 {
+		t.Fatalf("LifetimeTokens = %d, err=%v (want 60, zero double-counting)", total, err)
+	}
+}
+
+func encodeZstdBytes(t *testing.T, content string) []byte {
+	t.Helper()
+	var buf strings.Builder
+	enc, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := enc.Write([]byte(content)); err != nil {
+		enc.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return []byte(buf.String())
 }

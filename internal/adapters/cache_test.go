@@ -146,3 +146,94 @@ func TestDirectoryCachePathsMatchesMultiPartSuffixesWithoutCrossMatch(t *testing
 		t.Fatalf("empty extensions = %v, err=%v; want nil, nil", none, err)
 	}
 }
+
+func TestDirectoryCacheSubdirLifecycleRootRecreateAndSymlinks(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "sessions")
+	sub := filepath.Join(root, "2026", "08")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fileA := filepath.Join(sub, "a.jsonl")
+	if err := os.WriteFile(fileA, []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Symlinked .jsonl file and symlinked subdir must both be skipped.
+	outsideFile := filepath.Join(base, "outside.jsonl")
+	if err := os.WriteFile(outsideFile, []byte("out\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(root, "sym.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	outsideDir := filepath.Join(base, "outside-dir")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "b.jsonl"), []byte("b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(root, "symdir")); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewDirectoryCache()
+	paths, err := cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != fileA {
+		t.Fatalf("initial paths = %v, want [%s] (symlinks must be skipped)", paths, fileA)
+	}
+
+	// Creating a new subdirectory and file invalidates the cache.
+	sub2 := filepath.Join(root, "2026", "09")
+	if err := os.MkdirAll(sub2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fileC := filepath.Join(sub2, "c.jsonl")
+	if err := os.WriteFile(fileC, []byte("c\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("after subdir create paths = %v, err=%v (want 2)", paths, err)
+	}
+
+	// Deleting the subdirectory drops its file from Paths.
+	if err := os.RemoveAll(sub2); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil || len(paths) != 1 || paths[0] != fileA {
+		t.Fatalf("after subdir delete paths = %v, err=%v (want [%s])", paths, err, fileA)
+	}
+
+	// Deleting root removes the stale entry from c.entries and returns empty.
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("after root delete paths = %v, err=%v (want empty)", paths, err)
+	}
+	cache.mu.Lock()
+	entriesCount := len(cache.entries)
+	cache.mu.Unlock()
+	if entriesCount != 0 {
+		t.Fatalf("deleted root retained %d stale cache entries", entriesCount)
+	}
+
+	// Recreating root discovers newly added files cleanly.
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recreated := filepath.Join(root, "recreated.jsonl")
+	if err := os.WriteFile(recreated, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = cache.Paths(context.Background(), root, ".jsonl")
+	if err != nil || len(paths) != 1 || paths[0] != recreated {
+		t.Fatalf("after root recreate paths = %v, err=%v (want [%s])", paths, err, recreated)
+	}
+}

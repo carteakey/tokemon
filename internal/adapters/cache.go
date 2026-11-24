@@ -193,6 +193,9 @@ func (c *DirectoryCache) Paths(ctx context.Context, root string, extensions ...s
 	}
 	sort.Strings(paths)
 	if len(directories) == 0 {
+		c.mu.Lock()
+		delete(c.entries, key)
+		c.mu.Unlock()
 		return paths, nil
 	}
 	entry := directoryCacheEntry{paths: append([]string(nil), paths...), directories: directories}

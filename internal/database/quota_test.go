@@ -1116,3 +1116,128 @@ func TestQuotaStatusWarmupInvalidationDoesNotStallFirstIngest(t *testing.T) {
 		t.Fatalf("inside-window QuotaStatus after real read = %+v, want stale 10000", inside)
 	}
 }
+
+func TestQuotaStatusFreshGenerationSkewRetries(t *testing.T) {
+	t.Run("warm-SWR-mid-refresh-ingest-skew", func(t *testing.T) {
+		budget := int64(1_000)
+		store, err := OpenWithLocation(
+			filepath.Join(t.TempDir(), "warm-skew.db"),
+			catalog.Empty(),
+			time.UTC,
+			quota.Quota{Provider: "openai", Label: "Cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+		// Warm cache with 500 tokens.
+		ingestQuotaEvents(t, store, []usage.Event{
+			quotaUsageEvent("skew-w-1", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5", 500),
+		})
+		warm := store.QuotaStatus(ctx, now)
+		if len(warm) != 1 || warm[0].TokensUsed != 500 {
+			t.Fatalf("warm QuotaStatus = %+v, want 500", warm)
+		}
+
+		// Ingest +200 -> 700, then expire refreshDue so the next read triggers SWR refresh.
+		ingestQuotaEvents(t, store, []usage.Event{
+			quotaUsageEvent("skew-w-2", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "openai", "gpt-5", 200),
+		})
+		store.quotaMu.Lock()
+		store.quotaCache.refreshDue = time.Now().Add(-time.Millisecond)
+		store.quotaMu.Unlock()
+
+		// Slow down the first refresh deterministically so we can ingest mid-refresh.
+		store.SetQuotaRefreshDelayForTest(150 * time.Millisecond)
+		beforeRefreshes := store.quotaRefreshes.Load()
+
+		resCh := make(chan []QuotaStatus, 1)
+		go func() {
+			resCh <- store.QuotaStatusFresh(ctx, now)
+		}()
+
+		// Wait until the background refresh goroutine has started and is inside computeQuotaCacheEntry.
+		deadline := time.Now().Add(2 * time.Second)
+		for store.quotaRefreshes.Load() == beforeRefreshes {
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for first SWR refresh to start")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Clear delay for the follow-up generation and ingest +300 -> 1000 mid-refresh.
+		store.SetQuotaRefreshDelayForTest(0)
+		ingestQuotaEvents(t, store, []usage.Event{
+			quotaUsageEvent("skew-w-3", time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC), "openai", "gpt-5", 300),
+		})
+
+		got := <-resCh
+		if len(got) != 1 || got[0].TokensUsed != 1_000 {
+			t.Fatalf("QuotaStatusFresh after mid-refresh skew = %+v, want TokensUsed=1000 (never stale 500)", got)
+		}
+	})
+
+	t.Run("cold-cache-mid-compute-ingest-skew", func(t *testing.T) {
+		budget := int64(1_000)
+		store, err := OpenWithLocation(
+			filepath.Join(t.TempDir(), "cold-skew.db"),
+			catalog.Empty(),
+			time.UTC,
+			quota.Quota{Provider: "openai", Label: "Cap", ResetDay: 1, Budget: quota.Budget{TokensPerMonth: &budget}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+		// Seed 900 tokens while quotaCache remains nil (cold).
+		ingestQuotaEvents(t, store, []usage.Event{
+			quotaUsageEvent("skew-c-1", time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC), "openai", "gpt-5", 900),
+		})
+
+		store.SetQuotaRefreshDelayForTest(150 * time.Millisecond)
+		resCh := make(chan []QuotaStatus, 1)
+		go func() {
+			resCh <- store.QuotaStatusFresh(ctx, now)
+		}()
+
+		// Wait until QuotaStatusFresh enters the cold-cache synchronous compute (s.quotaReady != nil).
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			store.quotaMu.Lock()
+			inFlight := store.quotaReady != nil
+			store.quotaMu.Unlock()
+			if inFlight {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for cold-cache QuotaStatusFresh to enter compute")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		store.SetQuotaRefreshDelayForTest(0)
+		ingestQuotaEvents(t, store, []usage.Event{
+			quotaUsageEvent("skew-c-2", time.Date(2026, 11, 5, 11, 0, 0, 0, time.UTC), "openai", "gpt-5", 100),
+		})
+
+		got := <-resCh
+		if len(got) != 1 || got[0].TokensUsed != 1_000 {
+			t.Fatalf("cold QuotaStatusFresh after mid-compute skew = %+v, want TokensUsed=1000", got)
+		}
+
+		store.quotaMu.Lock()
+		cached := store.quotaCache
+		store.quotaMu.Unlock()
+		if cached == nil {
+			t.Fatal("expected cold QuotaStatusFresh retry to populate quotaCache")
+		}
+	})
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"sort"
@@ -149,12 +150,23 @@ func validateModel(id string, model Model) error {
 	default:
 		return fmt.Errorf("model %q pricing mode must be standard or unknown", id)
 	}
-	for name, price := range map[string]*float64{
-		"input": pricing.InputPricePerMillion, "output": pricing.OutputPricePerMillion,
-		"cached input": pricing.CacheReadPricePerMillion, "cache write": pricing.CacheWritePricePerMillion,
+	for _, field := range []struct {
+		name  string
+		price *float64
+	}{
+		{"input", pricing.InputPricePerMillion},
+		{"output", pricing.OutputPricePerMillion},
+		{"cached input", pricing.CacheReadPricePerMillion},
+		{"cache write", pricing.CacheWritePricePerMillion},
 	} {
-		if price != nil && *price < 0 {
-			return fmt.Errorf("model %q %s price cannot be negative", id, name)
+		if field.price == nil {
+			continue
+		}
+		if math.IsNaN(*field.price) || math.IsInf(*field.price, 0) {
+			return fmt.Errorf("model %q %s price must be finite", id, field.name)
+		}
+		if *field.price < 0 {
+			return fmt.Errorf("model %q %s price cannot be negative", id, field.name)
 		}
 	}
 	if err := validDate(pricing.VerifiedAt); err != nil {

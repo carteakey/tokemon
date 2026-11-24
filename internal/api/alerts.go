@@ -19,7 +19,6 @@ import (
 const (
 	alertHTTPTimeout    = 5 * time.Second
 	alertSWRRecheckWait = 2100 * time.Millisecond
-	alertSWRSettleWait  = 150 * time.Millisecond
 )
 
 type quotaAlertKey struct {
@@ -55,7 +54,6 @@ type quotaAlertState struct {
 	recheckNeeded  bool
 	recheckGen     uint64
 	recheckWait    time.Duration
-	recheckSettle  time.Duration
 	client         *http.Client
 }
 
@@ -65,10 +63,9 @@ func newQuotaAlertState(customClient *http.Client) *quotaAlertState {
 		client = &http.Client{Timeout: alertHTTPTimeout}
 	}
 	return &quotaAlertState{
-		sent:          make(map[quotaAlertKey]struct{}),
-		recheckWait:   alertSWRRecheckWait,
-		recheckSettle: alertSWRSettleWait,
-		client:        client,
+		sent:        make(map[quotaAlertKey]struct{}),
+		recheckWait: alertSWRRecheckWait,
+		client:      client,
 	}
 }
 
@@ -100,7 +97,7 @@ func (s *Server) triggerQuotaAlerts(fromIngest bool) {
 	go func() {
 		defer s.bgWG.Done()
 		ctx, cancel := context.WithTimeout(s.backgroundContext(), 15*time.Second)
-		s.evaluateAndSendQuotaAlerts(ctx)
+		s.evaluateAndSendQuotaAlerts(ctx, false)
 		cancel()
 
 		if !fromIngest {
@@ -108,8 +105,8 @@ func (s *Server) triggerQuotaAlerts(fromIngest bool) {
 		}
 		// Store.QuotaStatus uses a 2s SWR coalescing window on ingest and returns
 		// the stale cached bucket while refreshing asynchronously; run a
-		// coalesced follow-up after the 2s window that primes the SWR refresh
-		// and then evaluates the freshly published bucket.
+		// coalesced follow-up after the 2s window that triggers and awaits the
+		// fresh SWR refresh via QuotaStatusFresh before evaluating alerts.
 		s.alerts.mu.Lock()
 		s.alerts.recheckNeeded = true
 		if s.alerts.recheckRunning {
@@ -138,13 +135,9 @@ func (s *Server) triggerQuotaAlerts(fromIngest bool) {
 			}
 			s.alerts.recheckNeeded = false
 			recheckWait := s.alerts.recheckWait
-			recheckSettle := s.alerts.recheckSettle
 			s.alerts.mu.Unlock()
 			if recheckWait <= 0 {
 				recheckWait = alertSWRRecheckWait
-			}
-			if recheckSettle <= 0 {
-				recheckSettle = alertSWRSettleWait
 			}
 
 			timer := time.NewTimer(recheckWait)
@@ -156,22 +149,13 @@ func (s *Server) triggerQuotaAlerts(fromIngest bool) {
 			}
 
 			recheckCtx, recheckCancel := context.WithTimeout(s.backgroundContext(), 15*time.Second)
-			_ = s.store.QuotaStatus(recheckCtx, time.Now())
-			settle := time.NewTimer(recheckSettle)
-			select {
-			case <-settle.C:
-			case <-s.backgroundContext().Done():
-				settle.Stop()
-				recheckCancel()
-				return
-			}
-			s.evaluateAndSendQuotaAlerts(recheckCtx)
+			s.evaluateAndSendQuotaAlerts(recheckCtx, true)
 			recheckCancel()
 		}
 	}()
 }
 
-func (s *Server) evaluateAndSendQuotaAlerts(ctx context.Context) {
+func (s *Server) evaluateAndSendQuotaAlerts(ctx context.Context, fresh bool) {
 	if !s.alertingEnabled() || s.alerts == nil || ctx.Err() != nil {
 		return
 	}
@@ -179,7 +163,12 @@ func (s *Server) evaluateAndSendQuotaAlerts(ctx context.Context) {
 	defer s.alerts.evalMu.Unlock()
 
 	now := time.Now()
-	statuses := s.store.QuotaStatus(ctx, now)
+	var statuses []database.QuotaStatus
+	if fresh {
+		statuses = s.store.QuotaStatusFresh(ctx, now)
+	} else {
+		statuses = s.store.QuotaStatus(ctx, now)
+	}
 	if len(statuses) == 0 {
 		return
 	}
@@ -331,7 +320,21 @@ func (s *Server) postQuotaNtfy(ctx context.Context, targetURL string, payload qu
 		tags = "rotating_light,tokemon"
 	}
 	var usageSummary string
+	hasTokens := payload.TokensBudget != nil && *payload.TokensBudget > 0
+	hasCost := payload.CostBudget != nil && *payload.CostBudget > 0 && payload.CostUsed != nil
 	switch {
+	case hasTokens && hasCost:
+		tokensPct := float64(payload.TokensUsed) * 100 / float64(*payload.TokensBudget)
+		costPct := *payload.CostUsed * 100 / *payload.CostBudget
+		if costPct >= tokensPct {
+			usageSummary = fmt.Sprintf("%s / %s · %s / %s tokens",
+				money(*payload.CostUsed), money(*payload.CostBudget),
+				commas(payload.TokensUsed), commas(*payload.TokensBudget))
+		} else {
+			usageSummary = fmt.Sprintf("%s / %s tokens · %s / %s",
+				commas(payload.TokensUsed), commas(*payload.TokensBudget),
+				money(*payload.CostUsed), money(*payload.CostBudget))
+		}
 	case payload.TokensBudget != nil:
 		usageSummary = fmt.Sprintf("%s / %s tokens", commas(payload.TokensUsed), commas(*payload.TokensBudget))
 	case payload.CostBudget != nil && payload.CostUsed != nil:

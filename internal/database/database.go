@@ -30,9 +30,10 @@ type Store struct {
 	lock     *databaseLock
 	quotas   []quota.Quota
 
-	facetsMu      sync.RWMutex
-	facetsCache   *AnalyticsFacets
-	facetsFetched time.Time
+	facetsMu         sync.RWMutex
+	facetsCache      *AnalyticsFacets
+	facetsFetched    time.Time
+	facetsGeneration uint64
 
 	aliasesMu     sync.Mutex
 	aliasesCache  []DisplayAlias
@@ -46,6 +47,7 @@ type Store struct {
 	quotaReadyDay     string
 	quotaGeneration   uint64
 	quotaRefreshes    atomic.Int64
+	quotaRefreshDelay time.Duration
 
 	bgMu      sync.Mutex
 	bgClosed  bool
@@ -874,24 +876,44 @@ func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 }
 
 func backupBeforeMigration(ctx context.Context, db *sql.DB, databasePath string, fromVersion, toVersion int, now time.Time) error {
-	var integrity string
-	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
+	stats, err := verifyDatabase(ctx, db, databasePath)
+	if err != nil {
 		return fmt.Errorf("check database before migration: %w", err)
-	}
-	if integrity != "ok" {
-		return fmt.Errorf("database integrity check failed before migration: %s", integrity)
 	}
 
 	backupDir := filepath.Join(filepath.Dir(databasePath), "backups")
 	if err := os.MkdirAll(backupDir, 0o700); err != nil {
 		return fmt.Errorf("create backup directory: %w", err)
 	}
-	name := fmt.Sprintf("%s-v%d-before-v%d-%s.db", strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath)), fromVersion, toVersion, now.Format("20060102T150405.000000000Z"))
-	backupPath := filepath.Join(backupDir, name)
-	if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, backupPath); err != nil {
+	base := strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath))
+	tempPath, err := temporaryStagingPath(backupDir, base, "migration", now)
+	if err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, tempPath); err != nil {
+		_ = os.Remove(tempPath)
 		return fmt.Errorf("back up database before migration: %w", err)
 	}
-	if err := pruneBackups(backupDir, strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath))+"-", backupRetention); err != nil {
+	verified, err := VerifyBackup(ctx, tempPath)
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("verify migration backup: %w", err)
+	}
+	if verified.EventCount != stats.EventCount || verified.LifetimeTokens != stats.LifetimeTokens {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("migration backup differs from source: events %d/%d, tokens %d/%d", verified.EventCount, stats.EventCount, verified.LifetimeTokens, stats.LifetimeTokens)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("verify migration backup: %w", err)
+	}
+	name := fmt.Sprintf("%s-v%d-before-v%d-%s.db", base, fromVersion, toVersion, now.UTC().Format("20060102T150405.000000000Z"))
+	backupPath := filepath.Join(backupDir, name)
+	if err := os.Rename(tempPath, backupPath); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("install migration backup: %w", err)
+	}
+	if err := pruneBackups(backupDir, base+"-", backupRetention); err != nil {
 		return fmt.Errorf("prune database backups: %w", err)
 	}
 	return nil
@@ -943,6 +965,7 @@ func (s *Store) Ingest(ctx context.Context, events []usage.Event) (IngestResult,
 		return IngestResult{}, err
 	}
 	result := IngestResult{PreviousTotal: before, PreviousStage: evolution.Stage(before)}
+	facetsGen := s.currentFacetsGeneration()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return result, err
@@ -1086,7 +1109,7 @@ adapter, adapter_version
 	if facetsNeedInvalidate {
 		s.invalidateFacetsCache()
 	} else if result.Accepted > 0 {
-		s.mergeFacetsCache(addedMachines, addedProviders, addedModels, addedTools, addedProjects)
+		s.mergeFacetsCache(facetsGen, addedMachines, addedProviders, addedModels, addedTools, addedProjects)
 	}
 	if result.Accepted > 0 || result.Duplicates > 0 || facetsNeedInvalidate {
 		s.invalidateQuotaCache()
@@ -1399,11 +1422,12 @@ func (s *Store) DailyUsage(ctx context.Context, start, end time.Time) ([]DailyUs
 	if !end.After(start) {
 		return []DailyUsage{}, nil
 	}
+	pred, args := timestampWindowPredicate(start, end)
 	rows, err := s.readHandle().QueryContext(ctx, `SELECT timestamp,
 COALESCE(NULLIF(canonical_model, ''), raw_model), provider, total_tokens
 FROM usage_events
-WHERE timestamp >= ? AND timestamp < ?
-ORDER BY timestamp`, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+WHERE `+pred+`
+ORDER BY timestamp`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2447,6 +2471,21 @@ func (s *Store) normalizeAnalyticsQuery(query AnalyticsQuery) (AnalyticsQuery, t
 	return query, start, end
 }
 
+func timestampWindowPredicate(start, end time.Time) (string, []any) {
+	paddedStart := start.Add(-24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	paddedEnd := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	startEpoch := float64(start.UnixNano()) / 1e9
+	endEpoch := float64(end.UnixNano()) / 1e9
+	if start.Nanosecond() == 0 && end.Nanosecond() == 0 {
+		startNoZ := start.UTC().Format("2006-01-02T15:04:05")
+		endNoZ := end.UTC().Format("2006-01-02T15:04:05")
+		return "(timestamp >= ? AND timestamp < ? AND ((substr(timestamp, -1) = 'Z' AND timestamp >= ? AND timestamp < ?) OR (substr(timestamp, -1) != 'Z' AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)))",
+			[]any{paddedStart, paddedEnd, startNoZ, endNoZ, startEpoch, endEpoch}
+	}
+	return "(timestamp >= ? AND timestamp < ? AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)",
+		[]any{paddedStart, paddedEnd, startEpoch, endEpoch}
+}
+
 func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) {
 	if query.invalidRange || (!start.IsZero() && !end.IsZero() && !end.After(start)) {
 		return "1 = 0", nil
@@ -2455,19 +2494,9 @@ func analyticsWhere(query AnalyticsQuery, start, end time.Time) (string, []any) 
 	args := make([]any, 0, 14)
 	switch {
 	case !start.IsZero() && !end.IsZero():
-		paddedStart := start.Add(-24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
-		paddedEnd := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
-		startEpoch := float64(start.UnixNano()) / 1e9
-		endEpoch := float64(end.UnixNano()) / 1e9
-		if start.Nanosecond() == 0 && end.Nanosecond() == 0 {
-			startNoZ := start.UTC().Format("2006-01-02T15:04:05")
-			endNoZ := end.UTC().Format("2006-01-02T15:04:05")
-			conditions = append(conditions, "(timestamp >= ? AND timestamp < ? AND ((substr(timestamp, -1) = 'Z' AND timestamp >= ? AND timestamp < ?) OR (substr(timestamp, -1) != 'Z' AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)))")
-			args = append(args, paddedStart, paddedEnd, startNoZ, endNoZ, startEpoch, endEpoch)
-		} else {
-			conditions = append(conditions, "(timestamp >= ? AND timestamp < ? AND unixepoch(timestamp, 'subsec') >= ? AND unixepoch(timestamp, 'subsec') < ?)")
-			args = append(args, paddedStart, paddedEnd, startEpoch, endEpoch)
-		}
+		pred, windowArgs := timestampWindowPredicate(start, end)
+		conditions = append(conditions, pred)
+		args = append(args, windowArgs...)
 	case !end.IsZero():
 		paddedEnd := end.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
 		endNoZ := end.UTC().Format("2006-01-02T15:04:05")
@@ -3087,6 +3116,13 @@ func insertSortedUnique(existing []string, additions map[string]struct{}) ([]str
 // Facets returns the distinct machines, providers, models, and tools present
 // in the store. Unlike Analytics it costs only the facet queries, so handlers
 // that need just the filter values do not pay for the full aggregation.
+func (s *Store) currentFacetsGeneration() uint64 {
+	s.facetsMu.RLock()
+	gen := s.facetsGeneration
+	s.facetsMu.RUnlock()
+	return gen
+}
+
 func (s *Store) Facets(ctx context.Context) (AnalyticsFacets, error) {
 	s.facetsMu.RLock()
 	if s.facetsCache != nil && time.Since(s.facetsFetched) < facetsCacheTTL {
@@ -3101,19 +3137,29 @@ func (s *Store) Facets(ctx context.Context) (AnalyticsFacets, error) {
 	if s.facetsCache != nil && time.Since(s.facetsFetched) < facetsCacheTTL {
 		return cloneAnalyticsFacets(*s.facetsCache), nil
 	}
+	gen := s.facetsGeneration
 	result, err := s.analyticsFacets(ctx)
 	if err != nil {
 		return AnalyticsFacets{}, err
 	}
-	cached := cloneAnalyticsFacets(result)
-	s.facetsCache = &cached
-	s.facetsFetched = time.Now()
-	return cloneAnalyticsFacets(cached), nil
+	if s.facetsGeneration == gen {
+		cached := cloneAnalyticsFacets(result)
+		s.facetsCache = &cached
+		s.facetsFetched = time.Now()
+	}
+	return cloneAnalyticsFacets(result), nil
 }
 
-func (s *Store) mergeFacetsCache(machines, providers, models, tools, projects map[string]struct{}) {
+func (s *Store) mergeFacetsCache(expectedGen uint64, machines, providers, models, tools, projects map[string]struct{}) {
 	s.facetsMu.Lock()
 	defer s.facetsMu.Unlock()
+	if s.facetsGeneration != expectedGen {
+		if s.facetsCache != nil {
+			s.facetsCache = nil
+			s.facetsGeneration++
+		}
+		return
+	}
 	if s.facetsCache == nil {
 		return
 	}
@@ -3141,6 +3187,7 @@ func (s *Store) mergeFacetsCache(machines, providers, models, tools, projects ma
 func (s *Store) invalidateFacetsCache() {
 	s.facetsMu.Lock()
 	s.facetsCache = nil
+	s.facetsGeneration++
 	s.facetsMu.Unlock()
 }
 
@@ -3284,10 +3331,21 @@ func nullFloat64(value sql.NullFloat64) *float64 {
 }
 
 func (s *Store) PurgeBefore(ctx context.Context, before string) (int64, error) {
-	if _, err := timeParse(before + "T00:00:00Z"); err != nil {
+	if len(before) != 10 {
+		return 0, fmt.Errorf("before must be YYYY-MM-DD")
+	}
+	cutoff, err := time.Parse(time.DateOnly, before)
+	if err != nil {
 		return 0, fmt.Errorf("before must be YYYY-MM-DD: %w", err)
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM usage_events WHERE timestamp < ?`, before+"T00:00:00Z")
+	paddedCutoff := cutoff.Add(24 * time.Hour).UTC().Format("2006-01-02T15:04:05")
+	cutoffNoZ := cutoff.UTC().Format("2006-01-02T15:04:05")
+	cutoffEpoch := float64(cutoff.UnixNano()) / 1e9
+	result, err := s.db.ExecContext(
+		ctx,
+		`DELETE FROM usage_events WHERE timestamp < ? AND ((substr(timestamp, -1) = 'Z' AND timestamp < ?) OR (substr(timestamp, -1) != 'Z' AND unixepoch(timestamp, 'subsec') < ?))`,
+		paddedCutoff, cutoffNoZ, cutoffEpoch,
+	)
 	if err != nil {
 		return 0, err
 	}

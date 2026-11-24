@@ -2907,3 +2907,32 @@ func TestAnalytics_F23_T2_CustomFromToUnauthRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalytics_PreservesNonFacetFilterSelectsAcrossPeriodChanges(t *testing.T) {
+	requireE2E(t)
+	s := startTestServer(t, serverOpts{IngestToken: "an-nonfacet-tok"})
+	s.ingestEvents(t, []ingestEvent{{
+		EventID:     "an-nf-1",
+		MachineID:   "active-box",
+		Project:     "active-proj",
+		Provider:    "openai",
+		Model:       "gpt-5.4",
+		Tool:        "codex",
+		TotalTokens: i64(100),
+	}})
+	client := s.authClient(t)
+	waitOverviewLifetimeTokens(t, client, s.BaseURL, 100)
+
+	html := analyticsGetHTML(t, client, s.BaseURL+"/analytics?period=24h&dimension=models&machine=old-box&project=old-proj&provider=old-prov&model=old-model&tool=old-tool")
+	for _, want := range []string{
+		`<option value="old-box" selected>`,
+		`<option value="old-proj" selected>`,
+		`<option value="old-prov" selected>`,
+		`<option value="old-model" selected>`,
+		`<option value="old-tool" selected>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("/analytics dropped active non-facet filter option %q", want)
+		}
+	}
+}

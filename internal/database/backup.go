@@ -426,22 +426,28 @@ func backupDatabaseAt(ctx context.Context, db *sql.DB, databasePath, destination
 	}
 	base := strings.TrimSuffix(filepath.Base(databasePath), filepath.Ext(databasePath))
 	prefix := base + backupFilePrefix
-	backupPath, err := uniqueBackupPath(destination, prefix, stats.SchemaVersion, now)
+	initial := usageSnapshotStats{
+		SchemaVersion:  stats.SchemaVersion,
+		EventCount:     stats.EventCount,
+		LifetimeTokens: stats.LifetimeTokens,
+	}
+	tempPath, verified, err := vacuumVerifiedSnapshot(
+		ctx, db, destination, base, "backup", initial, now,
+		"write SQLite backup",
+		"verify SQLite backup",
+		"backup",
+	)
 	if err != nil {
 		return BackupResult{}, err
 	}
-	if err := vacuumInto(ctx, db, backupPath); err != nil {
-		_ = os.Remove(backupPath)
-		return BackupResult{}, fmt.Errorf("write SQLite backup: %w", err)
-	}
-	verified, err := VerifyBackup(ctx, backupPath)
+	backupPath, err := uniqueBackupPath(destination, prefix, verified.SchemaVersion, now)
 	if err != nil {
-		_ = os.Remove(backupPath)
-		return BackupResult{}, fmt.Errorf("verify SQLite backup: %w", err)
+		_ = os.Remove(tempPath)
+		return BackupResult{}, err
 	}
-	if verified.EventCount != stats.EventCount || verified.LifetimeTokens != stats.LifetimeTokens {
-		_ = os.Remove(backupPath)
-		return BackupResult{}, fmt.Errorf("backup differs from source: events %d/%d, tokens %d/%d", verified.EventCount, stats.EventCount, verified.LifetimeTokens, stats.LifetimeTokens)
+	if err := os.Rename(tempPath, backupPath); err != nil {
+		_ = os.Remove(tempPath)
+		return BackupResult{}, fmt.Errorf("install SQLite backup: %w", err)
 	}
 	if err := pruneBackups(destination, prefix, retention); err != nil {
 		return BackupResult{}, fmt.Errorf("prune scheduled backups: %w", err)
@@ -456,6 +462,111 @@ func backupDatabaseAt(ctx context.Context, db *sql.DB, databasePath, destination
 	}, nil
 }
 
+type usageSnapshotStats struct {
+	SchemaVersion  int
+	EventCount     int64
+	LifetimeTokens int64
+}
+
+func queryUsageSnapshotStats(ctx context.Context, db *sql.DB) (usageSnapshotStats, error) {
+	version, err := schemaVersion(ctx, db)
+	if err != nil {
+		return usageSnapshotStats{}, err
+	}
+	var events, tokens int64
+	if exists, err := hasTable(ctx, db, "usage_events"); err != nil {
+		return usageSnapshotStats{}, err
+	} else if exists {
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(COALESCE(total_tokens, 0)), 0) FROM usage_events`).Scan(&events, &tokens); err != nil {
+			return usageSnapshotStats{}, fmt.Errorf("read usage totals: %w", err)
+		}
+	}
+	return usageSnapshotStats{
+		SchemaVersion:  version,
+		EventCount:     events,
+		LifetimeTokens: tokens,
+	}, nil
+}
+
+func usageSnapshotMatches(before, after usageSnapshotStats, verified VerifyResult) bool {
+	if verified.SchemaVersion == before.SchemaVersion &&
+		verified.EventCount == before.EventCount &&
+		verified.LifetimeTokens == before.LifetimeTokens {
+		return true
+	}
+	if verified.SchemaVersion == after.SchemaVersion &&
+		verified.EventCount == after.EventCount &&
+		verified.LifetimeTokens == after.LifetimeTokens {
+		return true
+	}
+	if verified.SchemaVersion == before.SchemaVersion &&
+		verified.SchemaVersion == after.SchemaVersion &&
+		before.EventCount <= verified.EventCount &&
+		verified.EventCount <= after.EventCount &&
+		before.LifetimeTokens <= verified.LifetimeTokens &&
+		verified.LifetimeTokens <= after.LifetimeTokens {
+		return true
+	}
+	return false
+}
+
+func vacuumVerifiedSnapshot(
+	ctx context.Context,
+	db *sql.DB,
+	directory, base, kind string,
+	initial usageSnapshotStats,
+	now time.Time,
+	stageAction, verifyAction, mismatchLabel string,
+) (string, VerifyResult, error) {
+	before := initial
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", VerifyResult{}, fmt.Errorf("%s: %w", verifyAction, err)
+		}
+		tempPath, err := temporaryStagingPath(directory, base, kind, now)
+		if err != nil {
+			return "", VerifyResult{}, err
+		}
+		if err := vacuumInto(ctx, db, tempPath); err != nil {
+			_ = os.Remove(tempPath)
+			return "", VerifyResult{}, fmt.Errorf("%s: %w", stageAction, err)
+		}
+		verified, err := VerifyBackup(ctx, tempPath)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return "", VerifyResult{}, fmt.Errorf("%s: %w", verifyAction, err)
+		}
+		if verified.SchemaVersion == before.SchemaVersion &&
+			verified.EventCount == before.EventCount &&
+			verified.LifetimeTokens == before.LifetimeTokens {
+			if err := ctx.Err(); err != nil {
+				_ = os.Remove(tempPath)
+				return "", VerifyResult{}, fmt.Errorf("%s: %w", verifyAction, err)
+			}
+			return tempPath, verified, nil
+		}
+		after, err := queryUsageSnapshotStats(ctx, db)
+		if err != nil {
+			_ = os.Remove(tempPath)
+			return "", VerifyResult{}, fmt.Errorf("%s: %w", verifyAction, err)
+		}
+		if usageSnapshotMatches(before, after, verified) {
+			if err := ctx.Err(); err != nil {
+				_ = os.Remove(tempPath)
+				return "", VerifyResult{}, fmt.Errorf("%s: %w", verifyAction, err)
+			}
+			return tempPath, verified, nil
+		}
+		_ = os.Remove(tempPath)
+		if attempt+1 == maxAttempts {
+			return "", VerifyResult{}, fmt.Errorf("%s differs from source: events %d/%d, tokens %d/%d", mismatchLabel, verified.EventCount, after.EventCount, verified.LifetimeTokens, after.LifetimeTokens)
+		}
+		before = after
+	}
+	return "", VerifyResult{}, fmt.Errorf("%s differs from source", mismatchLabel)
+}
+
 func verifyDatabase(ctx context.Context, db *sql.DB, path string) (VerifyResult, error) {
 	var integrity string
 	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
@@ -464,23 +575,21 @@ func verifyDatabase(ctx context.Context, db *sql.DB, path string) (VerifyResult,
 	if !strings.EqualFold(integrity, "ok") {
 		return VerifyResult{}, fmt.Errorf("database integrity check failed: %s", integrity)
 	}
-	version, err := schemaVersion(ctx, db)
+	stats, err := queryUsageSnapshotStats(ctx, db)
 	if err != nil {
 		return VerifyResult{}, err
-	}
-	var events, tokens int64
-	if exists, err := hasTable(ctx, db, "usage_events"); err != nil {
-		return VerifyResult{}, err
-	} else if exists {
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(COALESCE(total_tokens, 0)), 0) FROM usage_events`).Scan(&events, &tokens); err != nil {
-			return VerifyResult{}, fmt.Errorf("read usage totals: %w", err)
-		}
 	}
 	digest, err := fileSHA256(path)
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	return VerifyResult{Path: path, SchemaVersion: version, EventCount: events, LifetimeTokens: tokens, SHA256: digest}, nil
+	return VerifyResult{
+		Path:           path,
+		SchemaVersion:  stats.SchemaVersion,
+		EventCount:     stats.EventCount,
+		LifetimeTokens: stats.LifetimeTokens,
+		SHA256:         digest,
+	}, nil
 }
 
 func openMaintenanceDatabase(path string) (*sql.DB, error) {
@@ -521,18 +630,22 @@ func uniqueBackupPath(destination, prefix string, schema int, now time.Time) (st
 }
 
 func temporaryRestorePath(directory, base string, now time.Time) (string, error) {
-	name := fmt.Sprintf(".%s.restore-%s-", base, now.UTC().Format("20060102T150405.000000000Z"))
+	return temporaryStagingPath(directory, base, "restore", now)
+}
+
+func temporaryStagingPath(directory, base, kind string, now time.Time) (string, error) {
+	name := fmt.Sprintf(".%s.%s-%s-", base, kind, now.UTC().Format("20060102T150405.000000000Z"))
 	file, err := os.CreateTemp(directory, name)
 	if err != nil {
-		return "", fmt.Errorf("create restore staging file: %w", err)
+		return "", fmt.Errorf("create %s staging file: %w", kind, err)
 	}
 	path := file.Name()
 	if err := file.Close(); err != nil {
 		_ = os.Remove(path)
-		return "", fmt.Errorf("close restore staging file: %w", err)
+		return "", fmt.Errorf("close %s staging file: %w", kind, err)
 	}
 	if err := os.Remove(path); err != nil {
-		return "", fmt.Errorf("prepare restore staging path: %w", err)
+		return "", fmt.Errorf("prepare %s staging path: %w", kind, err)
 	}
 	return path, nil
 }
@@ -543,7 +656,8 @@ func snapshotExistingDatabase(ctx context.Context, path string, now time.Time) (
 		return "", err
 	}
 	defer db.Close()
-	if _, err := verifyDatabase(ctx, db, path); err != nil {
+	stats, err := verifyDatabase(ctx, db, path)
+	if err != nil {
 		return "", fmt.Errorf("verify destination before restore: %w", err)
 	}
 	directory := filepath.Join(filepath.Dir(path), "backups")
@@ -552,17 +666,32 @@ func snapshotExistingDatabase(ctx context.Context, path string, now time.Time) (
 	}
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	prefix := base + restoreFilePrefix
-	backupPath, err := uniqueBackupPath(directory, prefix, databaseSchemaVersion, now)
+	initial := usageSnapshotStats{
+		SchemaVersion:  stats.SchemaVersion,
+		EventCount:     stats.EventCount,
+		LifetimeTokens: stats.LifetimeTokens,
+	}
+	tempPath, verified, err := vacuumVerifiedSnapshot(
+		ctx, db, directory, base, "snapshot", initial, now,
+		"snapshot destination before restore",
+		"verify pre-restore snapshot",
+		"pre-restore snapshot",
+	)
 	if err != nil {
 		return "", err
 	}
-	if err := vacuumInto(ctx, db, backupPath); err != nil {
-		_ = os.Remove(backupPath)
-		return "", fmt.Errorf("snapshot destination before restore: %w", err)
+	snapshotSchema := databaseSchemaVersion
+	if verified.SchemaVersion > 0 {
+		snapshotSchema = verified.SchemaVersion
 	}
-	if _, err := VerifyBackup(ctx, backupPath); err != nil {
-		_ = os.Remove(backupPath)
-		return "", fmt.Errorf("verify pre-restore snapshot: %w", err)
+	backupPath, err := uniqueBackupPath(directory, prefix, snapshotSchema, now)
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+	if err := os.Rename(tempPath, backupPath); err != nil {
+		_ = os.Remove(tempPath)
+		return "", fmt.Errorf("install pre-restore snapshot: %w", err)
 	}
 	if err := pruneBackups(directory, prefix, backupRetention); err != nil {
 		return "", fmt.Errorf("prune pre-restore snapshots: %w", err)

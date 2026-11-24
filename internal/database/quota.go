@@ -320,6 +320,25 @@ type QuotaStatus struct {
 // an event. With no quotas configured it returns nil — the dashboard renders
 // an explicit Unknown state for that case itself.
 func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
+	return s.quotaStatus(ctx, now, false)
+}
+
+// QuotaStatusFresh returns quota statuses, triggering and awaiting an
+// in-flight SWR refresh when the cached bucket is stale so alert rechecks
+// evaluate the freshly computed values without arbitrary sleep timers.
+func (s *Store) QuotaStatusFresh(ctx context.Context, now time.Time) []QuotaStatus {
+	return s.quotaStatus(ctx, now, true)
+}
+
+// SetQuotaRefreshDelayForTest injects an artificial delay into quota cache
+// refreshes so tests can verify slow-refresh behavior deterministically.
+func (s *Store) SetQuotaRefreshDelayForTest(delay time.Duration) {
+	s.quotaMu.Lock()
+	s.quotaRefreshDelay = delay
+	s.quotaMu.Unlock()
+}
+
+func (s *Store) quotaStatus(ctx context.Context, now time.Time, awaitFresh bool) []QuotaStatus {
 	loc := s.reportingLocation()
 	configured, err := s.effectiveQuotas(ctx)
 	if err != nil {
@@ -332,6 +351,9 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 		return nil
 	}
 	localDay := now.In(loc).Format("2006-01-02")
+	const maxFreshAttempts = 4
+	attempts := 0
+	var lastEntry *quotaCacheEntry
 
 	for {
 		s.quotaMu.Lock()
@@ -341,14 +363,45 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 			}
 			stale := time.Since(cached.fetched) >= quotaCacheTTL ||
 				(!cached.refreshDue.IsZero() && !time.Now().Before(cached.refreshDue))
-			if stale && s.quotaReady == nil {
+			if stale && s.quotaReady == nil && (!awaitFresh || attempts < maxFreshAttempts) {
 				s.startQuotaRefreshLocked(localDay, now)
 			}
 			entry := cached
+			ready := s.quotaReady
+			if awaitFresh && ready != nil && attempts < maxFreshAttempts {
+				attempts++
+				s.quotaMu.Unlock()
+				select {
+				case <-ready:
+					configured, err = s.effectiveQuotas(ctx)
+					if err != nil {
+						if len(s.quotas) == 0 {
+							return nil
+						}
+						return unknownQuotaStatuses(orderedQuotaList(s.quotas), loc, now)
+					}
+					if len(configured) == 0 {
+						return nil
+					}
+					continue
+				case <-ctx.Done():
+					return buildQuotaStatuses(entry, loc, now)
+				}
+			}
 			s.quotaMu.Unlock()
 			return buildQuotaStatuses(entry, loc, now)
 		}
 		if ready := s.quotaReady; ready != nil {
+			if awaitFresh && attempts >= maxFreshAttempts {
+				s.quotaMu.Unlock()
+				if lastEntry != nil {
+					return buildQuotaStatuses(lastEntry, loc, now)
+				}
+				return unknownQuotaStatuses(orderedQuotaListFromConfigured(configured), loc, now)
+			}
+			if awaitFresh {
+				attempts++
+			}
 			s.quotaMu.Unlock()
 			select {
 			case <-ready:
@@ -364,6 +417,9 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 				}
 				continue
 			case <-ctx.Done():
+				if lastEntry != nil {
+					return buildQuotaStatuses(lastEntry, loc, now)
+				}
 				return unknownQuotaStatuses(orderedQuotaListFromConfigured(configured), loc, now)
 			}
 		}
@@ -376,7 +432,8 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 		entry, ok := s.computeQuotaCacheEntry(ctx, localDay, now)
 
 		s.quotaMu.Lock()
-		if ok && s.quotaGeneration == generation {
+		superseded := s.quotaGeneration != generation
+		if ok && !superseded {
 			entry.fromWarmup = IsWarmupContext(ctx)
 			s.quotaCache = entry
 		}
@@ -386,7 +443,25 @@ func (s *Store) QuotaStatus(ctx context.Context, now time.Time) []QuotaStatus {
 		close(ready)
 
 		if !ok {
+			if lastEntry != nil {
+				return buildQuotaStatuses(lastEntry, loc, now)
+			}
 			return unknownQuotaStatuses(orderedQuotaListFromConfigured(configured), loc, now)
+		}
+		lastEntry = entry
+		if awaitFresh && superseded && attempts < maxFreshAttempts && ctx.Err() == nil {
+			attempts++
+			configured, err = s.effectiveQuotas(ctx)
+			if err != nil {
+				if len(s.quotas) == 0 {
+					return nil
+				}
+				return unknownQuotaStatuses(orderedQuotaList(s.quotas), loc, now)
+			}
+			if len(configured) == 0 {
+				return nil
+			}
+			continue
 		}
 		return buildQuotaStatuses(entry, loc, now)
 	}
@@ -428,7 +503,9 @@ func (s *Store) invalidateQuotaCache() {
 			s.quotaCache = nil
 		} else {
 			due := now
-			if windowEnd := s.quotaCache.fetched.Add(quotaMinRefreshInterval); windowEnd.After(now) {
+			if !s.quotaCache.refreshDue.IsZero() && !s.quotaCache.refreshDue.After(now) {
+				due = s.quotaCache.refreshDue
+			} else if windowEnd := s.quotaCache.fetched.Add(quotaMinRefreshInterval); windowEnd.After(now) {
 				due = windowEnd
 			}
 			s.quotaCache.refreshDue = due
@@ -438,6 +515,18 @@ func (s *Store) invalidateQuotaCache() {
 }
 
 func (s *Store) computeQuotaCacheEntry(ctx context.Context, localDay string, now time.Time) (*quotaCacheEntry, bool) {
+	s.quotaMu.Lock()
+	delay := s.quotaRefreshDelay
+	s.quotaMu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, false
+		}
+	}
 	configuredQuotas, err := s.effectiveQuotas(ctx)
 	if err != nil {
 		return nil, false

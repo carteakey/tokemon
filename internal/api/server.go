@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
@@ -788,8 +789,8 @@ func sessionDisplayName(raw string) string {
 			return label + " " + shortID(rest)
 		}
 	}
-	if len(trimmed) > 18 {
-		return trimmed[:18] + "…"
+	if utf8.RuneCountInString(trimmed) > 18 {
+		return string([]rune(trimmed)[:18]) + "…"
 	}
 	return trimmed
 }
@@ -798,8 +799,8 @@ func shortID(value string) string {
 	value = strings.TrimFunc(value, func(r rune) bool {
 		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'))
 	})
-	if len(value) > 8 {
-		return value[:8]
+	if utf8.RuneCountInString(value) > 8 {
+		return string([]rune(value)[:8])
 	}
 	return value
 }
@@ -938,7 +939,7 @@ func compactMachineName(raw string) string {
 			return strings.Join(words, " ")
 		}
 	}
-	if len(parts) == 2 && len(parts[0]) <= 4 {
+	if len(parts) == 2 && utf8.RuneCountInString(parts[0]) <= 4 {
 		return titleWord(parts[1])
 	}
 	return trimmed
@@ -948,7 +949,11 @@ func titleWord(value string) string {
 	if value == "" {
 		return value
 	}
-	return strings.ToUpper(value[:1]) + value[1:]
+	r, size := utf8.DecodeRuneInString(value)
+	if r == utf8.RuneError && size <= 1 {
+		return value
+	}
+	return string(unicode.ToUpper(r)) + value[size:]
 }
 
 func isDigits(value string) bool {

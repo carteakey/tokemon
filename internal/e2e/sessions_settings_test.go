@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type ssSessionRow struct {
@@ -2934,4 +2935,67 @@ quotas:
 	}
 	client2 := s2.authClient(t)
 	waitOverviewLifetimeTokens(t, client2, s2.BaseURL, 1500)
+}
+
+func TestSessions_MultibyteUTF8DisplayAndFallbackFilterSelects(t *testing.T) {
+	requireE2E(t)
+	s := startTestServer(t, serverOpts{IngestToken: "ss-utf8-tok"})
+	s.ingestEvents(t, []ingestEvent{
+		{
+			EventID:     "utf8-ev-1",
+			MachineID:   "mac-éclair",
+			SessionID:   "a日本語テストセッション名123456",
+			Provider:    "openai",
+			Model:       "gpt-5.4",
+			Tool:        "codex",
+			TotalTokens: i64(100),
+		},
+		{
+			EventID:     "utf8-ev-2",
+			MachineID:   "mac-éclair",
+			SessionID:   "sess_a123456日本語b",
+			Provider:    "openai",
+			Model:       "gpt-5.4",
+			Tool:        "codex",
+			TotalTokens: i64(200),
+		},
+	})
+	client := s.authClient(t)
+	waitOverviewLifetimeTokens(t, client, s.BaseURL, 300)
+
+	for _, path := range []string{
+		"/?fresh=1",
+		"/sessions?fresh=1",
+		"/analytics?period=30d&dimension=machines&fresh=1",
+	} {
+		htmlBody := ssGetHTML(t, client, s.BaseURL+path)
+		if !utf8.ValidString(htmlBody) {
+			t.Fatalf("%s returned invalid UTF-8 HTML", path)
+		}
+		if strings.ContainsRune(htmlBody, utf8.RuneError) {
+			t.Fatalf("%s contained replacement character U+FFFD", path)
+		}
+		if !strings.Contains(htmlBody, "Éclair") {
+			t.Fatalf("%s missing properly cased Éclair machine name", path)
+		}
+		if path != "/analytics?period=30d&dimension=machines&fresh=1" {
+			if !strings.Contains(htmlBody, "a日本語テストセッション名12345…") || !strings.Contains(htmlBody, "session a123456日") {
+				t.Fatalf("%s missing intact rune-truncated session display names", path)
+			}
+		}
+	}
+
+	// Non-facet active filters must remain selected in /sessions <select> controls.
+	filteredHTML := ssGetHTML(t, client, s.BaseURL+"/sessions?machine=missing-machine&project=missing-proj&provider=missing-prov&model=missing-model&tool=missing-tool")
+	for _, want := range []string{
+		`<option value="missing-machine" selected>`,
+		`<option value="missing-proj" selected>`,
+		`<option value="missing-prov" selected>`,
+		`<option value="missing-model" selected>`,
+		`<option value="missing-tool" selected>`,
+	} {
+		if !strings.Contains(filteredHTML, want) {
+			t.Fatalf("/sessions dropped active non-facet filter option %q", want)
+		}
+	}
 }

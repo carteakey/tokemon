@@ -184,7 +184,7 @@
     @keyframes chart-rise { from { opacity: .65; transform: scaleY(.12); } to { opacity: 1; transform: scaleY(1); } }
     @keyframes share-rise { from { opacity: .35; transform: scaleY(.1); } to { opacity: 1; transform: scaleY(1); } }
     @keyframes meter-grow { from { width: 0; } }
-    @keyframes stat-in { from { opacity: .72; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes stat-in { from { transform: translateY(3px); } to { transform: translateY(0); } }
     @media (max-width: 1080px) {
       .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .filter-actions { grid-column: span 2; }
@@ -275,24 +275,28 @@
           <label for="machine-filter">Machine
             <select id="machine-filter" name="machine">
               <option value="">All machines</option>
+              {{if and .Filter.Machine (not (hasString .Facets.Machines .Filter.Machine))}}<option value="{{.Filter.Machine}}" selected>{{machineDisplayName $.MachineAliases .Filter.Machine}}</option>{{end}}
               {{range .Facets.Machines}}<option value="{{.}}"{{if eq $.Filter.Machine .}} selected{{end}}>{{machineDisplayName $.MachineAliases .}}</option>{{end}}
             </select>
           </label>
           <label for="provider-filter">Provider
             <select id="provider-filter" name="provider">
               <option value="">All providers</option>
+              {{if and .Filter.Provider (not (hasString .Facets.Providers .Filter.Provider))}}<option value="{{.Filter.Provider}}" selected>{{.Filter.Provider}}</option>{{end}}
               {{range .Facets.Providers}}<option value="{{.}}"{{if eq $.Filter.Provider .}} selected{{end}}>{{.}}</option>{{end}}
             </select>
           </label>
           <label for="model-filter">Model
             <select id="model-filter" name="model">
               <option value="">All models</option>
+              {{if and .Filter.Model (not (hasString .Facets.Models .Filter.Model))}}<option value="{{.Filter.Model}}" selected>{{modelDisplayName $.ModelAliases .Filter.Model}}</option>{{end}}
               {{range .Facets.Models}}<option value="{{.}}"{{if eq $.Filter.Model .}} selected{{end}}>{{modelDisplayName $.ModelAliases .}}</option>{{end}}
             </select>
           </label>
           <label for="harness-filter">Harness
             <select id="harness-filter" name="tool">
               <option value="">All harnesses</option>
+              {{if and .Filter.Tool (not (hasString .Facets.Tools .Filter.Tool))}}<option value="{{.Filter.Tool}}" selected>{{harnessName .Filter.Tool}}</option>{{end}}
               {{range .Facets.Tools}}<option value="{{.}}"{{if eq $.Filter.Tool .}} selected{{end}}>{{harnessName .}}</option>{{end}}
             </select>
           </label>

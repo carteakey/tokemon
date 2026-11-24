@@ -1,7 +1,9 @@
 package catalog
 
 import (
+	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tokemon/tokemon/internal/usage"
@@ -123,5 +125,55 @@ func TestNewAcceptsUnknownPricingMode(t *testing.T) {
 	badMode.Pricing.Mode = "guessy"
 	if _, err := New(map[string]Model{"glm-5.3-flash": badMode}); err == nil {
 		t.Fatal("invalid pricing mode was accepted")
+	}
+}
+
+func TestNewRejectsNonFinitePrices(t *testing.T) {
+	badValues := []struct {
+		name string
+		val  float64
+	}{
+		{name: "NaN", val: math.NaN()},
+		{name: "+Inf", val: math.Inf(1)},
+		{name: "-Inf", val: math.Inf(-1)},
+	}
+
+	fields := []struct {
+		name string
+		set  func(p *Pricing, v *float64)
+	}{
+		{name: "input", set: func(p *Pricing, v *float64) { p.InputPricePerMillion = v }},
+		{name: "output", set: func(p *Pricing, v *float64) { p.OutputPricePerMillion = v }},
+		{name: "cached input", set: func(p *Pricing, v *float64) { p.CacheReadPricePerMillion = v }},
+		{name: "cache write", set: func(p *Pricing, v *float64) { p.CacheWritePricePerMillion = v }},
+	}
+
+	for _, field := range fields {
+		for _, bad := range badValues {
+			t.Run(field.name+"_"+bad.name, func(t *testing.T) {
+				okPrice := 1.0
+				badPrice := bad.val
+				p := Pricing{
+					Currency:              "USD",
+					Mode:                  "standard",
+					VerifiedAt:            "2026-11-24",
+					Source:                "https://example.com/pricing",
+					InputPricePerMillion:  &okPrice,
+					OutputPricePerMillion: &okPrice,
+				}
+				field.set(&p, &badPrice)
+				_, err := New(map[string]Model{
+					"non-finite": {
+						Provider:    "test",
+						DisplayName: "Non-Finite",
+						Aliases:     []string{"non-finite"},
+						Pricing:     p,
+					},
+				})
+				if err == nil || !strings.Contains(err.Error(), "must be finite") {
+					t.Fatalf("New with %s %s price = %v, want finite error", field.name, bad.name, err)
+				}
+			})
+		}
 	}
 }

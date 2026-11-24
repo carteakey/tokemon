@@ -1212,6 +1212,36 @@ func TestInsights_F17_T2_InsightsAuthAndCAR205UnlinkedWithFilters(t *testing.T) 
 	}
 }
 
+func TestInsights_F17_T2_PreservesNonFacetFilterSelects(t *testing.T) {
+	requireE2E(t)
+	s := startTestServer(t, serverOpts{IngestToken: "itc-ins-nonfacet-1"})
+	s.ingestEvents(t, []ingestEvent{{
+		EventID:     "ins-nf-1",
+		MachineID:   "active-box",
+		SessionID:   "s-nf-1",
+		Provider:    "openai",
+		Model:       "gpt-5.4",
+		Tool:        "codex",
+		TotalTokens: i64(250),
+	}})
+	client := s.authClient(t)
+	itcWaitInsights(t, client, s.BaseURL+"/api/v1/insights?period=30d", func(i itcInsightsPayload) bool {
+		return i.DataQuality.KnownTokens == 250
+	})
+
+	htmlBody := itcGetHTML(t, client, s.BaseURL+"/insights?period=30d&dimension=models&machine=missing-machine&provider=missing-prov&model=missing-model&tool=missing-tool")
+	for _, want := range []string{
+		`<option value="missing-machine" selected>`,
+		`<option value="missing-prov" selected>`,
+		`<option value="missing-model" selected>`,
+		`<option value="missing-tool" selected>`,
+	} {
+		if !strings.Contains(htmlBody, want) {
+			t.Fatalf("/insights dropped active non-facet filter option %q", want)
+		}
+	}
+}
+
 // --- Area C: Feature 22 (Tokedex, 30d What-If, /tokedex/<model>, "claude-desktop") ---
 
 func TestTokedex_F22_T1_EnabledShowsNavCardsLegendAndPricedVsUnknown(t *testing.T) {

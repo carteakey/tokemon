@@ -835,7 +835,6 @@ func TestM5BAlertSWRRecheckConcurrencyRace(t *testing.T) {
 	// Hammer concurrent/staggered triggerQuotaAlerts(true) across rapid exit boundaries under -race.
 	srv.alerts.mu.Lock()
 	srv.alerts.recheckWait = 5 * time.Millisecond
-	srv.alerts.recheckSettle = 2 * time.Millisecond
 	srv.alerts.mu.Unlock()
 
 	var wg sync.WaitGroup

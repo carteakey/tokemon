@@ -1941,9 +1941,10 @@ func TestPairwise_B04_DeclutteredAnalyticsPillsCacheSavingsEffectiveRateAndExpor
 	if !strings.Contains(filteredHTML, `<input type="hidden" name="dimension" value="harnesses">`) {
 		t.Fatalf("filter form missing hidden dimension=harnesses")
 	}
-	detailsSeg := p3SectionBetween(t, filteredHTML, `<details`, `</details>`)
-	if !strings.Contains(p3SectionBetween(t, detailsSeg, `<summary`, `</summary>`), "2") {
-		t.Fatalf("filter summary missing active count 2")
+	detailsSeg := p3SectionBetween(t, filteredHTML, `<details class="filter-details"`, `</details>`)
+	summarySeg := p3SectionBetween(t, detailsSeg, `<summary`, `</summary>`)
+	if !strings.Contains(summarySeg, "Filters") || !strings.Contains(summarySeg, "(2)") {
+		t.Fatalf("filter summary missing Filters (2): %q", summarySeg)
 	}
 	for _, want := range []string{"$1.80 saved", "$1.38", "80.0%"} {
 		if !strings.Contains(filteredHTML, want) {
@@ -1975,6 +1976,11 @@ func TestPairwise_B04_DeclutteredAnalyticsPillsCacheSavingsEffectiveRateAndExpor
 
 	// Unfiltered machines CSV export: formula sanitization (=CMD()) and raw machine IDs (m1, not Box One).
 	machHTML := p3GetHTML(t, client, s.BaseURL+"/analytics?period=30d&dimension=machines")
+	unfilteredDetails := p3SectionBetween(t, machHTML, `<details class="filter-details"`, `</details>`)
+	unfilteredSummary := p3SectionBetween(t, unfilteredDetails, `<summary`, `</summary>`)
+	if strings.Contains(unfilteredSummary, "(") || strings.Contains(unfilteredSummary, "(2)") {
+		t.Fatalf("unfiltered filter summary unexpectedly contained active count: %q", unfilteredSummary)
+	}
 	var csvHref string
 	exportRe := regexp.MustCompile(`<a\b[^>]*href="([^"]*export[^"]*)"[^>]*>`)
 	for _, m := range exportRe.FindAllStringSubmatch(machHTML, -1) {

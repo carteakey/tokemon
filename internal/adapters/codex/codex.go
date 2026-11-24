@@ -656,7 +656,7 @@ func (a *Adapter) parseLogUncached(ctx context.Context, source adapters.Source, 
 		lineStart := position
 		position += int64(len(line))
 		lineNumber++
-		if errors.Is(readErr, io.EOF) && !bytes.HasSuffix(line, []byte{'\n'}) {
+		if !compressed && errors.Is(readErr, io.EOF) && !bytes.HasSuffix(line, []byte{'\n'}) {
 			// The file ends mid-record. Rewind in both full and resume modes so
 			// the cursor never advances past a partially written record: once
 			// the record is complete, the next poll re-reads it whole with its

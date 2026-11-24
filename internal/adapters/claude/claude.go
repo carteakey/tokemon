@@ -319,7 +319,7 @@ func (u *tokenUsage) HasTokens() bool {
 func normalize(record transcriptRecord, raw *tokenUsage, machineID, identity string, lineNumber int64, sessionID string, timestamp time.Time) usage.Event {
 	cacheWrite := raw.CacheWriteTokens
 	if cacheWrite == nil && raw.CacheCreation != nil {
-		cacheWrite = sumPointers(raw.CacheCreation.Ephemeral5mInputTokens, raw.CacheCreation.Ephemeral1hInputTokens)
+		cacheWrite = sumPresentPointers(raw.CacheCreation.Ephemeral5mInputTokens, raw.CacheCreation.Ephemeral1hInputTokens)
 	}
 
 	total := raw.TotalTokens
@@ -367,6 +367,22 @@ func sumPointers(values ...*int64) *int64 {
 			return nil
 		}
 		total += *value
+	}
+	return usage.Int64(total)
+}
+
+func sumPresentPointers(values ...*int64) *int64 {
+	var total int64
+	var anyPresent bool
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		total += *value
+		anyPresent = true
+	}
+	if !anyPresent {
+		return nil
 	}
 	return usage.Int64(total)
 }

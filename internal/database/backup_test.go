@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -460,6 +462,402 @@ func TestLatestBackupInfo(t *testing.T) {
 	}
 	if _, err := LatestBackupInfo(dbPath, notDir); err == nil {
 		t.Fatal("expected error when backupDir is a file")
+	}
+}
+
+func TestCreateBackupStagesAtomicallyBeforeVerify(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tokemon.db")
+	store, err := Open(dbPath, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const eventCount = 2000
+	events := make([]usage.Event, 0, eventCount)
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < eventCount; i++ {
+		events = append(events, backupTestEvent(fmt.Sprintf("atomic-%04d", i), base.Add(time.Duration(i)*time.Second), 10))
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	destDir := filepath.Join(dir, "backups")
+	stopPoll := make(chan struct{})
+	pollErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			default:
+			}
+			info, err := LatestBackupInfo(dbPath, destDir)
+			if err != nil {
+				select {
+				case pollErr <- fmt.Errorf("LatestBackupInfo error: %w", err):
+				default:
+				}
+				return
+			}
+			if info.Exists {
+				verified, err := VerifyBackup(context.Background(), info.Path)
+				if err != nil {
+					select {
+					case pollErr <- fmt.Errorf("visible backup %q failed VerifyBackup: %w", info.Path, err):
+					default:
+					}
+					return
+				}
+				if verified.EventCount != eventCount || verified.LifetimeTokens != eventCount*10 {
+					select {
+					case pollErr <- fmt.Errorf("visible backup %q partial counts: %+v", info.Path, verified):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		res, err := CreateBackup(context.Background(), BackupOptions{
+			DatabasePath:   dbPath,
+			DestinationDir: destDir,
+			Retention:      5,
+			Now:            base.Add(time.Duration(i) * time.Minute),
+		})
+		if err != nil {
+			close(stopPoll)
+			wg.Wait()
+			t.Fatalf("CreateBackup %d: %v", i, err)
+		}
+		if res.EventCount != eventCount || res.LifetimeTokens != eventCount*10 {
+			close(stopPoll)
+			wg.Wait()
+			t.Fatalf("CreateBackup %d counts = %+v", i, res)
+		}
+	}
+	close(stopPoll)
+	wg.Wait()
+	select {
+	case err := <-pollErr:
+		t.Fatal(err)
+	default:
+	}
+
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("destDir entries = %d, want 3 (no leftover staging files)", len(entries))
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Fatalf("leftover hidden staging file in destDir: %q", entry.Name())
+		}
+	}
+}
+
+func TestCreateBackupCancelledDuringStagingLeavesNoVisibleBackup(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tokemon.db")
+	store, err := Open(dbPath, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make([]usage.Event, 0, 1500)
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 1500; i++ {
+		events = append(events, backupTestEvent(fmt.Sprintf("cancel-%04d", i), base.Add(time.Duration(i)*time.Second), 5))
+	}
+	if _, err := store.Ingest(context.Background(), events); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	destDir := filepath.Join(dir, "backups")
+	// Test both immediate pre-cancellation and mid-flight cancellation across short delays.
+	for _, delay := range []time.Duration{0, 1 * time.Millisecond, 5 * time.Millisecond, 10 * time.Millisecond} {
+		ctx, cancel := context.WithCancel(context.Background())
+		if delay == 0 {
+			cancel()
+		} else {
+			time.AfterFunc(delay, cancel)
+		}
+		_, err := CreateBackup(ctx, BackupOptions{
+			DatabasePath:   dbPath,
+			DestinationDir: destDir,
+			Retention:      5,
+			Now:            base.Add(delay),
+		})
+		cancel()
+		if err != nil {
+			info, infoErr := LatestBackupInfo(dbPath, destDir)
+			if infoErr != nil || info.Exists || info.Count != 0 {
+				t.Fatalf("cancelled CreateBackup (delay=%v) left visible backup: info=%+v err=%v", delay, info, infoErr)
+			}
+			entries, readErr := os.ReadDir(destDir)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("cancelled CreateBackup (delay=%v) left files in destDir: %v", delay, entries)
+			}
+			continue
+		}
+		// If backup completed before the timer fired, clean destDir and continue testing shorter delays.
+		_ = os.RemoveAll(destDir)
+	}
+
+	// Specifically ensure an already-canceled context leaves zero files and returns error.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := CreateBackup(canceledCtx, BackupOptions{
+		DatabasePath:   dbPath,
+		DestinationDir: destDir,
+		Retention:      5,
+		Now:            base.Add(time.Hour),
+	}); err == nil {
+		t.Fatal("expected error for already-canceled CreateBackup")
+	}
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 files in destDir after canceled CreateBackup, got %v", entries)
+	}
+}
+
+func TestCreateBackupConcurrentWithContinuousIngest(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tokemon.db")
+	store, err := Open(dbPath, catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(`PRAGMA wal_autocheckpoint = 1000000`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	const (
+		seedCount      = 100
+		seedTokensEach = int64(100)
+		minIngests     = 100
+		backupRuns     = 20
+	)
+	seedBase := time.Date(2026, 8, 10, 10, 0, 0, 0, time.UTC)
+	seedEvents := make([]usage.Event, 0, seedCount)
+	for i := 0; i < seedCount; i++ {
+		seedEvents = append(seedEvents, backupTestEvent(fmt.Sprintf("seed-%04d", i), seedBase.Add(time.Duration(i)*time.Second), seedTokensEach))
+	}
+	if _, err := store.Ingest(ctx, seedEvents); err != nil {
+		t.Fatal(err)
+	}
+
+	destDir := filepath.Join(dir, "backups")
+	backupsDone := make(chan struct{})
+	firstWaveReady := make(chan struct{})
+	var readyOnce sync.Once
+	var totalIngests atomic.Int64
+	var ingestErrMu sync.Mutex
+	var ingestErr error
+
+	const workers = 2
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		workerID := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for seq := 0; seq < 2000; seq++ {
+				select {
+				case <-backupsDone:
+					if totalIngests.Load() >= minIngests {
+						return
+					}
+				default:
+				}
+				ev := backupTestEvent(
+					fmt.Sprintf("live-w%d-%04d", workerID, seq),
+					seedBase.Add(time.Hour+time.Duration(workerID*10000+seq)*time.Millisecond),
+					150,
+				)
+				res, err := store.Ingest(ctx, []usage.Event{ev})
+				if err != nil || res.Rejected != 0 || res.Accepted != 1 {
+					ingestErrMu.Lock()
+					if ingestErr == nil {
+						ingestErr = fmt.Errorf("worker %d seq %d ingest failed: res=%+v err=%v", workerID, seq, res, err)
+					}
+					ingestErrMu.Unlock()
+					return
+				}
+				if totalIngests.Add(1) >= 4 {
+					readyOnce.Do(func() { close(firstWaveReady) })
+				}
+			}
+		}()
+	}
+
+	<-firstWaveReady
+
+	results := make([]BackupResult, 0, backupRuns)
+	for i := 0; i < backupRuns; i++ {
+		res, err := CreateBackup(ctx, BackupOptions{
+			DatabasePath:   dbPath,
+			DestinationDir: destDir,
+			Retention:      backupRuns + 10,
+			Now:            seedBase.Add(2*time.Hour + time.Duration(i)*time.Second),
+		})
+		if err != nil {
+			close(backupsDone)
+			wg.Wait()
+			t.Fatalf("CreateBackup %d failed under concurrent ingest: %v", i, err)
+		}
+		results = append(results, res)
+	}
+	close(backupsDone)
+	wg.Wait()
+
+	ingestErrMu.Lock()
+	err = ingestErr
+	ingestErrMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotIngests := totalIngests.Load()
+	if gotIngests < minIngests {
+		t.Fatalf("total concurrent ingests = %d, want >= %d", gotIngests, minIngests)
+	}
+
+	finalStats, err := queryUsageSnapshotStats(ctx, store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialTokens := int64(seedCount) * seedTokensEach
+	wantFinalEvents := int64(seedCount) + gotIngests
+	wantFinalTokens := initialTokens + gotIngests*150
+	if finalStats.EventCount != wantFinalEvents || finalStats.LifetimeTokens != wantFinalTokens {
+		t.Fatalf("finalStats = %+v, want events=%d tokens=%d", finalStats, wantFinalEvents, wantFinalTokens)
+	}
+
+	for i, res := range results {
+		verified, err := VerifyBackup(ctx, res.Path)
+		if err != nil {
+			t.Fatalf("VerifyBackup %d (%s): %v", i, res.Path, err)
+		}
+		if verified.SchemaVersion != res.SchemaVersion ||
+			verified.EventCount != res.EventCount ||
+			verified.LifetimeTokens != res.LifetimeTokens ||
+			verified.SHA256 != res.SHA256 {
+			t.Fatalf("backup %d mismatch between CreateBackup (%+v) and VerifyBackup (%+v)", i, res, verified)
+		}
+		if res.EventCount < seedCount || res.EventCount > wantFinalEvents {
+			t.Fatalf("backup %d EventCount=%d out of range [%d, %d]", i, res.EventCount, seedCount, wantFinalEvents)
+		}
+		if res.LifetimeTokens < initialTokens || res.LifetimeTokens > wantFinalTokens {
+			t.Fatalf("backup %d LifetimeTokens=%d out of range [%d, %d]", i, res.LifetimeTokens, initialTokens, wantFinalTokens)
+		}
+	}
+
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Fatalf("leftover hidden staging file in destDir: %q", entry.Name())
+		}
+	}
+}
+
+func TestUsageSnapshotMatchesAndRejectsDivergence(t *testing.T) {
+	cases := []struct {
+		name     string
+		before   usageSnapshotStats
+		after    usageSnapshotStats
+		verified VerifyResult
+		want     bool
+	}{
+		{
+			name:     "exact match on idle source",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			want:     true,
+		},
+		{
+			name:     "matches post-vacuum after concurrent ingest",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 24150},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 24150},
+			want:     true,
+		},
+		{
+			name:     "monotonically bracketed between continuous ingests",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 163, LifetimeTokens: 24450},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 24150},
+			want:     true,
+		},
+		{
+			name:     "monotonically bracketed with zero-token events",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 162, LifetimeTokens: 24000},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 24000},
+			want:     true,
+		},
+		{
+			name:     "rejects divergence on idle source",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 159, LifetimeTokens: 23850},
+			want:     false,
+		},
+		{
+			name:     "rejects non-monotonic token regression",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 163, LifetimeTokens: 24450},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 23900},
+			want:     false,
+		},
+		{
+			name:     "rejects verified exceeding after bound",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 163, LifetimeTokens: 24450},
+			verified: VerifyResult{SchemaVersion: 5, EventCount: 164, LifetimeTokens: 24450},
+			want:     false,
+		},
+		{
+			name:     "rejects schema version mismatch",
+			before:   usageSnapshotStats{SchemaVersion: 5, EventCount: 160, LifetimeTokens: 24000},
+			after:    usageSnapshotStats{SchemaVersion: 5, EventCount: 161, LifetimeTokens: 24150},
+			verified: VerifyResult{SchemaVersion: 4, EventCount: 161, LifetimeTokens: 24150},
+			want:     false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageSnapshotMatches(tc.before, tc.after, tc.verified); got != tc.want {
+				t.Fatalf("usageSnapshotMatches(%+v, %+v, %+v) = %v, want %v", tc.before, tc.after, tc.verified, got, tc.want)
+			}
+		})
 	}
 }
 

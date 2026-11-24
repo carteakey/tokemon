@@ -392,3 +392,49 @@ func TestParseSeparatesClaudeDesktopEntrypoint(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePartialCacheCreationTiers(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude", "projects", "project", "partial-cache.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Join([]string{
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:01Z","sessionId":"s-5m","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":40}}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:02Z","sessionId":"s-1h","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation":{"ephemeral_1h_input_tokens":50}}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:03Z","sessionId":"s-both","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":50}}}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T12:00:04Z","sessionId":"s-neither","message":{"model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation":{}}}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := New(home).Parse(context.Background(), adapters.Source{Path: path}, adapters.ParseRequest{MachineID: "machine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 4 {
+		t.Fatalf("events = %d, want 4", len(result.Events))
+	}
+
+	// 5m only -> cache_write=40, total=100, derived
+	e0 := result.Events[0]
+	if e0.CacheWriteTokens == nil || *e0.CacheWriteTokens != 40 || e0.TotalTokens == nil || *e0.TotalTokens != 100 || e0.TokenAccuracy != usage.AccuracyDerived {
+		t.Fatalf("5m-only event = %+v, want cacheWrite=40 total=100 derived", e0)
+	}
+	// 1h only -> cache_write=50, total=110, derived
+	e1 := result.Events[1]
+	if e1.CacheWriteTokens == nil || *e1.CacheWriteTokens != 50 || e1.TotalTokens == nil || *e1.TotalTokens != 110 || e1.TokenAccuracy != usage.AccuracyDerived {
+		t.Fatalf("1h-only event = %+v, want cacheWrite=50 total=110 derived", e1)
+	}
+	// both -> cache_write=90, total=150, derived
+	e2 := result.Events[2]
+	if e2.CacheWriteTokens == nil || *e2.CacheWriteTokens != 90 || e2.TotalTokens == nil || *e2.TotalTokens != 150 || e2.TokenAccuracy != usage.AccuracyDerived {
+		t.Fatalf("both-tiers event = %+v, want cacheWrite=90 total=150 derived", e2)
+	}
+	// neither -> cache_write=nil, total=nil, unknown
+	e3 := result.Events[3]
+	if e3.CacheWriteTokens != nil || e3.TotalTokens != nil || e3.TokenAccuracy != usage.AccuracyUnknown {
+		t.Fatalf("neither-tier event = %+v, want cacheWrite=nil total=nil unknown", e3)
+	}
+}

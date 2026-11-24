@@ -114,7 +114,8 @@ func identifierContainsSensitiveValue(value string) bool {
 	if value == "" {
 		return false
 	}
-	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "Bearer ") || containsCredentialPrefix(value, "sk-") || strings.Contains(value, "ghp_") {
+	lower := strings.ToLower(value)
+	if strings.ContainsAny(value, "\r\n") || strings.Contains(lower, "bearer ") || containsCredentialPrefix(lower, "sk-") || strings.Contains(lower, "ghp_") || containsCredentialPrefix(lower, "github_pat_") {
 		return true
 	}
 	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\\`) {
@@ -203,7 +204,7 @@ func validateMetadataValue(key string, value any) error {
 		return nil
 	case string:
 		lower := strings.ToLower(typed)
-		if strings.ContainsAny(typed, "\r\n/\\") || strings.Contains(typed, "Bearer ") || containsCredentialPrefix(typed, "sk-") || strings.Contains(typed, "ghp_") {
+		if strings.ContainsAny(typed, "\r\n/\\") || strings.Contains(lower, "bearer ") || containsCredentialPrefix(lower, "sk-") || strings.Contains(lower, "ghp_") || containsCredentialPrefix(lower, "github_pat_") {
 			return fmt.Errorf("%w: metadata value for %q resembles sensitive content", ErrSensitiveContent, key)
 		}
 		for _, sensitive := range []string{"prompt", "response", "source", "path", "title", "secret", "credential", "repository", "repo", "code", "message", "conversation", "command", "cwd", "http:", "https:"} {

@@ -39,6 +39,13 @@ func TestValidateOutboundRejectsCredentialOrPathLikeIdentifiers(t *testing.T) {
 		"session sk after separator": func(event *Event) { event.SessionID = "prefix_sk-secret-key" },
 		"session sk after hyphen":    func(event *Event) { event.SessionID = "prefix-sk-secret-key" },
 		"event id sk after slash":    func(event *Event) { event.EventID = "foo/sk-secret" },
+		"model lowercase bearer":     func(event *Event) { event.Model = "bearer secret-token" },
+		"provider mixed bearer":      func(event *Event) { event.Provider = "auth-BeArEr xyz" },
+		"model github_pat":           func(event *Event) { event.Model = "github_pat_11ABC_secret" },
+		"event id github_pat":        func(event *Event) { event.EventID = "tok_github_pat_11ABC_secret" },
+		"model uppercase sk":         func(event *Event) { event.Model = "SK-proj-secret" },
+		"metadata lowercase bearer":  func(event *Event) { event.Metadata = map[string]any{"tokemon_note": "bearer secret123"} },
+		"metadata github_pat":        func(event *Event) { event.Metadata = map[string]any{"tokemon_note": "prefix-github_pat_11XYZ"} },
 	} {
 		event := base
 		mutate(&event)

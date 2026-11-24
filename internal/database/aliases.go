@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -27,7 +28,7 @@ func (s *Store) DisplayAliases(ctx context.Context) ([]DisplayAlias, error) {
 	s.aliasesMu.Lock()
 	defer s.aliasesMu.Unlock()
 	if s.aliasesCached {
-		return s.aliasesCache, nil
+		return slices.Clone(s.aliasesCache), nil
 	}
 	rows, err := s.readHandle().QueryContext(ctx, `SELECT kind, identity, alias FROM display_aliases ORDER BY kind, identity`)
 	if err != nil {
@@ -46,9 +47,9 @@ func (s *Store) DisplayAliases(ctx context.Context) ([]DisplayAlias, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	s.aliasesCache = aliases
+	s.aliasesCache = slices.Clone(aliases)
 	s.aliasesCached = true
-	return aliases, nil
+	return slices.Clone(aliases), nil
 }
 
 func (s *Store) invalidateAliasesCache() {

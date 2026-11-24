@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
@@ -3925,5 +3926,154 @@ func TestAuthenticatedPagesShareChromeTopbarActionsAndCAR205(t *testing.T) {
 		} else if strings.Contains(body, `id="refresh-now"`) {
 			t.Errorf("%s unexpectedly renders overview refresh controls", path)
 		}
+	}
+}
+
+func TestDisplayFormattersPreserveValidUTF8OnMultibyteInputs(t *testing.T) {
+	sessionCases := []struct{ raw, want string }{
+		{"a日本語テストセッション名", "a日本語テストセッション名"},
+		{"a日本語テストセッション名1234567890", "a日本語テストセッション名12345…"},
+		{"sess_a123456日本語b", "session a123456日"},
+		{"🚀✨🔥💡🎉🌟🎯🧩🛠📦🎨", "🚀✨🔥💡🎉🌟🎯🧩🛠📦🎨"},
+		{"🚀✨🔥💡🎉🌟🎯🧩🛠📦🎨12345678", "🚀✨🔥💡🎉🌟🎯🧩🛠📦🎨1234567…"},
+	}
+	for _, tc := range sessionCases {
+		got := sessionDisplayName(tc.raw)
+		if !utf8.ValidString(got) || strings.ContainsRune(got, utf8.RuneError) {
+			t.Fatalf("sessionDisplayName(%q) produced invalid UTF-8: %q", tc.raw, got)
+		}
+		if got != tc.want {
+			t.Errorf("sessionDisplayName(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	shortCases := []struct{ raw, want string }{
+		{"a123456日本語b", "a123456日"},
+		{"x日本語テストセッション名y", "x日本語テストセ"},
+	}
+	for _, tc := range shortCases {
+		got := shortID(tc.raw)
+		if !utf8.ValidString(got) || strings.ContainsRune(got, utf8.RuneError) {
+			t.Fatalf("shortID(%q) produced invalid UTF-8: %q", tc.raw, got)
+		}
+		if got != tc.want {
+			t.Errorf("shortID(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	machineCases := []struct{ raw, want string }{
+		{"mac-éclair", "Éclair"},
+		{"dev-über", "Über"},
+		{"box-日本語", "日本語"},
+	}
+	for _, tc := range machineCases {
+		got := compactMachineName(tc.raw)
+		if !utf8.ValidString(got) || strings.ContainsRune(got, utf8.RuneError) {
+			t.Fatalf("compactMachineName(%q) produced invalid UTF-8: %q", tc.raw, got)
+		}
+		if got != tc.want {
+			t.Errorf("compactMachineName(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	if got := titleWord("éclair"); !utf8.ValidString(got) || got != "Éclair" {
+		t.Fatalf("titleWord(%q) = %q, want Éclair", "éclair", got)
+	}
+}
+
+func TestAnalyticsAndSessionsPreserveNonFacetActiveSelectFilters(t *testing.T) {
+	store, err := database.Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Ingest(context.Background(), []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "sel-ev-1",
+		Timestamp:     time.Now().UTC(),
+		MachineID:     "present-box",
+		Project:       "present-proj",
+		Provider:      "openai",
+		Model:         "gpt-5",
+		Tool:          "codex",
+		SessionID:     "sel-sess-1",
+		TotalTokens:   usage.Int64(100),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := newTestServer(store, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	query := "machine=missing-machine&project=missing-proj&provider=missing-prov&model=missing-model&tool=missing-tool"
+	for _, path := range []string{"/analytics?period=30d&dimension=models&" + query, "/sessions?" + query} {
+		body := renderAccessiblePage(t, srv, path)
+		for _, want := range []string{
+			`<option value="missing-machine" selected>`,
+			`<option value="missing-proj" selected>`,
+			`<option value="missing-prov" selected>`,
+			`<option value="missing-model" selected>`,
+			`<option value="missing-tool" selected>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s dropped active non-facet filter option %q", path, want)
+			}
+		}
+	}
+
+	insightsPath := "/insights?period=30d&dimension=models&machine=missing-machine&provider=missing-prov&model=missing-model&tool=missing-tool"
+	insightsBody := renderAccessiblePage(t, srv, insightsPath)
+	for _, want := range []string{
+		`<option value="missing-machine" selected>`,
+		`<option value="missing-prov" selected>`,
+		`<option value="missing-model" selected>`,
+		`<option value="missing-tool" selected>`,
+	} {
+		if !strings.Contains(insightsBody, want) {
+			t.Errorf("%s dropped active non-facet filter option %q", insightsPath, want)
+		}
+	}
+}
+
+func TestCatalogWhatIfBaselinePreservesParentheticalDisplayNameWithoutUsage(t *testing.T) {
+	cat := catalog.MustNew(map[string]catalog.Model{
+		"custom-bedrock-x": {
+			Provider:    "anthropic",
+			DisplayName: "Model X (Bedrock)",
+			Aliases:     []string{"custom-bedrock-x"},
+			Tier:        "A",
+			Pricing: catalog.Pricing{
+				Currency:                 "USD",
+				Mode:                     "standard",
+				Source:                   "https://example.com/pricing",
+				VerifiedAt:               "2026-11-20",
+				InputPricePerMillion:     usage.Float64(3.0),
+				OutputPricePerMillion:    usage.Float64(15.0),
+				CacheReadPricePerMillion: usage.Float64(0.3),
+			},
+		},
+	})
+	store, err := database.Open(t.TempDir()+"/tokemon.db", cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	srv, err := NewWithConfig(store, Config{IngestToken: "secret", DashboardToken: testDashboardToken, EnableTokedex: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	body := renderAccessiblePage(t, srv, "/tokedex")
+	want := `<option value="custom-bedrock-x" data-base-label="Model X (Bedrock)">Model X (Bedrock)</option>`
+	if !strings.Contains(body, want) {
+		t.Fatalf("/tokedex missing data-base-label option %q", want)
 	}
 }

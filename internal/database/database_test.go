@@ -2731,3 +2731,336 @@ func TestOverviewModelAndMachineEventAndUnknownCounts(t *testing.T) {
 		t.Fatalf("mac-unknown-only = %+v, want tokens=0 events=1 unknown=1", got)
 	}
 }
+
+func TestDisplayAliasesReturnsClonedSlice(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetDisplayAlias(ctx, AliasKindModel, "gpt-5", "GPT Five"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetDisplayAlias(ctx, AliasKindMachine, "mac-1", "Main Mac"); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.DisplayAliases(ctx)
+	if err != nil || len(first) != 2 {
+		t.Fatalf("DisplayAliases = %+v, err=%v", first, err)
+	}
+	first[0].Alias = "MUTATED"
+	first[1].Identity = "MUTATED"
+
+	second, err := store.DisplayAliases(ctx)
+	if err != nil || len(second) != 2 {
+		t.Fatalf("second DisplayAliases = %+v, err=%v", second, err)
+	}
+	for _, a := range second {
+		if a.Alias == "MUTATED" || a.Identity == "MUTATED" {
+			t.Fatalf("caller mutation corrupted cached DisplayAliases: %+v", second)
+		}
+	}
+}
+
+func TestPeriodSummaryMachinesAndActivitySubsecondMidnightBoundaries(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ist := time.FixedZone("IST", 5*3600+30*60)
+
+	for _, tc := range []struct {
+		name string
+		loc  *time.Location
+	}{
+		{name: "UTC", loc: time.UTC},
+		{name: "America/New_York", loc: ny},
+		{name: "Asia/Kolkata", loc: ist},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := OpenWithLocation(t.TempDir()+"/tokemon.db", catalog.Empty(), tc.loc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+
+			// 2026-11-24 is a Tuesday, so weekStart is Sunday 2026-11-22.
+			day := time.Date(2026, 11, 24, 0, 0, 0, 0, tc.loc)
+			tomorrow := day.AddDate(0, 0, 1)
+			weekStart := day.AddDate(0, 0, -int(day.Weekday()))
+
+			events := []usage.Event{
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "today-subsec",
+					Timestamp: day.Add(500 * time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(1000), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "today-end-minus-1ms",
+					Timestamp: tomorrow.Add(-time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(200), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "tomorrow-subsec",
+					Timestamp: tomorrow.Add(500 * time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(2500), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "week-start-subsec",
+					Timestamp: weekStart.Add(500 * time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(700), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "before-week-subsec",
+					Timestamp: weekStart.Add(-500 * time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(900), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "today-non-z-offset",
+					Timestamp: day.Add(250 * time.Millisecond),
+					MachineID: "m-sub", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(300), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+			}
+			if _, err := store.Ingest(ctx, events); err != nil {
+				t.Fatal(err)
+			}
+			// Rewrite today-non-z-offset to a non-Z RFC3339 offset representation of the exact same instant.
+			nonZ := day.Add(250 * time.Millisecond).In(time.FixedZone("OFF", 2*3600)).Format(time.RFC3339Nano)
+			if _, err := store.db.ExecContext(ctx, `UPDATE usage_events SET timestamp = ? WHERE event_id = 'today-non-z-offset'`, nonZ); err != nil {
+				t.Fatal(err)
+			}
+
+			wantToday := int64(1000 + 200 + 300) // 1500
+			wantWeek := wantToday + 700          // 2200
+			wantLifetime := wantWeek + 2500 + 900
+
+			todaySummary, err := store.PeriodSummary(ctx, day, tomorrow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if todaySummary.Tokens != wantToday || todaySummary.Events != 3 {
+				t.Fatalf("PeriodSummary(today) = %+v, want tokens=%d events=3", todaySummary, wantToday)
+			}
+
+			weekSummary, err := store.PeriodSummary(ctx, weekStart, tomorrow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if weekSummary.Tokens != wantWeek || weekSummary.Events != 4 {
+				t.Fatalf("PeriodSummary(week) = %+v, want tokens=%d events=4", weekSummary, wantWeek)
+			}
+
+			machines, err := store.MachinesAt(ctx, day.Add(12*time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(machines) != 1 || machines[0].TodayTokens != wantToday || machines[0].WeekTokens != wantWeek || machines[0].LifetimeTokens != wantLifetime {
+				t.Fatalf("MachinesAt = %+v, want today=%d week=%d lifetime=%d", machines, wantToday, wantWeek, wantLifetime)
+			}
+
+			daily, err := store.DailyUsage(ctx, weekStart, tomorrow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byDay := make(map[string]int64, len(daily))
+			for _, d := range daily {
+				byDay[d.Date] = d.Tokens
+			}
+			if byDay[day.Format("2006-01-02")] != wantToday || byDay[weekStart.Format("2006-01-02")] != 700 || len(byDay) != 2 {
+				t.Fatalf("DailyUsage = %+v, want %s=%d %s=700", daily, day.Format("2006-01-02"), wantToday, weekStart.Format("2006-01-02"))
+			}
+
+			// Also verify Activity's 53-week start boundary at subsecond precision:
+			// currentWeekStart.AddDate(0, 0, -7*(activityWeeks-1)) + 500ms must be included,
+			// while -500ms before that boundary must be excluded, and tomorrow + 500ms excluded.
+			activityStart := weekStart.AddDate(0, 0, -7*(activityWeeks-1))
+			if _, err := store.Ingest(ctx, []usage.Event{
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "activity-start-subsec",
+					Timestamp: activityStart.Add(500 * time.Millisecond),
+					MachineID: "m-act", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(4321), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+				{
+					SchemaVersion: usage.SchemaVersion, EventID: "activity-before-start-subsec",
+					Timestamp: activityStart.Add(-500 * time.Millisecond),
+					MachineID: "m-act", Provider: "openai", Model: "gpt-5", Tool: "codex",
+					TotalTokens: usage.Int64(8888), TokenAccuracy: usage.AccuracyReported,
+					Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			activity, err := store.Activity(ctx, day.Add(12*time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Activity covers activityStart through the end of the current week:
+			// includes activityStart+500ms (4321), before-week (900), weekStart (700), day (1500), and tomorrow (2500),
+			// while excluding activityStart-500ms (8888).
+			wantActivityTotal := wantWeek + 900 + 2500 + 4321
+			if activity.TotalTokens != wantActivityTotal || activity.ActiveDays != 5 {
+				t.Fatalf("Activity = %+v, want total=%d active_days=5 (start=%s)", activity, wantActivityTotal, activity.StartDate)
+			}
+
+			// Must agree with Analytics for `today` and `week`.
+			analyticsToday, err := store.Analytics(ctx, AnalyticsQuery{
+				From:      day.Format("2006-01-02"),
+				To:        day.Format("2006-01-02"),
+				Dimension: "models",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if analyticsToday.Summary.Tokens != todaySummary.Tokens {
+				t.Fatalf("Analytics(today) tokens=%d != PeriodSummary(today) tokens=%d", analyticsToday.Summary.Tokens, todaySummary.Tokens)
+			}
+		})
+	}
+}
+
+func TestPurgeBeforeSubsecondMidnightAndNonZOffsets(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "purge.db"), catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	for _, invalid := range []string{"", "2026-11-4", "2026-11-24T00:00:00Z", "2026-11-24 ", "not-a-date"} {
+		if deleted, err := store.PurgeBefore(ctx, invalid); err == nil || deleted != 0 {
+			t.Fatalf("PurgeBefore(%q) = (%d, %v), want error", invalid, deleted, err)
+		}
+	}
+
+	seed := []usage.Event{
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "before-midnight",
+			Timestamp:     time.Date(2026, 11, 23, 23, 59, 59, 999_000_000, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(100), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "on-day-subsec",
+			Timestamp:     time.Date(2026, 11, 24, 0, 0, 0, 500_000_000, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(200), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "on-day-exact",
+			Timestamp:     time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(300), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "nonz-before",
+			Timestamp:     time.Date(2026, 11, 23, 22, 30, 0, 0, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(400), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "nonz-after",
+			Timestamp:     time.Date(2026, 11, 24, 1, 30, 0, 0, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(500), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "nonz-exact",
+			Timestamp:     time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(600), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "nonz-subsec-before",
+			Timestamp:     time.Date(2026, 11, 23, 23, 59, 59, 999_000_000, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(700), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+		{
+			SchemaVersion: usage.SchemaVersion,
+			EventID:       "nonz-subsec-after",
+			Timestamp:     time.Date(2026, 11, 24, 0, 0, 0, 1_000_000, time.UTC),
+			MachineID:     "m-purge", Provider: "openai", Model: "gpt-5", Tool: "codex",
+			TotalTokens: usage.Int64(800), TokenAccuracy: usage.AccuracyReported,
+			Source: usage.Source{Adapter: "codex", AdapterVersion: "1"},
+		},
+	}
+	if _, err := store.Ingest(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite legacy non-Z offset rows directly in SQLite.
+	nonZRows := map[string]string{
+		"nonz-before":        "2026-11-24T00:30:00+02:00",
+		"nonz-after":         "2026-11-23T23:30:00-02:00",
+		"nonz-exact":         "2026-11-24T02:00:00+02:00",
+		"nonz-subsec-before": "2026-11-24T01:59:59.999+02:00",
+		"nonz-subsec-after":  "2026-11-24T02:00:00.001+02:00",
+	}
+	for id, rawTS := range nonZRows {
+		if _, err := store.db.ExecContext(ctx, `UPDATE usage_events SET timestamp = ? WHERE event_id = ?`, rawTS, id); err != nil {
+			t.Fatalf("update %s: %v", id, err)
+		}
+	}
+
+	deleted, err := store.PurgeBefore(ctx, "2026-11-24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 3 {
+		t.Fatalf("PurgeBefore('2026-11-24') deleted = %d, want 3 (before-midnight, nonz-before, nonz-subsec-before)", deleted)
+	}
+
+	rows, err := store.readHandle().QueryContext(ctx, `SELECT event_id FROM usage_events ORDER BY event_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var remaining []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		remaining = append(remaining, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantRemaining := []string{"nonz-after", "nonz-exact", "nonz-subsec-after", "on-day-exact", "on-day-subsec"}
+	if strings.Join(remaining, ",") != strings.Join(wantRemaining, ",") {
+		t.Fatalf("remaining event IDs = %v, want %v", remaining, wantRemaining)
+	}
+}

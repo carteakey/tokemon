@@ -125,6 +125,7 @@ func (s *Store) PeriodSummary(ctx context.Context, start, end time.Time) (Period
 	if !end.After(start) {
 		return result, nil
 	}
+	pred, args := timestampWindowPredicate(start, end)
 	row := s.readHandle().QueryRowContext(ctx, `SELECT
 COUNT(*),
 COALESCE(SUM(CASE WHEN total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0),
@@ -134,8 +135,7 @@ COALESCE(SUM(CASE WHEN output_tokens IS NOT NULL THEN output_tokens ELSE 0 END),
 COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN cost ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN cost IS NOT NULL AND total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN cost IS NULL AND total_tokens IS NOT NULL THEN total_tokens ELSE 0 END), 0)
-FROM usage_events WHERE timestamp >= ? AND timestamp < ?`,
-		start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+FROM usage_events WHERE `+pred, args...)
 	if err := row.Scan(&result.Events, &result.Tokens, &result.UnknownTokens, &result.InputTokens, &result.OutputTokens,
 		&result.EstimatedCost.Amount, &result.EstimatedCost.PricedTokens, &result.EstimatedCost.UnpricedTokens); err != nil {
 		return PeriodSummary{}, err
@@ -402,16 +402,20 @@ func (s *Store) MachinesAt(ctx context.Context, now time.Time) ([]MachineInfo, e
 func (s *Store) machinesAndTotalsAt(ctx context.Context, now time.Time) ([]MachineInfo, []MachineTotal, error) {
 	now = now.In(s.reportingLocation())
 	today := s.dateOnly(now)
+	tomorrow := today.AddDate(0, 0, 1)
 	weekStart := today.AddDate(0, 0, -int(today.Weekday()))
+	todayPred, todayArgs := timestampWindowPredicate(today, tomorrow)
+	weekPred, weekArgs := timestampWindowPredicate(weekStart, tomorrow)
+	args := make([]any, 0, len(todayArgs)+len(weekArgs))
+	args = append(args, todayArgs...)
+	args = append(args, weekArgs...)
 	usageRows, err := s.readHandle().QueryContext(ctx, `SELECT machine_id,
 COALESCE(SUM(total_tokens), 0),
-COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0),
-COALESCE(SUM(CASE WHEN timestamp >= ? AND timestamp < ? THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN `+todayPred+` THEN total_tokens ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN `+weekPred+` THEN total_tokens ELSE 0 END), 0),
 COUNT(*),
 COALESCE(SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END), 0)
-FROM usage_events GROUP BY machine_id`,
-		today.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339),
-		weekStart.UTC().Format(time.RFC3339), today.AddDate(0, 0, 1).UTC().Format(time.RFC3339))
+FROM usage_events GROUP BY machine_id`, args...)
 	if err != nil {
 		return nil, nil, err
 	}

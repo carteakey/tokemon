@@ -350,4 +350,85 @@ func TestFacetsConcurrentIngestPurgeRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	got, err := store.Facets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := store.analyticsFacets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.Machines, direct.Machines) ||
+		!slices.Equal(got.Providers, direct.Providers) ||
+		!slices.Equal(got.Models, direct.Models) ||
+		!slices.Equal(got.Tools, direct.Tools) ||
+		!slices.Equal(got.Projects, direct.Projects) {
+		t.Fatalf("Facets %+v diverged from analyticsFacets %+v after concurrent ingest/purge", got, direct)
+	}
+}
+
+func TestFacetsMergeGenerationSkewDoesNotResurrectPurgedFacets(t *testing.T) {
+	store, err := Open(t.TempDir()+"/tokemon.db", catalog.Empty())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if _, err := store.Ingest(ctx, []usage.Event{{
+		SchemaVersion: usage.SchemaVersion,
+		EventID:       "gen-keep-1",
+		Timestamp:     time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
+		MachineID:     "m-keep",
+		Project:       "proj-keep",
+		Provider:      "openai",
+		Model:         "model-keep",
+		Tool:          "codex",
+		TotalTokens:   usage.Int64(10),
+		TokenAccuracy: usage.AccuracyReported,
+		Source:        usage.Source{Adapter: "codex", AdapterVersion: "1"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Facets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	staleGen := store.currentFacetsGeneration()
+
+	// Simulate a concurrent PurgeBefore + Facets repopulating the cache at a newer generation.
+	store.invalidateFacetsCache()
+	if _, err := store.Facets(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A delayed mergeFacetsCache carrying the pre-invalidation generation must not
+	// resurrect stale facets into the newer cache generation.
+	store.mergeFacetsCache(
+		staleGen,
+		map[string]struct{}{"m-purged": {}},
+		map[string]struct{}{"prov-purged": {}},
+		map[string]struct{}{"model-purged": {}},
+		map[string]struct{}{"tool-purged": {}},
+		map[string]struct{}{"proj-purged": {}},
+	)
+
+	got, err := store.Facets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := store.analyticsFacets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got.Machines, "m-purged") || slices.Contains(got.Models, "model-purged") || slices.Contains(got.Projects, "proj-purged") {
+		t.Fatalf("stale generation merge resurrected purged facets: %+v", got)
+	}
+	if !slices.Equal(got.Machines, direct.Machines) ||
+		!slices.Equal(got.Providers, direct.Providers) ||
+		!slices.Equal(got.Models, direct.Models) ||
+		!slices.Equal(got.Tools, direct.Tools) ||
+		!slices.Equal(got.Projects, direct.Projects) {
+		t.Fatalf("Facets %+v != analyticsFacets %+v", got, direct)
+	}
 }

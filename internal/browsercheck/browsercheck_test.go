@@ -1902,6 +1902,9 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		if resp.Status != http.StatusOK || !strings.Contains(resp.URL, "/sessions/smoke-sess-alpha") {
 			t.Fatalf("click session-link landed on %s status=%d", resp.URL, resp.Status)
 		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+			t.Fatalf("settle animations after session-link click: %v", err)
+		}
 		assertNoProblems(t, ctx, sessionDetailInvariantJS)
 		assertAxeAllowlist(t, ctx, "/sessions/smoke-sess-alpha")
 
@@ -1976,6 +1979,9 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			return JSON.stringify(problems);
 		})()`
 		assertNoProblems(t, ctx, p2Problems)
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+			t.Fatalf("settle animations after pagination click: %v", err)
+		}
 		assertNoProblems(t, ctx, sharedInvariantJS)
 		assertAxeAllowlist(t, ctx, "/sessions")
 	})
@@ -2072,6 +2078,9 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		if _, err := chromedp.Run(ctx, chromedp.WaitReady(".filter-pill")); err != nil {
 			t.Fatalf("filter-pill missing after auto-submit: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Evaluate[bool](settleAnimationJS)); err != nil {
+			t.Fatalf("settle animations after filter auto-submit: %v", err)
 		}
 		assertNoProblems(t, ctx, `(() => {
 			const problems = [];
@@ -2399,6 +2408,54 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		if _, err := chromedp.Run(ctx, chromedp.Click("#auto-refresh-toggle")); err != nil {
 			t.Fatalf("restore unpaused state: %v", err)
 		}
+	})
+
+	t.Run("tokedex-whatif-parenthetical-no-usage", func(t *testing.T) {
+		cat := catalog.MustNew(map[string]catalog.Model{
+			"custom-bedrock-x": {
+				Provider:    "anthropic",
+				DisplayName: "Model X (Bedrock)",
+				Aliases:     []string{"custom-bedrock-x"},
+				Tier:        "A",
+				Pricing: catalog.Pricing{
+					Currency:                 "USD",
+					Mode:                     "standard",
+					Source:                   "https://example.com/pricing",
+					VerifiedAt:               "2026-11-20",
+					InputPricePerMillion:     usage.Float64(3.0),
+					OutputPricePerMillion:    usage.Float64(15.0),
+					CacheReadPricePerMillion: usage.Float64(0.3),
+				},
+			},
+		})
+		noUsageStore, err := database.Open(filepath.Join(t.TempDir(), "no-usage-tokedex.db"), cat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { noUsageStore.Close() })
+
+		noUsageURL := serveStore(t, noUsageStore, true)
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(noUsageURL+"/tokedex")); err != nil {
+			t.Fatalf("navigate /tokedex: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("#whatif-baseline")); err != nil {
+			t.Fatalf("#whatif-baseline missing: %v", err)
+		}
+		assertNoProblems(t, ctx, `(() => {
+			const problems = [];
+			const opt = document.querySelector('#whatif-baseline option[value="custom-bedrock-x"]');
+			if (!opt) {
+				problems.push('missing custom-bedrock-x option in #whatif-baseline');
+			} else {
+				if (opt.dataset.baseLabel !== 'Model X (Bedrock)') {
+					problems.push('data-base-label = ' + JSON.stringify(opt.dataset.baseLabel));
+				}
+				if (opt.textContent.trim() !== 'Model X (Bedrock)') {
+					problems.push('option textContent stripped suffix: ' + JSON.stringify(opt.textContent));
+				}
+			}
+			return JSON.stringify(problems);
+		})()`)
 	})
 }
 
