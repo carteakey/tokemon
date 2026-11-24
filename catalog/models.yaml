@@ -367,11 +367,71 @@ models:
   gemini-3.7-flash:
     provider: google
     display_name: Gemini 3.7 Flash
-    aliases: [gemini-3.7-flash]
+    aliases: [gemini-3.7-flash, gemini-3.7-flash-low, gemini-3.7-flash-medium, gemini-3.7-flash-high, google/gemini-3.7-flash]
     pricing:
       currency: USD
       mode: unknown
       verified_at: 2026-11-12
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-3.8-flash:
+    provider: google
+    display_name: Gemini 3.8 Flash
+    aliases: [gemini-3.8-flash, gemini-3.8-flash-low, gemini-3.8-flash-medium, gemini-3.8-flash-high, gemini-3.8-flash-tiered, gemini-3.8-flash-tiered-high, google/gemini-3.8-flash]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-3.1-pro:
+    provider: google
+    display_name: Gemini 3.1 Pro
+    aliases: [gemini-3.1-pro, gemini-3.1-pro-low, gemini-3.1-pro-high, google/gemini-3.1-pro]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-4-neon:
+    provider: google
+    display_name: Gemini 4 Neon
+    aliases: [gemini-4-neon, gemini-4-neon-medium, gemini-4-neon-high, gemini-4-neon-xhigh, gemini-4-neon-tiered-high, google/gemini-4-neon]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-4-carbon:
+    provider: google
+    display_name: Gemini 4 Carbon
+    aliases: [gemini-4-carbon, gemini-4-carbon-medium, gemini-4-carbon-high, gemini-4-carbon-xhigh, google/gemini-4-carbon]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-4-hydrogen:
+    provider: google
+    display_name: Gemini 4 Hydrogen
+    aliases: [gemini-4-hydrogen, gemini-4-hydrogen-medium, gemini-4-hydrogen-high, gemini-4-hydrogen-tiered-high, google/gemini-4-hydrogen]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
+      source: https://ai.google.dev/gemini-api/docs/pricing
+
+  gemini-4-argon:
+    provider: google
+    display_name: Gemini 4 Argon
+    aliases: [gemini-4-argon, gemini-4-argon-medium, gemini-4-argon-high, google/gemini-4-argon]
+    pricing:
+      currency: USD
+      mode: unknown
+      verified_at: 2026-11-23
       source: https://ai.google.dev/gemini-api/docs/pricing
 
   nemotron-3.5-super-vl-120b-a12b:
