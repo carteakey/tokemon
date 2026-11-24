@@ -62,11 +62,15 @@ test("guards product facts", async () => {
   }
   assert.match(page, /MIT licensed/);
   assert.match(page, /Latest release/);
-  assert.match(page, /https:\/\/github\.com\/carteakey\/tokemon\/releases\/tag\/v0\.4\.0/);
+  assert.match(page, /https:\/\/github\.com\/carteakey\/tokemon\/releases\/tag\/v0\.5\.0/);
   assert.match(page, /https:\/\/github\.com\/carteakey\/tokemon\/blob\/main\/DEPLOYMENT\.md/);
   assert.match(page, /https:\/\/github\.com\/carteakey\/tokemon\/blob\/main\/LICENSE/);
-  assert.match(page, /v0\.4\.0/);
-  assert.doesNotMatch(page, /v0\.3\.3|v0\.3\.2/);
+  assert.match(page, /v0\.5\.0/);
+  assert.match(page, /Go 1\.26\.11\+/);
+  assert.match(page, /tokemon status/);
+  assert.match(page, /\/api\/v1\/card\.svg/);
+  assert.match(page, /\.jsonl\.zst/);
+  assert.doesNotMatch(page, /v0\.4\.3|v0\.4\.2|v0\.4\.0|v0\.3\.3|v0\.3\.2/);
   assert.doesNotMatch(page, /Six adapters|UNNAMED_08/);
   assert.match(page, /Not affiliated with, endorsed by, or connected to Pokémon or The Pokémon Company/);
 });
@@ -74,7 +78,7 @@ test("guards product facts", async () => {
 test("shows the real installer flags and release trust signals", async () => {
   const page = await html();
   assert.match(page, /install-agent\.sh/);
-  assert.match(page, /--version<\/span> 0\.4\.0/);
+  assert.match(page, /--version<\/span> 0\.5\.0/);
   assert.match(page, /--token-stdin/);
   assert.doesNotMatch(page, /--token [^-]/);
   assert.match(page, /Cosign/);

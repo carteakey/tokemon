@@ -1,11 +1,11 @@
 // Facts for the landing page. Every value here is sourced from the repository:
 // thresholds and names from internal/evolution/evolution.go, adapters from
-// internal/adapters/builtin, release details from CHANGELOG.md (0.4.0) and
+// internal/adapters/builtin, release details from CHANGELOG.md (0.5.0) and
 // DEPLOYMENT.md, and the event shape from docs/tokemon-spec-v0.2.md §13.
 
 export const links = {
   repo: "https://github.com/carteakey/tokemon",
-  release: "https://github.com/carteakey/tokemon/releases/tag/v0.4.2",
+  release: "https://github.com/carteakey/tokemon/releases/tag/v0.5.0",
   deployment: "https://github.com/carteakey/tokemon/blob/main/DEPLOYMENT.md",
   license: "https://github.com/carteakey/tokemon/blob/main/LICENSE",
   spec: "https://github.com/carteakey/tokemon/blob/main/docs/tokemon-spec-v0.2.md",
@@ -14,7 +14,7 @@ export const links = {
   catalog: "https://github.com/carteakey/tokemon/blob/main/catalog/models.yaml",
 } as const;
 
-export const version = "0.4.0";
+export const version = "0.5.0";
 
 export type Specimen = {
   stage: string;
@@ -83,7 +83,7 @@ export type Adapter = { no: string; name: string; id: string; habitat: string; f
 
 export const adapters: Adapter[] = [
   { no: "01", name: "Claude Code", id: "claude-code", habitat: "~/.claude/projects", format: "JSONL", enabled: "Default on" },
-  { no: "02", name: "Codex", id: "codex", habitat: "~/.codex/sessions", format: "JSONL + SQLite", enabled: "Default on" },
+  { no: "02", name: "Codex", id: "codex", habitat: "~/.codex/sessions", format: "JSONL / .zst + SQLite", enabled: "Default on" },
   { no: "03", name: "GitHub Copilot CLI", id: "copilot-cli", habitat: "~/.copilot/session-state", format: "JSONL", enabled: "Default on" },
   { no: "04", name: "OpenCode", id: "opencode", habitat: "opencode.db", format: "SQLite", enabled: "Default on" },
   { no: "05", name: "Antigravity", id: "antigravity", habitat: "~/.gemini/antigravity*", format: "SQLite", enabled: "Default on" },
@@ -94,13 +94,14 @@ export const adapters: Adapter[] = [
 ];
 
 export const releaseNotes = [
-  { tag: "AUTH", title: "Locked dashboard", copy: "Dashboard pages, read APIs, and /metrics require Basic or Bearer auth. /healthz stays open for liveness checks." },
-  { tag: "SIGNED", title: "Signed release assets", copy: "Every archive, the checksums, and the SPDX SBOM are signed with keyless Cosign. The installer refuses anything unsigned." },
-  { tag: "GUARD", title: "Outbound privacy guard", copy: "One guard for tokemon inspect and every upload rejects content, credentials, tool arguments, full paths, and titles before a request opens." },
-  { tag: "/TOKEDEX", title: "Model catalog page", copy: "Bundled YAML model tiers, aliases, pricing provenance, and observed usage context." },
-  { tag: "/SESSIONS", title: "Session timeline", copy: "A filterable, metadata-only session timeline with export." },
-  { tag: "SHARE", title: "Usage share over time", copy: "Analytics shows the top five harnesses, providers, models, or machines per window, plus aggregated Others." },
-  { tag: "BACKUP", title: "Backups that restore", copy: "tokemon backup create, verify, and restore: WAL-safe versioned SQLite snapshots with retention." },
+  { tag: "SPEED", title: "Split SQLite & single-pass analytics", copy: "Dedicated read-only pools, incremental facets, SWR caches, gzip, and pre-rendered overview pages cut warm request latency to milliseconds." },
+  { tag: "LIVE UI", title: "Shared chrome & in-place refresh", copy: "Unified styles across all pages, clickable drill-downs from overview and charts, active filter pills, and ETag-driven live updates without full-page reloads." },
+  { tag: "QUOTAS", title: "Editable SQLite budgets & pace", copy: "Create and edit token or spend quotas in /settings, track period pace on /, and enable optional overage alerts with non-overlapping attribution." },
+  { tag: "ANALYTICS", title: "Cache savings, $/1M & streaks", copy: "Estimated cache savings, effective $/1M tokens, per-dimension cache hit rates, custom from/to date ranges, and daily activity streaks." },
+  { tag: "/SESSIONS", title: "Search, pagination & detail view", copy: "Filter metadata-only sessions by project or query, paginate cleanly, and inspect any session on its own /sessions/<id> page." },
+  { tag: "/TOKEDEX", title: "Model detail & 30-day what-if", copy: "Dedicated /tokedex/<model> pages with observed breakdowns, pricing provenance, and 30-day what-if cost comparisons across catalog models." },
+  { tag: "ADAPTERS", title: "Zstd rollouts & cache accounting", copy: "Codex reads .jsonl.zst archived rollouts, Claude distinguishes claude-desktop, and Antigravity captures cache_read_tokens and reasoning_tokens." },
+  { tag: "CLI + SVG", title: "Terminal status, auto-backups & card", copy: "Check hub health with tokemon status (--short/--json), run built-in daily WAL-safe SQLite backups, and fetch an authenticated /api/v1/card.svg." },
 ];
 
 export const trust = [
@@ -129,7 +130,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 curl --fail http://localhost:18787/healthz`;
 
 export const agentCommand = `bash deploy/install-agent.sh \\
-  --version 0.4.0 \\
+  --version 0.5.0 \\
   --server https://tokemon.example.ts.net \\
   --machine-id laptop \\
   --adapters claude-code,codex \\
@@ -137,7 +138,7 @@ export const agentCommand = `bash deploy/install-agent.sh \\
 replace-with-a-generated-secret
 TOKEN`;
 
-export const cloneCommand = `git clone --branch v0.4.2 https://github.com/carteakey/tokemon.git
+export const cloneCommand = `git clone --branch v0.5.0 https://github.com/carteakey/tokemon.git
 cd tokemon`;
 
 export const localCommand = `go run ./cmd/tokemon serve --addr 127.0.0.1:8080 \\

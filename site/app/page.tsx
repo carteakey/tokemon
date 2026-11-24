@@ -131,7 +131,7 @@ export default function Home() {
             <div className="heroCopy">
               <a className="releasePill" href={links.release}>
                 <span className="pillTag">NEW</span>
-                <span>v{version} · signed releases, locked dashboard</span>
+                <span>v{version} · split SQLite, live updates, editable quotas</span>
                 <Ext />
               </a>
               <p className="eyebrow">LOCAL-FIRST TOKEN GARDEN</p>
@@ -300,7 +300,7 @@ export default function Home() {
           <div className="sectionHead sectionHeadCenter">
             <p className="eyebrow">03 / THE INSTRUMENT PANEL</p>
             <h2 id="dash-title">See exactly where <em>your tokens go.</em></h2>
-            <p>Lifetime totals, token mix, a 53-week activity field, machine health, and breakdowns by project, harness, model, and machine. Quiet by default, detailed on demand.</p>
+            <p>Lifetime totals, token mix, budget pace, streaks, a 53-week activity field, machine health, and clickable breakdowns by project, harness, model, and machine. Quiet by default, detailed on demand.</p>
           </div>
 
           <figure className="showcase">
@@ -311,29 +311,29 @@ export default function Home() {
                 <span className="lock">AUTH</span>
               </div>
               <div className="browserView">
-                <img src="/tokemon/dashboard-sample.webp" alt="The Tokemon dashboard with representative sample data: lifetime token counter, input and output split, next-evolution progress, summary cards, a 53-week token activity field, and tables for projects, harnesses, models, and machines. The creature panel is redacted with a sealed silhouette." width="1280" height="1039" loading="lazy" decoding="async" />
+                <img src="/tokemon/dashboard-sample.webp" alt="The Tokemon v0.5.0 dashboard with representative sample data: lifetime token counter, input and output split, next-evolution progress, summary cards, today and week context with freshness pill, monthly budget pace bars, a 53-week token activity field with streaks, and clickable breakdown tables for projects, harnesses, models, and machines. The creature panel is redacted with a sealed silhouette." width="1280" height="1283" loading="lazy" decoding="async" />
                 <span className="redactStamp" aria-hidden="true">SEALED</span>
-                <span className="pin" style={{ "--px": "50.5%", "--py": "11.2%" } as CSSProperties} aria-hidden="true">1</span>
-                <span className="pin" style={{ "--px": "49.4%", "--py": "36.7%" } as CSSProperties} aria-hidden="true">2</span>
-                <span className="pin" style={{ "--px": "14.6%", "--py": "55.6%" } as CSSProperties} aria-hidden="true">3</span>
-                <span className="pin" style={{ "--px": "10.8%", "--py": "73%" } as CSSProperties} aria-hidden="true">4</span>
+                <span className="pin" style={{ "--px": "50.8%", "--py": "9.1%" } as CSSProperties} aria-hidden="true">1</span>
+                <span className="pin" style={{ "--px": "50.5%", "--py": "29.8%" } as CSSProperties} aria-hidden="true">2</span>
+                <span className="pin" style={{ "--px": "15.8%", "--py": "64.9%" } as CSSProperties} aria-hidden="true">3</span>
+                <span className="pin" style={{ "--px": "11.8%", "--py": "79.0%" } as CSSProperties} aria-hidden="true">4</span>
               </div>
             </div>
             <figcaption>Representative sample data. The creature panel is sealed here; on your hub it shows your current form.</figcaption>
           </figure>
 
           <ol className="legend">
-            <li><span>1</span><div><h3>Lifetime counter</h3><p>One global number with its token mix. Filters never change it.</p></div></li>
-            <li><span>2</span><div><h3>Next evolution</h3><p>Tokens to go and progress toward the next threshold.</p></div></li>
-            <li><span>3</span><div><h3>Activity field</h3><p>53 weeks of daily usage at a glance.</p></div></li>
-            <li><span>4</span><div><h3>Breakdowns</h3><p>Projects, harnesses, models, and machines with share.</p></div></li>
+            <li><span>1</span><div><h3>Lifetime counter</h3><p>One global number with its live token mix. Filters never change it.</p></div></li>
+            <li><span>2</span><div><h3>Next evolution</h3><p>Tokens to go, progress toward the next threshold, and budget pace below.</p></div></li>
+            <li><span>3</span><div><h3>Activity field</h3><p>53 weeks of daily usage with current streak, best streak, and peak day.</p></div></li>
+            <li><span>4</span><div><h3>Breakdowns</h3><p>Clickable drill-downs for projects, harnesses, models, and machines.</p></div></li>
           </ol>
 
           <ul className="routes" aria-label="Dashboard pages">
-            <li><code>/analytics</code><span>Trends, comparisons, filters, usage share over time, and export.</span></li>
-            <li><code>/tokedex</code><span>Model tiers, aliases, pricing provenance, observed usage.</span></li>
-            <li><code>/sessions</code><span>A filterable, metadata-only session timeline with export.</span></li>
-            <li><code>/insights</code><span>Deterministic, evidence-backed aggregate cards. Local by default.</span></li>
+            <li><code>/analytics</code><span>Trends, custom date ranges, cache savings, usage share over time, and export.</span></li>
+            <li><code>/tokedex</code><span>Model tiers, aliases, pricing provenance, model detail, and 30-day what-if.</span></li>
+            <li><code>/sessions</code><span>Searchable, paginated metadata-only timeline with session detail and export.</span></li>
+            <li><code>/insights</code><span>Deterministic, evidence-backed aggregate cards and 24h rhythm. Local by default.</span></li>
           </ul>
         </section>
 
@@ -427,8 +427,8 @@ export default function Home() {
           <div className="releaseLayout">
             <div className="sectionHead">
               <p className="eyebrow">07 / PATCH NOTES</p>
-              <h2 id="release-title">v{version}: locked, signed, <em>catalogued.</em></h2>
-              <p>The first signed Tokemon release. It also ships the 0.3.3 changes, which were tagged but never published.</p>
+              <h2 id="release-title">v{version}: faster, live, <em>self-keeping.</em></h2>
+              <p>Split SQLite pools and single-pass analytics cut warm request latency to milliseconds, while every dashboard page gains shared chrome, live ETag updates, editable quotas, and deeper per-model and per-session views.</p>
               <a className="textLink" href={links.release}>Latest release <Ext /></a>
               <a className="textLink" href={links.changelog}>Full changelog <Ext /></a>
             </div>
@@ -501,7 +501,7 @@ export default function Home() {
                 <li>Hub: Docker with Compose</li>
                 <li>Agents: macOS or Linux, arm64 or amd64</li>
                 <li>Installer requires Cosign</li>
-                <li>From source: Go 1.26.9+</li>
+                <li>From source: Go 1.26.11+</li>
               </ul>
               <div className="installLinks">
                 <a className="button buttonPrimary" href={links.release}>Download v{version} <Ext /></a>
