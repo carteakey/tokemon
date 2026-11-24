@@ -70,6 +70,21 @@
     .stat-value.muted { color: var(--muted); font-size: 13px; font-weight: 500; }
     .stat-detail { display: block; margin-top: 4px; overflow: hidden; color: var(--faint); font: 9px/1.2 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .activity-panel { margin-bottom: 10px; padding: 12px 16px; border-radius: 7px; }
+    .activity-panel .section-head { flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+    .activity-header-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-left: auto; }
+    .activity-streaks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; color: var(--muted); font: 10px/1.2 var(--font-data); }
+    .activity-streaks strong { color: var(--text); font-weight: 700; }
+    .activity-streaks strong.unknown-value { color: var(--warm); }
+    .quota-pace-panel { margin-top: 10px; margin-bottom: 10px; padding: 12px 16px; }
+    .quota-pace-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-top: 10px; }
+    .quota-pace-item { min-width: 0; padding: 10px 12px; border: 1px dashed var(--line-bright); border-radius: 6px; background: var(--surface-raised); }
+    .quota-pace-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .quota-pace-head strong { color: var(--text); font: 700 12px/1.2 var(--font-data); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .quota-pace-figures { color: var(--muted); font: 10px/1.2 var(--font-data); white-space: nowrap; }
+    .quota-track { margin-top: 7px; height: 8px; overflow: hidden; background: var(--line); border-radius: 999px; }
+    .quota-fill { height: 100%; background: var(--accent-dim); transition: width 300ms cubic-bezier(.2, .75, .25, 1); }
+    .quota-fill.over { background: #d88b7e; }
+    .quota-pace-detail { margin-top: 6px; color: var(--faint); font: 10px/1.35 var(--font-data); overflow-wrap: anywhere; }
     .activity-shell { display: flex; gap: 8px; margin-top: 7px; min-width: 0; }
     .activity-weekday-labels { display: grid; flex: 0 0 26px; grid-template-rows: 12px repeat(7, 12px); gap: 2px; color: var(--faint); font: 8px/12px var(--font-data); text-align: right; }
     .activity-weekday-labels span { height: 12px; }
@@ -201,6 +216,7 @@
       .sessions-table td:nth-child(4), .sessions-table td:nth-child(5) { display: none; }
       .health-table td[data-label]::before, .sessions-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
       .source-details { max-width: none; margin-left: 0; }
+      .activity-header-meta { margin-left: 0; }
     }
     @media (max-width: 500px) {
       /* The topbar cannot fit two uppercase text buttons beside the brand,
@@ -281,10 +297,34 @@
     <article class="context-card"><h2>This week</h2><div class="context-value">{{commas .Week.Tokens}} tokens</div><div class="context-detail">{{commas .Week.Events}} events · {{commas .Week.InputTokens}} input · {{commas .Week.OutputTokens}} output{{if .Week.UnknownTokens}} · {{commas .Week.UnknownTokens}} unknown totals{{end}}</div></article>
   </section>
 
+  {{if .Quotas}}
+  <section class="panel quota-panel quota-pace-panel" aria-labelledby="quota-title">
+    <div class="section-head"><h2 class="section-title" id="quota-title">Budget pace</h2><a class="section-link" href="/settings#quotas-title">Manage quotas</a></div>
+    <div class="quota-pace-list">
+      {{range .Quotas}}
+      <div class="quota-pace-item">
+        <div class="quota-pace-head"><strong>{{.DisplayLabel}}</strong><span class="quota-pace-figures">{{.UsedLabel}} / {{.BudgetLabel}} ({{printf "%.0f" .Percent}}%)</span></div>
+        <div class="quota-track" role="img" aria-label="{{.DisplayLabel}}: {{printf "%.0f" .Percent}} percent of the quota used"><div class="quota-fill{{if .Over}} over{{end}}" style="width: {{printf "%.1f" .Fill}}%"></div></div>
+        <div class="quota-pace-detail">{{.Detail}}</div>
+      </div>
+      {{end}}
+    </div>
+  </section>
+  {{end}}
+
   <section class="panel activity-panel" aria-labelledby="activity-title">
     <div class="section-head">
       <h2 class="section-title" id="activity-title">Token activity</h2>
-      {{if .Activity.ActiveDays}}<div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>{{end}}
+      {{if .Activity.ActiveDays}}
+      <div class="activity-header-meta">
+        <div class="activity-streaks" aria-label="Activity streaks">
+          <span class="streak-stat">Streak <strong>{{.Activity.CurrentStreak}}d</strong></span>
+          <span class="streak-stat">Best <strong>{{.Activity.LongestStreak}}d</strong></span>
+          {{if .Activity.PeakDay}}<span class="streak-stat" title="{{.Activity.PeakDay.Label}} · {{commas .Activity.PeakDay.Tokens}} tokens">Peak <strong>{{compact .Activity.PeakDay.Tokens}}</strong> ({{.Activity.PeakDay.Date}})</span>{{else}}<span class="streak-stat">Peak <strong class="unknown-value">—</strong></span>{{end}}
+        </div>
+        <div class="activity-legend"><span>LOW</span><span class="activity-cell level-0" aria-hidden="true"></span><span class="activity-cell level-1" aria-hidden="true"></span><span class="activity-cell level-2" aria-hidden="true"></span><span class="activity-cell level-3" aria-hidden="true"></span><span class="activity-cell level-4" aria-hidden="true"></span><span>HIGH</span></div>
+      </div>
+      {{end}}
     </div>
     <div class="activity-shell">
       <div class="activity-weekday-labels" aria-hidden="true"><span></span><span>MON</span><span></span><span>WED</span><span></span><span>FRI</span><span></span></div>
@@ -776,6 +816,17 @@
       if (cur && nxt && cur.innerHTML !== nxt.innerHTML) {
         replaceChildrenFrom(cur, nxt);
       }
+    }
+
+    const curQuotaPanel = document.querySelector('.quota-pace-panel');
+    const nxtQuotaPanel = doc.querySelector('.quota-pace-panel');
+    if (curQuotaPanel && !nxtQuotaPanel) {
+      curQuotaPanel.remove();
+    } else if (!curQuotaPanel && nxtQuotaPanel) {
+      const activityPanel = document.querySelector('.activity-panel');
+      if (activityPanel) activityPanel.before(document.importNode(nxtQuotaPanel, true));
+    } else if (curQuotaPanel && nxtQuotaPanel && curQuotaPanel.innerHTML !== nxtQuotaPanel.innerHTML) {
+      replaceChildrenFrom(curQuotaPanel, nxtQuotaPanel);
     }
 
     patchActivityPanel(doc);

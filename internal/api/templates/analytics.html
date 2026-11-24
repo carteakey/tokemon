@@ -23,11 +23,11 @@
     .filter-summary:hover, .filter-summary:focus-visible { border-color: var(--accent); color: var(--accent); }
     .filter-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .filter-count { color: var(--warm); }
-    .filter-form { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; gap: 10px; }
+    .filter-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 10px; }
     .filter-details[open] .filter-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
     label { display: grid; gap: 7px; color: var(--faint); }
-    select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); }
-    select:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
+    select, input[type="date"] { width: 100%; min-width: 0; min-height: 36px; padding: 8px 10px; border: 1px solid var(--control-border); border-radius: 4px; background: #11130f; color: var(--text); font: 12px var(--font-data); }
+    select:focus-visible, input[type="date"]:focus-visible { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; }
     .filter-actions { display: flex; align-items: end; gap: 8px; }
     .filter-actions .action { min-height: 36px; padding: 9px 11px; border-color: var(--control-border); color: var(--muted); }
     .filter-actions .apply { border-color: var(--accent); color: var(--accent); }
@@ -36,6 +36,9 @@
     .insight { min-width: 0; padding: 11px 14px; border: 1px dashed var(--line-bright); border-radius: 7px; background: transparent; }
     .insight-value { margin-top: 8px; display: flex; align-items: center; gap: 8px; overflow: hidden; color: var(--text); font: 700 17px/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
     .insight-detail { margin-top: 6px; color: var(--muted); font: 11px/1.4 var(--font-data); }
+    .insight-action { margin-top: 7px; font: 700 10px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .insight-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .insight-link:hover, .insight-link:focus-visible { color: var(--text); }
     .quota-panel { margin-top: 10px; padding: 12px 16px; }
     .quota-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
     .quota { min-width: 0; padding: 11px 13px; border: 1px dashed var(--line-bright); border-radius: 7px; }
@@ -163,6 +166,8 @@
     th:not(:first-child), td:not(:first-child) { padding-left: 9px; text-align: right; white-space: nowrap; }
     td:first-child { overflow: hidden; color: var(--text); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
     .breakdown-panel td:first-child { overflow: visible; }
+    .breakdown-panel table { min-width: 640px; table-layout: auto; }
+    .breakdown-panel th:first-child, .breakdown-panel td:first-child { width: auto; min-width: 140px; max-width: 220px; }
     tbody tr { transition: background-color 140ms ease; }
     tbody tr:hover { background: rgba(155, 187, 160, .035); }
     .breakdown-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -182,7 +187,7 @@
     @keyframes stat-in { from { opacity: .72; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 1080px) {
       .filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .filter-actions { grid-column: span 3; }
+      .filter-actions { grid-column: span 2; }
       .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .analytics-grid { grid-template-columns: minmax(0, 1fr); }
     }
@@ -230,11 +235,12 @@
     </div>
     <div class="heading-actions">
       <nav class="window-nav" aria-label="Time window">
-        <a class="window-link{{if eq .Filter.Period "24h"}} active{{end}}" href="{{analyticsPeriodURL .Filter "24h"}}"{{if eq .Filter.Period "24h"}} aria-current="page"{{end}}>24H</a>
-        <a class="window-link{{if eq .Filter.Period "7d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "7d"}}"{{if eq .Filter.Period "7d"}} aria-current="page"{{end}}>7D</a>
-        <a class="window-link{{if eq .Filter.Period "30d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "30d"}}"{{if eq .Filter.Period "30d"}} aria-current="page"{{end}}>30D</a>
-        <a class="window-link{{if eq .Filter.Period "90d"}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if eq .Filter.Period "90d"}} aria-current="page"{{end}}>90D</a>
-        <a class="window-link{{if eq .Filter.Period "all"}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if eq .Filter.Period "all"}} aria-current="page"{{end}}>ALL</a>
+        {{$hasRange := or .Filter.From .Filter.To}}
+        <a class="window-link{{if and (not $hasRange) (eq .Filter.Period "24h")}} active{{end}}" href="{{analyticsPeriodURL .Filter "24h"}}"{{if and (not $hasRange) (eq .Filter.Period "24h")}} aria-current="page"{{end}}>24H</a>
+        <a class="window-link{{if and (not $hasRange) (eq .Filter.Period "7d")}} active{{end}}" href="{{analyticsPeriodURL .Filter "7d"}}"{{if and (not $hasRange) (eq .Filter.Period "7d")}} aria-current="page"{{end}}>7D</a>
+        <a class="window-link{{if and (not $hasRange) (eq .Filter.Period "30d")}} active{{end}}" href="{{analyticsPeriodURL .Filter "30d"}}"{{if and (not $hasRange) (eq .Filter.Period "30d")}} aria-current="page"{{end}}>30D</a>
+        <a class="window-link{{if and (not $hasRange) (eq .Filter.Period "90d")}} active{{end}}" href="{{analyticsPeriodURL .Filter "90d"}}"{{if and (not $hasRange) (eq .Filter.Period "90d")}} aria-current="page"{{end}}>90D</a>
+        <a class="window-link{{if and (not $hasRange) (eq .Filter.Period "all")}} active{{end}}" href="{{analyticsPeriodURL .Filter "all"}}"{{if and (not $hasRange) (eq .Filter.Period "all")}} aria-current="page"{{end}}>ALL</a>
       </nav>
       <details class="export-menu">
         <summary class="action export-summary">Export <span aria-hidden="true">&#9662;</span></summary>
@@ -253,8 +259,12 @@
         <form class="filter-form" method="get" action="/analytics">
           <input type="hidden" name="period" value="{{.Filter.Period}}">
           <input type="hidden" name="dimension" value="{{.Filter.Dimension}}">
-          {{if .Filter.From}}<input type="hidden" name="from" value="{{.Filter.From}}">{{end}}
-          {{if .Filter.To}}<input type="hidden" name="to" value="{{.Filter.To}}">{{end}}
+          <label for="analytics-from">From
+            <input id="analytics-from" type="date" name="from" value="{{validDateInput .Filter.From}}">
+          </label>
+          <label for="analytics-to">To
+            <input id="analytics-to" type="date" name="to" value="{{validDateInput .Filter.To}}">
+          </label>
           <label for="project-filter">Project
             <select id="project-filter" name="project">
               <option value="">All projects</option>
@@ -305,15 +315,15 @@
     <article class="stat"><div class="stat-label">Period tokens</div><div class="stat-value" data-count="{{.Summary.Tokens}}">{{commas .Summary.Tokens}}</div>{{if .Comparison}}{{if .Comparison.TokenChangePercent}}<div class="stat-meta comparison {{analyticsChangeClass .Comparison.TokenChangePercent}}"><strong>{{analyticsChange .Comparison.TokenChangePercent}}</strong><span>vs previous window</span></div>{{else}}<div class="stat-meta">No earlier baseline</div>{{end}}{{else}}<div class="stat-meta">{{analyticsDateRangeLabel .Filter .StartDate .EndDate}}</div>{{end}}</article>
     <article class="stat"><div class="stat-label">Active days</div><div class="stat-value" data-count="{{.Summary.ActiveDays}}">{{commas .Summary.ActiveDays}}</div><div class="stat-meta">{{analyticsDateRangeLabel .Filter .StartDate .EndDate}}</div></article>
     <article class="stat"><div class="stat-label">Average thread</div><div class="stat-value" data-count="{{.AverageThread}}">{{commas .AverageThread}}</div><div class="stat-meta">Across {{commas .Summary.Threads}} thread{{if ne .Summary.Threads 1}}s{{end}}</div></article>
-    <article class="stat"><div class="stat-label">Cache hit</div>{{if .Summary.Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (percent .Summary.Cache.HitRate)}}</div><div class="stat-meta">{{commas .Summary.Cache.CachedTokens}} cached tokens</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No eligible input tokens</div>{{end}}</article>
-    <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}{{if .Summary.EstimatedCost.UnpricedTokens}} · unpriced: {{commas .Summary.EstimatedCost.UnpricedTokens}}{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens{{if .Summary.EstimatedCost.UnpricedTokens}} · {{commas .Summary.EstimatedCost.UnpricedTokens}} unpriced{{end}}</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Cache hit</div>{{if .Summary.Cache.EligibleTokens}}<div class="stat-value">{{printf "%.1f%%" (percent .Summary.Cache.HitRate)}}</div><div class="stat-meta">{{commas .Summary.Cache.CachedTokens}} cached{{if .Summary.HasCacheSavings}} · {{money .Summary.CacheSavings}} saved{{else}} tokens{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No eligible input tokens{{if .Summary.HasCacheSavings}} · {{money .Summary.CacheSavings}} saved{{end}}</div>{{end}}</article>
+    <article class="stat"><div class="stat-label">Est. API cost</div>{{if .Summary.EstimatedCost.PricedTokens}}<div class="stat-value">{{money .Summary.EstimatedCost.Amount}}</div><div class="stat-meta">{{if .Summary.HasEffectiveCost}}{{money .Summary.EffectiveCostPerMillion}}/1M · {{end}}Priced tokens: {{commas .Summary.EstimatedCost.PricedTokens}}{{if .Summary.EstimatedCost.UnpricedTokens}} · unpriced: {{commas .Summary.EstimatedCost.UnpricedTokens}}{{end}}</div>{{else}}<div class="stat-value muted">—</div><div class="stat-meta">No priced tokens{{if .Summary.EstimatedCost.UnpricedTokens}} · {{commas .Summary.EstimatedCost.UnpricedTokens}} unpriced{{end}}</div>{{end}}</article>
   </section>
   {{if .Summary.UnknownEvents}}<div class="note" role="status">{{commas .Summary.UnknownEvents}} event{{if ne .Summary.UnknownEvents 1}}s{{end}} in this view have unavailable token totals. They remain visible as unknown.</div>{{end}}
 
-  {{if .Insights}}<section class="insights-strip" aria-label="Usage insights">{{range .Insights}}<article class="insight"><div class="stat-label">{{.Label}}</div><div class="insight-value">{{.Value}}{{if .State}}<span class="comparison {{.State}}"><strong aria-hidden="true">{{if eq .State "up"}}▲{{else if eq .State "down"}}▼{{else}}—{{end}}</strong><span class="sr-only">{{if eq .State "up"}}rising{{else if eq .State "down"}}falling{{else}}flat{{end}}</span></span>{{end}}</div><div class="insight-detail">{{.Detail}}</div></article>{{end}}</section>{{end}}
+  {{if .Insights}}<section class="insights-strip" aria-label="Usage insights">{{range .Insights}}<article class="insight"><div class="stat-label">{{.Label}}</div><div class="insight-value">{{.Value}}{{if .State}}<span class="comparison {{.State}}"><strong aria-hidden="true">{{if eq .State "up"}}▲{{else if eq .State "down"}}▼{{else}}—{{end}}</strong><span class="sr-only">{{if eq .State "up"}}rising{{else if eq .State "down"}}falling{{else}}flat{{end}}</span></span>{{end}}</div><div class="insight-detail">{{.Detail}}</div>{{if .LinkURL}}<div class="insight-action"><a class="insight-link" href="{{.LinkURL}}">{{.LinkLabel}} &rarr;</a></div>{{end}}</article>{{end}}</section>{{end}}
 
   {{if .Quotas}}<section class="panel quota-panel" aria-labelledby="quota-title">
-    <div class="section-head"><h2 class="section-title" id="quota-title">Quota</h2><div class="section-meta">Config-defined budgets · current period</div></div>
+    <div class="section-head"><h2 class="section-title" id="quota-title">Quota</h2><div class="section-meta">Configured budgets · current period</div></div>
     <div class="quota-list">{{range .Quotas}}<div class="quota">
       <div class="quota-head"><strong>{{.DisplayLabel}}</strong><span class="quota-figures">{{.UsedLabel}} / {{.BudgetLabel}}</span></div>
       <div class="quota-track" role="img" aria-label="{{.DisplayLabel}}: {{printf "%.0f" .Percent}} percent of the quota used"><div class="quota-fill{{if .Over}} over{{end}}" style="width: {{printf "%.1f" .Fill}}%"></div></div>
@@ -339,12 +349,13 @@
           {{$trendStop := -1}}
           {{range $index, $point := .Points}}{{if and (lt $trendStop 0) (gt $.PeakPoint.Tokens 0) (eq $point.Tokens $.PeakPoint.Tokens)}}{{$trendStop = $index}}{{end}}{{end}}
           {{if lt $trendStop 0}}{{$trendStop = 0}}{{end}}
+          {{$tickPeriod := analyticsTickPeriod .Bucket (len .Points)}}
           <div class="trend-chart period-{{.Filter.Period}}" tabindex="0" role="region" aria-label="Token volume over the selected window" data-filter-machine="{{.Filter.Machine}}" data-filter-provider="{{.Filter.Provider}}" data-filter-model="{{.Filter.Model}}" data-filter-tool="{{.Filter.Tool}}" data-filter-project="{{.Filter.Project}}">
             {{range $index, $point := .Points}}
-            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $.Filter.Period}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-date="{{trendPointDate . $.Bucket}}" data-from="{{trendPointFrom . $.Bucket}}" data-to="{{trendPointTo . $.Bucket}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="trend-column{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.Points) $tickPeriod}}{{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}} peak selected{{end}}" type="button" tabindex="{{if eq $index $trendStop}}0{{else}}-1{{end}}" style="--index: {{$index}}" data-label="{{.Label}}" data-date="{{trendPointDate . $.Bucket}}" data-from="{{trendPointFrom . $.Bucket}}" data-to="{{trendPointTo . $.Bucket}}" data-tokens="{{.Tokens}}" data-input="{{.InputTokens}}" data-cached="{{.CachedTokens}}" data-output="{{.OutputTokens}}" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{if and (gt $.PeakPoint.Tokens 0) (eq .Tokens $.PeakPoint.Tokens)}}<span class="trend-annotation" aria-hidden="true">PEAK<strong>{{compact .Tokens}}</strong></span>{{end}}
               <span class="trend-track"><span class="trend-bar" style="height: {{analyticsBar .Tokens $.AxisMax}}%"><span class="trend-part input" style="height: {{analyticsPart .InputTokens .Tokens}}%"></span><span class="trend-part cached" style="height: {{analyticsPart .CachedTokens .Tokens}}%"></span><span class="trend-part output" style="height: {{analyticsPart .OutputTokens .Tokens}}%"></span></span></span>
-              <span class="trend-label">{{analyticsDateLabel . $.Filter.Period}}</span>
+              <span class="trend-label">{{analyticsDateLabel . $tickPeriod}}</span>
             </button>
             {{end}}
           </div>
@@ -362,12 +373,12 @@
         <a class="dimension-link{{if eq .Filter.Dimension "models"}} active{{end}}" href="{{analyticsURL .Filter "models"}}"{{if eq .Filter.Dimension "models"}} aria-current="page"{{end}}>Models</a>
         <a class="dimension-link{{if eq .Filter.Dimension "machines"}} active{{end}}" href="{{analyticsURL .Filter "machines"}}"{{if eq .Filter.Dimension "machines"}} aria-current="page"{{end}}>Machines</a>
       </nav>
-      <div class="table-scroll breakdown-scroll" tabindex="0" aria-label="Analytics breakdown table, scrollable">
-        <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th></tr></thead><tbody>
+      <div class="table-scroll breakdown-scroll" tabindex="0" role="region" aria-label="Analytics breakdown table, scrollable">
+        <table aria-label="Analytics breakdown"><caption class="sr-only">Analytics breakdown</caption><thead><tr><th scope="col">Name</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Threads</th><th scope="col">Cache hit</th><th scope="col">Cost</th><th scope="col">$/1M</th><th scope="col">Saved</th></tr></thead><tbody>
           {{range .Breakdown}}
           {{$href := breakdownDrillURL $.Filter .Name}}
-          <tr><td title="{{.Name}}">{{if $href}}<a class="breakdown-link" href="{{$href}}"><span class="breakdown-name">{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}</span></a>{{else}}<span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span>{{end}}<span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td></tr>
-          {{else}}<tr class="empty-row"><td colspan="4">No usage matches these filters.</td></tr>{{end}}
+          <tr><td title="{{.Name}}">{{if $href}}<a class="breakdown-link" href="{{$href}}"><span class="breakdown-name">{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}</span></a>{{else}}<span class="breakdown-name">{{if isUnknownName .Name}}<span class="unknown-value">{{unknownLabel $.Filter.Dimension}}</span>{{else}}{{breakdownName $.Filter.Dimension $.ModelAliases $.MachineAliases .Name}}{{end}}</span>{{end}}<span class="breakdown-meter" aria-hidden="true"><span style="--share: {{mul .Share 100}}%"></span></span></td><td>{{commas .Tokens}}</td><td>{{printf "%.1f%%" (mul .Share 100)}}</td><td>{{commas .Sessions}}</td><td>{{if .HasCacheRate}}{{printf "%.1f%%" (mul .CacheHitRate 100)}}{{else}}<span class="unknown-value">—</span>{{end}}</td><td>{{if .HasCost}}{{money .Cost}}{{else}}<span class="unknown-value">—</span>{{end}}</td><td>{{if .HasEffectiveCost}}{{money .EffectiveCostPerMillion}}/1M{{else}}<span class="unknown-value">—</span>{{end}}</td><td>{{if .HasCacheSavings}}{{money .CacheSavings}} saved{{else}}<span class="unknown-value">—</span>{{end}}</td></tr>
+          {{else}}<tr class="empty-row"><td colspan="8">No usage matches these filters.</td></tr>{{end}}
         </tbody></table>
       </div>
     </article>
@@ -399,10 +410,11 @@
           </div>
           <div class="share-hit-grid">
             {{/* Same roving tabindex as the trend chart, tracked independently: the first bucket is the Tab stop, the rest join via arrow keys. */}}
+            {{$shareTickPeriod := analyticsTickPeriod .Bucket (len .SharePoints)}}
             {{range $index, $point := .SharePoints}}
-            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $.Filter.Period}}" type="button" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
+            <button class="share-point{{if .UnknownEvents}} unknown{{end}}{{analyticsDateTick $index (len $.SharePoints) $shareTickPeriod}}" type="button" tabindex="{{if eq $index 0}}0{{else}}-1{{end}}" data-label="{{.Label}}" data-tokens="{{.Tokens}}" data-unknown="{{.UnknownEvents}}" aria-describedby="share-tooltip" aria-label="{{.Label}} · {{commas .Tokens}} tokens{{range .Values}} · {{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases .Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases .Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName .Name}}{{else}}{{.Name}}{{end}} {{printf "%.1f%%" (mul .Share 100)}}{{end}}{{if .UnknownEvents}} · unknown totals present{{end}}">
               {{range $seriesIndex, $value := .Values}}<span class="share-point-data" data-share-value data-series="{{$seriesIndex}}" data-name="{{if eq $.Filter.Dimension "models"}}{{modelDisplayName $.ModelAliases $value.Name}}{{else if eq $.Filter.Dimension "machines"}}{{machineDisplayName $.MachineAliases $value.Name}}{{else if eq $.Filter.Dimension "harnesses"}}{{harnessName $value.Name}}{{else}}{{$value.Name}}{{end}}" data-tokens="{{$value.Tokens}}" data-share="{{printf "%.1f" (mul $value.Share 100)}}"></span>{{end}}
-              <span class="share-label">{{shareDateLabel . $.Filter.Period}}</span>
+              <span class="share-label">{{shareDateLabel . $shareTickPeriod}}</span>
             </button>
             {{end}}
           </div>

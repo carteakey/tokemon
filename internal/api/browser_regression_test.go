@@ -99,7 +99,7 @@ func TestMobileNavigation390BrowserRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pages := []string{"/", "/analytics", "/tokedex", "/sessions", "/sessions/reg-sess", "/insights", "/settings"}
+	pages := []string{"/", "/analytics", "/tokedex", "/tokedex/gpt-5", "/sessions", "/sessions/reg-sess", "/insights", "/settings"}
 	for _, path := range pages {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.SetBasicAuth("tokemon", testDashboardToken)

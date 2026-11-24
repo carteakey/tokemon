@@ -38,9 +38,47 @@
     .save-aliases:hover, .save-aliases:focus-visible { background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
     .error { margin-top: 14px; padding: 10px 12px; border: 2px solid var(--warm); color: var(--warm); font-family: var(--font-data); font-size: 12px; }
     .empty { margin: 12px 0 0; color: var(--faint); font-family: var(--font-data); font-size: 12px; }
+    .settings-section { margin-top: 28px; }
+    .quota-list { display: grid; gap: 10px; margin-top: 12px; }
+    .quota-card { padding: 12px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .quota-card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+    .quota-card-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+    .quota-card-title strong { color: var(--text); font: 700 13px/1.2 var(--font-data); }
+    .quota-badge { display: inline-flex; align-items: center; padding: 2px 7px; border: 1px solid var(--line-bright); border-radius: 999px; color: var(--muted); font: 700 9px/1.2 var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
+    .quota-badge.yaml { border-color: rgba(155, 187, 160, .45); color: var(--accent); }
+    .quota-badge.override { border-color: rgba(210, 164, 119, .55); color: var(--warm); }
+    .quota-badge.sqlite { border-color: rgba(155, 187, 160, .65); color: var(--accent); }
+    .quota-scope { color: var(--faint); font: 11px/1.2 var(--font-data); }
+    .quota-status-block { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+    .quota-status-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; font: 11px/1.3 var(--font-data); color: var(--muted); }
+    .quota-track { margin-top: 6px; height: 8px; overflow: hidden; background: var(--line); border-radius: 999px; }
+    .quota-fill { height: 100%; background: var(--accent-dim); }
+    .quota-fill.over { background: #d88b7e; }
+    .quota-status-detail { margin-top: 5px; color: var(--faint); font: 10px/1.35 var(--font-data); }
+    .quota-edit-form, .quota-add-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 10px; margin-top: 12px; }
+    .quota-add-form { padding: 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .quota-edit-form label, .quota-add-form label { display: grid; gap: 5px; color: var(--faint); font: 700 10px/1.2 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .quota-form-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+    .quota-delete-form { display: flex; justify-content: flex-end; margin-top: 8px; }
+    .quota-save { padding: 8px 12px; border: 1px solid var(--accent); border-radius: 4px; background: transparent; color: var(--accent); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; }
+    .quota-save:hover, .quota-save:focus-visible { background: rgba(155, 187, 160, .1); outline: 2px solid var(--accent); outline-offset: 2px; }
+    .quota-delete { padding: 8px 12px; border: 1px solid var(--control-border); border-radius: 4px; background: transparent; color: var(--warm); cursor: pointer; font: 700 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; }
+    .quota-delete:hover, .quota-delete:focus-visible { border-color: var(--warm); background: rgba(210, 164, 119, .1); outline: 2px solid var(--warm); outline-offset: 2px; }
+    .backup-panel { margin-top: 12px; padding: 14px; }
+    .backup-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .backup-item { min-width: 0; }
+    .backup-label { color: var(--accent); font: 700 10px/1.2 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .backup-value { margin-top: 6px; color: var(--text); font: 700 13px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .backup-sub { margin-top: 4px; color: var(--faint); font: 10px/1.3 var(--font-data); }
+    @media (max-width: 720px) {
+      .quota-edit-form, .quota-add-form, .backup-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     @media (max-width: 620px) {
       .settings-body { padding: 0 6px 4px; }
       .alias-row { grid-template-columns: 1fr; gap: 8px; }
+    }
+    @media (max-width: 440px) {
+      .quota-edit-form, .quota-add-form, .backup-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -52,6 +90,7 @@
   <p class="intro">Give machines and models short dashboard names. Leave an alias blank to use Tokemon’s compact default. Raw IDs remain available on hover and in the data view.</p>
   <p class="intro">Auth mode: <strong>{{.AuthMode}}</strong> · Dashboard token: <strong>{{.TokenSource}}</strong>.</p>
   {{if .Saved}}<div class="notice" role="status">Aliases saved.</div>{{end}}
+  {{if .QuotaNotice}}<div class="notice" role="status">{{.QuotaNotice}}</div>{{end}}
   {{if .Error}}<div class="error" role="alert" tabindex="-1">{{.Error}}</div>{{end}}
   <section class="panel filter-panel" role="search" aria-label="Filter aliases">
     <label for="alias-filter">Filter models and machines</label>
@@ -108,6 +147,99 @@
     {{else}}<p class="empty">No machines recorded yet.</p>{{end}}
     <div class="actions"><button class="save-aliases" type="submit">Save aliases</button></div>
   </form>
+
+  <section class="settings-section" aria-labelledby="quotas-title">
+    <h2 id="quotas-title">Monthly quotas</h2>
+    <p class="intro">Configure monthly token or USD cost budgets. UI rules are stored in SQLite and override matching YAML config rules without modifying files on disk.</p>
+    {{if .Quotas}}
+    <div class="quota-list">
+      {{range $index, $q := .Quotas}}
+      <article class="quota-card" data-quota-row data-source="{{$q.Source}}">
+        <div class="quota-card-head">
+          <div class="quota-card-title">
+            <strong>{{$q.DisplayLabel}}</strong>
+            <span class="quota-badge {{if eq $q.Source "yaml"}}yaml{{else if $q.OverridesYAML}}override{{else}}sqlite{{end}}">{{$q.SourceBadge}}</span>
+          </div>
+          <span class="quota-scope">{{$q.ScopeLabel}} · resets day {{$q.ResetDay}}</span>
+        </div>
+        {{if $q.HasStatus}}
+        <div class="quota-status-block">
+          <div class="quota-status-head">
+            <span>Current period</span>
+            <span>{{$q.StatusFigures}} ({{printf "%.0f" $q.StatusPercent}}%)</span>
+          </div>
+          <div class="quota-track" role="img" aria-label="{{$q.DisplayLabel}}: {{printf "%.0f" $q.StatusPercent}} percent of the quota used"><div class="quota-fill{{if $q.StatusOver}} over{{end}}" style="width: {{printf "%.1f" $q.StatusFill}}%"></div></div>
+          <div class="quota-status-detail">{{$q.StatusDetail}}</div>
+        </div>
+        {{end}}
+        <form class="quota-edit-form" action="/settings/quotas" method="post" aria-label="Edit quota {{$q.DisplayLabel}}">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+          <input type="hidden" name="action" value="upsert">
+          <input type="hidden" name="provider" value="{{$q.Provider}}">
+          <input type="hidden" name="model" value="{{$q.Model}}">
+          <label for="quota-label-{{$index}}">Label<input id="quota-label-{{$index}}" name="label" value="{{$q.Label}}" maxlength="128" placeholder="{{$q.ScopeLabel}}"></label>
+          <label for="quota-reset-{{$index}}">Reset day<input id="quota-reset-{{$index}}" name="reset_day" type="number" min="1" max="31" step="1" value="{{$q.ResetDay}}" required></label>
+          <label for="quota-tokens-{{$index}}">Tokens / month<input id="quota-tokens-{{$index}}" name="tokens_per_month" type="number" min="1" step="1" value="{{$q.TokensValue}}" placeholder="Optional"></label>
+          <label for="quota-cost-{{$index}}">USD / month<input id="quota-cost-{{$index}}" name="cost_per_month" type="number" min="0.01" step="0.01" value="{{$q.CostValue}}" placeholder="Optional"></label>
+          <div class="quota-form-actions"><button class="quota-save" type="submit">{{$q.SaveLabel}}</button></div>
+        </form>
+        {{if $q.CanDelete}}
+        <form class="quota-delete-form" action="/settings/quotas" method="post" aria-label="{{$q.DeleteLabel}} {{$q.DisplayLabel}}">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="provider" value="{{$q.Provider}}">
+          <input type="hidden" name="model" value="{{$q.Model}}">
+          {{if $q.OverridesYAML}}<input type="hidden" name="overrides_yaml" value="1">{{end}}
+          <button class="quota-delete" type="submit">{{$q.DeleteLabel}}</button>
+        </form>
+        {{end}}
+      </article>
+      {{end}}
+    </div>
+    {{else}}
+    <p class="empty">No quotas configured yet. Add one below to track monthly token or cost pace.</p>
+    {{end}}
+    <form class="quota-add-form" action="/settings/quotas" method="post" aria-label="Add or override quota">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="action" value="upsert">
+      <label for="quota-new-provider">Provider<input id="quota-new-provider" name="provider" maxlength="128" placeholder="All providers (blank)"></label>
+      <label for="quota-new-model">Model<input id="quota-new-model" name="model" maxlength="256" placeholder="All models (blank)"></label>
+      <label for="quota-new-label">Label<input id="quota-new-label" name="label" maxlength="128" placeholder="Optional display label"></label>
+      <label for="quota-new-reset">Reset day<input id="quota-new-reset" name="reset_day" type="number" min="1" max="31" step="1" value="1" required></label>
+      <label for="quota-new-tokens">Tokens / month<input id="quota-new-tokens" name="tokens_per_month" type="number" min="1" step="1" placeholder="e.g. 50000000"></label>
+      <label for="quota-new-cost">USD / month<input id="quota-new-cost" name="cost_per_month" type="number" min="0.01" step="0.01" placeholder="e.g. 100.00"></label>
+      <div class="quota-form-actions"><button class="save-aliases" type="submit">Add quota</button></div>
+    </form>
+  </section>
+
+  <section class="settings-section" aria-labelledby="backup-title">
+    <h2 id="backup-title">Database backups</h2>
+    <div class="panel backup-panel">
+      <div class="backup-grid">
+        <div class="backup-item">
+          <div class="backup-label">Status</div>
+          <div class="backup-value{{if .Backup.Error}} unknown-value{{end}}">{{.Backup.StatusLabel}}</div>
+        </div>
+        <div class="backup-item">
+          <div class="backup-label">Last backup</div>
+          {{if .Backup.Exists}}
+          <div class="backup-value">{{.Backup.AgeLabel}}</div>
+          <div class="backup-sub">{{.Backup.TimestampUI}}</div>
+          {{else}}
+          <div class="backup-value unknown-value">—</div>
+          {{end}}
+        </div>
+        <div class="backup-item">
+          <div class="backup-label">Retained</div>
+          <div class="backup-value">{{.Backup.Count}}</div>
+        </div>
+        <div class="backup-item">
+          <div class="backup-label">Schedule</div>
+          <div class="backup-value">{{.Backup.Schedule}}</div>
+        </div>
+      </div>
+    </div>
+  </section>
   </div>
   {{template "footer" .}}
 <script>

@@ -280,6 +280,64 @@ const tokedexFilterInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+const tokedexWhatIfInvariantJS = `(() => {
+	const problems = [];
+	const panel = document.querySelector('.whatif-panel');
+	if (!panel) {
+		problems.push('missing .whatif-panel');
+		return JSON.stringify(problems);
+	}
+	const summary = panel.querySelector('[data-whatif-summary]');
+	if (!summary || !summary.textContent.includes('970') || !summary.textContent.includes('430')) {
+		problems.push('whatif summary missing seeded 970 input / 430 output totals');
+	}
+	const claudeRow = panel.querySelector('[data-whatif-row][data-model-id="claude-sonnet-4"]');
+	if (!claudeRow) {
+		problems.push('missing whatif row for claude-sonnet-4');
+	} else {
+		const costCell = claudeRow.querySelector('[data-whatif-cost-cell]');
+		if (!costCell || !costCell.textContent.includes('$0.0042')) {
+			problems.push('claude-sonnet-4 1x what-if cost = ' + (costCell ? costCell.textContent : 'missing') + ', want $0.0042');
+		}
+	}
+	const gptRow = panel.querySelector('[data-whatif-row][data-model-id="gpt-5"]');
+	if (!gptRow) {
+		problems.push('missing whatif row for gpt-5');
+	} else {
+		const costCell = gptRow.querySelector('[data-whatif-cost-cell]');
+		if (!costCell || !costCell.textContent.includes('Unknown') || costCell.textContent.includes('$0.00')) {
+			problems.push('gpt-5 unknown pricing row must stay Unknown, got ' + (costCell ? costCell.textContent : 'missing'));
+		}
+	}
+	const scale = document.getElementById('whatif-scale');
+	const baseline = document.getElementById('whatif-baseline');
+	if (!scale || !baseline) {
+		problems.push('missing #whatif-scale or #whatif-baseline');
+		return JSON.stringify(problems);
+	}
+	scale.value = '2';
+	scale.dispatchEvent(new Event('change', { bubbles: true }));
+	if (claudeRow) {
+		const costCell = claudeRow.querySelector('[data-whatif-cost-cell]');
+		if (!costCell || !costCell.textContent.includes('$0.0084')) {
+			problems.push('2x scale did not update claude-sonnet-4 cost to $0.0084, got ' + (costCell ? costCell.textContent : 'missing'));
+		}
+	}
+	baseline.value = 'claude-sonnet-4';
+	baseline.dispatchEvent(new Event('change', { bubbles: true }));
+	if (claudeRow) {
+		const deltaCell = claudeRow.querySelector('[data-whatif-delta-cell]');
+		if (!deltaCell || !deltaCell.textContent.includes('Baseline')) {
+			problems.push('baseline selection did not mark claude-sonnet-4 as Baseline');
+		}
+	}
+	scale.value = '1';
+	scale.dispatchEvent(new Event('change', { bubbles: true }));
+	baseline.value = '';
+	baseline.dispatchEvent(new Event('change', { bubbles: true }));
+	return JSON.stringify(problems);
+})()`
+
 // exportInvariantJS asserts every export anchor opts into a download instead
 // of navigating the dashboard away and losing filter state.
 const exportInvariantJS = `(() => {
@@ -871,6 +929,28 @@ const sessionDetailInvariantJS = `(() => {
 	return JSON.stringify(problems);
 })()`
 
+const tokedexDetailInvariantJS = `(() => {
+	const problems = [];
+	const h1 = document.querySelector('h1');
+	if (!h1 || !h1.textContent.includes('Claude Sonnet 4')) {
+		problems.push('tokedex detail missing Claude Sonnet 4 heading');
+	}
+	if (!document.querySelector('a[href="/tokedex"]')) {
+		problems.push('tokedex detail missing back link to /tokedex');
+	}
+	if (!document.querySelector('.copy-id[data-copy-value="claude-sonnet-4"]')) {
+		problems.push('tokedex detail missing copy-id button for claude-sonnet-4');
+	}
+	if (!document.querySelector('table[aria-label="Model machine distribution"]')) {
+		problems.push('tokedex detail missing Model machine distribution table');
+	}
+	const html = document.documentElement.innerHTML;
+	if (html.includes('/Users/') || html.includes('/home/') || html.includes('ZgotmplZ')) {
+		problems.push('tokedex detail leaked path or template error marker');
+	}
+	return JSON.stringify(problems);
+})()`
+
 // settleAnimationJS injects a stylesheet that disables animations and
 // transitions. Headless Chrome can leave elements parked at an animation's
 // backwards fill (from) state when no frame ticks after load — the stat cards
@@ -1157,6 +1237,7 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			refreshControlInvariantJS,
 			activityGridInvariantJS,
 			creatureArtInvariantJS,
+			quotaAbsentInvariantJS,
 			belowFoldReachabilityJS(".health-panel", ".sessions-panel"),
 		}},
 		{path: "/analytics?period=7d&dimension=models", invariants: []string{
@@ -1166,7 +1247,8 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 			belowFoldReachabilityJS(".share-panel", ".sessions-panel"),
 			chartRovingInvariantJS,
 		}},
-		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS}},
+		{path: "/tokedex", invariants: []string{tokedexInvariantJS, tokedexFilterInvariantJS, tokedexWhatIfInvariantJS}},
+		{path: "/tokedex/claude-sonnet-4", invariants: []string{tokedexDetailInvariantJS}},
 		{path: "/sessions", invariants: []string{exportInvariantJS, sortInvariantJS, sessionsFilterInvariantJS}},
 		{path: "/sessions/smoke-sess-alpha", invariants: []string{sessionDetailInvariantJS}},
 		{path: "/insights", invariants: []string{insightsRovingInvariantJS}},
@@ -1388,6 +1470,106 @@ func TestDashboardBrowserSmokeAndAccessibility(t *testing.T) {
 		}
 		if settingsTokedexCount != 0 {
 			t.Fatalf("disabled /settings still renders %d Tokedex links", settingsTokedexCount)
+		}
+		detailResp, err := chromedp.RunResponse(disabledRunCtx, chromedp.Navigate(disabledURL+"/tokedex/claude-sonnet-4"))
+		if err != nil {
+			t.Fatalf("navigation to disabled /tokedex/claude-sonnet-4 failed: %v", err)
+		}
+		if detailResp.Status != http.StatusNotFound {
+			t.Fatalf("disabled /tokedex/claude-sonnet-4 status = %d, want %d", detailResp.Status, http.StatusNotFound)
+		}
+	})
+
+	t.Run("tokedex-detail", func(t *testing.T) {
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/tokedex")); err != nil {
+			t.Fatalf("navigate /tokedex: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`a.model-card-link[href="/tokedex/claude-sonnet-4"]`)); err != nil {
+			t.Fatalf("model card link missing: %v", err)
+		}
+		if _, err := chromedp.RunResponse(ctx, chromedp.Click(`a.model-card-link[href="/tokedex/claude-sonnet-4"]`)); err != nil {
+			t.Fatalf("tokedex detail click-through failed: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`a[href="/sessions/smoke-sess-alpha"]`)); err != nil {
+			t.Fatalf("tokedex detail session link missing: %v", err)
+		}
+		// Alias containing '/' resolves cleanly to canonical GPT-5 with Unknown pricing.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/tokedex/openai/gpt-5")); err != nil {
+			t.Fatalf("navigate /tokedex/openai/gpt-5: %v", err)
+		}
+		aliasText, err := chromedp.Run(ctx, chromedp.Evaluate[string](`document.body.textContent`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(aliasText, "GPT-5") || !strings.Contains(aliasText, "Rates not published yet") || strings.Contains(aliasText, "$0.00") {
+			t.Fatalf("alias detail /tokedex/openai/gpt-5 rendered unexpected copy: %q", aliasText)
+		}
+		// Zero-usage model renders cleanly with semantic table.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/tokedex/smoke-zero-usage")); err != nil {
+			t.Fatalf("navigate /tokedex/smoke-zero-usage: %v", err)
+		}
+		zeroText, err := chromedp.Run(ctx, chromedp.Evaluate[string](`document.body.textContent`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(zeroText, "No usage recorded yet") || !strings.Contains(zeroText, "No usage recorded in the last 12 weeks.") {
+			t.Fatalf("zero-usage detail missing empty copy: %q", zeroText)
+		}
+		// Nonexistent model returns 404.
+		notFoundResp, err := chromedp.RunResponse(ctx, chromedp.Navigate(baseURL+"/tokedex/nonexistent-model"))
+		if err != nil {
+			t.Fatalf("navigate nonexistent model: %v", err)
+		}
+		if notFoundResp.Status != http.StatusNotFound {
+			t.Fatalf("/tokedex/nonexistent-model status = %d, want 404", notFoundResp.Status)
+		}
+	})
+
+	t.Run("quotas-settings-and-pace-bar", func(t *testing.T) {
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/settings")); err != nil {
+			t.Fatalf("navigate /settings: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady("#quota-new-label")); err != nil {
+			t.Fatalf("wait #quota-new-label: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.SetValue("#quota-new-label", "Smoke Monthly Cap")); err != nil {
+			t.Fatalf("set #quota-new-label: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.SetValue("#quota-new-tokens", "5000")); err != nil {
+			t.Fatalf("set #quota-new-tokens: %v", err)
+		}
+		if _, err := chromedp.RunResponse(ctx, chromedp.Click(`form.quota-add-form button[type="submit"]`)); err != nil {
+			t.Fatalf("submit add quota: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`[data-quota-row]`)); err != nil {
+			t.Fatalf("wait [data-quota-row]: %v", err)
+		}
+		// / now renders the compact budget pace bar and passes accessibility + layout invariants.
+		assertPageAtViewports(t, ctx, baseURL, "/", []string{
+			`(() => { const p = document.querySelector('.quota-pace-panel'); return JSON.stringify(p && p.textContent.includes('Smoke Monthly Cap') ? [] : ['missing Smoke Monthly Cap pace bar on /']); })()`,
+		})
+		// Delete the quota in /settings and confirm / removes the pace bar cleanly.
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/settings")); err != nil {
+			t.Fatalf("navigate /settings for delete: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`form.quota-delete-form button[type="submit"]`)); err != nil {
+			t.Fatalf("wait delete button: %v", err)
+		}
+		if _, err := chromedp.RunResponse(ctx, chromedp.Click(`form.quota-delete-form button[type="submit"]`)); err != nil {
+			t.Fatalf("submit delete quota: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`#quota-new-label`)); err != nil {
+			t.Fatalf("wait #quota-new-label after delete: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.Navigate(baseURL+"/")); err != nil {
+			t.Fatalf("navigate / after delete: %v", err)
+		}
+		if _, err := chromedp.Run(ctx, chromedp.WaitReady(`#lifetime-counter`)); err != nil {
+			t.Fatalf("wait #lifetime-counter after delete: %v", err)
+		}
+		absentProblems, err := chromedp.Run(ctx, chromedp.Evaluate[string](quotaAbsentInvariantJS))
+		if err != nil || absentProblems != "[]" {
+			t.Fatalf("quota pace bar did not clear after delete: problems=%s err=%v", absentProblems, err)
 		}
 	})
 
@@ -2358,7 +2540,7 @@ func smokeCatalog() *catalog.Catalog {
 			Pricing: catalog.Pricing{Currency: "USD", Mode: "standard", VerifiedAt: "2026-11-07", Source: "https://example.com/pricing", InputPricePerMillion: &price, OutputPricePerMillion: &price},
 		},
 		"gpt-5": {
-			Provider: "openai", DisplayName: "GPT-5", Aliases: []string{"gpt-5"}, Tier: "A",
+			Provider: "openai", DisplayName: "GPT-5", Aliases: []string{"gpt-5", "openai/gpt-5"}, Tier: "A",
 			Pricing: catalog.Pricing{Currency: "USD", Mode: "unknown", VerifiedAt: "2026-11-07"},
 		},
 		"smoke-zero-usage": {

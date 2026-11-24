@@ -67,6 +67,13 @@ type Config struct {
 	HeartbeatTimeout  time.Duration
 	IngestTimeout     time.Duration
 	StaleAgentAfter   time.Duration
+	DatabasePath      string
+	BackupDir         string
+	BackupInterval    time.Duration
+	BackupRetention   int
+	AlertWebhookURL   string
+	AlertNtfyURL      string
+	AlertHTTPClient   *http.Client
 }
 
 const (
@@ -102,6 +109,8 @@ func (c Config) normalized() Config {
 	if c.StaleAgentAfter <= 0 {
 		c.StaleAgentAfter = DefaultStaleAgentAfter
 	}
+	c.AlertWebhookURL = strings.TrimSpace(c.AlertWebhookURL)
+	c.AlertNtfyURL = strings.TrimSpace(c.AlertNtfyURL)
 	return c
 }
 
@@ -154,6 +163,36 @@ func (c Config) validateDashboardPasswordAuth() error {
 	}
 	if _, err := bcrypt.Cost(c.DashboardPasswordHash); err != nil {
 		return errors.New("TOKEMON_DASHBOARD_PASSWORD_HASH is not a bcrypt hash; generate one with: tokemon passwd")
+	}
+	return nil
+}
+
+func validateAlertURL(name, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s must not contain control characters", name)
+		}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", name, err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+		return fmt.Errorf("%s must be an http:// or https:// URL with a host", name)
+	}
+	return nil
+}
+
+func (c Config) validateAlertConfig() error {
+	if err := validateAlertURL("TOKEMON_ALERT_WEBHOOK_URL", c.AlertWebhookURL); err != nil {
+		return err
+	}
+	if err := validateAlertURL("TOKEMON_ALERT_NTFY_URL", c.AlertNtfyURL); err != nil {
+		return err
 	}
 	return nil
 }

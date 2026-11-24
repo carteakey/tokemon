@@ -170,6 +170,8 @@ func runServe(args []string) error {
 	backupDir := flags.String("backup-dir", envOr("TOKEMON_BACKUP_DIR", ""), "directory for automated SQLite backups (defaults to <database-dir>/backups)")
 	backupRetention := flags.Int("backup-retention", configIntEnv("TOKEMON_BACKUP_RETENTION", defaultBackupRetention), "number of automated backups to retain")
 	backupInterval := flags.Duration("backup-interval", configDurationEnv("TOKEMON_BACKUP_INTERVAL", defaultBackupInterval), "automated backup interval (0 disables automated backups)")
+	alertWebhookURL := flags.String("alert-webhook-url", os.Getenv("TOKEMON_ALERT_WEBHOOK_URL"), "optional HTTP webhook URL for quota warning/overage alerts")
+	alertNtfyURL := flags.String("alert-ntfy-url", os.Getenv("TOKEMON_ALERT_NTFY_URL"), "optional ntfy topic URL for quota warning/overage alerts")
 	configPath := flags.String("config", envOr("TOKEMON_SERVER_CONFIG", ""), "dotenv config path (defaults to ~/.config/tokemon/server.env)")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -186,6 +188,7 @@ func runServe(args []string) error {
 		return err
 	}
 	applyServerConfig(flags, configValues, addr, databasePath, ingestToken, catalogPath, timezone, quotasPath, backupDir, backupRetention, backupInterval)
+	applyServerAlertConfig(flags, configValues, alertWebhookURL, alertNtfyURL)
 	applyServerSecurityConfig(flags, configValues, dashboardToken, devLoopback, enableTokedex, trustedProxyCIDRs, dashboardUsername, dashboardPasswordHash)
 	dashboardTokenBefore := *dashboardToken
 	*dashboardToken = applyDashboardTokenFallback(*dashboardToken, *ingestToken, flags)
@@ -245,6 +248,12 @@ func runServe(args []string) error {
 		AllowLoopbackDev:       *devLoopback,
 		EnableTokedex:          *enableTokedex,
 		TrustedProxyCIDRs:      splitConfiguredPaths(*trustedProxyCIDRs),
+		DatabasePath:           *databasePath,
+		BackupDir:              *backupDir,
+		BackupInterval:         *backupInterval,
+		BackupRetention:        *backupRetention,
+		AlertWebhookURL:        *alertWebhookURL,
+		AlertNtfyURL:           *alertNtfyURL,
 		Logger:                 logger,
 	}, insightsSynthesizer)
 	if err != nil {
@@ -959,6 +968,19 @@ func applyServerConfig(flags *flag.FlagSet, values map[string]string, addr, data
 			if parsed, err := time.ParseDuration(value); err == nil {
 				*backupInterval = parsed
 			}
+		}
+	}
+}
+
+func applyServerAlertConfig(flags *flag.FlagSet, values map[string]string, alertWebhookURL, alertNtfyURL *string) {
+	if alertWebhookURL != nil && !flagWasSet(flags, "alert-webhook-url") && strings.TrimSpace(os.Getenv("TOKEMON_ALERT_WEBHOOK_URL")) == "" {
+		if value := strings.TrimSpace(values["TOKEMON_ALERT_WEBHOOK_URL"]); value != "" {
+			*alertWebhookURL = value
+		}
+	}
+	if alertNtfyURL != nil && !flagWasSet(flags, "alert-ntfy-url") && strings.TrimSpace(os.Getenv("TOKEMON_ALERT_NTFY_URL")) == "" {
+		if value := strings.TrimSpace(values["TOKEMON_ALERT_NTFY_URL"]); value != "" {
+			*alertNtfyURL = value
 		}
 	}
 }

@@ -1,0 +1,159 @@
+{{define "tokedex_detail"}}<!doctype html>
+<html lang="en">
+<head>
+  {{template "head" .}}
+  <style>
+    .detail-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding: 20px 10px 15px; }
+    .heading-links { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .back-link { display: inline-flex; align-items: center; min-height: 32px; padding: 4px 10px; border: 1px solid var(--control-border); border-radius: 4px; color: var(--muted); font: 700 10px/1 var(--font-data); letter-spacing: .07em; text-transform: uppercase; }
+    .back-link:hover, .back-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+    .eyebrow, .section-title, .stat-label, .meta-label, th { color: var(--accent); font: 700 10px/1 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    .detail-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 8px; }
+    h1 { margin: 0; font: 700 clamp(26px, 3.8vw, 40px)/1 var(--font-display); overflow-wrap: anywhere; }
+    .tier-badge { padding: 4px 8px; border: 1px solid var(--warm); border-radius: 4px; color: var(--warm); font: 700 10px/1 var(--font-data); letter-spacing: .08em; text-transform: uppercase; }
+    .detail-id { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; color: var(--faint); font: 11px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .detail-id code { color: var(--muted); }
+    .alias-note { color: var(--warm); }
+    .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+    .stat { min-width: 0; min-height: 82px; padding: 12px 14px; border: 1px solid var(--line-bright); border-radius: 7px; background: var(--surface); }
+    .stat-value { margin-top: 8px; overflow: hidden; color: var(--text); font: 700 clamp(17px, 2vw, 23px)/1.1 var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+    .stat-value.unknown-value { color: var(--warm); font-size: 16px; }
+    .stat-meta { margin-top: 6px; color: var(--faint); font: 10px/1.25 var(--font-data); overflow-wrap: anywhere; }
+    .meta-panel, .detail-panel { margin-top: 10px; overflow: hidden; }
+    .section-head { padding: 13px 16px 10px; }
+    .section-meta { color: var(--faint); font: 10px var(--font-data); }
+    .meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 14px 16px 16px; }
+    .meta-item { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-raised); }
+    .meta-value { margin-top: 6px; color: var(--text); font: 600 13px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .meta-sub { margin-top: 4px; color: var(--faint); font: 10px/1.3 var(--font-data); overflow-wrap: anywhere; }
+    .meta-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .meta-link:hover, .meta-link:focus-visible { color: var(--text); }
+    .weekly-chart { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; align-items: end; padding: 16px; }
+    .weekly-col { display: grid; justify-items: center; gap: 6px; min-width: 0; }
+    .weekly-track { display: flex; align-items: end; width: 100%; height: 112px; padding: 2px; border: 1px solid var(--line); border-radius: 4px; background: #11130f; }
+    .weekly-bar { display: block; width: 100%; min-height: 2px; border-radius: 2px 2px 0 0; background: var(--accent); }
+    .weekly-bar.empty { min-height: 0; height: 0; }
+    .weekly-val { color: var(--muted); font: 9px/1 var(--font-data); white-space: nowrap; }
+    .weekly-label { color: var(--faint); font: 9px/1 var(--font-data); white-space: nowrap; }
+    .empty-note { margin: 0; padding: 14px 16px 16px; color: var(--faint); font: 12px/1.4 var(--font-data); }
+    .table-scroll { padding: 0 16px 14px; }
+    table { min-width: 720px; table-layout: auto; }
+    th, td { padding: 9px 0; vertical-align: top; }
+    th { color: var(--faint); }
+    td { color: var(--muted); font: 12px/1.25 var(--font-data); }
+    th:first-child, td:first-child { width: auto; }
+    th:not(:first-child), td:not(:first-child) { padding-left: 16px; text-align: right; white-space: nowrap; }
+    td:first-child { color: var(--text); font-weight: 600; }
+    .session-link { border-radius: 3px; color: var(--text); }
+    .session-link:hover, .session-link:focus-visible { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .subline { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; font-weight: 400; }
+    .empty-row td { padding: 22px 0 8px; color: var(--faint); text-align: left; }
+    @media (max-width: 900px) {
+      .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .detail-heading { align-items: start; flex-direction: column; padding: 16px 8px 12px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .meta-grid { grid-template-columns: 1fr; }
+      .weekly-chart { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px 6px; }
+      table { min-width: 0; }
+      thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+      tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+      tbody td, tbody td:not(:first-child) { display: block; width: auto; padding: 0; border: 0; text-align: left; white-space: normal; }
+      tbody td:first-child, .empty-row td { grid-column: 1 / -1; }
+      td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--faint); font: 700 9px/1.2 var(--font-data); letter-spacing: .1em; text-transform: uppercase; }
+    }
+    @media (max-width: 420px) {
+      .summary-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>{{template "topbar" .}}
+  <section class="detail-heading">
+    <div>
+      <div class="eyebrow">{{if .Detail.Cataloged}}Cataloged model{{else}}Uncataloged model{{end}}</div>
+      <div class="detail-title-row">
+        <h1>{{.Detail.DisplayName}}</h1>
+        {{if .Detail.Tier}}<span class="tier-badge">Tier {{.Detail.Tier}}</span>{{end}}
+      </div>
+      <div class="detail-id">
+        <code>{{.Detail.ID}}</code>{{copyID .Detail.ID "model"}}
+        {{if .Detail.RequestedID}}<span class="alias-note">Requested via alias <code>{{.Detail.RequestedID}}</code></span>{{end}}
+      </div>
+    </div>
+    <div class="heading-links">
+      <a class="back-link" href="/tokedex">&larr; Tokedex</a>
+      {{if .AnalyticsURL}}<a class="back-link" href="{{.AnalyticsURL}}">Analytics &rarr;</a>{{end}}
+      {{if .SessionsURL}}<a class="back-link" href="{{.SessionsURL}}">Sessions &rarr;</a>{{end}}
+    </div>
+  </section>
+
+  <section class="summary-grid" aria-label="Model usage summary">
+    {{$totalUnknown := or (eq .Detail.Events 0) (and (eq .Detail.Tokens 0) (gt .Detail.UnknownEvents 0))}}
+    {{$ioUnknown := and (eq .Detail.InputTokens 0) (eq .Detail.OutputTokens 0) (or (eq .Detail.Events 0) (gt .Detail.UnknownEvents 0))}}
+    <article class="stat"><div class="stat-label">Total tokens</div><div class="stat-value{{if $totalUnknown}} unknown-value{{end}}">{{if $totalUnknown}}—{{else}}{{commas .Detail.Tokens}}{{end}}</div><div class="stat-meta">{{if eq .Detail.Events 0}}No usage recorded yet{{else}}{{commas .Detail.Events}} event{{if ne .Detail.Events 1}}s{{end}} · {{commas .Detail.Sessions}} session{{if ne .Detail.Sessions 1}}s{{end}}{{if .Detail.UnknownEvents}} · {{commas .Detail.UnknownEvents}} unknown{{end}}{{end}}</div></article>
+    <article class="stat"><div class="stat-label">Input / Output</div><div class="stat-value{{if $ioUnknown}} unknown-value{{end}}">{{if $ioUnknown}}—{{else}}{{compact .Detail.InputTokens}} / {{compact .Detail.OutputTokens}}{{end}}</div><div class="stat-meta">Cache read: {{compact .Detail.CacheReadTokens}} · Write: {{compact .Detail.CacheWriteTokens}}</div></article>
+    <article class="stat"><div class="stat-label">Cache hit</div><div class="stat-value{{if eq .Detail.Cache.EligibleTokens 0}} unknown-value{{end}}">{{if .Detail.Cache.EligibleTokens}}{{printf "%.1f%%" (percent .Detail.Cache.HitRate)}}{{else}}—{{end}}</div><div class="stat-meta">{{if .Detail.HasCacheSavings}}{{money .Detail.CacheSavings}} saved{{else if .Detail.Cache.EligibleTokens}}{{commas .Detail.Cache.CachedTokens}} cached tokens{{else}}No eligible input tokens{{end}}</div></article>
+    <article class="stat"><div class="stat-label">Est. API cost</div><div class="stat-value{{if not .Detail.HasCost}} unknown-value{{end}}">{{if .Detail.HasCost}}{{formatDetailCost .Detail.EstimatedCost.Amount}}{{else}}Unknown{{end}}</div><div class="stat-meta">{{if .Detail.HasCost}}{{compact .Detail.EstimatedCost.PricedTokens}} priced{{if .Detail.EstimatedCost.UnpricedTokens}} · {{compact .Detail.EstimatedCost.UnpricedTokens}} unpriced{{end}}{{else if not .Detail.Priced}}Rates not published yet{{else}}No priced usage yet{{end}}</div></article>
+    <article class="stat"><div class="stat-label">Effective $/1M</div><div class="stat-value{{if not .Detail.EffectiveCostPerMillion}} unknown-value{{end}}">{{if .Detail.EffectiveCostPerMillion}}{{formatRatePtr .Detail.EffectiveCostPerMillion}}{{else}}Unknown{{end}}</div><div class="stat-meta">Blended rate across priced tokens</div></article>
+  </section>
+
+  <section class="panel meta-panel" aria-labelledby="model-meta-title">
+    <div class="section-head"><h2 class="section-title" id="model-meta-title">Pricing &amp; provenance</h2><div class="section-meta">{{.Detail.Context}}</div></div>
+    <div class="meta-grid">
+      <div class="meta-item"><div class="meta-label">Pricing status</div><div class="meta-value">{{if .Detail.Priced}}Standard ({{if .Detail.Pricing.Currency}}{{.Detail.Pricing.Currency}}{{else}}USD{{end}}){{else if .Detail.Cataloged}}Rates not published yet{{else}}Uncataloged{{end}}</div><div class="meta-sub">Unknown pricing stays Unknown, never zero</div></div>
+      <div class="meta-item"><div class="meta-label">Provider / Tier</div><div class="meta-value">{{if .Detail.Provider}}{{.Detail.Provider}}{{else if .Detail.Providers}}{{joinStrings .Detail.Providers}}{{else}}Unknown{{end}} · {{if .Detail.Tier}}Tier {{.Detail.Tier}}{{else}}Uncataloged{{end}}</div><div class="meta-sub">{{if .Detail.Providers}}Observed: {{joinStrings .Detail.Providers}}{{else}}Catalog metadata{{end}}</div></div>
+      <div class="meta-item"><div class="meta-label">Published rates</div><div class="meta-value">In {{priceValue .Detail.Pricing.InputPricePerMillion}} · Out {{priceValue .Detail.Pricing.OutputPricePerMillion}}</div><div class="meta-sub">Cached {{priceValue .Detail.Pricing.CacheReadPricePerMillion}} · Write {{priceValue .Detail.Pricing.CacheWritePricePerMillion}}</div></div>
+      <div class="meta-item"><div class="meta-label">Provenance</div><div class="meta-value">{{if .Detail.Pricing.VerifiedAt}}Checked {{.Detail.Pricing.VerifiedAt}}{{else}}—{{end}}</div><div class="meta-sub">{{if .Detail.Pricing.Source}}<a class="meta-link" href="{{.Detail.Pricing.Source}}" target="_blank" rel="noopener">Pricing source</a>{{else}}No source link recorded{{end}}</div></div>
+      <div class="meta-item"><div class="meta-label">Aliases</div><div class="meta-value">{{if .Detail.Aliases}}{{range $i, $a := .Detail.Aliases}}{{if $i}} · {{end}}<code>{{$a}}</code>{{end}}{{else}}None{{end}}</div><div class="meta-sub">Matched case-insensitively in Tokedex</div></div>
+      <div class="meta-item"><div class="meta-label">Observed span</div><div class="meta-value">{{if .Detail.LastSeen}}{{analyticsTime .Detail.LastSeen}}{{else}}No usage recorded yet{{end}}</div><div class="meta-sub">{{if .Detail.FirstSeen}}First seen {{analyticsTime .Detail.FirstSeen}}{{else}}Metadata-only record{{end}}</div></div>
+    </div>
+  </section>
+
+  <section class="panel detail-panel" aria-labelledby="weekly-trend-title">
+    <div class="section-head"><h2 class="section-title" id="weekly-trend-title">12-week usage trend</h2><div class="section-meta">{{if .Detail.WeeklyTrend}}Sunday-start local weeks{{else}}No recent activity{{end}}</div></div>
+    {{if .Detail.WeeklyTrend}}
+    <div class="weekly-chart" aria-hidden="true">
+      {{range .Detail.WeeklyTrend}}
+      <div class="weekly-col" title="{{.Label}}: {{commas .Tokens}} tokens">
+        <span class="weekly-val">{{if .Tokens}}{{compact .Tokens}}{{else}}0{{end}}</span>
+        <span class="weekly-track"><span class="weekly-bar{{if eq .Tokens 0}} empty{{end}}" style="height: {{analyticsBar .Tokens $.WeeklyMaxTokens}}%"></span></span>
+        <span class="weekly-label">{{.Label}}</span>
+      </div>
+      {{end}}
+    </div>
+    <div class="sr-only">
+      <table aria-label="12-week model usage trend"><caption>12-week model usage trend</caption><thead><tr><th scope="col">Week</th><th scope="col">Tokens</th><th scope="col">Events</th><th scope="col">Est. Cost</th></tr></thead><tbody>
+        {{range .Detail.WeeklyTrend}}<tr><th scope="row">{{.Label}} ({{.WeekStart}} to {{.WeekEnd}})</th><td>{{commas .Tokens}}</td><td>{{commas .Events}}</td><td>{{if and $.Detail.HasCost (gt .PricedTokens 0)}}{{formatDetailCost .Cost}}{{else}}Unknown{{end}}</td></tr>{{end}}
+      </tbody></table>
+    </div>
+    {{else}}
+    <p class="empty-note">No usage recorded in the last 12 weeks.</p>
+    {{end}}
+  </section>
+
+  <section class="panel detail-panel" aria-labelledby="machines-title">
+    <div class="section-head"><h2 class="section-title" id="machines-title">Machine distribution</h2><div class="section-meta">{{len .Detail.Machines}} machine{{if ne (len .Detail.Machines) 1}}s{{end}}</div></div>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Model machine distribution table, scrollable">
+      <table aria-label="Model machine distribution"><caption class="sr-only">Model machine distribution</caption><thead><tr><th scope="col">Machine</th><th scope="col">Tokens</th><th scope="col">Share</th><th scope="col">Sessions</th><th scope="col">Events</th><th scope="col">Est. Cost</th><th scope="col">Last seen</th></tr></thead><tbody>
+        {{range .Detail.Machines}}
+        <tr><td data-label="Machine">{{machineDisplayName $.MachineAliases .Machine}}<span class="subline">{{.Machine}}</span></td><td data-label="Tokens"{{if and (eq .Tokens 0) (gt .UnknownEvents 0)}} class="unknown-value"{{end}}>{{if and (eq .Tokens 0) (gt .UnknownEvents 0)}}—{{else}}{{commas .Tokens}}{{end}}</td><td data-label="Share">{{printf "%.1f%%" (mul .Share 100)}}</td><td data-label="Sessions">{{commas .Sessions}}</td><td data-label="Events">{{commas .Events}}</td><td data-label="Est. Cost"{{if or (not $.Detail.HasCost) (le .Cost 0.0)}} class="unknown-value"{{end}}>{{if and $.Detail.HasCost (gt .Cost 0.0)}}{{formatDetailCost .Cost}}{{else}}Unknown{{end}}</td><td data-label="Last seen">{{analyticsTime .LastSeen}}</td></tr>
+        {{else}}<tr class="empty-row"><td colspan="7">No machine usage recorded yet.</td></tr>{{end}}
+      </tbody></table>
+    </div>
+  </section>
+
+  <section class="panel detail-panel" aria-labelledby="model-sessions-title">
+    <div class="section-head"><h2 class="section-title" id="model-sessions-title">Recent sessions</h2><div class="section-meta">Metadata only · latest {{len .Detail.RecentSessions}}</div></div>
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Recent sessions using this model, scrollable">
+      <table aria-label="Recent sessions using this model"><caption class="sr-only">Recent sessions using this model</caption><thead><tr><th scope="col">Session</th><th scope="col">When</th><th scope="col">Project / machine</th><th scope="col">Harness</th><th scope="col">Total</th><th scope="col">Cost</th><th scope="col">Accuracy</th></tr></thead><tbody>
+        {{range .Detail.RecentSessions}}
+        <tr><td data-label="Session" title="{{.SessionID}}"><a class="session-link" href="{{sessionDetailURL .SessionID}}">{{sessionDisplayName .SessionID}}</a>{{copyID .SessionID "session"}}</td><td data-label="When">{{analyticsTime .Timestamp}}</td><td data-label="Project / machine">{{if .Project}}{{.Project}}{{else}}Unknown project{{end}}<span class="subline">{{machineDisplayName $.MachineAliases .Machine}}</span></td><td data-label="Harness">{{harnessName .Tool}}</td><td data-label="Total"{{if not .TotalTokens}} class="unknown-value"{{end}}>{{tokenValue .TotalTokens}}</td><td data-label="Cost"{{if not .Cost}} class="unknown-value"{{end}}>{{costValue .Cost .CostEstimated}}</td><td data-label="Accuracy">{{.Accuracy}}</td></tr>
+        {{else}}<tr class="empty-row"><td colspan="7">No sessions recorded for this model yet.</td></tr>{{end}}
+      </tbody></table>
+    </div>
+  </section>
+
+  {{template "footer" .}}
+{{copyIDScript}}</body></html>{{end}}

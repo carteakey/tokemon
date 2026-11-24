@@ -170,6 +170,50 @@ func TestApplyServerConfigPrecedence(t *testing.T) {
 	}
 }
 
+func TestApplyServerAlertConfigPrecedence(t *testing.T) {
+	t.Setenv("TOKEMON_ALERT_WEBHOOK_URL", "")
+	t.Setenv("TOKEMON_ALERT_NTFY_URL", "")
+
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	webhook := flags.String("alert-webhook-url", "", "")
+	ntfy := flags.String("alert-ntfy-url", "", "")
+	if err := flags.Parse([]string{}); err != nil {
+		t.Fatal(err)
+	}
+	applyServerAlertConfig(flags, map[string]string{
+		"TOKEMON_ALERT_WEBHOOK_URL": "https://hooks.example.com/tokemon",
+		"TOKEMON_ALERT_NTFY_URL":    "https://ntfy.sh/tokemon-file",
+	}, webhook, ntfy)
+	if *webhook != "https://hooks.example.com/tokemon" || *ntfy != "https://ntfy.sh/tokemon-file" {
+		t.Fatalf("dotenv alert config not applied: webhook=%q ntfy=%q", *webhook, *ntfy)
+	}
+
+	t.Setenv("TOKEMON_ALERT_WEBHOOK_URL", "https://env.example.com/hook")
+	flags2 := flag.NewFlagSet("serve", flag.ContinueOnError)
+	webhook2 := flags2.String("alert-webhook-url", os.Getenv("TOKEMON_ALERT_WEBHOOK_URL"), "")
+	ntfy2 := flags2.String("alert-ntfy-url", os.Getenv("TOKEMON_ALERT_NTFY_URL"), "")
+	if err := flags2.Parse([]string{}); err != nil {
+		t.Fatal(err)
+	}
+	applyServerAlertConfig(flags2, map[string]string{
+		"TOKEMON_ALERT_WEBHOOK_URL": "https://hooks.example.com/tokemon",
+		"TOKEMON_ALERT_NTFY_URL":    "https://ntfy.sh/tokemon-file",
+	}, webhook2, ntfy2)
+	if *webhook2 != "https://env.example.com/hook" || *ntfy2 != "https://ntfy.sh/tokemon-file" {
+		t.Fatalf("env did not override dotenv: webhook=%q ntfy=%q", *webhook2, *ntfy2)
+	}
+
+	if err := flags.Set("alert-ntfy-url", "https://ntfy.sh/flag-override"); err != nil {
+		t.Fatal(err)
+	}
+	applyServerAlertConfig(flags, map[string]string{
+		"TOKEMON_ALERT_NTFY_URL": "https://ntfy.sh/tokemon-file",
+	}, webhook, ntfy)
+	if *ntfy != "https://ntfy.sh/flag-override" {
+		t.Fatalf("CLI flag was overwritten: ntfy=%q", *ntfy)
+	}
+}
+
 func TestApplyAgentConfigProjectLabelOptOut(t *testing.T) {
 	t.Setenv("TOKEMON_INCLUDE_PROJECTS", "")
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)

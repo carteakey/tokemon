@@ -2226,7 +2226,7 @@ func TestAnalyticsQuotaPanel(t *testing.T) {
 	if page.Code != http.StatusOK {
 		t.Fatalf("analytics status = %d", page.Code)
 	}
-	if strings.Contains(page.Body.String(), "Config-defined budgets") {
+	if strings.Contains(page.Body.String(), "Configured budgets") {
 		t.Fatal("quota panel rendered without quotas configured")
 	}
 
@@ -2263,6 +2263,7 @@ func TestAnalyticsQuotaPanel(t *testing.T) {
 	body := page.Body.String()
 	for _, want := range []string{
 		`id="quota-title">Quota`,
+		"Configured budgets · current period",
 		"OpenAI cap",
 		"60,000,000 tokens / 50,000,000 tokens",
 		`quota-fill over`,
@@ -3898,7 +3899,7 @@ func TestAuthenticatedPagesShareChromeTopbarActionsAndCAR205(t *testing.T) {
 	navInsightsPattern := regexp.MustCompile(`<a[^>]*class="[^"]*nav-link[^"]*"[^>]*href="/insights"`)
 	wantStylesheet := `<link rel="stylesheet" href="/static/tokemon/base.css?v=` + server.assetVersion + `">`
 
-	for _, path := range []string{"/", "/analytics", "/tokedex", "/sessions", "/sessions/chrome-sess", "/settings", "/insights"} {
+	for _, path := range []string{"/", "/analytics", "/tokedex", "/tokedex/gpt-5", "/sessions", "/sessions/chrome-sess", "/settings", "/insights"} {
 		body := renderAccessiblePage(t, server, path)
 		for _, want := range []string{
 			wantStylesheet,

@@ -24,11 +24,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/tokemon/tokemon/internal/catalog"
 	"github.com/tokemon/tokemon/internal/database"
 	"github.com/tokemon/tokemon/internal/evolution"
 	insightai "github.com/tokemon/tokemon/internal/insights"
+	"github.com/tokemon/tokemon/internal/quota"
 	"github.com/tokemon/tokemon/internal/usage"
 	"github.com/tokemon/tokemon/web"
 )
@@ -75,6 +77,7 @@ type Server struct {
 	insightsCache      map[string]*insightsCacheEntry
 	insightsGeneration uint64
 	insightsRefreshes  atomic.Int64
+	alerts             *quotaAlertState
 
 	bgMu      sync.Mutex
 	bgClosed  bool
@@ -196,6 +199,7 @@ type dashboardPage struct {
 	Machines       []database.MachineInfo
 	Sessions       []database.SessionRecord
 	Freshness      dataFreshness
+	Quotas         []quotaView
 }
 
 // dataFreshness describes how recent the newest persisted event is, using the
@@ -334,14 +338,73 @@ type aliasRow struct {
 	TokedexURL    string
 }
 
+type settingsQuotaRow struct {
+	Provider      string
+	Model         string
+	Label         string
+	DisplayLabel  string
+	ScopeLabel    string
+	ResetDay      int
+	TokensValue   string
+	CostValue     string
+	Source        string
+	SourceBadge   string
+	OverridesYAML bool
+	CanDelete     bool
+	DeleteLabel   string
+	SaveLabel     string
+	StatusFigures string
+	StatusDetail  string
+	StatusPercent float64
+	StatusFill    float64
+	StatusOver    bool
+	HasStatus     bool
+}
+
+type settingsBackupInfo struct {
+	StatusLabel string
+	AgeLabel    string
+	TimestampUI template.HTML
+	Count       int
+	Schedule    string
+	Exists      bool
+	Error       bool
+}
+
 type settingsPage struct {
 	PageChrome
 	Models      []aliasRow
 	Machines    []aliasRow
+	Quotas      []settingsQuotaRow
+	Backup      settingsBackupInfo
 	Saved       bool
+	QuotaNotice string
 	Error       string
 	AuthMode    string
 	TokenSource string
+}
+
+type tokedexWhatIfRow struct {
+	ID                 string
+	DisplayName        string
+	Provider           string
+	Tier               string
+	Priced             bool
+	InputRate          *float64
+	CacheReadRate      *float64
+	OutputRate         *float64
+	InputEff           float64
+	CacheReadEff       float64
+	CacheWriteEff      float64
+	OutputEff          float64
+	InputRateAttr      string
+	CacheReadRateAttr  string
+	CacheWriteRateAttr string
+	OutputRateAttr     string
+	Cost               float64
+	CostLabel          string
+	Note               string
+	DetailURL          string
 }
 
 type catalogTier struct {
@@ -410,6 +473,20 @@ type catalogPageData struct {
 	PricedTokens           int64
 	CatalogedUnknownTokens int64
 	UncatalogedModels      int
+	Recent30d              database.ComponentUsageTotals
+	WhatIfRows             []tokedexWhatIfRow
+	WhatIfByID             map[string]tokedexWhatIfRow
+	WhatIfHasUsage         bool
+}
+
+type tokedexDetailPageData struct {
+	PageChrome
+	Detail          database.TokedexModelDetail
+	ModelAliases    map[string]string
+	MachineAliases  map[string]string
+	AnalyticsURL    string
+	SessionsURL     string
+	WeeklyMaxTokens int64
 }
 
 type activeFilterPill struct {
@@ -1022,6 +1099,23 @@ func analyticsShareDateTickLabel(point database.AnalyticsSharePoint, period stri
 	return point.Label
 }
 
+func analyticsTickPeriod(bucket string, count int) string {
+	switch bucket {
+	case "hour":
+		return "24h"
+	case "month":
+		return "all"
+	default:
+		if count <= 10 {
+			return "7d"
+		}
+		if count <= 35 {
+			return "30d"
+		}
+		return "90d"
+	}
+}
+
 func analyticsDimensionLabel(dimension string) string {
 	switch dimension {
 	case "harnesses":
@@ -1109,11 +1203,13 @@ func analyticsAverageThread(summary database.AnalyticsSummary) int64 {
 // dashboard's Unknown vocabulary. State feeds the shared comparison pill
 // classes (up/down/flat; empty is neutral or unknown).
 type analyticsInsight struct {
-	ID     string
-	Label  string
-	Value  string
-	State  string
-	Detail string
+	ID        string
+	Label     string
+	Value     string
+	State     string
+	Detail    string
+	LinkURL   string
+	LinkLabel string
 }
 
 // analyticsMoverShareThreshold keeps the mover card honest: sub-0.1pt share
@@ -1121,6 +1217,10 @@ type analyticsInsight struct {
 const analyticsMoverShareThreshold = 0.1
 
 func analyticsInsights(result database.Analytics, now time.Time, modelAliases, machineAliases map[string]string) []analyticsInsight {
+	return analyticsInsightsWithTokedex(result, now, modelAliases, machineAliases, false)
+}
+
+func analyticsInsightsWithTokedex(result database.Analytics, now time.Time, modelAliases, machineAliases map[string]string, tokedex bool) []analyticsInsight {
 	var insights []analyticsInsight
 
 	// Spend burn rate: the window's daily cost average and, for day-bucketed
@@ -1237,13 +1337,18 @@ func analyticsInsights(result database.Analytics, now time.Time, modelAliases, m
 	total := result.Summary.EstimatedCost.PricedTokens + result.Summary.EstimatedCost.UnpricedTokens
 	if result.Summary.EstimatedCost.UnpricedTokens > 0 && total > 0 {
 		unpriced := float64(result.Summary.EstimatedCost.UnpricedTokens) * 100 / float64(total)
-		insights = append(insights, analyticsInsight{
+		insight := analyticsInsight{
 			ID:    "unpriced_share",
 			Label: "Catalog coverage",
 			Value: fmt.Sprintf("%.1f%%", unpriced),
 			Detail: fmt.Sprintf("%s of %s window tokens lack catalog pricing and contribute no cost estimate.",
 				commas(result.Summary.EstimatedCost.UnpricedTokens), commas(total)),
-		})
+		}
+		if tokedex {
+			insight.LinkURL = "/tokedex#uncataloged-title"
+			insight.LinkLabel = "Inspect in Tokedex"
+		}
+		insights = append(insights, insight)
 	}
 	return insights
 }
@@ -1805,6 +1910,18 @@ func sessionDetailURL(id string) string {
 	return "/sessions/" + url.PathEscape(id)
 }
 
+func tokedexDetailURL(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "/tokedex"
+	}
+	parts := strings.Split(id, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return "/tokedex/" + strings.Join(parts, "/")
+}
+
 func isDrillableBucket(name string) bool {
 	return strings.TrimSpace(name) != "" && !isUnknownBucketName(name)
 }
@@ -2171,6 +2288,9 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 	if err := config.validateDashboardPasswordAuth(); err != nil {
 		return nil, err
 	}
+	if err := config.validateAlertConfig(); err != nil {
+		return nil, err
+	}
 	trustedProxyNetworks, err := parseTrustedProxyCIDRs(config.TrustedProxyCIDRs)
 	if err != nil {
 		return nil, err
@@ -2208,21 +2328,22 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 			}
 			return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 		},
-		"topProjects":        topProjects,
-		"topModels":          topModels,
-		"topTools":           topTools,
-		"harnessName":        harnessName,
-		"modelDisplayName":   modelDisplayName,
-		"machineDisplayName": machineDisplayName,
-		"analyticsBar":       analyticsBarPercent,
-		"analyticsPart":      analyticsPartPercent,
-		"analyticsDateTick":  analyticsDateTickClass,
-		"analyticsDateLabel": analyticsDateTickLabel,
-		"shareDateLabel":     analyticsShareDateTickLabel,
-		"dimensionLabel":     analyticsDimensionLabel,
-		"unknownLabel":       analyticsUnknownLabel,
-		"isUnknownName":      isUnknownBucketName,
-		"breakdownName":      breakdownDisplayName,
+		"topProjects":         topProjects,
+		"topModels":           topModels,
+		"topTools":            topTools,
+		"harnessName":         harnessName,
+		"modelDisplayName":    modelDisplayName,
+		"machineDisplayName":  machineDisplayName,
+		"analyticsBar":        analyticsBarPercent,
+		"analyticsPart":       analyticsPartPercent,
+		"analyticsDateTick":   analyticsDateTickClass,
+		"analyticsDateLabel":  analyticsDateTickLabel,
+		"shareDateLabel":      analyticsShareDateTickLabel,
+		"analyticsTickPeriod": analyticsTickPeriod,
+		"dimensionLabel":      analyticsDimensionLabel,
+		"unknownLabel":        analyticsUnknownLabel,
+		"isUnknownName":       isUnknownBucketName,
+		"breakdownName":       breakdownDisplayName,
 		"analyticsTime": func(raw string) template.HTML {
 			return analyticsShortTimeAt(raw, store.Location(), time.Now())
 		},
@@ -2252,6 +2373,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		"sessionsExportURL":        sessionsExportURL,
 		"sessionsPageURL":          sessionsPageURL,
 		"sessionDetailURL":         sessionDetailURL,
+		"tokedexDetailURL":         tokedexDetailURL,
 		"validDateInput":           parseQueryDate,
 		"validDateRange":           validDateRange,
 		"overviewDrillURL":         overviewDrillURL,
@@ -2324,6 +2446,16 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 			}
 			return fmt.Sprintf("$%.3f/M", *value)
 		},
+		"formatDetailCost": formatSubDollarCost,
+		"formatRatePtr": func(value *float64) string {
+			if value == nil {
+				return "Unknown"
+			}
+			return money(*value) + "/1M"
+		},
+		"joinStrings": func(values []string) string {
+			return strings.Join(values, ", ")
+		},
 		// pricingKnown reports whether a catalog entry carries the published
 		// rates the dashboard can honestly price usage with. It mirrors the
 		// PricedTokens accounting in Store.CatalogSnapshot: standard mode plus
@@ -2389,6 +2521,7 @@ func NewWithConfig(store *database.Store, config Config, providers ...InsightsRe
 		static:               http.FileServer(http.FS(staticFiles)),
 		assetVersion:         assetVersion,
 		recapProvider:        recap,
+		alerts:               newQuotaAlertState(config.AlertHTTPClient),
 		bgCtx:                bgCtx,
 		bgCancel:             bgCancel,
 	}, nil
@@ -2446,6 +2579,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /insights", dashboard(http.HandlerFunc(s.insightsPage)))
 	mux.Handle("GET /api/v1/insights", dashboard(http.HandlerFunc(s.insightsAPI)))
 	mux.Handle("GET /tokedex", dashboard(http.HandlerFunc(s.catalogPage)))
+	mux.Handle("GET /tokedex/{model...}", dashboard(http.HandlerFunc(s.tokedexDetailPage)))
 	mux.Handle("GET /catalog", dashboard(http.HandlerFunc(s.catalogPage)))
 	mux.Handle("GET /sessions", dashboard(http.HandlerFunc(s.sessionsPage)))
 	mux.Handle("GET /sessions/", dashboard(http.NotFoundHandler()))
@@ -2453,6 +2587,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /settings", dashboard(http.HandlerFunc(s.settings)))
 	mux.Handle("GET /settings/aliases", dashboard(http.HandlerFunc(s.settings)))
 	mux.Handle("POST /settings/aliases", dashboard(http.HandlerFunc(s.saveSettings)))
+	mux.Handle("POST /settings/quotas", dashboard(http.HandlerFunc(s.saveQuota)))
 	mux.Handle("POST /api/v1/events/batch", s.withDeadline(s.config.IngestTimeout, http.HandlerFunc(s.ingest)))
 	mux.Handle("POST /api/v1/agents/heartbeat", s.withDeadline(s.config.HeartbeatTimeout, http.HandlerFunc(s.heartbeat)))
 	mux.Handle("GET /api/v1/machines", dashboard(http.HandlerFunc(s.machines)))
@@ -2466,6 +2601,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/analytics", dashboard(http.HandlerFunc(s.analyticsAPI)))
 	mux.Handle("GET /api/v1/analytics/timeline", dashboard(http.HandlerFunc(s.timelineAPI)))
 	mux.Handle("GET /api/v1/analytics/export", dashboard(http.HandlerFunc(s.analyticsExport)))
+	mux.Handle("GET /api/v1/card.svg", dashboard(http.HandlerFunc(s.shareCardSVG)))
 	mux.Handle("GET /metrics", dashboard(http.HandlerFunc(s.metricsHandler)))
 	return s.requestLogging(securityHeaders(gzipMiddleware(mux)))
 }
@@ -2656,6 +2792,9 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	s.invalidateCatalogCache()
 	s.invalidateSessionsCache()
 	s.invalidateInsightsCache()
+	if result.Accepted > 0 {
+		s.triggerQuotaAlerts(true)
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -3643,16 +3782,59 @@ func (s *Server) renderDashboardHTML(ctx context.Context, result database.Overvi
 	if err != nil {
 		return nil, err
 	}
+	quotas := quotaViews(s.store.QuotaStatus(ctx, time.Now()))
 	// The pre-rendered page is served to every authenticated user, so the
 	// logout affordance keys on the password account being configured, not
 	// on the per-request auth method. POST /logout is a no-op redirect for
 	// credentials-authenticated users.
-	page := dashboardPage{PageChrome: s.pageChrome("Tokemon · Overview", "overview", true), Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now())}
+	page := dashboardPage{PageChrome: s.pageChrome("Tokemon · Overview", "overview", true), Overview: result, ModelAliases: modelAliases, MachineAliases: machineAliases, Machines: result.Machines, Sessions: sessions, Freshness: dataFreshnessFor(result.NewestEvent, time.Now()), Quotas: quotas}
 	var buffer bytes.Buffer
 	if err := s.template.ExecuteTemplate(&buffer, "dashboard", page); err != nil {
 		return nil, err
 	}
 	return buffer.Bytes(), nil
+}
+
+func formatSubDollarCost(amount float64) string {
+	if amount >= 1 {
+		return money(amount)
+	}
+	return fmt.Sprintf("$%.4f", amount)
+}
+
+func pricingHasKnownRates(pricing catalog.Pricing) bool {
+	return pricing.Mode == "standard" && pricing.InputPricePerMillion != nil && pricing.OutputPricePerMillion != nil
+}
+
+func catalogWhatIfEstimate(pricing catalog.Pricing, recent30d database.ComponentUsageTotals) (priced bool, inEff, crEff, cwEff, outEff, cost float64, note string) {
+	if !pricingHasKnownRates(pricing) {
+		return false, 0, 0, 0, 0, 0, ""
+	}
+	inEff = *pricing.InputPricePerMillion
+	outEff = *pricing.OutputPricePerMillion
+	crEff = inEff
+	cwEff = inEff
+	cacheFallback := false
+	if pricing.CacheReadPricePerMillion != nil {
+		crEff = *pricing.CacheReadPricePerMillion
+	} else if recent30d.CacheReadTokens > 0 {
+		cacheFallback = true
+	}
+	if pricing.CacheWritePricePerMillion != nil {
+		cwEff = *pricing.CacheWritePricePerMillion
+	} else if recent30d.CacheWriteTokens > 0 {
+		cacheFallback = true
+	}
+	if cacheFallback {
+		note = "cache @ input rate"
+	}
+	if recent30d.ComponentEvents > 0 {
+		cost = (float64(recent30d.InputTokens)*inEff +
+			float64(recent30d.CacheReadTokens)*crEff +
+			float64(recent30d.CacheWriteTokens)*cwEff +
+			float64(recent30d.OutputTokens)*outEff) / 1_000_000.0
+	}
+	return true, inEff, crEff, cwEff, outEff, cost, note
 }
 
 func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
@@ -3674,10 +3856,67 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	byTier := make(map[string][]database.CatalogEntry)
+	whatIfRows := make([]tokedexWhatIfRow, 0, len(snapshot.Models))
+	whatIfByID := make(map[string]tokedexWhatIfRow, len(snapshot.Models))
+	hasUsage := snapshot.Recent30d.ComponentEvents > 0
 	for _, model := range snapshot.Models {
+		priced, inEff, crEff, cwEff, outEff, cost, note := catalogWhatIfEstimate(model.Pricing, snapshot.Recent30d)
+		row := tokedexWhatIfRow{
+			ID:            model.ID,
+			DisplayName:   model.DisplayName,
+			Provider:      model.Provider,
+			Tier:          model.Tier,
+			Priced:        priced,
+			InputRate:     model.Pricing.InputPricePerMillion,
+			CacheReadRate: model.Pricing.CacheReadPricePerMillion,
+			OutputRate:    model.Pricing.OutputPricePerMillion,
+			InputEff:      inEff,
+			CacheReadEff:  crEff,
+			CacheWriteEff: cwEff,
+			OutputEff:     outEff,
+			Cost:          cost,
+			Note:          note,
+			DetailURL:     tokedexDetailURL(model.ID),
+		}
+		if priced {
+			row.InputRateAttr = strconv.FormatFloat(inEff, 'f', -1, 64)
+			row.CacheReadRateAttr = strconv.FormatFloat(crEff, 'f', -1, 64)
+			row.CacheWriteRateAttr = strconv.FormatFloat(cwEff, 'f', -1, 64)
+			row.OutputRateAttr = strconv.FormatFloat(outEff, 'f', -1, 64)
+			if hasUsage {
+				row.CostLabel = formatSubDollarCost(cost)
+			} else {
+				row.CostLabel = "—"
+			}
+		} else {
+			row.CostLabel = "Unknown"
+		}
 		byTier[model.Tier] = append(byTier[model.Tier], model)
+		whatIfRows = append(whatIfRows, row)
+		whatIfByID[model.ID] = row
 	}
-	page := catalogPageData{PageChrome: s.pageChrome("Tokemon · Tokedex", "tokedex", false), Tiers: make([]catalogTier, 0, len(snapshot.Tiers)), Uncataloged: snapshot.Uncataloged, ObservedTokens: snapshot.ObservedTokens, PricedTokens: snapshot.PricedTokens, CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens, UncatalogedModels: snapshot.UncatalogedModels}
+	sort.SliceStable(whatIfRows, func(i, j int) bool {
+		if whatIfRows[i].Priced != whatIfRows[j].Priced {
+			return whatIfRows[i].Priced
+		}
+		if whatIfRows[i].Priced && whatIfRows[i].Cost != whatIfRows[j].Cost {
+			return whatIfRows[i].Cost < whatIfRows[j].Cost
+		}
+		return whatIfRows[i].DisplayName < whatIfRows[j].DisplayName
+	})
+	page := catalogPageData{
+		PageChrome:             s.pageChrome("Tokemon · Tokedex", "tokedex", false),
+		Tiers:                  make([]catalogTier, 0, len(snapshot.Tiers)),
+		Uncataloged:            snapshot.Uncataloged,
+		ObservedTokens:         snapshot.ObservedTokens,
+		PricedTokens:           snapshot.PricedTokens,
+		CatalogedUnknownTokens: snapshot.CatalogedUnknownTokens,
+		UncatalogedModels:      snapshot.UncatalogedModels,
+		Recent30d:              snapshot.Recent30d,
+		WhatIfRows:             whatIfRows,
+		WhatIfByID:             whatIfByID,
+		WhatIfHasUsage:         hasUsage,
+	}
 	for _, tier := range snapshot.Tiers {
 		models := byTier[tier]
 		if len(models) == 0 {
@@ -3689,6 +3928,75 @@ func (s *Server) catalogPage(w http.ResponseWriter, r *http.Request) {
 	page.Providers = catalogProviders(page.Tiers)
 	page.ModelCount = len(snapshot.Models) + len(snapshot.Uncataloged)
 	if err := s.template.ExecuteTemplate(w, "catalog", page); err != nil {
+		return
+	}
+}
+
+func containsBackslashOrControl(value string) bool {
+	for _, r := range value {
+		if r == '\\' || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) tokedexDetailPage(w http.ResponseWriter, r *http.Request) {
+	if !s.config.EnableTokedex {
+		http.NotFound(w, r)
+		return
+	}
+	modelID := strings.TrimSpace(r.PathValue("model"))
+	if modelID == "" || modelID == "." || modelID == ".." || len([]rune(modelID)) > usage.MaxModelLength || containsBackslashOrControl(modelID) {
+		http.NotFound(w, r)
+		return
+	}
+	started := time.Now()
+	detail, err := s.store.TokedexModelDetail(r.Context(), modelID)
+	s.metrics.observeDB(started)
+	if err != nil {
+		if errors.Is(err, database.ErrModelNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if clientGone(err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	started = time.Now()
+	aliases, err := s.store.DisplayAliases(r.Context())
+	s.metrics.observeDB(started)
+	if err != nil {
+		if clientGone(err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	modelAliases, machineAliases := aliasMaps(aliases)
+	var weeklyMax int64
+	for _, wk := range detail.WeeklyTrend {
+		if wk.Tokens > weeklyMax {
+			weeklyMax = wk.Tokens
+		}
+	}
+	var analyticsURL, sessionsURL string
+	if isDrillableBucket(detail.ID) {
+		analyticsURL = "/analytics?period=all&dimension=projects&model=" + url.QueryEscape(detail.ID)
+		sessionsURL = "/sessions?period=all&model=" + url.QueryEscape(detail.ID)
+	}
+	page := tokedexDetailPageData{
+		PageChrome:      s.pageChrome("Tokemon · "+detail.DisplayName, "tokedex", false),
+		Detail:          detail,
+		ModelAliases:    modelAliases,
+		MachineAliases:  machineAliases,
+		AnalyticsURL:    analyticsURL,
+		SessionsURL:     sessionsURL,
+		WeeklyMaxTokens: weeklyMax,
+	}
+	if err := s.template.ExecuteTemplate(w, "tokedex_detail", page); err != nil {
 		return
 	}
 }
@@ -3861,7 +4169,7 @@ func (s *Server) analyticsPage(w http.ResponseWriter, r *http.Request) {
 		AverageThread:     analyticsAverageThread(result.Summary),
 		AxisMax:           axisMax,
 		AxisTicks:         analyticsAxisTicks(axisMax),
-		Insights:          analyticsInsights(result, time.Now(), modelAliases, machineAliases),
+		Insights:          analyticsInsightsWithTokedex(result, time.Now(), modelAliases, machineAliases, s.config.EnableTokedex),
 		Quotas:            quotaViews(s.store.QuotaStatus(r.Context(), time.Now())),
 		ActiveFilters:     activeFilters,
 		ActiveFilterCount: len(activeFilters),
@@ -4377,40 +4685,312 @@ func writeAnalyticsCSV(w http.ResponseWriter, result database.Analytics) {
 	}
 }
 
-func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+func quotaNoticeMessage(code string) string {
+	switch code {
+	case "1":
+		return "Quota saved."
+	case "override":
+		return "Quota override saved in SQLite."
+	case "deleted":
+		return "Quota deleted."
+	case "reset":
+		return "UI override removed; YAML config quota restored."
+	default:
+		return ""
+	}
+}
+
+func settingsQuotaScopeLabel(provider, model string) string {
+	switch {
+	case provider != "" && model != "":
+		return provider + " · " + model
+	case provider != "":
+		return "Provider: " + provider
+	case model != "":
+		return "Model: " + model
+	default:
+		return "All usage (catch-all)"
+	}
+}
+
+func settingsQuotaRows(configured []database.ConfiguredQuota, statuses []database.QuotaStatus) []settingsQuotaRow {
+	views := quotaViews(statuses)
+	viewByKey := make(map[string]quotaView, len(views))
+	for _, v := range views {
+		viewByKey[quota.Key(v.Provider, v.Model)] = v
+	}
+	rows := make([]settingsQuotaRow, 0, len(configured))
+	for _, item := range configured {
+		row := settingsQuotaRow{
+			Provider:      item.Provider,
+			Model:         item.Model,
+			Label:         item.Label,
+			DisplayLabel:  item.Label,
+			ScopeLabel:    settingsQuotaScopeLabel(item.Provider, item.Model),
+			ResetDay:      item.ResetDay,
+			Source:        item.Source,
+			OverridesYAML: item.OverridesYAML,
+		}
+		if row.DisplayLabel == "" {
+			row.DisplayLabel = settingsQuotaScopeLabel(item.Provider, item.Model)
+		}
+		if item.Budget.TokensPerMonth != nil {
+			row.TokensValue = strconv.FormatInt(*item.Budget.TokensPerMonth, 10)
+		}
+		if item.Budget.CostPerMonth != nil {
+			row.CostValue = strconv.FormatFloat(*item.Budget.CostPerMonth, 'f', -1, 64)
+		}
+		switch {
+		case item.Source == database.QuotaSourceYAML:
+			row.SourceBadge = "YAML config"
+			row.SaveLabel = "Override in UI"
+		case item.OverridesYAML:
+			row.SourceBadge = "UI override"
+			row.CanDelete = true
+			row.DeleteLabel = "Reset to YAML"
+			row.SaveLabel = "Save override"
+		default:
+			row.SourceBadge = "UI (SQLite)"
+			row.CanDelete = true
+			row.DeleteLabel = "Delete"
+			row.SaveLabel = "Save quota"
+		}
+		if v, ok := viewByKey[quota.Key(item.Provider, item.Model)]; ok {
+			row.HasStatus = true
+			row.StatusFigures = v.UsedLabel + " / " + v.BudgetLabel
+			row.StatusDetail = v.Detail
+			row.StatusPercent = v.Percent
+			row.StatusFill = v.Fill
+			row.StatusOver = v.Over
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func backupAgeLabel(age time.Duration) string {
+	if age < 0 {
+		age = 0
+	}
+	if age >= 24*time.Hour {
+		days := int(age / (24 * time.Hour))
+		hours := int((age % (24 * time.Hour)) / time.Hour)
+		return fmt.Sprintf("%dd %dh ago", days, hours)
+	}
+	return durationLabel(age.Milliseconds()) + " ago"
+}
+
+func (s *Server) settingsBackupStatus() settingsBackupInfo {
+	schedule := "Disabled"
+	dbPath := strings.TrimSpace(s.config.DatabasePath)
+	fileBacked := dbPath != "" && !strings.HasPrefix(dbPath, ":") && !strings.HasPrefix(dbPath, "file:")
+	switch {
+	case !fileBacked && strings.TrimSpace(s.config.BackupDir) == "":
+		schedule = "Not configured"
+	case s.config.BackupInterval > 0:
+		retention := s.config.BackupRetention
+		if retention < 1 {
+			retention = 10
+		}
+		schedule = fmt.Sprintf("Every %s (retain %d)", s.config.BackupInterval.String(), retention)
+	}
+	info, err := database.LatestBackupInfo(s.config.DatabasePath, s.config.BackupDir)
+	if err != nil {
+		return settingsBackupInfo{
+			StatusLabel: "Unavailable",
+			Schedule:    schedule,
+			Error:       true,
+		}
+	}
+	if !info.Exists {
+		return settingsBackupInfo{
+			StatusLabel: "No backups recorded yet",
+			Schedule:    schedule,
+		}
+	}
+	return settingsBackupInfo{
+		StatusLabel: "Latest backup",
+		AgeLabel:    backupAgeLabel(info.Age),
+		TimestampUI: analyticsShortTimeAt(info.Timestamp.UTC().Format(time.RFC3339), s.store.Location(), time.Now()),
+		Count:       info.Count,
+		Schedule:    schedule,
+		Exists:      true,
+	}
+}
+
+func (s *Server) buildSettingsPage(ctx context.Context, saved bool, quotaNotice, errMsg string) (settingsPage, error) {
 	started := time.Now()
-	result, _, err := s.cachedOverview(r.Context())
+	result, _, err := s.cachedOverview(ctx)
 	s.metrics.observeDB(started)
 	if err != nil {
-		if clientGone(err) {
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return settingsPage{}, err
 	}
 	started = time.Now()
-	aliases, err := s.store.DisplayAliases(r.Context())
+	aliases, err := s.store.DisplayAliases(ctx)
 	s.metrics.observeDB(started)
 	if err != nil {
-		if clientGone(err) {
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return settingsPage{}, err
 	}
+	started = time.Now()
+	configuredQuotas, err := s.store.Quotas(ctx)
+	s.metrics.observeDB(started)
+	if err != nil {
+		return settingsPage{}, err
+	}
+	statuses := s.store.QuotaStatus(ctx, time.Now())
 	modelAliases, machineAliases := aliasMaps(aliases)
 	authMode, tokenSource := s.authSummary()
-	page := settingsPage{
+	return settingsPage{
 		PageChrome:  s.pageChrome("Tokemon · Settings", "settings", false),
 		Models:      modelAliasRows(result.ByModel, modelAliases, s.config.EnableTokedex),
 		Machines:    machineAliasRows(result.ByMachine, machineAliases),
-		Saved:       r.URL.Query().Get("saved") == "1",
+		Quotas:      settingsQuotaRows(configuredQuotas, statuses),
+		Backup:      s.settingsBackupStatus(),
+		Saved:       saved,
+		QuotaNotice: quotaNotice,
+		Error:       errMsg,
 		AuthMode:    authMode,
 		TokenSource: tokenSource,
+	}, nil
+}
+
+func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	page, err := s.buildSettingsPage(
+		r.Context(),
+		r.URL.Query().Get("saved") == "1",
+		quotaNoticeMessage(r.URL.Query().Get("quota_saved")),
+		"",
+	)
+	if err != nil {
+		if clientGone(err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	if err := s.template.ExecuteTemplate(w, "settings", page); err != nil {
 		return
 	}
+}
+
+func (s *Server) renderSettingsError(w http.ResponseWriter, r *http.Request, status int, errMsg string) {
+	page, err := s.buildSettingsPage(r.Context(), false, "", errMsg)
+	if err != nil {
+		writeAccessibleError(w, status, errMsg)
+		return
+	}
+	var buf bytes.Buffer
+	if err := s.template.ExecuteTemplate(&buf, "settings", page); err != nil {
+		writeAccessibleError(w, status, errMsg)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (s *Server) saveQuota(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		writeAccessibleError(w, http.StatusBadRequest, "Invalid quota form.")
+		return
+	}
+	if !s.validSettingsOrigin(r) || !s.validCSRFToken(r.Form.Get("csrf_token")) {
+		writeAccessibleError(w, http.StatusForbidden, "The settings form could not be verified. Reload the page and try again.")
+		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(r.Form.Get("action")))
+	provider := strings.TrimSpace(r.Form.Get("provider"))
+	model := strings.TrimSpace(r.Form.Get("model"))
+	if action == "delete" {
+		overridesYAML := r.Form.Get("overrides_yaml") == "1"
+		started := time.Now()
+		err := s.store.DeleteQuota(r.Context(), provider, model)
+		s.metrics.observeDB(started)
+		if err != nil {
+			s.renderSettingsError(w, r, http.StatusBadRequest, "Could not delete quota: "+err.Error())
+			return
+		}
+		s.dropOverviewHTMLCache()
+		s.invalidateAnalyticsCache()
+		s.resetAlertStateForQuota(provider, model)
+		s.triggerQuotaAlerts(false)
+		code := "deleted"
+		if overridesYAML {
+			code = "reset"
+		}
+		http.Redirect(w, r, "/settings?quota_saved="+code, http.StatusSeeOther)
+		return
+	}
+
+	resetDay := 1
+	if rawDay := strings.TrimSpace(r.Form.Get("reset_day")); rawDay != "" {
+		parsed, err := strconv.Atoi(rawDay)
+		if err != nil {
+			s.renderSettingsError(w, r, http.StatusBadRequest, "Quota reset day must be a whole number between 1 and 31.")
+			return
+		}
+		resetDay = parsed
+	}
+	var tokensPtr *int64
+	if rawTokens := strings.TrimSpace(r.Form.Get("tokens_per_month")); rawTokens != "" {
+		parsed, err := strconv.ParseInt(rawTokens, 10, 64)
+		if err != nil {
+			s.renderSettingsError(w, r, http.StatusBadRequest, "Monthly token budget must be a whole number.")
+			return
+		}
+		tokensPtr = &parsed
+	}
+	var costPtr *float64
+	if rawCost := strings.TrimSpace(r.Form.Get("cost_per_month")); rawCost != "" {
+		parsed, err := strconv.ParseFloat(rawCost, 64)
+		if err != nil {
+			s.renderSettingsError(w, r, http.StatusBadRequest, "Monthly cost budget must be a valid decimal USD amount.")
+			return
+		}
+		costPtr = &parsed
+	}
+
+	candidate := quota.Quota{
+		Provider: provider,
+		Model:    model,
+		Label:    r.Form.Get("label"),
+		ResetDay: resetDay,
+		Budget: quota.Budget{
+			TokensPerMonth: tokensPtr,
+			CostPerMonth:   costPtr,
+		},
+	}
+
+	existing, err := s.store.Quotas(r.Context())
+	isYAMLOverride := false
+	if err == nil {
+		key := quota.Key(candidate.Provider, candidate.Model)
+		for _, item := range existing {
+			if quota.Key(item.Provider, item.Model) == key && (item.Source == database.QuotaSourceYAML || item.OverridesYAML) {
+				isYAMLOverride = true
+				break
+			}
+		}
+	}
+
+	started := time.Now()
+	if err := s.store.UpsertQuota(r.Context(), candidate); err != nil {
+		s.metrics.observeDB(started)
+		s.renderSettingsError(w, r, http.StatusBadRequest, "Could not save quota: "+err.Error())
+		return
+	}
+	s.metrics.observeDB(started)
+	s.dropOverviewHTMLCache()
+	s.invalidateAnalyticsCache()
+	s.resetAlertStateForQuota(candidate.Provider, candidate.Model)
+	s.triggerQuotaAlerts(false)
+	code := "1"
+	if isYAMLOverride {
+		code = "override"
+	}
+	http.Redirect(w, r, "/settings?quota_saved="+code, http.StatusSeeOther)
 }
 
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request) {
