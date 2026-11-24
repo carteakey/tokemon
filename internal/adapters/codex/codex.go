@@ -68,32 +68,26 @@ func (a *Adapter) Discover(ctx context.Context) ([]adapters.Source, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(logs) > 0 {
-		if err := a.refreshSessionIndex(ctx, logs); err != nil {
-			return nil, err
-		}
-		seen := make(map[string]struct{}, len(logs))
-		for _, source := range logs {
-			seen[source.Path] = struct{}{}
-		}
-		a.cache.Prune(seen)
-		return logs, nil
+	if err := a.refreshSessionIndex(ctx, logs); err != nil {
+		return nil, err
 	}
 
+	// Thread snapshots are always discovered, even when rollout logs exist:
+	// rollouts can be archived or deleted before their full usage was parsed.
+	// The server keeps the snapshot as the residual between tokens_used and
+	// the detailed events, so both sources together stay exact.
 	paths, err := filepath.Glob(filepath.Join(a.root, "state_*.sqlite"))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(paths)
-	sources := make([]adapters.Source, 0, len(paths))
+	sources := make([]adapters.Source, 0, len(logs)+len(paths))
+	sources = append(sources, logs...)
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		sources = append(sources, adapters.Source{Path: path})
-	}
-	if err := a.refreshSessionIndex(ctx, nil); err != nil {
-		return nil, err
 	}
 	seen := make(map[string]struct{}, len(sources))
 	for _, source := range sources {
